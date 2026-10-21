@@ -323,6 +323,71 @@ export class SharedAuthSessionError extends Error {
   }
 }
 
+type CallbackFailurePhase =
+  | "attempt"
+  | "exchange"
+  | "issuer"
+  | "bootstrap"
+  | "workspace"
+  | "organization"
+  | "principal"
+  | "prior_session"
+  | "session_write"
+  | "response"
+  | "cleanup";
+
+function reportCallbackFailure(phase: CallbackFailurePhase, error: unknown): void {
+  // Diagnostics must not inspect an exception's message, stack, name or raw code.
+  // Even a hostile accessor or a failing logger cannot alter callback cleanup.
+  try {
+    let failureClass: "session" | "oidc" | "unknown" = "unknown";
+    let code:
+      | "session_invalid"
+      | "session_unavailable"
+      | "workspace_forbidden"
+      | "oidc_invalid"
+      | "oidc_unavailable"
+      | "unknown" = "unknown";
+    if (error instanceof SharedAuthSessionError) {
+      switch (error.code) {
+        case "session_invalid":
+          failureClass = "session";
+          code = "session_invalid";
+          break;
+        case "session_unavailable":
+          failureClass = "session";
+          code = "session_unavailable";
+          break;
+        case "workspace_forbidden":
+          failureClass = "session";
+          code = "workspace_forbidden";
+          break;
+      }
+    } else if (error instanceof SharedAuthOidcError) {
+      switch (error.code) {
+        case "oidc_invalid":
+          failureClass = "oidc";
+          code = "oidc_invalid";
+          break;
+        case "oidc_unavailable":
+          failureClass = "oidc";
+          code = "oidc_unavailable";
+          break;
+      }
+    }
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.callback.failure.v1",
+        phase,
+        class: failureClass,
+        code,
+      }),
+    );
+  } catch {
+    // Logging is never part of authentication or revocation authority.
+  }
+}
+
 const attemptCookie = "__Host-takoserver_oidc_attempt";
 const sessionCookie = "__Host-takoserver_shared_session";
 const directoryPath = "/api/v1/account/shared-workspaces";
@@ -1329,6 +1394,10 @@ export function createSharedAuthSession(options: {
         headers.set("access-control-allow-origin", consoleOrigin);
         headers.set("access-control-allow-credentials", "true");
       }
+      let callbackPhase: CallbackFailurePhase | undefined =
+        initial.pathname === "/auth/oidc/callback" && request.method === "GET"
+          ? "attempt"
+          : undefined;
       try {
         const url = requestUrl(request);
         const store = createStore();
@@ -1395,13 +1464,16 @@ export function createSharedAuthSession(options: {
             sessionDigest = await hash(secret);
           let value: SharedAuthGrant | undefined;
           try {
+            callbackPhase = "exchange";
             value = await client.exchange(code, attempt.verifier, attempt.nonce);
+            callbackPhase = "issuer";
             if (
               !(await client.active(value)) ||
               (await client.canonicalAccount(value)).accountId !== value.subject
             )
               throw new SharedAuthSessionError("session_invalid");
             // Explicit canonical bootstrap precedes ACTIVE local session creation.
+            callbackPhase = "bootstrap";
             const bootstrap = await directory(value, "/bootstrap", true);
             const workspace = bootstrap.workspace;
             if (
@@ -1411,6 +1483,7 @@ export function createSharedAuthSession(options: {
               workspace.ownerUserId !== value.subject
             )
               throw new SharedAuthSessionError("session_invalid");
+            callbackPhase = "workspace";
             const selected = await currentWorkspace(value, workspace.id);
             if (selected.type !== "personal" || !selected.owner)
               throw new SharedAuthSessionError("workspace_forbidden");
@@ -1427,20 +1500,24 @@ export function createSharedAuthSession(options: {
             // stores even when they cannot furnish a qualified original.
             // A source that was qualified before this await must not drift.
             const qualifiedBefore = freshOriginalSource();
+            callbackPhase = "organization";
             const workspaceOrganization = workspaceOrganizationFromDirectory(
               await directory(value, `/${encodeURIComponent(selected.id)}/billing-organization`),
               selected.id,
             );
             if (qualifiedBefore && !freshOriginalSource())
               throw new SharedAuthSessionError("session_unavailable");
+            callbackPhase = "principal";
             const resolved = await principal(value, selected, store, {
               phase: "fresh-callback",
               workspaceOrganization,
               originalSource: () => qualifiedBefore && freshOriginalSource(),
             });
             const principalId = resolved.principalId;
+            callbackPhase = "prior_session";
             const oldSecret = cookie(request, sessionCookie);
             if (oldSecret) await store.revokeSession(await hash(oldSecret), now());
+            callbackPhase = "session_write";
             const stamp = now();
             const createSession = store.createSession;
             const session: OidcSessionRecord = {
@@ -1463,10 +1540,13 @@ export function createSharedAuthSession(options: {
             } finally {
               closeWrite();
             }
+            callbackPhase = "response";
             headers.append("set-cookie", setCookie(sessionCookie, secret, absoluteTtl / 1000));
             headers.set("location", `${consoleOrigin}/`);
             return new Response(null, { status: 303, headers });
           } catch (error) {
+            const failedPhase = callbackPhase;
+            callbackPhase = "cleanup";
             if (value) {
               await store.queueRevocation({
                 id: `callback:${crypto.randomUUID()}`,
@@ -1477,6 +1557,7 @@ export function createSharedAuthSession(options: {
               // A lost create acknowledgement must not leave a usable local row.
               await store.revokeSession(sessionDigest, now());
             }
+            callbackPhase = failedPhase;
             throw error;
           }
         }
@@ -1503,6 +1584,7 @@ export function createSharedAuthSession(options: {
         }
         return Response.json({ error: { code: "method_not_allowed" } }, { status: 405, headers });
       } catch (error) {
+        if (callbackPhase) reportCallbackFailure(callbackPhase, error);
         const forbidden =
           error instanceof SharedAuthSessionError && error.code === "workspace_forbidden";
         const bad = invalid(error);

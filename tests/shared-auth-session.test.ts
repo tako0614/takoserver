@@ -320,6 +320,109 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
     }
   }, 30_000);
 
+  test("callback bootstrap failure emits only a closed phase and keeps grant cleanup", async () => {
+    const f = await fixture();
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      f.issuer.control.onBootstrap = async () => {
+        throw new Error("private callback code, bearer token and SQL text must not be logged");
+      };
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE))).toBe(
+        false,
+      );
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "bootstrap",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+        1,
+      );
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test.each(["captured", "emitter-throws"])(
+    "callback creation ACK loss keeps cleanup when diagnostic %s",
+    async (diagnostic) => {
+      const privateFailure = {
+        get name(): never {
+          throw new Error("private name accessor");
+        },
+        get code(): never {
+          throw new Error("private code accessor");
+        },
+        get message(): never {
+          throw new Error("private message accessor");
+        },
+        get stack(): never {
+          throw new Error("private stack accessor");
+        },
+      };
+      const f = await fixture({
+        wrapStore: (store) => ({
+          ...store,
+          async createSession(record) {
+            await store.createSession(record);
+            throw privateFailure;
+          },
+        }),
+      });
+      const originalConsoleError = console.error;
+      const emitted: unknown[][] = [];
+      try {
+        const started = await f.login();
+        console.error = (...args: unknown[]) => {
+          if (diagnostic === "emitter-throws") throw new Error("diagnostic sink failed");
+          emitted.push(args);
+        };
+        const response = await f.callback(started);
+        expect(response.status).toBe(503);
+        expect(
+          response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE)),
+        ).toBe(false);
+        expect(await f.d1.sql.query("SELECT status FROM shared_auth_sessions")).toEqual([
+          { status: "revocation_pending" },
+        ]);
+        expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+          1,
+        );
+        expect(emitted).toEqual(
+          diagnostic === "emitter-throws"
+            ? []
+            : [
+                [
+                  JSON.stringify({
+                    marker: "takoserver.shared_auth.callback.failure.v1",
+                    phase: "session_write",
+                    class: "unknown",
+                    code: "unknown",
+                  }),
+                ],
+              ],
+        );
+      } finally {
+        console.error = originalConsoleError;
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
   test("Console session confirmation uses exact credentialed CORS and logout requires its Origin", async () => {
     const f = await fixture();
     try {
