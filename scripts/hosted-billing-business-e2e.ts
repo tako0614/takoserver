@@ -1,7 +1,7 @@
 /** Authenticated staging billing journey. Importing this module has no effects. */
 
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -11,13 +11,18 @@ import {
   openSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmdirSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseHostedPricing } from "../src/hosted-pricing.ts";
+import { canonicalJson } from "../src/json.ts";
 import { workspaceBillingOrganizationRef } from "../src/workspace-billing-organization.ts";
 import { type DeployTarget, loadTarget } from "./deploy/target.ts";
+import { verifyServiceReceiptEvidence } from "./hosted-billing-service-receipts.ts";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REFERENCE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -40,6 +45,19 @@ type Event =
     }
   | { kind: "intent"; step: Step; organizationId: string | null; body: ObjectValue }
   | { kind: "ack"; step: Step; organizationId?: string }
+  | {
+      kind: "workspace-usage-observation";
+      organizationId: string;
+      usageReference: string;
+      workspaceRef: string;
+      amountMicros: string;
+      attributionPeriodStart: string;
+      attributionPeriodEnd: string;
+      receiptCreatedAt: string;
+      snapshotAt: string;
+      usedMicros: string;
+      pendingMicros: string;
+    }
   | { kind: "select"; step: "personal"; organizationId: string; source: "shared-workspace" };
 
 export interface BusinessInput {
@@ -82,6 +100,24 @@ function reference(value: unknown): string {
   const result = string(value);
   if (!REFERENCE.test(result)) throw new Error("invalid billing reference");
   return result;
+}
+
+function canonicalInstant(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) &&
+    Number.isFinite(Date.parse(value)) &&
+    new Date(value).toISOString() === value
+  );
+}
+
+function canonicalMicros(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^(?:0|[1-9][0-9]*)$/u.test(value) &&
+    value.length <= 16 &&
+    BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER)
+  );
 }
 
 export function parseBusinessInput(raw: string): BusinessInput {
@@ -155,6 +191,15 @@ export function parseBusinessInput(raw: string): BusinessInput {
   return input as unknown as BusinessInput;
 }
 
+/** Local source pin only; serving artifact identity remains operator evidence. */
+export function assertBusinessSourceHead(input: BusinessInput): void {
+  const actualHead = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: ROOT,
+    encoding: "utf8",
+  }).trim();
+  if (input.sourceHead !== actualHead) throw new Error("source HEAD differs from input pin");
+}
+
 const digest = (value: string): string =>
   `sha256:${createHash("sha256").update(value).digest("hex")}`;
 
@@ -195,6 +240,12 @@ function journalParent(path: string): void {
     throw new Error("journal parent must be an owned 0700-or-stricter directory");
 }
 
+/** Validate a new evidence destination before any remote read. */
+export function privateEvidenceParent(path: string): string {
+  journalParent(path);
+  return resolve(path, "..");
+}
+
 function syncParent(path: string): void {
   const fd = openSync(resolve(path, ".."), "r");
   try {
@@ -204,8 +255,8 @@ function syncParent(path: string): void {
   }
 }
 
-function writeFully(fd: number, value: string): void {
-  const bytes = Buffer.from(value, "utf8");
+function writeFully(fd: number, value: string | Buffer): void {
+  const bytes = typeof value === "string" ? Buffer.from(value, "utf8") : value;
   let offset = 0;
   while (offset < bytes.length) {
     const written = writeSync(fd, bytes, offset, bytes.length - offset);
@@ -223,6 +274,55 @@ function append(path: string, event: Event): void {
     fsyncSync(fd);
   } finally {
     closeSync(fd);
+  }
+}
+
+/** Publish only the optional observation as a complete journal replacement. */
+function appendObservation(
+  path: string,
+  observation: Extract<Event, { kind: "workspace-usage-observation" }>,
+): void {
+  journalParent(path);
+  readPrivateFile(path);
+  const before = lstatSync(path, { bigint: true });
+  const original = readFileSync(path);
+  journal(path);
+  const sameOriginal = (): boolean => {
+    readPrivateFile(path);
+    const current = lstatSync(path, { bigint: true });
+    return (
+      current.dev === before.dev &&
+      current.ino === before.ino &&
+      current.size === before.size &&
+      current.mode === before.mode &&
+      current.uid === before.uid &&
+      current.mtimeNs === before.mtimeNs &&
+      current.ctimeNs === before.ctimeNs &&
+      readFileSync(path).equals(original)
+    );
+  };
+  if (!sameOriginal()) throw new Error("journal changed during observation preparation");
+  const temp = `${path}.observation-${randomUUID()}`;
+  let fd: number | undefined;
+  let created = false;
+  let renamed = false;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    created = true;
+    writeFully(fd, Buffer.concat([original, Buffer.from(`${JSON.stringify(observation)}\n`)]));
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    if (!sameOriginal()) throw new Error("journal changed before observation publication");
+    renameSync(temp, path);
+    renamed = true;
+    syncParent(path);
+  } finally {
+    try {
+      if (fd !== undefined) closeSync(fd);
+    } finally {
+      if (created && !renamed) unlinkSync(temp);
+    }
   }
 }
 
@@ -254,6 +354,7 @@ function journal(path: string): Event[] {
   let next = 0;
   let pending: Step | undefined;
   let organizationId: string | undefined;
+  let workspaceObservation: Extract<Event, { kind: "workspace-usage-observation" }> | undefined;
   for (const event of records.slice(1)) {
     if (event.kind === "intent") {
       keys(event, ["kind", "step", "organizationId", "body"]);
@@ -285,6 +386,56 @@ function journal(path: string): Event[] {
         source: "shared-workspace",
       });
       next++;
+    } else if (event.kind === "workspace-usage-observation") {
+      keys(event, [
+        "kind",
+        "organizationId",
+        "usageReference",
+        "workspaceRef",
+        "amountMicros",
+        "attributionPeriodStart",
+        "attributionPeriodEnd",
+        "receiptCreatedAt",
+        "snapshotAt",
+        "usedMicros",
+        "pendingMicros",
+      ]);
+      if (next !== 2 || pending !== undefined || workspaceObservation !== undefined)
+        throw new Error("invalid Workspace usage observation sequence");
+      const observation = {
+        kind: "workspace-usage-observation" as const,
+        organizationId: reference(event.organizationId),
+        usageReference: reference(event.usageReference),
+        workspaceRef: reference(event.workspaceRef),
+        amountMicros: string(event.amountMicros),
+        attributionPeriodStart: string(event.attributionPeriodStart),
+        attributionPeriodEnd: string(event.attributionPeriodEnd),
+        receiptCreatedAt: string(event.receiptCreatedAt),
+        snapshotAt: string(event.snapshotAt),
+        usedMicros: string(event.usedMicros),
+        pendingMicros: string(event.pendingMicros),
+      };
+      if (
+        !canonicalMicros(observation.amountMicros) ||
+        !canonicalMicros(observation.usedMicros) ||
+        !canonicalMicros(observation.pendingMicros) ||
+        !canonicalInstant(observation.attributionPeriodStart) ||
+        !canonicalInstant(observation.attributionPeriodEnd) ||
+        observation.attributionPeriodStart >= observation.attributionPeriodEnd ||
+        !canonicalInstant(observation.receiptCreatedAt) ||
+        !canonicalInstant(observation.snapshotAt) ||
+        Date.parse(observation.snapshotAt) < Date.parse(observation.attributionPeriodStart) ||
+        Date.parse(observation.snapshotAt) >= Date.parse(observation.attributionPeriodEnd) ||
+        Date.parse(observation.snapshotAt) < Date.parse(observation.receiptCreatedAt) ||
+        BigInt(observation.amountMicros) <= 0n ||
+        BigInt(observation.usedMicros) + BigInt(observation.pendingMicros) <
+          BigInt(observation.amountMicros) ||
+        BigInt(observation.usedMicros) + BigInt(observation.pendingMicros) >
+          BigInt(Number.MAX_SAFE_INTEGER)
+      )
+        throw new Error("invalid Workspace usage observation");
+      workspaceObservation = observation;
+      events.push(observation);
     } else if (event.kind === "ack") {
       if (pending === undefined || event.step !== pending)
         throw new Error("orphan or out-of-order mutation acknowledgement");
@@ -304,10 +455,114 @@ function journal(path: string): Event[] {
   return events;
 }
 
+function validatedJournalBinding(options: {
+  readonly journalPath: string;
+  readonly inputRaw: string;
+  readonly targetSha256: string;
+  readonly origin: string;
+}): { readonly events: readonly Event[]; readonly organizationId: string | null } {
+  const input = parseBusinessInput(options.inputRaw);
+  const events = journal(options.journalPath);
+  const initial = events[0];
+  if (
+    initial?.kind !== JOURNAL_KIND ||
+    initial.inputSha256 !== digest(options.inputRaw) ||
+    initial.targetSha256 !== options.targetSha256 ||
+    initial.sourceHead !== input.sourceHead ||
+    initial.origin !== options.origin
+  )
+    throw new Error("original input, source, or target differs from journal");
+  for (const event of events) {
+    if (event.kind === "workspace-usage-observation") {
+      const personalAck = events.find(
+        (candidate): candidate is Extract<Event, { kind: "ack" }> =>
+          candidate.kind === "ack" && candidate.step === "personal",
+      );
+      const selected = events.find(
+        (candidate): candidate is Extract<Event, { kind: "select" }> => candidate.kind === "select",
+      );
+      const journalOrganizationId = personalAck?.organizationId ?? selected?.organizationId;
+      if (
+        event.organizationId !== journalOrganizationId ||
+        event.usageReference !== input.usage.reference ||
+        event.workspaceRef !== input.usage.workspaceRef ||
+        event.amountMicros !== input.usage.expectedMicros ||
+        Date.parse(event.attributionPeriodStart) > Date.parse(input.usage.periodStart) ||
+        Date.parse(event.attributionPeriodEnd) < Date.parse(input.usage.periodEnd)
+      )
+        throw new Error("Workspace usage observation differs from original input or Organization");
+      continue;
+    }
+    if (event.kind !== "intent") continue;
+    const expected =
+      event.step === "personal"
+        ? {}
+        : event.step === "usage"
+          ? input.usage
+          : event.step === "subscription"
+            ? input.subscription
+            : input.topup;
+    if (JSON.stringify(event.body) !== JSON.stringify(expected))
+      throw new Error("original command body differs from journal");
+  }
+  const personalAck = events.find(
+    (event): event is Extract<Event, { kind: "ack" }> =>
+      event.kind === "ack" && event.step === "personal",
+  );
+  const selected = events.find(
+    (event): event is Extract<Event, { kind: "select" }> => event.kind === "select",
+  );
+  return {
+    events,
+    organizationId: personalAck?.organizationId ?? selected?.organizationId ?? null,
+  };
+}
+
+/** The collector needs every original acknowledgement before contacting providers. */
+export function readCompleteBusinessJournalBinding(options: {
+  readonly journalPath: string;
+  readonly inputRaw: string;
+  readonly targetSha256: string;
+  readonly origin: string;
+}): string {
+  const { events, organizationId } = validatedJournalBinding(options);
+  if (
+    organizationId === null ||
+    !(["usage", "subscription", "topup"] as const).every((step) =>
+      events.some((event) => event.kind === "ack" && event.step === step),
+    )
+  )
+    throw new Error("original billing journal is incomplete");
+  return organizationId;
+}
+
 function lockJournal<T>(path: string, action: () => Promise<T>): Promise<T> {
   journalParent(path);
   mkdirSync(`${path}.lock`, { mode: 0o700 });
   return action().finally(() => rmdirSync(`${path}.lock`));
+}
+
+function assertPublicPricingTable(actual: unknown, expected: unknown): void {
+  if (
+    !actual ||
+    typeof actual !== "object" ||
+    Array.isArray(actual) ||
+    canonicalJson(actual) !== canonicalJson(expected)
+  )
+    throw new Error("public pricing table differs from selected target pricing");
+}
+
+function hasExpectedContainerPricing(table: unknown): boolean {
+  if (!table || typeof table !== "object" || Array.isArray(table)) return false;
+  const plans = (table as ObjectValue).plans;
+  if (!Array.isArray(plans)) return false;
+  const usage = plans.find((plan) => object(plan).tier === "usage");
+  if (!usage) return false;
+  const meters = object(usage).meters;
+  if (!meters || typeof meters !== "object" || Array.isArray(meters)) return false;
+  return ["container.cpu", "container.memory", "container.egress", "container.image-storage"].every(
+    (meter) => Object.hasOwn(meters, meter),
+  );
 }
 
 export function assertStagingTarget(
@@ -421,6 +676,121 @@ function usageProjectionMatches(
   );
 }
 
+function receiptUsageTiming(
+  value: unknown,
+  input: BusinessInput,
+): {
+  readonly createdAt: string;
+  readonly attributionPeriodStart: string;
+  readonly attributionPeriodEnd: string;
+} {
+  const receipt = object(value);
+  if (
+    (receipt.status !== "pending" && receipt.status !== "paid") ||
+    !canonicalInstant(receipt.createdAt) ||
+    !canonicalInstant(receipt.attributionPeriodStart) ||
+    !canonicalInstant(receipt.attributionPeriodEnd) ||
+    receipt.attributionPeriodStart >= receipt.attributionPeriodEnd ||
+    Date.parse(receipt.attributionPeriodStart) > Date.parse(input.usage.periodStart) ||
+    Date.parse(receipt.attributionPeriodEnd) < Date.parse(input.usage.periodEnd)
+  )
+    throw new Error("usage receipt attribution or creation time is invalid");
+  return {
+    createdAt: receipt.createdAt,
+    attributionPeriodStart: receipt.attributionPeriodStart,
+    attributionPeriodEnd: receipt.attributionPeriodEnd,
+  };
+}
+
+type WorkspaceUsageObservation = Extract<Event, { kind: "workspace-usage-observation" }>;
+
+function workspaceAggregateObservation(
+  value: unknown,
+  organizationId: string,
+  input: BusinessInput,
+  receiptValue: unknown,
+): WorkspaceUsageObservation {
+  const timing = receiptUsageTiming(receiptValue, input);
+  const snapshot = object(value);
+  if (
+    snapshot.organizationId !== organizationId ||
+    snapshot.unit !== "USD-micros" ||
+    snapshot.cursor !== null ||
+    !canonicalInstant(snapshot.snapshotAt) ||
+    !Array.isArray(snapshot.workspaces) ||
+    snapshot.workspaces.length !== 1 ||
+    snapshot.periodStart !== timing.attributionPeriodStart ||
+    snapshot.periodEnd !== timing.attributionPeriodEnd ||
+    !canonicalInstant(snapshot.periodStart) ||
+    !canonicalInstant(snapshot.periodEnd) ||
+    snapshot.periodStart >= snapshot.periodEnd ||
+    Date.parse(snapshot.snapshotAt) < Date.parse(snapshot.periodStart) ||
+    Date.parse(snapshot.snapshotAt) >= Date.parse(snapshot.periodEnd) ||
+    Date.parse(snapshot.snapshotAt) < Date.parse(timing.createdAt)
+  )
+    throw new Error("Workspace usage snapshot is not comparable to the original receipt");
+  const row = object(snapshot.workspaces[0]);
+  if (row.workspaceRef !== input.usage.workspaceRef)
+    throw new Error("Workspace usage snapshot does not contain the exact original Workspace");
+  for (const field of ["usedMicros", "heldMicros", "pendingMicros"] as const) {
+    if (!canonicalMicros(row[field])) throw new Error("Workspace usage snapshot amount is invalid");
+  }
+  if (
+    BigInt(row.usedMicros as string) +
+      BigInt(row.heldMicros as string) +
+      BigInt(row.pendingMicros as string) >
+    BigInt(Number.MAX_SAFE_INTEGER)
+  )
+    throw new Error("Workspace usage snapshot total exceeds the safe integer range");
+  const amountMicros = input.usage.expectedMicros;
+  if (BigInt(amountMicros) <= 0n)
+    throw new Error("zero usage amount cannot prove a Workspace aggregate lower bound");
+  if (BigInt(row.usedMicros as string) + BigInt(row.pendingMicros as string) < BigInt(amountMicros))
+    throw new Error("Workspace usage aggregate is below the original usage amount");
+  return {
+    kind: "workspace-usage-observation",
+    organizationId,
+    usageReference: input.usage.reference,
+    workspaceRef: input.usage.workspaceRef,
+    amountMicros,
+    attributionPeriodStart: timing.attributionPeriodStart,
+    attributionPeriodEnd: timing.attributionPeriodEnd,
+    receiptCreatedAt: timing.createdAt,
+    snapshotAt: snapshot.snapshotAt,
+    usedMicros: row.usedMicros as string,
+    pendingMicros: row.pendingMicros as string,
+  };
+}
+
+function usageAggregateResult(
+  source:
+    | "saved-pre-checkout-observation"
+    | "current-filtered-snapshot"
+    | "not-comparable"
+    | "unproven",
+  observation: WorkspaceUsageObservation | undefined,
+): ObjectValue {
+  return {
+    workspaceUsageAggregateLowerBoundProven: observation !== undefined,
+    workspaceUsageAggregateLowerBoundSource: source,
+    workspaceUsageAggregateLowerBound: observation
+      ? {
+          scope: "workspace-period-aggregate-lower-bound",
+          organizationId: observation.organizationId,
+          usageReference: observation.usageReference,
+          workspaceRef: observation.workspaceRef,
+          amountMicros: observation.amountMicros,
+          attributionPeriodStart: observation.attributionPeriodStart,
+          attributionPeriodEnd: observation.attributionPeriodEnd,
+          receiptCreatedAt: observation.receiptCreatedAt,
+          snapshotAt: observation.snapshotAt,
+          usedMicros: observation.usedMicros,
+          pendingMicros: observation.pendingMicros,
+        }
+      : null,
+  };
+}
+
 function subscriptionCheckout(value: unknown): { readonly url?: string } {
   const checkout = object(value);
   const state = checkout.state;
@@ -496,6 +866,7 @@ export async function runStart(options: {
   readonly client: BillingHttp;
   readonly handoffPath: string;
   readonly billingAuthority?: string;
+  readonly expectedPlanTable?: unknown;
 }): Promise<void> {
   const { journalPath: path, inputRaw, targetSha256, origin, client, handoffPath } = options;
   const input = parseBusinessInput(inputRaw);
@@ -550,13 +921,17 @@ export async function runStart(options: {
     await client.request("GET", orgPath(org, "wallet/usage-summary"));
     await client.request("GET", orgPath(org, "wallet/usage-summary/workspaces"));
     const subscription = await client.request("GET", orgPath(org, "payments/subscription"));
+    if (options.expectedPlanTable !== undefined) {
+      assertPublicPricingTable(subscription.planTable, options.expectedPlanTable);
+    }
     if (
       !Array.isArray(object(subscription.planTable).plans) ||
       !(subscription.planTable as { plans: ObjectValue[] }).plans.some(
         (plan) => plan.planId === input.subscription.planKey,
       )
-    )
+    ) {
       throw new Error("selected plan is absent from the target plan table");
+    }
     const usage = await mutate(
       path,
       "usage",
@@ -568,6 +943,15 @@ export async function runStart(options: {
     if (!usageProjectionMatches(usage.usageRecord, org, input))
       throw new Error("usage acknowledgement mismatch");
     ack(path, "usage");
+    const workspace = await client.request(
+      "GET",
+      orgPath(
+        org,
+        `wallet/usage-summary/workspaces?workspaceRef=${encodeURIComponent(input.usage.workspaceRef)}`,
+      ),
+    );
+    const observation = workspaceAggregateObservation(workspace, org, input, usage.usageRecord);
+    appendObservation(path, observation);
     const started = await mutate(
       path,
       "subscription",
@@ -643,44 +1027,30 @@ export async function runVerify(options: {
   readonly origin: string;
   readonly client: BillingHttp;
   readonly handoffPath: string;
+  readonly serviceReceipts?: {
+    readonly raw: string;
+    readonly workerName: string;
+    readonly d1DatabaseId: string;
+    readonly stripeAccountId: string;
+  };
+  readonly expectedPlanTable?: unknown;
 }): Promise<ObjectValue> {
   const { journalPath: path, inputRaw, targetSha256, origin, client, handoffPath } = options;
   const input = parseBusinessInput(inputRaw);
   return await lockJournal(path, async () => {
     journalParent(`${handoffPath}.subscription.url`);
     journalParent(`${handoffPath}.topup.url`);
-    const events = journal(path);
-    const initial = events[0];
-    if (
-      initial?.kind !== JOURNAL_KIND ||
-      initial.inputSha256 !== digest(inputRaw) ||
-      initial.targetSha256 !== targetSha256 ||
-      initial.sourceHead !== input.sourceHead ||
-      initial.origin !== origin
-    )
-      throw new Error("original input, source, or target differs from journal");
-    for (const event of events) {
-      if (event.kind !== "intent") continue;
-      const expected =
-        event.step === "personal"
-          ? {}
-          : event.step === "usage"
-            ? input.usage
-            : event.step === "subscription"
-              ? input.subscription
-              : input.topup;
-      if (JSON.stringify(event.body) !== JSON.stringify(expected))
-        throw new Error("original command body differs from journal");
+    const { events, organizationId: org } = validatedJournalBinding({
+      journalPath: path,
+      inputRaw,
+      targetSha256,
+      origin,
+    });
+    if (org === null) {
+      if (options.serviceReceipts)
+        throw new Error("service receipts require resolved original Organization");
+      return { state: "unresolved-personal-ack", webhookProven: false };
     }
-    const personalAck = events.find(
-      (event): event is Extract<Event, { kind: "ack" }> =>
-        event.kind === "ack" && event.step === "personal",
-    );
-    const selected = events.find(
-      (event): event is Extract<Event, { kind: "select" }> => event.kind === "select",
-    );
-    const org = personalAck?.organizationId ?? selected?.organizationId;
-    if (!org) return { state: "unresolved-personal-ack", webhookProven: false };
     await client.request("GET", "/v1/me");
     const wallet = await client.request("GET", orgPath(org, "wallet"));
     const summary = await client.request("GET", orgPath(org, "wallet/usage-summary"));
@@ -692,6 +1062,9 @@ export async function runVerify(options: {
       ),
     );
     const subscription = await client.request("GET", orgPath(org, "payments/subscription"));
+    if (options.expectedPlanTable !== undefined) {
+      assertPublicPricingTable(subscription.planTable, options.expectedPlanTable);
+    }
     const result: ObjectValue = {
       state: "readback-incomplete",
       organizationId: org,
@@ -703,6 +1076,13 @@ export async function runVerify(options: {
       subscriptionRead: Object.hasOwn(subscription, "subscription"),
       webhookProven: false,
     };
+    if (options.expectedPlanTable !== undefined) {
+      result.pricingTableMatched = true;
+      result.containerPricingMatched = hasExpectedContainerPricing(options.expectedPlanTable);
+    }
+    let subscriptionCommand: ObjectValue | undefined;
+    let topUpReceipt: ObjectValue | undefined;
+    let matchingUsageReceipt: ObjectValue | undefined;
     if (events.some((event) => event.kind === "intent" && event.step === "usage")) {
       let cursor: string | undefined;
       result.usagePublicFieldsMatch = false;
@@ -722,11 +1102,56 @@ export async function runVerify(options: {
           if (!usageProjectionMatches(original, org, input))
             throw new Error("usage receipt differs from original public fields");
           result.usagePublicFieldsMatch = true;
+          matchingUsageReceipt = object(original);
           break;
         }
         if (page.cursor === null || page.cursor === undefined) break;
         cursor = string(page.cursor);
       }
+      let aggregateSource:
+        | "saved-pre-checkout-observation"
+        | "current-filtered-snapshot"
+        | "not-comparable"
+        | "unproven" = "unproven";
+      let aggregateObservation: WorkspaceUsageObservation | undefined;
+      const savedObservation = events.find(
+        (event): event is WorkspaceUsageObservation => event.kind === "workspace-usage-observation",
+      );
+      if (matchingUsageReceipt) {
+        if (savedObservation) {
+          const timing = receiptUsageTiming(matchingUsageReceipt, input);
+          if (
+            savedObservation.organizationId !== org ||
+            savedObservation.usageReference !== input.usage.reference ||
+            savedObservation.workspaceRef !== input.usage.workspaceRef ||
+            savedObservation.amountMicros !== input.usage.expectedMicros ||
+            savedObservation.attributionPeriodStart !== timing.attributionPeriodStart ||
+            savedObservation.attributionPeriodEnd !== timing.attributionPeriodEnd ||
+            savedObservation.receiptCreatedAt !== timing.createdAt ||
+            BigInt(savedObservation.amountMicros) <= 0n ||
+            BigInt(savedObservation.usedMicros) + BigInt(savedObservation.pendingMicros) <
+              BigInt(savedObservation.amountMicros)
+          )
+            throw new Error("saved Workspace usage observation differs from original receipt");
+          aggregateSource = "saved-pre-checkout-observation";
+          aggregateObservation = savedObservation;
+        } else {
+          try {
+            aggregateObservation = workspaceAggregateObservation(
+              workspace,
+              org,
+              input,
+              matchingUsageReceipt,
+            );
+            aggregateSource = "current-filtered-snapshot";
+          } catch {
+            aggregateSource = "not-comparable";
+          }
+        }
+      }
+      Object.assign(result, usageAggregateResult(aggregateSource, aggregateObservation));
+    } else {
+      Object.assign(result, usageAggregateResult("unproven", undefined));
     }
     if (events.some((event) => event.kind === "intent" && event.step === "subscription")) {
       let command: ObjectValue | undefined;
@@ -750,6 +1175,7 @@ export async function runVerify(options: {
         )
           throw new Error("subscription command readback differs from original");
         result.subscriptionCommandState = string(receipt.state);
+        subscriptionCommand = receipt;
         saveCheckoutHandoff(`${handoffPath}.subscription.url`, receipt.checkout);
       }
     }
@@ -770,8 +1196,28 @@ export async function runVerify(options: {
         if (receipt.reference !== input.topup.reference)
           throw new Error("top-up receipt readback differs from original");
         result.topupState = string(receipt.state);
+        topUpReceipt = receipt;
         if (amountProven) saveCheckoutHandoff(`${handoffPath}.topup.url`, receipt.checkout);
       }
+    }
+    if (options.serviceReceipts) {
+      const saved = options.serviceReceipts;
+      verifyServiceReceiptEvidence(saved.raw, {
+        input,
+        targetSha256,
+        origin,
+        organizationId: org,
+        workerName: saved.workerName,
+        d1DatabaseId: saved.d1DatabaseId,
+        stripeAccountId: saved.stripeAccountId,
+        subscriptionCommand,
+        subscription: subscription.subscription,
+        topUpReceipt,
+        topUpAmountProven: result.topupAmountProven === true,
+      });
+      result.serviceReceiptEvidenceMatched = true;
+      result.serviceReceiptEvidenceScope =
+        "saved-data-only; collection, delivery, and serving provenance unverified";
     }
     return result;
   });
@@ -794,14 +1240,17 @@ function args(argv: string[]): Record<string, string> {
     "--journal",
     "--handoff",
   ];
-  keys(parsed, required);
+  keys(
+    parsed,
+    parsed["--service-receipts"] === undefined ? required : [...required, "--service-receipts"],
+  );
   return parsed;
 }
 
 export async function main(argv: string[]): Promise<void> {
   if (argv.length === 1 && argv[0] === "--help") {
     process.stdout.write(
-      "bun --no-env-file scripts/hosted-billing-business-e2e.ts --phase start|verify --environment integration|rehearsal --target ABS --input ABS --session-file ABS --journal ABS --handoff ABS\n",
+      "bun --no-env-file scripts/hosted-billing-business-e2e.ts --phase start|verify --environment integration|rehearsal --target ABS --input ABS --session-file ABS --journal ABS --handoff ABS [--service-receipts ABS (verify only)]\n",
     );
     return;
   }
@@ -813,6 +1262,8 @@ export async function main(argv: string[]): Promise<void> {
     (environment !== "integration" && environment !== "rehearsal")
   )
     throw new Error("only explicit staging start or verify is supported");
+  if (phase === "start" && flags["--service-receipts"] !== undefined)
+    throw new Error("service receipts are verify-only evidence");
   const targetPath = string(flags["--target"]);
   outsideRepository(targetPath);
   const targetRaw = readPrivateFile(targetPath);
@@ -820,16 +1271,16 @@ export async function main(argv: string[]): Promise<void> {
   if (readPrivateFile(targetPath) !== targetRaw)
     throw new Error("target descriptor changed during selection");
   const origin = assertStagingTarget(target);
+  const hostedPricing = parseHostedPricing(target.hostedPricing);
+  if (!hostedPricing)
+    throw new Error("selected target has no canonical hosted pricing configuration");
+  const expectedPlanTable = hostedPricing.hostedPlanTable;
   const inputRaw = readPrivateFile(string(flags["--input"]));
   const input = parseBusinessInput(inputRaw);
   const targetSha256 = digest(targetRaw);
   if (input.targetSha256 !== targetSha256)
     throw new Error("selected target differs from input pin");
-  const actualHead = execFileSync("git", ["rev-parse", "HEAD"], {
-    cwd: ROOT,
-    encoding: "utf8",
-  }).trim();
-  if (input.sourceHead !== actualHead) throw new Error("source HEAD differs from input pin");
+  assertBusinessSourceHead(input);
   const session = readPrivateFile(string(flags["--session-file"])).trim();
   if (!session || /\s/u.test(session)) throw new Error("invalid session file");
   const options = {
@@ -839,9 +1290,20 @@ export async function main(argv: string[]): Promise<void> {
     targetSha256,
     origin,
     client: new BillingHttp(origin, session),
+    ...(flags["--service-receipts"] === undefined
+      ? {}
+      : {
+          serviceReceipts: {
+            raw: readPrivateFile(flags["--service-receipts"]),
+            workerName: target.workerName,
+            d1DatabaseId: target.d1.databaseId,
+            stripeAccountId: target.hostedBilling?.accountId ?? "",
+          },
+        }),
     ...(target.hostedBilling === undefined
       ? {}
       : { billingAuthority: target.hostedBilling.billingAuthority }),
+    expectedPlanTable,
   };
   if (phase === "start") {
     await runStart(options);
