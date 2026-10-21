@@ -603,71 +603,14 @@ class BillingHttpStatusError extends Error {
   }
 }
 
-export type BillingSessionCredential =
-  | string
-  | {
-      readonly kind: "shared-cookie";
-      readonly secret: string;
-      readonly consoleOrigin: string;
-    };
-
-const SHARED_SESSION_COOKIE = "__Host-takoserver_shared_session";
-
-function exactConsoleOrigin(value: string | undefined): string {
-  if (!value) throw new Error("shared session requires the selected target console Origin");
-  const url = new URL(value);
-  if (url.protocol !== "https:" || url.origin !== value || url.username || url.password)
-    throw new Error("invalid selected console Origin");
-  return value;
-}
-
-/** A named Server RP cookie is explicit custody, never a bearer-token alias. */
-export function parseBillingSessionFile(
-  raw: string,
-  consoleOrigin?: string,
-): BillingSessionCredential {
-  const value = raw.trim();
-  const secret = /^__Host-takoserver_shared_session=([A-Za-z0-9_-]{1,4096})$/u.exec(value)?.[1];
-  if (secret)
-    return Object.freeze({
-      kind: "shared-cookie",
-      secret,
-      consoleOrigin: exactConsoleOrigin(consoleOrigin),
-    });
-  if (
-    !value ||
-    value.startsWith(`${SHARED_SESSION_COOKIE}=`) ||
-    /[\s;,]/u.test(value) ||
-    /^[^=]+=[^=]/u.test(value)
-  )
-    throw new Error("invalid session file");
-  return value;
-}
-
 export class BillingHttp {
-  private readonly credentialHeaders: Readonly<Record<string, string>>;
-
   constructor(
     readonly origin: string,
-    session: BillingSessionCredential,
+    private readonly session: string,
     private readonly fetcher: (request: Request) => Promise<Response> = (request) => fetch(request),
   ) {
-    if (!/^https:\/\/[^/]+$/u.test(origin)) throw new Error("invalid HTTP client configuration");
-    if (typeof session === "string") {
-      if (!session || /[\r\n]/u.test(session)) throw new Error("invalid HTTP client configuration");
-      this.credentialHeaders = Object.freeze({ authorization: `Bearer ${session}` });
-    } else {
-      if (
-        session?.kind !== "shared-cookie" ||
-        typeof session.secret !== "string" ||
-        !/^[A-Za-z0-9_-]{1,4096}$/u.test(session.secret)
-      )
-        throw new Error("invalid HTTP client configuration");
-      this.credentialHeaders = Object.freeze({
-        cookie: `${SHARED_SESSION_COOKIE}=${session.secret}`,
-        origin: exactConsoleOrigin(session.consoleOrigin),
-      });
-    }
+    if (!/^https:\/\/[^/]+$/u.test(origin) || !session || /[\r\n]/u.test(session))
+      throw new Error("invalid HTTP client configuration");
   }
 
   async request(method: "GET" | "POST", path: string, body?: unknown): Promise<ObjectValue> {
@@ -680,7 +623,7 @@ export class BillingHttp {
       const request = new Request(url, {
         method,
         headers: {
-          ...this.credentialHeaders,
+          authorization: `Bearer ${this.session}`,
           ...(body === undefined ? {} : { "content-type": "application/json" }),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -1338,10 +1281,8 @@ export async function main(argv: string[]): Promise<void> {
   if (input.targetSha256 !== targetSha256)
     throw new Error("selected target differs from input pin");
   assertBusinessSourceHead(input);
-  const session = parseBillingSessionFile(
-    readPrivateFile(string(flags["--session-file"])),
-    target.consoleOrigin,
-  );
+  const session = readPrivateFile(string(flags["--session-file"])).trim();
+  if (!session || /\s/u.test(session)) throw new Error("invalid session file");
   const options = {
     journalPath: string(flags["--journal"]),
     handoffPath: string(flags["--handoff"]),
