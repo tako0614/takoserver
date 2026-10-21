@@ -43,6 +43,26 @@ export class SharedAuthOidcError extends Error {
   }
 }
 
+type ExchangeRequestEndpoint = "token" | "jwks";
+type ExchangeRequestFailureReason = "deadline" | "transport" | "aborted" | "http_5xx";
+
+function reportExchangeRequestFailure(
+  endpoint: ExchangeRequestEndpoint,
+  reason: ExchangeRequestFailureReason,
+): void {
+  try {
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.oidc.exchange_request.failure.v1",
+        endpoint,
+        reason,
+      }),
+    );
+  } catch {
+    // Diagnostics never affect request cleanup or the original OIDC result.
+  }
+}
+
 const MAX_RESPONSE_BYTES = 64 * 1024;
 const MAX_TOKEN_BYTES = 16 * 1024;
 const DEADLINE_MILLISECONDS = 5000;
@@ -96,12 +116,17 @@ export function createSharedAuthOidcClient(options: {
     form?: URLSearchParams,
     empty = false,
     bearer?: string,
+    exchangeEndpoint?: ExchangeRequestEndpoint,
   ): Promise<Record<string, unknown>> {
     const controller = new AbortController();
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let failureReason: ExchangeRequestFailureReason | undefined;
+    let rejected = false;
+    let rejection: unknown;
     const deadline = new Promise<never>((_, reject) => {
       timeout = setTimeout(() => {
+        failureReason ??= "deadline";
         controller.abort();
         void reader?.cancel().catch(() => {});
         reject(new SharedAuthOidcError("oidc_unavailable"));
@@ -131,17 +156,19 @@ export function createSharedAuthOidcClient(options: {
               }),
             );
           } catch {
+            failureReason ??= "transport";
             throw new SharedAuthOidcError("oidc_unavailable");
           }
           if (controller.signal.aborted) {
             void response.body?.cancel().catch(() => {});
+            failureReason ??= "aborted";
             throw new SharedAuthOidcError("oidc_unavailable");
           }
           if (!response.ok) {
             void response.body?.cancel().catch(() => {});
-            throw new SharedAuthOidcError(
-              response.status >= 500 ? "oidc_unavailable" : "oidc_invalid",
-            );
+            const unavailable = response.status >= 500;
+            if (unavailable) failureReason ??= "http_5xx";
+            throw new SharedAuthOidcError(unavailable ? "oidc_unavailable" : "oidc_invalid");
           }
           if (empty) {
             void response.body?.cancel().catch(() => {});
@@ -185,8 +212,20 @@ export function createSharedAuthOidcClient(options: {
           }
         })(),
       ]);
+    } catch (error) {
+      rejected = true;
+      rejection = error;
+      throw error;
     } finally {
       if (timeout !== undefined) clearTimeout(timeout);
+      if (exchangeEndpoint && failureReason && rejected) {
+        try {
+          if (rejection instanceof SharedAuthOidcError && rejection.code === "oidc_unavailable")
+            reportExchangeRequestFailure(exchangeEndpoint, failureReason);
+        } catch {
+          // A throwing error accessor cannot replace the original rejection.
+        }
+      }
     }
   }
 
@@ -194,6 +233,7 @@ export function createSharedAuthOidcClient(options: {
     token: unknown,
     nonce: string,
     previous?: SharedAuthGrant,
+    freshExchange = false,
   ): Promise<SharedAuthIdentity> {
     if (!text(token, MAX_TOKEN_BYTES)) throw new SharedAuthOidcError("oidc_invalid");
     const segments = token.split(".");
@@ -238,7 +278,13 @@ export function createSharedAuthOidcClient(options: {
           claims.auth_time !== previous.authTime))
     )
       throw new SharedAuthOidcError("oidc_invalid");
-    const jwks = await request("/oauth/jwks");
+    const jwks = await request(
+      "/oauth/jwks",
+      undefined,
+      false,
+      undefined,
+      freshExchange ? "jwks" : undefined,
+    );
     if (!Array.isArray(jwks.keys) || jwks.keys.length > 32)
       throw new SharedAuthOidcError("oidc_invalid");
     const candidates = jwks.keys.filter((key: unknown) => record(key) && key.kid === header.kid);
@@ -305,6 +351,7 @@ export function createSharedAuthOidcClient(options: {
     body: Record<string, unknown>,
     nonce: string,
     previous?: SharedAuthGrant,
+    freshExchange = false,
   ): Promise<SharedAuthGrant> {
     if (
       body.token_type !== "Bearer" ||
@@ -321,7 +368,7 @@ export function createSharedAuthOidcClient(options: {
     const verified =
       body.id_token === undefined && previous
         ? previous
-        : await identity(body.id_token, nonce, previous);
+        : await identity(body.id_token, nonce, previous, freshExchange);
     return {
       issuer: verified.issuer,
       clientId: verified.clientId,
@@ -379,8 +426,13 @@ export function createSharedAuthOidcClient(options: {
             redirect_uri: redirectUri,
             code_verifier: codeVerifier,
           }),
+          false,
+          undefined,
+          "token",
         ),
         nonce,
+        undefined,
+        true,
       );
     },
     async refresh(previous: SharedAuthGrant) {
