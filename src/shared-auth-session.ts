@@ -388,10 +388,10 @@ function reportCallbackFailure(phase: CallbackFailurePhase, error: unknown): voi
   }
 }
 
-type BootstrapRequestFailureReason = "deadline" | "transport" | "aborted" | "http_non_ok";
+type DirectoryRequestFailureReason = "deadline" | "transport" | "aborted" | "http_non_ok";
 
 function reportBootstrapRequestFailure(
-  reason: BootstrapRequestFailureReason,
+  reason: DirectoryRequestFailureReason,
   status: number | null,
 ): void {
   try {
@@ -407,6 +407,26 @@ function reportBootstrapRequestFailure(
     );
   } catch {
     // Diagnostics cannot change the original Directory rejection or cleanup.
+  }
+}
+
+function reportOrganizationFailure(
+  reason: DirectoryRequestFailureReason | "source_drift",
+  status: number | null,
+): void {
+  try {
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.organization.failure.v1",
+        reason,
+        status:
+          status !== null && Number.isInteger(status) && status >= 0 && status <= 599
+            ? status
+            : null,
+      }),
+    );
+  } catch {
+    // A private diagnostic cannot change the callback failure or grant cleanup.
   }
 }
 
@@ -627,7 +647,7 @@ export function createSharedAuthSession(options: {
     const controller = new AbortController();
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    let failureReason: BootstrapRequestFailureReason | undefined;
+    let failureReason: DirectoryRequestFailureReason | undefined;
     let failureStatus: number | null = null;
     let rejected = false;
     let rejection: unknown;
@@ -737,13 +757,17 @@ export function createSharedAuthSession(options: {
       throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      if (path === "/bootstrap" && post && freshCallback && rejected && failureReason) {
+      if (freshCallback && rejected && failureReason) {
         try {
           if (
             rejection instanceof SharedAuthSessionError &&
             rejection.code === "session_unavailable"
-          )
-            reportBootstrapRequestFailure(failureReason, failureStatus);
+          ) {
+            if (path === "/bootstrap" && post)
+              reportBootstrapRequestFailure(failureReason, failureStatus);
+            else if (!post && path.endsWith("/billing-organization"))
+              reportOrganizationFailure(failureReason, failureStatus);
+          }
         } catch {
           // A hostile error accessor cannot replace the original rejection.
         }
@@ -1563,11 +1587,18 @@ export function createSharedAuthSession(options: {
             const qualifiedBefore = freshOriginalSource();
             callbackPhase = "organization";
             const workspaceOrganization = workspaceOrganizationFromDirectory(
-              await directory(value, `/${encodeURIComponent(selected.id)}/billing-organization`),
+              await directory(
+                value,
+                `/${encodeURIComponent(selected.id)}/billing-organization`,
+                false,
+                true,
+              ),
               selected.id,
             );
-            if (qualifiedBefore && !freshOriginalSource())
+            if (qualifiedBefore && !freshOriginalSource()) {
+              reportOrganizationFailure("source_drift", null);
               throw new SharedAuthSessionError("session_unavailable");
+            }
             callbackPhase = "principal";
             const resolved = await principal(value, selected, store, {
               phase: "fresh-callback",
