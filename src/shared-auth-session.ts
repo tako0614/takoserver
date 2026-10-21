@@ -388,6 +388,28 @@ function reportCallbackFailure(phase: CallbackFailurePhase, error: unknown): voi
   }
 }
 
+type BootstrapRequestFailureReason = "deadline" | "transport" | "aborted" | "http_non_ok";
+
+function reportBootstrapRequestFailure(
+  reason: BootstrapRequestFailureReason,
+  status: number | null,
+): void {
+  try {
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+        reason,
+        status:
+          status !== null && Number.isInteger(status) && status >= 0 && status <= 599
+            ? status
+            : null,
+      }),
+    );
+  } catch {
+    // Diagnostics cannot change the original Directory rejection or cleanup.
+  }
+}
+
 const attemptCookie = "__Host-takoserver_oidc_attempt";
 const sessionCookie = "__Host-takoserver_shared_session";
 const directoryPath = "/api/v1/account/shared-workspaces";
@@ -600,12 +622,18 @@ export function createSharedAuthSession(options: {
     value: SharedAuthGrant,
     path: string,
     post = false,
+    freshCallback = false,
   ): Promise<Record<string, unknown>> {
     const controller = new AbortController();
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let failureReason: BootstrapRequestFailureReason | undefined;
+    let failureStatus: number | null = null;
+    let rejected = false;
+    let rejection: unknown;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        failureReason ??= "deadline";
         controller.abort();
         void reader?.cancel().catch(() => {});
         reject(new SharedAuthSessionError("session_unavailable"));
@@ -631,21 +659,39 @@ export function createSharedAuthSession(options: {
               }),
             );
           } catch {
+            failureReason ??= "transport";
             throw new SharedAuthSessionError("session_unavailable");
           }
           if (controller.signal.aborted) {
             void response.body?.cancel().catch(() => {});
+            failureReason ??= "aborted";
             throw new SharedAuthSessionError("session_unavailable");
           }
           if (!response.ok) {
             void response.body?.cancel().catch(() => {});
-            throw new SharedAuthSessionError(
+            const failure = new SharedAuthSessionError(
               response.status === 401
                 ? "session_invalid"
                 : response.status === 403 || response.status === 404
                   ? "workspace_forbidden"
                   : "session_unavailable",
             );
+            if (failure.code === "session_unavailable") {
+              failureReason ??= "http_non_ok";
+              try {
+                const observedStatus = response.status;
+                if (
+                  typeof observedStatus === "number" &&
+                  Number.isInteger(observedStatus) &&
+                  observedStatus >= 0 &&
+                  observedStatus <= 599
+                )
+                  failureStatus = observedStatus;
+              } catch {
+                // Reading status for diagnostics cannot replace the mapped error.
+              }
+            }
+            throw failure;
           }
           if (
             response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !==
@@ -685,8 +731,23 @@ export function createSharedAuthSession(options: {
           }
         })(),
       ]);
+    } catch (error) {
+      rejected = true;
+      rejection = error;
+      throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      if (path === "/bootstrap" && post && freshCallback && rejected && failureReason) {
+        try {
+          if (
+            rejection instanceof SharedAuthSessionError &&
+            rejection.code === "session_unavailable"
+          )
+            reportBootstrapRequestFailure(failureReason, failureStatus);
+        } catch {
+          // A hostile error accessor cannot replace the original rejection.
+        }
+      }
     }
   }
   async function currentWorkspace(
@@ -1474,7 +1535,7 @@ export function createSharedAuthSession(options: {
               throw new SharedAuthSessionError("session_invalid");
             // Explicit canonical bootstrap precedes ACTIVE local session creation.
             callbackPhase = "bootstrap";
-            const bootstrap = await directory(value, "/bootstrap", true);
+            const bootstrap = await directory(value, "/bootstrap", true, true);
             const workspace = bootstrap.workspace;
             if (
               !record(workspace) ||
