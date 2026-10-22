@@ -2,8 +2,8 @@
  * Source extension seam for an operator-owned v2 backend.
  *
  * Resource and Operation authority remains with the public v2 SQL engine.
- * This entrypoint only reexports its existing contracts and the read-only
- * Worker publication resolver; it does not register Forms or publish traffic.
+ * This entrypoint exposes contracts and read-only accepted graph readers;
+ * it does not register Forms or publish traffic.
  */
 export type { JsonObject, Sql } from "../ports.ts";
 export {
@@ -225,6 +225,11 @@ export {
   WorkerFormValidationError,
   type WorkerVersionSpec,
 } from "./forms/worker-specs.ts";
+export {
+  createV2ForwardContainerBindingReader,
+  type V2ForwardContainerBindingClaim,
+  type V2ForwardContainerBindingSnapshot,
+} from "./forward-container-binding-authority.ts";
 export {
   createInternalV2ModuleWorkerForm,
   type V2WorkerRetirementReader,

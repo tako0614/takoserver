@@ -75,6 +75,17 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/takoform-v2\/container-binding-authority\.ts$/u,
     may: ["core", "v2-form"],
   },
+  {
+    // Forward binding graph DATA is read-only and cannot reach native adapters.
+    name: "v2-forward-container-binding-authority",
+    match: /^src\/takoform-v2\/forward-container-binding-authority\.ts$/u,
+    may: ["core", "v2-form", "v2-operation-generation-index"],
+  },
+  {
+    name: "v2-operation-generation-index",
+    match: /^src\/takoform-v2\/operation-generation-index\.ts$/u,
+    may: ["core"],
+  },
   // v2 shares neutral primitives, not the v1 package/admission domain. The
   // Queue and Durable Workflow Resource/Operation managers are exposed as
   // source-extension factories, but this does not register them in the normal
@@ -93,6 +104,7 @@ const LAYERS: readonly Layer[] = [
       "v2-code-validation",
       "v2-runtime",
       "v2-service-binding-authority",
+      "v2-forward-container-binding-authority",
       "v2-queue-manager",
       "v2-actor-sql-graph",
       "v2-actor-physical-backend",
@@ -116,7 +128,7 @@ const LAYERS: readonly Layer[] = [
     name: "v2-state",
     match:
       /^src\/takoform-v2\/(?:store|configured-update-inputs-schema|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema)\.ts$/u,
-    may: ["core", "v2-contract", "v2-private", "v2-state"],
+    may: ["core", "v2-contract", "v2-private", "v2-state", "v2-operation-generation-index"],
   },
   {
     // Node's DatabaseSync and authorizer are the self-host-only realization.
@@ -808,6 +820,12 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   readonly typeOnly: boolean;
   readonly names: readonly string[];
 }[] = [
+  {
+    source: "src/takoform-v2/forward-container-binding-authority.ts",
+    target: "src/takoform-v2/worker-publication-state.ts",
+    typeOnly: false,
+    names: ["MAX_FAILED_TAIL"],
+  },
   {
     source: "src/providers/selfhost-container-entry-contract.ts",
     target: "src/takoform-v2/host-acceptance.ts",
