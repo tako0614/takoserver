@@ -232,7 +232,7 @@ export async function stripeRefundSource(sql: Sql): Promise<LedgerRefundSource |
     sql.query("PRAGMA table_info(stripe_billing_on_demand_funding)"),
     sql.query("PRAGMA table_info(stripe_billing_on_demand_refunds)"),
     sql.query("PRAGMA table_info(stripe_billing_refund_receipts_all)"),
-    sql.query("PRAGMA foreign_key_list(stripe_billing_on_demand_refunds)"),
+    sql.query("SELECT * FROM pragma_foreign_key_list('stripe_billing_on_demand_refunds')"),
   ]);
   if (
     ![
