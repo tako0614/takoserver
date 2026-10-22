@@ -347,6 +347,104 @@ function fixture() {
   return { dir, db, options, ports, target, input, command, journal, d1Commands, stripeRequests };
 }
 
+test("collector preserves a modern original invoice snapshot for the receipt matcher", async () => {
+  const f = fixture();
+  try {
+    const stripeFetch = f.ports.stripeFetch;
+    if (!stripeFetch) throw new Error("missing Stripe fake");
+    await collectServiceReceipts(f.options, {
+      ...f.ports,
+      stripeFetch: async (request) => {
+        const response = await stripeFetch(request);
+        if (new URL(request.url).pathname !== "/v1/events/evt_invoice_original") return response;
+        const event = (await response.json()) as Record<string, unknown>;
+        event.api_version = "2026-05-27.dahlia";
+        const data = event.data as Record<string, unknown>;
+        const object = data.object as Record<string, unknown>;
+        delete object.paid;
+        delete object.subscription;
+        delete object.subscription_details;
+        Object.assign(object, {
+          amount_paid: 1000,
+          amount_remaining: 0,
+          currency: "usd",
+          status_transitions: { paid_at: created - 1 },
+          parent: {
+            type: "subscription_details",
+            subscription_details: {
+              subscription: sub,
+              metadata: {
+                takoserverPurpose: "hosted_subscription",
+                organizationId: org,
+                planKey: f.input.subscription.planKey,
+                pricingRevision: revision,
+                subscriptionCheckoutIntentId: "sci_original",
+              },
+            },
+          },
+        });
+        return Response.json(event);
+      },
+    });
+    const raw = readFileSync(f.options.outputPath, "utf8");
+    const evidence = JSON.parse(raw);
+    expect(evidence.invoice.stripeEvent.api_version).toBe("2026-05-27.dahlia");
+    expect(evidence.invoice.stripeEvent.data.object.parent.type).toBe("subscription_details");
+  } finally {
+    f.db.close();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("collector refuses a modern invoice crossed to another checkout intent", async () => {
+  const f = fixture();
+  try {
+    const stripeFetch = f.ports.stripeFetch;
+    if (!stripeFetch) throw new Error("missing Stripe fake");
+    await expect(
+      collectServiceReceipts(f.options, {
+        ...f.ports,
+        stripeFetch: async (request) => {
+          const response = await stripeFetch(request);
+          if (new URL(request.url).pathname !== "/v1/events/evt_invoice_original") return response;
+          const event = (await response.json()) as Record<string, unknown>;
+          event.api_version = "2026-05-27.dahlia";
+          const data = event.data as Record<string, unknown>;
+          const object = data.object as Record<string, unknown>;
+          delete object.paid;
+          delete object.subscription;
+          delete object.subscription_details;
+          Object.assign(object, {
+            amount_paid: 1000,
+            amount_remaining: 0,
+            currency: "usd",
+            status_transitions: { paid_at: created - 1 },
+            parent: {
+              type: "subscription_details",
+              subscription_details: {
+                subscription: sub,
+                metadata: {
+                  takoserverPurpose: "hosted_subscription",
+                  organizationId: org,
+                  planKey: f.input.subscription.planKey,
+                  pricingRevision: revision,
+                  subscriptionCheckoutIntentId: "sci_other",
+                },
+              },
+            },
+          });
+          return Response.json(event);
+        },
+      }),
+    ).rejects.toThrow();
+    expect(existsSync(f.options.outputPath)).toBe(false);
+    expect(existsSync(`${f.options.outputPath}.metadata.json`)).toBe(false);
+  } finally {
+    f.db.close();
+    rmSync(f.dir, { recursive: true, force: true });
+  }
+});
+
 test("collector reads five actual SQLite SELECTs and two parsed Stripe GETs into private matcher data", async () => {
   const f = fixture();
   try {

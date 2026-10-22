@@ -6,6 +6,15 @@ import type { BusinessInput } from "./hosted-billing-business-e2e.ts";
 
 type RecordValue = Record<string, unknown>;
 
+const MODERN_INVOICE_API_VERSION = "2026-05-27.dahlia";
+
+export interface InvoiceSnapshotData {
+  readonly modern: boolean;
+  readonly subscriptionId: string;
+  readonly customerId: string;
+  readonly metadata: RecordValue;
+}
+
 export interface ServiceReceiptContext {
   readonly input: BusinessInput;
   readonly targetSha256: string;
@@ -54,6 +63,86 @@ function instant(value: unknown): string {
 
 function digest(value: unknown): string {
   return createHash("sha256").update(canonicalJson(value)).digest("hex");
+}
+
+/** Parse only the invoice DATA shapes this matcher understands; callers retain the source snapshot. */
+export function parseInvoiceSnapshot(
+  eventValue: unknown,
+  objectValue: unknown,
+): InvoiceSnapshotData {
+  const event = record(eventValue);
+  const invoice = record(objectValue);
+  const version = event.api_version;
+  const modern = version === MODERN_INVOICE_API_VERSION;
+  if (
+    version !== undefined &&
+    version !== null &&
+    version !== MODERN_INVOICE_API_VERSION &&
+    (typeof version !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}$/u.test(version) ||
+      version >= "2026-05-27")
+  )
+    throw new Error("unsupported Stripe invoice event API version");
+
+  let subscriptionId: string;
+  let metadata: RecordValue;
+  if (modern) {
+    if (invoice.status !== "paid") throw new Error("modern invoice is not paid");
+    if (
+      !Number.isSafeInteger(invoice.amount_paid) ||
+      (invoice.amount_paid as number) < 0 ||
+      invoice.amount_remaining !== 0
+    )
+      throw new Error("modern invoice has invalid paid amounts");
+    const paidAt = record(invoice.status_transitions).paid_at;
+    if (
+      !Number.isSafeInteger(paidAt) ||
+      (paidAt as number) <= 0 ||
+      !Number.isSafeInteger(event.created) ||
+      (event.created as number) < (paidAt as number)
+    )
+      throw new Error("modern invoice has invalid paid time");
+    const parent = record(invoice.parent);
+    if (parent.type !== "subscription_details")
+      throw new Error("modern invoice parent is not subscription details");
+    const details = record(parent.subscription_details);
+    subscriptionId = identifier(details.subscription, "sub");
+    metadata = record(details.metadata);
+    if (
+      typeof metadata.subscriptionCheckoutIntentId !== "string" ||
+      metadata.subscriptionCheckoutIntentId.length === 0
+    )
+      throw new Error("modern invoice lacks its subscription checkout intent");
+
+    if (invoice.paid !== undefined && invoice.paid !== true)
+      throw new Error("modern invoice conflicts with legacy paid alias");
+    if (invoice.subscription !== undefined) requireEqual(invoice.subscription, subscriptionId);
+    if (invoice.subscription_details !== undefined) {
+      const legacy = record(record(invoice.subscription_details).metadata);
+      for (const key of [
+        "takoserverPurpose",
+        "organizationId",
+        "planKey",
+        "pricingRevision",
+        "subscriptionCheckoutIntentId",
+      ])
+        if (legacy[key] !== undefined) requireEqual(legacy[key], metadata[key]);
+    }
+  } else {
+    if (Object.hasOwn(invoice, "parent"))
+      throw new Error("legacy invoice contains a modern parent shape");
+    if (invoice.status !== "paid") throw new Error("legacy invoice is not paid");
+    requireEqual(invoice.paid, true);
+    subscriptionId = identifier(invoice.subscription, "sub");
+    metadata = record(record(invoice.subscription_details).metadata);
+  }
+
+  return {
+    modern,
+    subscriptionId,
+    customerId: identifier(invoice.customer, "cus"),
+    metadata,
+  };
 }
 
 function eventAndReceipt(
@@ -320,14 +409,15 @@ export function verifyServiceReceiptEvidence(raw: string, context: ServiceReceip
     "invoice_credit_granted",
   );
   requireEqual(invoice.object, "invoice");
-  requireEqual(invoice.status, "paid");
-  requireEqual(invoice.paid, true);
-  requireEqual(invoice.subscription, subscriptionId);
-  requireEqual(invoice.customer, customerId);
-  const pinned = record(record(invoice.subscription_details).metadata);
+  const invoiceEvent = record(record(evidence.invoice).stripeEvent);
+  const snapshot = parseInvoiceSnapshot(invoiceEvent, invoice);
+  requireEqual(snapshot.subscriptionId, subscriptionId);
+  requireEqual(snapshot.customerId, customerId);
+  const pinned = snapshot.metadata;
   requireEqual(pinned.takoserverPurpose, "hosted_subscription");
   requireEqual(pinned.organizationId, context.organizationId);
   requireEqual(pinned.planKey, context.input.subscription.planKey);
   requireEqual(pinned.pricingRevision, intent.pricing_revision);
+  if (snapshot.modern) requireEqual(pinned.subscriptionCheckoutIntentId, intent.id);
   return true;
 }

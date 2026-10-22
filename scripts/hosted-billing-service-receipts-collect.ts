@@ -29,6 +29,7 @@ import {
   readCompleteBusinessJournalBinding,
   readPrivateFile,
 } from "./hosted-billing-business-e2e.ts";
+import { parseInvoiceSnapshot } from "./hosted-billing-service-receipts.ts";
 
 const EVENT = /^evt_[A-Za-z0-9_]{1,240}$/u;
 type Row = Record<string, unknown>;
@@ -112,26 +113,72 @@ function projectedEvent(
     throw new Error("invalid Stripe event time");
   const source = record(record(event.data).object);
   same(source.livemode, false);
+  const invoiceSnapshot = type === "invoice.paid" ? parseInvoiceSnapshot(event, source) : undefined;
+  const legacyInvoiceMetadata =
+    source.subscription_details === undefined
+      ? undefined
+      : record(record(source.subscription_details).metadata);
   const object =
     type === "invoice.paid"
-      ? {
-          object: source.object,
-          id: source.id,
-          livemode: source.livemode,
-          status: source.status,
-          paid: source.paid,
-          subscription: source.subscription,
-          customer: source.customer,
-          subscription_details: {
-            metadata: {
-              takoserverPurpose: record(record(source.subscription_details).metadata)
-                .takoserverPurpose,
-              organizationId: record(record(source.subscription_details).metadata).organizationId,
-              planKey: record(record(source.subscription_details).metadata).planKey,
-              pricingRevision: record(record(source.subscription_details).metadata).pricingRevision,
+      ? invoiceSnapshot?.modern
+        ? {
+            object: source.object,
+            id: source.id,
+            livemode: source.livemode,
+            status: source.status,
+            amount_paid: source.amount_paid,
+            amount_remaining: source.amount_remaining,
+            currency: source.currency,
+            status_transitions: { paid_at: record(source.status_transitions).paid_at },
+            customer: source.customer,
+            parent: {
+              type: record(source.parent).type,
+              subscription_details: {
+                subscription: invoiceSnapshot.subscriptionId,
+                metadata: {
+                  takoserverPurpose: invoiceSnapshot.metadata.takoserverPurpose,
+                  organizationId: invoiceSnapshot.metadata.organizationId,
+                  planKey: invoiceSnapshot.metadata.planKey,
+                  pricingRevision: invoiceSnapshot.metadata.pricingRevision,
+                  subscriptionCheckoutIntentId:
+                    invoiceSnapshot.metadata.subscriptionCheckoutIntentId,
+                },
+              },
             },
-          },
-        }
+            ...(source.paid === undefined ? {} : { paid: source.paid }),
+            ...(source.subscription === undefined ? {} : { subscription: source.subscription }),
+            ...(source.subscription_details === undefined
+              ? {}
+              : {
+                  subscription_details: {
+                    metadata: {
+                      takoserverPurpose: legacyInvoiceMetadata?.takoserverPurpose,
+                      organizationId: legacyInvoiceMetadata?.organizationId,
+                      planKey: legacyInvoiceMetadata?.planKey,
+                      pricingRevision: legacyInvoiceMetadata?.pricingRevision,
+                      subscriptionCheckoutIntentId:
+                        legacyInvoiceMetadata?.subscriptionCheckoutIntentId,
+                    },
+                  },
+                }),
+          }
+        : {
+            object: source.object,
+            id: source.id,
+            livemode: source.livemode,
+            status: source.status,
+            paid: source.paid,
+            subscription: source.subscription,
+            customer: source.customer,
+            subscription_details: {
+              metadata: {
+                takoserverPurpose: legacyInvoiceMetadata?.takoserverPurpose,
+                organizationId: legacyInvoiceMetadata?.organizationId,
+                planKey: legacyInvoiceMetadata?.planKey,
+                pricingRevision: legacyInvoiceMetadata?.pricingRevision,
+              },
+            },
+          }
       : {
           object: source.object,
           id: source.id,
@@ -153,7 +200,10 @@ function projectedEvent(
             topUpCommandDigest: record(source.metadata).topUpCommandDigest,
           },
         };
-  const nested = record(object).metadata ?? record(record(object).subscription_details).metadata;
+  const nested =
+    invoiceSnapshot?.metadata ??
+    record(object).metadata ??
+    record(record(object).subscription_details).metadata;
   if (
     Object.values(object).some((value) => value === undefined) ||
     Object.values(record(nested)).some((value) => value === undefined)
@@ -164,6 +214,7 @@ function projectedEvent(
     type: event.type,
     livemode: event.livemode,
     created: event.created,
+    ...(event.api_version === undefined ? {} : { api_version: event.api_version }),
     ...(event.account === undefined ? {} : { account: event.account }),
     data: { object },
   };
@@ -398,15 +449,16 @@ export async function collectServiceReceipts(
       "invoice_credit_granted",
     );
     same(invoiceObject.object, "invoice");
-    same(invoiceObject.status, "paid");
-    same(invoiceObject.paid, true);
-    same(invoiceObject.subscription, subscriptionId);
-    same(invoiceObject.customer, subscriptionIntent.customer_id);
-    const invoiceMetadata = record(record(invoiceObject.subscription_details).metadata);
+    const invoiceData = parseInvoiceSnapshot(invoice.event, invoiceObject);
+    same(invoiceData.subscriptionId, subscriptionId);
+    same(invoiceData.customerId, subscriptionIntent.customer_id);
+    const invoiceMetadata = invoiceData.metadata;
     same(invoiceMetadata.takoserverPurpose, "hosted_subscription");
     same(invoiceMetadata.organizationId, organizationId);
     same(invoiceMetadata.planKey, input.subscription.planKey);
     same(invoiceMetadata.pricingRevision, subscriptionIntent.pricing_revision);
+    if (invoiceData.modern)
+      same(invoiceMetadata.subscriptionCheckoutIntentId, subscriptionIntent.id);
     const evidence = {
       kind: "takoserver.hosted-billing-service-receipts@v1",
       sourceHead: input.sourceHead,
