@@ -813,13 +813,21 @@ type PublicationStateOptions = {
     Partial<Pick<StaticAssetBundleCustody, "openHeldUnverified">>;
 };
 export function createV2WorkerPublicationState(options: PublicationStateOptions) {
-  return createPublicationState(options, false);
+  return createPublicationState(options, false, false);
 }
 /** Trusted source-owned forward composition; no tenant-selected profile. */
 export function createV2ForwardWorkerPublicationState(options: PublicationStateOptions) {
-  return createPublicationState(options, true);
+  return createPublicationState(options, true, false);
 }
-function createPublicationState(options: PublicationStateOptions, forwardFamily: boolean) {
+/** Private Hosted source selection for read-only Forward Container graph data. */
+export function createV2ForwardContainerWorkerPublicationState(options: PublicationStateOptions) {
+  return createPublicationState(options, true, true);
+}
+function createPublicationState(
+  options: PublicationStateOptions,
+  forwardFamily: boolean,
+  forwardContainerBindings: boolean,
+) {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
   const publicationForms = (forward: boolean): readonly string[] =>
@@ -1405,6 +1413,7 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
     space: string,
     serviceTargets: ReadonlySet<string>,
     targetKey: string,
+    containerTargets: ReadonlySet<string> = new Set(),
   ): Promise<readonly unknown[] | null> {
     const evidence: unknown[] = [];
     for (const reference of rows) {
@@ -1416,7 +1425,8 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
         target.form_url !== reference.form_url ||
         target.principal !== principal ||
         target.space !== space ||
-        (serviceTargets.has(reference.target_uid) && target.target_key !== targetKey) ||
+        ((serviceTargets.has(reference.target_uid) || containerTargets.has(reference.target_uid)) &&
+          target.target_key !== targetKey) ||
         !settled(target, last) ||
         (reference.readiness === "ready" && observed?.ready !== true)
       )
@@ -2167,6 +2177,7 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
               : parseWorkerVersionSpec(parseObject(row.spec_json));
           if (
             row.form_url === FORWARD_WORKER_VERSION_FORM_URL &&
+            !forwardContainerBindings &&
             parseForwardWorkerVersionSpec(versionSpec).containerBindings.length
           )
             throw new Error("Container runtime unavailable");
@@ -2202,6 +2213,13 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
           own.space,
           new Set(versionSpec.serviceBindings.map((item) => item.resource.resourceUid)),
           op.target_key,
+          new Set(
+            forwardContainerBindings && row.form_url === FORWARD_WORKER_VERSION_FORM_URL
+              ? parseForwardWorkerVersionSpec(versionSpec).containerBindings.map(
+                  (item) => item.resource.resourceUid,
+                )
+              : [],
+          ),
         );
         if (!active || !targets) {
           return unresolved("graph_unresolved", "Version active references changed");

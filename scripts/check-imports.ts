@@ -86,6 +86,11 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/takoform-v2\/operation-generation-index\.ts$/u,
     may: ["core"],
   },
+  {
+    name: "v2-forward-native-source",
+    match: /^src\/takoform-v2\/forward-worker-native-source\.ts$/u,
+    may: [],
+  },
   // v2 shares neutral primitives, not the v1 package/admission domain. The
   // Queue and Durable Workflow Resource/Operation managers are exposed as
   // source-extension factories, but this does not register them in the normal
@@ -127,7 +132,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-state",
     match:
-      /^src\/takoform-v2\/(?:store|configured-update-inputs-schema|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema)\.ts$/u,
+      /^src\/takoform-v2\/(?:store|configured-update-inputs-schema|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema|forward-worker-native-schema)\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state", "v2-operation-generation-index"],
   },
   {
@@ -820,6 +825,18 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   readonly typeOnly: boolean;
   readonly names: readonly string[];
 }[] = [
+  {
+    source: "src/takoform-v2/worker-invocation-custody.ts",
+    target: "src/takoform-v2/forms/worker-specs.ts",
+    typeOnly: false,
+    names: ["FORWARD_WORKER_DEPLOYMENT_FORM_URL", "FORWARD_WORKER_VERSION_FORM_URL"],
+  },
+  {
+    source: "src/takoform-v2/forward-worker-native-schema.ts",
+    target: "src/takoform-v2/forward-worker-native-source.ts",
+    typeOnly: false,
+    names: ["FORWARD_NATIVE_BASE_OBJECTS"],
+  },
   {
     source: "src/takoform-v2/forward-container-binding-authority.ts",
     target: "src/takoform-v2/worker-publication-state.ts",

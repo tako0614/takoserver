@@ -273,6 +273,7 @@ export {
   type WorkerCronTriggerTickResult,
 } from "./worker-cron-trigger-scheduler.ts";
 export {
+  createForwardV2WorkerInvocationLifecycle,
   createV2WorkerInvocationLifecycle,
   type V2WorkerCronInvocationClaim,
   type V2WorkerCronRouteRelease,
@@ -296,12 +297,15 @@ export {
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
 export {
+  createForwardV2NativeDeletionCustody,
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
   type V2NativeDeletionInspection,
   type V2NativeDeletionItem,
 } from "./worker-native-deletions.ts";
 export {
+  createForwardV2NativeEffectCustody,
+  createRetainedV2NativeEffectCustody,
   createV2NativeEffectCustody,
   type V2NativeEffectCustody,
   type V2NativeEffectIdentity,
@@ -313,6 +317,7 @@ export {
 } from "./worker-native-identity-schema.ts";
 export type { V2ForwardWorkerFamilyProfile } from "./worker-publication-state.ts";
 export {
+  createV2ForwardContainerWorkerPublicationState,
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,
   type V2WorkerPublicationSnapshot,

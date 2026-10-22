@@ -1,6 +1,7 @@
 import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject, Sql, SqlParam } from "../ports.ts";
-import { WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
+import { FORWARD_WORKER_VERSION_FORM_URL, WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
+import { forwardWorkerNativeSchemaReady } from "./forward-worker-native-schema.ts";
 import type { V2Execution } from "./types.ts";
 import {
   inspectV2WorkerInvocationSchema,
@@ -80,8 +81,8 @@ const CLAIM = `op.id = ? AND op.resource_uid = ? AND op.principal = ?
   AND r.busy_operation = op.id AND r.phase = 'deleting'
   AND r.deleted_at IS NULL AND r.spec_json = op.accepted_spec_json`;
 
-function validExecution(e: V2Execution): boolean {
-  return e.form === WORKER_VERSION_FORM_URL && e.action === "delete";
+function validExecution(e: V2Execution, form: string): boolean {
+  return e.form === form && e.action === "delete";
 }
 
 function validReceipt(value: string): boolean {
@@ -170,8 +171,27 @@ export function createV2NativeDeletionCustody(options: {
   readonly sql: Sql;
   readonly now?: Clock;
 }): V2NativeDeletionCustody {
+  return createNativeDeletionCustody(options, WORKER_VERSION_FORM_URL);
+}
+
+/** Source-selected Forward WV0.7 cleanup; every authority write repeats 106 readiness. */
+export function createForwardV2NativeDeletionCustody(options: {
+  readonly sql: Sql;
+  readonly now?: Clock;
+}): V2NativeDeletionCustody {
+  return createNativeDeletionCustody(options, FORWARD_WORKER_VERSION_FORM_URL);
+}
+
+function createNativeDeletionCustody(
+  options: { readonly sql: Sql; readonly now?: Clock },
+  form: string,
+): V2NativeDeletionCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
+  const forwardReady =
+    form === FORWARD_WORKER_VERSION_FORM_URL ? forwardWorkerNativeSchemaReady() : null;
+  const readySuffix = forwardReady === null ? "" : ` AND (${forwardReady})`;
+  const claim = `${CLAIM}${readySuffix}`;
 
   async function currentUnsafePredicate(): Promise<{
     readonly unsafe: string;
@@ -184,9 +204,11 @@ export function createV2NativeDeletionCustody(options: {
       (await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationDrainSchemaReady()}`)).length === 1;
     return {
       unsafe: unsafePredicate(kind !== "endpoint", drainAware),
-      ready: drainAware
-        ? v2WorkerInvocationDrainSchemaReady()
-        : v2WorkerInvocationLegacySchemaReady(kind),
+      ready: `(${
+        drainAware
+          ? v2WorkerInvocationDrainSchemaReady()
+          : v2WorkerInvocationLegacySchemaReady(kind)
+      })${readySuffix}`,
     };
   }
 
@@ -197,12 +219,12 @@ export function createV2NativeDeletionCustody(options: {
 
   async function current(e: V2Execution): Promise<boolean> {
     const nowMs = time();
-    if (!validExecution(e) || nowMs === null) return false;
+    if (!validExecution(e, form) || nowMs === null) return false;
     return (
       (
         await sql.query(
           `SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r
-      ON r.uid = op.resource_uid WHERE ${CLAIM} LIMIT 1`,
+      ON r.uid = op.resource_uid WHERE ${claim} LIMIT 1`,
           claimParams(e, nowMs),
         )
       ).length === 1
@@ -230,7 +252,7 @@ export function createV2NativeDeletionCustody(options: {
         AND op.accepted_spec_json = ? AND r.principal = ? AND r.space = ?
         AND r.name = ? AND r.form_url = ? AND r.backend_id = op.backend_id
         AND r.target_key = op.target_key
-        ${ready ? `AND (${ready})` : ""} LIMIT 1`,
+        ${ready ? `AND (${ready})` : ""}${readySuffix} LIMIT 1`,
           [
             e.operationId,
             e.resourceUid,
@@ -254,7 +276,7 @@ export function createV2NativeDeletionCustody(options: {
     async stageNext(input) {
       const e = captureExecution(input);
       const nowMs = time();
-      if (!validExecution(e) || nowMs === null) return "unknown";
+      if (!validExecution(e, form) || nowMs === null) return "unknown";
       try {
         const result = await sql.run(
           `INSERT INTO tf_v2_worker_native_deletions (
@@ -267,7 +289,7 @@ export function createV2NativeDeletionCustody(options: {
           op.lease_token, ${DB_NOW}
         FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
         JOIN tf_v2_worker_native_effects effect ON effect.resource_uid = r.uid
-        WHERE ${CLAIM} AND effect.generation < op.generation
+        WHERE ${claim} AND effect.generation < op.generation
           AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_deletions item
             WHERE item.delete_operation_id = op.id AND item.source_operation_id = effect.operation_id)
         ORDER BY effect.generation, effect.operation_id LIMIT 32`,
@@ -328,7 +350,7 @@ export function createV2NativeDeletionCustody(options: {
           `UPDATE tf_v2_worker_native_deletions
           SET qualified_source_receipt = ?, qualification_lease_token = ?
           WHERE delete_operation_id = ? AND source_operation_id = ?
-            AND qualified_source_receipt IS NULL AND grant_lease_token IS NULL`,
+            AND qualified_source_receipt IS NULL AND grant_lease_token IS NULL${readySuffix}`,
           [receipt, item.execution.leaseToken, item.execution.operationId, item.sourceOperationId],
         );
         return changed.changes === 1;
@@ -340,7 +362,7 @@ export function createV2NativeDeletionCustody(options: {
       const item = captureItem(input);
       const e = item.execution;
       const nowMs = time();
-      if (!validExecution(e) || nowMs === null || !validReceipt(currentSourceReceipt))
+      if (!validExecution(e, form) || nowMs === null || !validReceipt(currentSourceReceipt))
         return "unknown";
       const existing = await row(item);
       if (!existing || !sameRow(existing, item)) return "unknown";
@@ -362,7 +384,7 @@ export function createV2NativeDeletionCustody(options: {
                 AND later.source_generation > tf_v2_worker_native_deletions.source_generation)
             AND (${predicate.ready})
             AND EXISTS (SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r
-              ON r.uid = op.resource_uid WHERE ${CLAIM}
+              ON r.uid = op.resource_uid WHERE ${claim}
                 AND NOT (${predicate.unsafe}) AND NOT (${MISSING}))`,
           [
             e.leaseToken,
@@ -382,7 +404,7 @@ export function createV2NativeDeletionCustody(options: {
     },
     async inspect(input) {
       const item = captureItem(input);
-      if (!validExecution(item.execution)) return { kind: "unknown" };
+      if (!validExecution(item.execution, form)) return { kind: "unknown" };
       const existing = await row(item);
       const predicate = await currentUnsafePredicate();
       if (
@@ -417,7 +439,7 @@ export function createV2NativeDeletionCustody(options: {
             await sql.run(
               `UPDATE tf_v2_worker_native_deletions
         SET acknowledged_receipt = ? WHERE delete_operation_id = ? AND source_operation_id = ?
-          AND acknowledged_receipt IS NULL AND grant_lease_token IS NOT NULL`,
+          AND acknowledged_receipt IS NULL AND grant_lease_token IS NOT NULL${readySuffix}`,
               [receipt, item.execution.operationId, item.sourceOperationId],
             )
           ).changes === 1
@@ -452,7 +474,7 @@ export function createV2NativeDeletionCustody(options: {
             (upload_receipt IS NOT NULL AND EXISTS (
               SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r
               ON r.uid = op.resource_uid WHERE ${CLAIM}
-                AND NOT (${predicate.unsafe}) AND NOT (${MISSING}))))`,
+                AND NOT (${predicate.unsafe}) AND NOT (${MISSING}))))${readySuffix}`,
               [
                 receipt,
                 item.execution.leaseToken,
@@ -470,12 +492,12 @@ export function createV2NativeDeletionCustody(options: {
     async allAbsent(input) {
       const e = captureExecution(input);
       const nowMs = time();
-      if (!validExecution(e) || nowMs === null) return false;
+      if (!validExecution(e, form) || nowMs === null) return false;
       const predicate = await currentUnsafePredicate();
       if (predicate === null) return false;
       const rows = await sql.query(
         `SELECT 1 FROM tf_v2_operations op
-        JOIN tf_v2_resources r ON r.uid = op.resource_uid WHERE ${CLAIM}
+        JOIN tf_v2_resources r ON r.uid = op.resource_uid WHERE ${claim}
           AND (${predicate.ready})
           AND NOT (${predicate.unsafe}) AND NOT (${MISSING})
           AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_deletions item
