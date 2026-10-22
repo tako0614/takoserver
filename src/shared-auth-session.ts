@@ -432,6 +432,7 @@ function reportOrganizationFailure(
 
 const attemptCookie = "__Host-takoserver_oidc_attempt";
 const sessionCookie = "__Host-takoserver_shared_session";
+const legacySessionCookie = "takoserver_session";
 const directoryPath = "/api/v1/account/shared-workspaces";
 const attemptTtl = 5 * 60 * 1000;
 const idleTtl = 12 * 60 * 60 * 1000;
@@ -1634,6 +1635,8 @@ export function createSharedAuthSession(options: {
             }
             callbackPhase = "response";
             headers.append("set-cookie", setCookie(sessionCookie, secret, absoluteTtl / 1000));
+            // Only an acknowledged shared login replaces the legacy browser login.
+            headers.append("set-cookie", setCookie(legacySessionCookie, "", 0));
             headers.set("location", `${consoleOrigin}/`);
             return new Response(null, { status: 303, headers });
           } catch (error) {
@@ -1656,8 +1659,16 @@ export function createSharedAuthSession(options: {
         if (url.pathname === "/auth/oidc/logout" && request.method === "POST") {
           if (url.search !== "" || request.headers.get("origin") !== consoleOrigin)
             throw new SharedAuthSessionError("session_invalid");
-          headers.set("set-cookie", setCookie(sessionCookie, "", 0));
           const secret = cookie(request, sessionCookie);
+          if (
+            !secret &&
+            (request.headers.get("cookie") ?? "")
+              .split(";")
+              .some((part) => part.trim().split("=", 1)[0] === legacySessionCookie)
+          )
+            throw new SharedAuthSessionError("session_invalid");
+          headers.set("set-cookie", setCookie(sessionCookie, "", 0));
+          headers.append("set-cookie", setCookie(legacySessionCookie, "", 0));
           if (secret) await store.revokeSession(await hash(secret), now());
           // Upstream outages cannot delay the browser's local logout. The
           // owning maintenance entry drains this already durable outbox.
