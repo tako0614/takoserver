@@ -3,9 +3,8 @@ import { readFileSync } from "node:fs";
 import { readFinancial0104CanonicalMigrationSource } from "../scripts/deploy/financial0104-canonical-source.ts";
 import { parseBillingConfig } from "../src/billing-config.ts";
 import { createLedger, LedgerError, stripeRefundSource } from "../src/ledger.ts";
-import { createFreshNativeSql, createMoneyCutoverSql } from "../src/money-cutover-sql.ts";
+import { createMoneyCutoverSql } from "../src/money-cutover-sql.ts";
 import { createOrgBilling } from "../src/org-billing.ts";
-import type { Sql } from "../src/ports.ts";
 import { createHostedBillingRealmTestDatabase } from "./helpers/hosted-billing-realm-fixture.ts";
 
 const ORG = "refund_source_wrapper_org";
@@ -47,27 +46,22 @@ async function ordinary0105() {
   }
 }
 
-test("stripeRefundSource reads ordinary 0105 through both actual native SQL wrappers", async () => {
-  const wrappers: readonly ((sql: Sql) => Sql)[] = [
-    createFreshNativeSql,
-    (sql) => createMoneyCutoverSql(sql, WRITER),
-  ];
-  for (const wrap of wrappers) {
-    const fixture = await ordinary0105();
-    try {
-      expect(await stripeRefundSource(wrap(fixture.sql))).toBe(
-        "stripe_billing_refund_receipts_all",
-      );
-    } finally {
-      fixture.db.close();
-    }
+test("stripeRefundSource reads ordinary 0105 through raw SQL and the public Money wrapper", async () => {
+  const fixture = await ordinary0105();
+  try {
+    expect(await stripeRefundSource(fixture.sql)).toBe("stripe_billing_refund_receipts_all");
+    expect(await stripeRefundSource(createMoneyCutoverSql(fixture.sql, WRITER))).toBe(
+      "stripe_billing_refund_receipts_all",
+    );
+  } finally {
+    fixture.db.close();
   }
 });
 
 test("Org billing summary and workspace reads retain source success and composite-FK refusal", async () => {
   const fixture = await ordinary0105();
   try {
-    const sql = createFreshNativeSql(fixture.sql);
+    const sql = fixture.sql;
     const clock = () => new Date("2026-10-15T00:00:00.000Z");
     const billing = createOrgBilling({
       sql,
