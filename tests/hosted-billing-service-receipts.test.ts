@@ -223,6 +223,134 @@ test("saved TEST events match actual local stripe_events rows and original custo
   expect(verifyServiceReceiptEvidence(JSON.stringify(evidence), context)).toBe(true);
 });
 
+test("original modern invoice snapshots retain their versioned parent and paid facts", async () => {
+  const { evidence, context } = await fixture();
+  const candidate = structuredClone(evidence);
+  const event = candidate.invoice.stripeEvent as Record<string, unknown>;
+  event.api_version = "2026-05-27.dahlia";
+  const data = event.data as Record<string, unknown>;
+  const object = data.object as Record<string, unknown>;
+  delete object.paid;
+  delete object.subscription;
+  delete object.subscription_details;
+  Object.assign(object, {
+    amount_paid: 500,
+    amount_remaining: 0,
+    currency: "usd",
+    status_transitions: { paid_at: 1792454300 },
+    parent: {
+      type: "subscription_details",
+      subscription_details: {
+        subscription: sub,
+        metadata: {
+          takoserverPurpose: "hosted_subscription",
+          organizationId: org,
+          planKey: input.subscription.planKey,
+          pricingRevision: revision,
+          subscriptionCheckoutIntentId: "sci_original",
+        },
+      },
+    },
+  });
+  expect(verifyServiceReceiptEvidence(JSON.stringify(candidate), context)).toBe(true);
+});
+
+test("modern invoice snapshots reject unknown, unpaid, crossed, or conflicting facts", async () => {
+  const { evidence, context } = await fixture();
+  const modern = () => {
+    const candidate = structuredClone(evidence);
+    const event = candidate.invoice.stripeEvent as Record<string, unknown>;
+    event.api_version = "2026-05-27.dahlia";
+    const data = event.data as Record<string, unknown>;
+    const object = data.object as Record<string, unknown>;
+    delete object.paid;
+    delete object.subscription;
+    delete object.subscription_details;
+    Object.assign(object, {
+      amount_paid: 500,
+      amount_remaining: 0,
+      currency: "usd",
+      status_transitions: { paid_at: 1792454300 },
+      parent: {
+        type: "subscription_details",
+        subscription_details: {
+          subscription: sub,
+          metadata: {
+            takoserverPurpose: "hosted_subscription",
+            organizationId: org,
+            planKey: input.subscription.planKey,
+            pricingRevision: revision,
+            subscriptionCheckoutIntentId: "sci_original",
+          },
+        },
+      },
+    });
+    return { candidate, event, object };
+  };
+  const fail = (
+    mutate: (event: Record<string, unknown>, object: Record<string, unknown>) => void,
+  ) => {
+    const { candidate, event, object } = modern();
+    mutate(event, object);
+    expect(() => verifyServiceReceiptEvidence(JSON.stringify(candidate), context)).toThrow();
+  };
+  for (const version of [undefined, "2024-06-20"]) {
+    const { candidate, event, object } = modern();
+    if (version === undefined) delete event.api_version;
+    else event.api_version = version;
+    object.paid = true;
+    object.subscription = sub;
+    object.subscription_details = {
+      metadata: {
+        takoserverPurpose: "hosted_subscription",
+        organizationId: org,
+        planKey: input.subscription.planKey,
+        pricingRevision: revision,
+      },
+    };
+    expect(() => verifyServiceReceiptEvidence(JSON.stringify(candidate), context)).toThrow();
+  }
+  fail((event) => delete event.api_version);
+  fail((event) => (event.api_version = "2026-05-27.rose"));
+  fail((_event, object) => {
+    object.parent = {
+      type: "subscription_details",
+      subscription_details: {
+        subscription: "sub_other",
+        metadata: {
+          takoserverPurpose: "hosted_subscription",
+          organizationId: org,
+          planKey: input.subscription.planKey,
+          pricingRevision: revision,
+        },
+      },
+    };
+  });
+  fail((_event, object) => (object.customer = "cus_other"));
+  fail((_event, object) => {
+    const parent = object.parent as Record<string, unknown>;
+    const details = parent.subscription_details as Record<string, unknown>;
+    const metadata = details.metadata as Record<string, unknown>;
+    metadata.organizationId = "org_other";
+  });
+  fail((_event, object) => {
+    const parent = object.parent as Record<string, unknown>;
+    const details = parent.subscription_details as Record<string, unknown>;
+    const metadata = details.metadata as Record<string, unknown>;
+    metadata.pricingRevision = "revision_other";
+  });
+  fail((_event, object) => {
+    const parent = object.parent as Record<string, unknown>;
+    const details = parent.subscription_details as Record<string, unknown>;
+    const metadata = details.metadata as Record<string, unknown>;
+    metadata.subscriptionCheckoutIntentId = "sci_other";
+  });
+  fail((_event, object) => (object.status = "open"));
+  fail((_event, object) => (object.amount_remaining = 1));
+  fail((_event, object) => (object.status_transitions = {}));
+  fail((_event, object) => (object.subscription = "sub_other"));
+});
+
 test("crossed, unfinished, and unrelated saved receipts cannot match the original journey", async () => {
   const { evidence, context } = await fixture();
   const fail = (mutate: (candidate: typeof evidence) => void) => {

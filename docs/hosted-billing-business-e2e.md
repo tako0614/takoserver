@@ -254,6 +254,16 @@ times. The invoice subscription must link through the saved original checkout
 intent and association. `received`, `deferred`, `ignored`, or a subscription
 Checkout's `subscription_updated` alone refuses the comparison.
 
+Stripe event snapshots retain their creation-time API version, even when the
+GET uses a different `Stripe-Version` header ([Stripe event reference](https://docs.stripe.com/api/events/list)).
+The comparison keeps that version and supports the legacy invoice snapshot and
+the `2026-05-27.dahlia` snapshot separately. The latter must carry its original
+`parent.subscription_details`, paid status, zero remaining amount, and positive
+paid timestamp; it is not rewritten into a legacy event. Its retained checkout
+intent ID must also match the selected D1 intent. Unknown modern versions,
+conflicting aliases, modern parents disguised as legacy snapshots, and
+incomplete paid facts refuse the comparison.
+
 Matching data adds `serviceReceiptEvidenceMatched: true` and
 `serviceReceiptEvidenceScope: "saved-data-only; collection, delivery, and serving provenance unverified"`
 to the usual `readback-incomplete` result; it **never** changes
