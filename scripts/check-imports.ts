@@ -832,6 +832,13 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   readonly names: readonly string[];
 }[] = [
   {
+    // The guarded discard factory consumes only its fixed schema and object names.
+    source: "src/takoform-v2/configured-private-inputs.ts",
+    target: "src/takoform-v2/configured-update-inputs-schema.ts",
+    typeOnly: false,
+    names: ["v2ConfiguredUpdateDiscardObjects", "v2ConfiguredUpdateDiscardSchema"],
+  },
+  {
     source: "src/takoform-v2/worker-invocation-custody.ts",
     target: "src/takoform-v2/forms/worker-specs.ts",
     typeOnly: false,
