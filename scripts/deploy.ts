@@ -102,6 +102,12 @@ const USAGE = `takoserver deploy
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   Integration --through-migration=0103 selects only the fixed audited100 -> original101/102/103
   source registration plus its same-artifact mandatory deployment/RP receipts in one import.
+  Integration --through-migration=0103 --register-current-auth103-runtime selects only
+  the already-published current Root Auth103 Version for a separate, once-only
+  deployment/receipt pair append in the same STATE_DB; status never dispatches.
+  Integration --apply --through-migration=0103 --finalize-current-auth103-runtime-installed
+  only seals installed custody for an exact, already-present runtime pair whose
+  dispatch-only slot matches; it reads D1 and never writes it.
   It requires source-proved pre-auth103-quiesced all-traffic Worker and private install custody.
   Integration --through-migration=0104 separately appends only the exact Root-registered
   Financial0104 recipe after installed Auth103 (thawed when Money-preserved) in one guarded import.
@@ -226,6 +232,8 @@ interface InvocationBase {
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly reverse?: boolean;
   readonly repairOriginalMoneyMaintenance?: boolean;
+  readonly registerCurrentAuth103Runtime?: true;
+  readonly finalizeCurrentAuth103RuntimeInstalled?: true;
 }
 
 type Invocation =
@@ -440,7 +448,19 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let apiKeyId: string | null = null;
   let reverse = false;
   let repairOriginalMoneyMaintenance = false;
+  let registerCurrentAuth103Runtime = false;
+  let finalizeCurrentAuth103RuntimeInstalled = false;
   for (const flag of flags) {
+    if (flag === "--register-current-auth103-runtime") {
+      if (registerCurrentAuth103Runtime || finalizeCurrentAuth103RuntimeInstalled) return null;
+      registerCurrentAuth103Runtime = true;
+      continue;
+    }
+    if (flag === "--finalize-current-auth103-runtime-installed") {
+      if (finalizeCurrentAuth103RuntimeInstalled || registerCurrentAuth103Runtime) return null;
+      finalizeCurrentAuth103RuntimeInstalled = true;
+      continue;
+    }
     if (flag === "--repair-original-money-maintenance") {
       if (repairOriginalMoneyMaintenance) return null;
       repairOriginalMoneyMaintenance = true;
@@ -692,6 +712,24 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (!action || !environment || !commit) return null;
+  if (
+    registerCurrentAuth103Runtime &&
+    (surfaceValue !== "takoserver-d1-schema" ||
+      (action !== "status" && action !== "apply") ||
+      environment !== "integration" ||
+      throughMigration !== "0103" ||
+      args.length !== 6)
+  )
+    return null;
+  if (
+    finalizeCurrentAuth103RuntimeInstalled &&
+    (surfaceValue !== "takoserver-d1-schema" ||
+      action !== "apply" ||
+      environment !== "integration" ||
+      throughMigration !== "0103" ||
+      args.length !== 6)
+  )
+    return null;
   if (
     repairOriginalMoneyMaintenance &&
     (surfaceValue !== "takoserver-integration-worker-bootstrap" ||
@@ -1153,6 +1191,10 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(adoptLivePath === null ? {} : { adoptLivePath }),
     ...(bootstrapVerifierBridge ? { bootstrapVerifierBridge: true } : {}),
     ...(repairOriginalMoneyMaintenance ? { repairOriginalMoneyMaintenance: true } : {}),
+    ...(registerCurrentAuth103Runtime ? { registerCurrentAuth103Runtime: true } : {}),
+    ...(finalizeCurrentAuth103RuntimeInstalled
+      ? { finalizeCurrentAuth103RuntimeInstalled: true }
+      : {}),
     ...(bootstrapProbePredecessorVersionId === null ? {} : { bootstrapProbePredecessorVersionId }),
     ...(throughMigration === null ? {} : { throughMigration }),
     ...(protectedReferenceEnvironment === null ? {} : { protectedReferenceEnvironment }),
@@ -1336,6 +1378,30 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       requireEnvironment("TAKOSERVER_DEPLOY_TARGET_PRODUCTION"),
       "production",
     );
+    if (
+      invocation.registerCurrentAuth103Runtime ||
+      invocation.finalizeCurrentAuth103RuntimeInstalled
+    ) {
+      if (
+        invocation.finalizeCurrentAuth103RuntimeInstalled &&
+        (invocation.registerCurrentAuth103Runtime || invocation.action !== "apply")
+      )
+        throw new DeployError("preflight", "Auth103 current runtime finalize selection differs");
+      const { runD1SchemaAuth103CurrentRuntimeRegistration } = await import(
+        "./deploy/schema-auth103-current-runtime-registration.ts"
+      );
+      return await runD1SchemaAuth103CurrentRuntimeRegistration(
+        {
+          action: invocation.finalizeCurrentAuth103RuntimeInstalled
+            ? "finalize"
+            : invocation.action,
+          environment: "integration",
+          commit: invocation.commit,
+        },
+        target,
+        production.d1,
+      );
+    }
     const { runD1SchemaAuth103 } = await import("./deploy/schema-auth103-native-source.ts");
     return await runD1SchemaAuth103(
       { action: invocation.action, environment: "integration", commit: invocation.commit },

@@ -1100,6 +1100,110 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(integrationWithoutWave.stderr).not.toContain("no target was touched");
     });
 
+    test("the Auth103 current-runtime selectors are confined to integration 0103", async () => {
+      const route = [
+        "takoserver-d1-schema",
+        "--environment=integration",
+        `--commit=${sha}`,
+        "--through-migration=0103",
+      ] as const;
+      for (const [action, selector] of [
+        ["--status", "--register-current-auth103-runtime"],
+        ["--apply", "--register-current-auth103-runtime"],
+        ["--apply", "--finalize-current-auth103-runtime-installed"],
+      ] as const) {
+        const selected = await deploy([route[0], action, ...route.slice(1), selector]);
+        expect(selected.exitCode).toBe(2);
+        expect(selected.stderr).toContain("deploy target descriptor not found");
+        expect(selected.stderr).not.toContain("no target was touched");
+      }
+
+      for (const args of [
+        [route[0], "--status", ...route.slice(1), "--finalize-current-auth103-runtime-installed"],
+        [
+          route[0],
+          "--apply",
+          "--environment=production",
+          `--commit=${sha}`,
+          "--through-migration=0103",
+          "--register-current-auth103-runtime",
+        ],
+        [
+          route[0],
+          "--apply",
+          "--environment=rehearsal",
+          `--commit=${sha}`,
+          "--through-migration=0103",
+          "--finalize-current-auth103-runtime-installed",
+        ],
+        [
+          route[0],
+          "--apply",
+          "--environment=integration",
+          `--commit=${sha}`,
+          "--through-migration=0104",
+          "--register-current-auth103-runtime",
+        ],
+        [
+          route[0],
+          "--apply",
+          "--environment=integration",
+          `--commit=${sha}`,
+          "--through-migration=0100",
+          "--finalize-current-auth103-runtime-installed",
+        ],
+        [
+          route[0],
+          "--apply",
+          "--environment=integration",
+          `--commit=${sha}`,
+          "--register-current-auth103-runtime",
+        ],
+        ["takoserver-worker", "--apply", ...route.slice(1), "--register-current-auth103-runtime"],
+        [
+          "takoserver-worker",
+          "--apply",
+          ...route.slice(1),
+          "--finalize-current-auth103-runtime-installed",
+        ],
+        [route[0], "--apply", ...route.slice(1), "--reverse", "--register-current-auth103-runtime"],
+        [
+          route[0],
+          "--apply",
+          ...route.slice(1),
+          "--reverse",
+          "--finalize-current-auth103-runtime-installed",
+        ],
+        [
+          route[0],
+          "--apply",
+          ...route.slice(1),
+          "--register-current-auth103-runtime",
+          "--register-current-auth103-runtime",
+        ],
+        [
+          route[0],
+          "--apply",
+          ...route.slice(1),
+          "--finalize-current-auth103-runtime-installed",
+          "--finalize-current-auth103-runtime-installed",
+        ],
+        [
+          route[0],
+          "--apply",
+          ...route.slice(1),
+          "--register-current-auth103-runtime",
+          "--finalize-current-auth103-runtime-installed",
+        ],
+        [route[0], "--apply", ...route.slice(1), "--forward-after-dispatched-auth103"],
+        [route[0], "--apply", ...route.slice(1), "--forward-after-dispatched-auth103-v2"],
+      ]) {
+        const refused = await deploy(args);
+        expect(refused.exitCode).toBe(2);
+        expect(refused.stderr).toContain("no target was touched");
+      }
+    });
+
     for (const [label, args] of [
       [
         "rehearsal baseline in integration",
