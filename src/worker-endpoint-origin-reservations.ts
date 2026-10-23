@@ -2314,8 +2314,39 @@ export function createWorkerEndpointOriginReservations(options: {
           throw new WorkerEndpointOriginReservationError("invalid_argument", 400);
         const exact = `EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations WHERE ${columns.map((column) => `${column} IS ?`).join(" AND ")})`;
         const witness = `shared-carrier:${crypto.randomUUID()}`;
+        const physical = await hasStagingCarrierWitnessTable(sharedSql);
         const statements = [
           ...allocation.before,
+          ...(physical
+            ? [
+                sharedStatement(
+                  `INSERT INTO shared_app_staging_carrier_witnesses
+              (witness,action,organization_id,reservation_id,name,incarnation,generation,before_json,after_json)
+             SELECT ?,'prepare',?,?,?,?,1,NULL,? WHERE (${allocation.publicationGuard.sql})`,
+                  [
+                    witness,
+                    request.organizationId,
+                    request.reservationId,
+                    request.requestedSubdomain,
+                    sharedHoldPin(allocation.expected).incarnation,
+                    JSON.stringify(metadata),
+                    ...(allocation.publicationGuard.params ?? []),
+                  ],
+                ),
+                sharedStatement(
+                  `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
+             SELECT ?,CASE WHEN EXISTS (SELECT 1 FROM shared_app_staging_carrier_witnesses
+               WHERE witness=? AND action='prepare' AND incarnation=?)
+               AND (${allocation.publicationGuard.sql}) THEN 1 ELSE 0 END,1`,
+                  [
+                    witness,
+                    witness,
+                    sharedHoldPin(allocation.expected).incarnation,
+                    ...(allocation.publicationGuard.params ?? []),
+                  ],
+                ),
+              ]
+            : []),
           sharedStatement(
             `INSERT INTO worker_endpoint_origin_reservations (${columns.join(",")})
             SELECT ${values.map(() => "?").join(",")} WHERE NOT EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations
@@ -2330,12 +2361,46 @@ export function createWorkerEndpointOriginReservations(options: {
           sharedStatement(
             `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
             SELECT ?,CASE WHEN (${exact}) AND (${allocation.publicationGuard.sql}) THEN 1 ELSE 0 END,0`,
-            [witness, ...values, ...(allocation.publicationGuard.params ?? [])],
+            [
+              physical ? `${witness}:result` : witness,
+              ...values,
+              ...(allocation.publicationGuard.params ?? []),
+            ],
           ),
+          ...(physical
+            ? [
+                sharedStatement(
+                  "DELETE FROM shared_app_staging_carrier_witnesses WHERE witness=?",
+                  [witness],
+                ),
+                sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
+                  witness,
+                ]),
+              ]
+            : []),
           ...allocation.after,
-          sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
-            witness,
-          ]),
+          ...(physical
+            ? [
+                sharedStatement(
+                  `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
+             SELECT ?,CASE WHEN (${exact})
+               AND NOT EXISTS (SELECT 1 FROM shared_app_staging_carrier_witnesses WHERE witness=?)
+               AND NOT EXISTS (SELECT 1 FROM shared_app_staging_batch_assertions WHERE witness=?)
+               THEN 1 ELSE 0 END,0`,
+                  [`${witness}:closed`, ...values, witness, witness],
+                ),
+                sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
+                  `${witness}:result`,
+                ]),
+                sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
+                  `${witness}:closed`,
+                ]),
+              ]
+            : [
+                sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
+                  witness,
+                ]),
+              ]),
         ];
         const settle = async () => {
           const row = await readRow(sharedSql, request.organizationId, request.reservationId);
@@ -2492,8 +2557,42 @@ export function createWorkerEndpointOriginReservations(options: {
             WHERE ${columns.map((column) => `${column} IS ?`).join(" AND ")})`;
           const absence = noAcceptance(sharedHoldPin(expected));
           const witness = `shared-carrier-release:${crypto.randomUUID()}`;
+          const physical = await hasStagingCarrierWitnessTable(sharedSql);
           const batch = [
             ...release.before,
+            ...(physical
+              ? [
+                  sharedStatement(
+                    `INSERT INTO shared_app_staging_carrier_witnesses
+                (witness,action,organization_id,reservation_id,name,incarnation,generation,before_json,after_json)
+               SELECT ?,'cancel',?,?,?,?,2,?,? WHERE (${absence.sql}) AND (${release.publicationGuard.sql})`,
+                    [
+                      witness,
+                      organizationId,
+                      reservationId,
+                      sharedHoldPin(expected).name,
+                      sharedHoldPin(expected).incarnation,
+                      JSON.stringify(row),
+                      JSON.stringify(metadata),
+                      ...(absence.params ?? []),
+                      ...(release.publicationGuard.params ?? []),
+                    ],
+                  ),
+                  sharedStatement(
+                    `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
+               SELECT ?,CASE WHEN EXISTS (SELECT 1 FROM shared_app_staging_carrier_witnesses
+                 WHERE witness=? AND action='cancel' AND incarnation=?)
+                 AND (${absence.sql}) AND (${release.publicationGuard.sql}) THEN 1 ELSE 0 END,1`,
+                    [
+                      witness,
+                      witness,
+                      sharedHoldPin(expected).incarnation,
+                      ...(absence.params ?? []),
+                      ...(release.publicationGuard.params ?? []),
+                    ],
+                  ),
+                ]
+              : []),
             sharedStatement(
               `UPDATE worker_endpoint_origin_reservations SET state='released',revision=2,released_at=?,updated_at=?
                 WHERE organization_id=? AND reservation_id=? AND (${exactBefore})
@@ -2513,16 +2612,56 @@ export function createWorkerEndpointOriginReservations(options: {
                 SELECT ?,CASE WHEN (${exactAfter}) AND (${absence.sql})
                   AND (${release.publicationGuard.sql}) THEN 1 ELSE 0 END,0`,
               [
-                witness,
+                physical ? `${witness}:result` : witness,
                 ...Object.values(metadata),
                 ...(absence.params ?? []),
                 ...(release.publicationGuard.params ?? []),
               ],
             ),
+            ...(physical
+              ? [
+                  sharedStatement(
+                    "DELETE FROM shared_app_staging_carrier_witnesses WHERE witness=?",
+                    [witness],
+                  ),
+                  sharedStatement(
+                    "DELETE FROM shared_app_staging_batch_assertions WHERE witness=?",
+                    [witness],
+                  ),
+                ]
+              : []),
             ...release.after,
-            sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
-              witness,
-            ]),
+            ...(physical
+              ? [
+                  sharedStatement(
+                    `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
+               SELECT ?,CASE WHEN (${exactAfter})
+                 AND NOT EXISTS (SELECT 1 FROM shared_app_staging_carrier_witnesses WHERE witness=?)
+                 AND NOT EXISTS (SELECT 1 FROM shared_app_staging_batch_assertions WHERE witness=?)
+                 AND (${absence.sql}) THEN 1 ELSE 0 END,0`,
+                    [
+                      `${witness}:closed`,
+                      ...Object.values(metadata),
+                      witness,
+                      witness,
+                      ...(absence.params ?? []),
+                    ],
+                  ),
+                  sharedStatement(
+                    "DELETE FROM shared_app_staging_batch_assertions WHERE witness=?",
+                    [`${witness}:result`],
+                  ),
+                  sharedStatement(
+                    "DELETE FROM shared_app_staging_batch_assertions WHERE witness=?",
+                    [`${witness}:closed`],
+                  ),
+                ]
+              : [
+                  sharedStatement(
+                    "DELETE FROM shared_app_staging_batch_assertions WHERE witness=?",
+                    [witness],
+                  ),
+                ]),
           ];
           const settle = async () => {
             const observed = await readRow(sharedSql, organizationId, reservationId);
@@ -2636,6 +2775,14 @@ function sharedUnboundMetadata(row: ReservationRow, held: SharedAppRouteAssignme
     row.legacy_worker_name !== null ||
     row.legacy_endpoint_name !== null
   );
+}
+
+async function hasStagingCarrierWitnessTable(sql: Sql): Promise<boolean> {
+  const rows = await sql.query(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='shared_app_staging_carrier_witnesses' LIMIT 2",
+  );
+  if (rows.length > 1) throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+  return rows.length === 1 && rows[0]?.name === "shared_app_staging_carrier_witnesses";
 }
 
 function sharedStatement(sql: string, params: readonly SqlParam[]): SqlStatement {

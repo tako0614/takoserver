@@ -55,6 +55,46 @@ claims. Default legacy expiry/reclaim paths still require the same authority
 cutover; they retain their behavior when the explicit typed construction is
 absent. No staging label makes a durable database disposable.
 
+## Staging physical adoption source candidate (reserved 0107, unregistered)
+
+`src/shared-app-staging-adoption.ts` now holds a staging-only physical schema
+candidate and a closed atomic adoption operation. Root has reserved the next
+shared source slot as 0107 after the existing 0101–0106 recipes; this module is
+not a numbered migration, deploy registration, installed schema, or runtime
+selection. The original 0035/0081/0100 bytes and the 0101–0106 recipes remain
+unchanged. Its tests apply the source DDL to isolated full-Core SQLite and a
+minimal native D1 fixture; neither is an adoption of a real target.
+
+Only one exact, unexpired `0035` v2 reservation in revision 1 and `prepared`
+state, with no Worker/Endpoint binding, is eligible. The operation compares its
+complete original row inside the batch, refuses retained same-name/Host history,
+and refuses matching accepted v2 Resource or native Host route history. It
+inserts a tagged reserved assignment, retained adoption reference and name head
+with a terminal assertion; a zero-row phase rolls back all phases. The old
+reservation metadata is untouched. A lost write acknowledgement is settled by
+readback of that exact generated incarnation; unreadable readback retains it as
+indeterminate, and repeating the call does not create another incarnation.
+Invalid labels, NFKC aliases, foreign originals, released/expired rows and
+ambiguous history are refusals, not choices of a winner. Bound/activated rows
+remain legacy read/drain history until their accepted Resource, provider and
+native relation can be proven by the owning transition; this candidate does
+not infer that proof from a reservation row.
+
+Physical triggers refuse old reservation INSERT/UPDATE/DELETE for a name held
+by the global head and refuse a new head over unadopted 0035 history. The
+selected carrier alone can insert its exact new metadata or cancel its own
+never-published scalar original through a transient, tuple-bound witness in
+the same atomic batch. Terminal assertions reject a missing metadata write or
+an unconsumed witness. They also require a route-command batch witness for
+assignment/name updates, so the old standalone scalar `activate`/`release`
+cannot advance an adopted head. An adopted 0035 row remains frozen; the carrier
+cancel path cannot release its tagged original. Actual accepted-route
+publication, owner-qualified release, old installed Worker/credential drain,
+and private gateway/consumer selection remain later owning steps. The DB
+triggers do not undo a provider side effect already sent by an old Worker; that
+is why the old-writer drain must precede serving activation. Unadopted legacy
+read/drain behavior remains available.
+
 ## Existing reservation carrier in the selected typed construction
 
 The existing authenticated

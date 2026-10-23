@@ -769,6 +769,12 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/shared-app-ledger-d1\.ts$/u,
     may: ["core", "adapter", "domain"],
   },
+  {
+    // Staging physical adoption uses SQL ports and the existing name policy.
+    name: "domain",
+    match: /^src\/shared-app-staging-adoption\.ts$/u,
+    may: ["core", "domain"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
