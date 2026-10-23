@@ -239,6 +239,14 @@ export {
   type RuntimeInputPublicApply,
   runtimeInputPublicApplyCommitment,
 } from "./runtime-input-preparations.ts";
+export type { SharedAppLedger, SharedAppRouteSelection } from "./shared-app-ledger.ts";
+export { createSharedAppLedgerD1 } from "./shared-app-ledger-d1.ts";
+export { sharedAppStagingNameFromHost } from "./shared-app-name.ts";
+export {
+  createSharedAppStagingAdoption,
+  SHARED_APP_STAGING_PHYSICAL_DDL,
+  type SharedAppStagingAdoptionOriginal,
+} from "./shared-app-staging-adoption.ts";
 export {
   createSponsorshipAuthority,
   type SponsorshipAuthority,
