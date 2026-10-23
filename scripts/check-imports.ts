@@ -1026,6 +1026,21 @@ const EXACT_RP_FINANCIAL_ORIGIN_IMPORTS: Readonly<Record<string, readonly string
   ],
 };
 
+/** The operator barrel exposes this constructor, never the composition layer. */
+function exactSharedAppLedgerD1ExportEdge(path: string, target: string): boolean {
+  if (path !== "src/index.ts" || target !== "src/shared-app-ledger-d1.ts") return false;
+  const source = readFileSync(path, "utf8");
+  const references = [...source.matchAll(/(["'`])(\.[^"'`]+)\1/gu)].filter(
+    (entry) => normalize(relative(resolve("."), resolve(dirname(path), entry[2] ?? ""))) === target,
+  );
+  return (
+    references.length === 1 &&
+    /^export\s+\{\s*createSharedAppLedgerD1\s*,?\s*\}\s+from\s+(["'])\.\/shared-app-ledger-d1\.ts\1;$/mu.test(
+      source,
+    )
+  );
+}
+
 function exactRpFinancialOriginImportEdge(path: string, target: string): boolean {
   if (target !== "src/financial-request-origin.ts") return false;
   const expected = EXACT_RP_FINANCIAL_ORIGIN_IMPORTS[path];
@@ -1216,6 +1231,7 @@ for (const path of walk("src")) {
       !exactContainerConstructionExportEdge &&
       !exactContainerAdapterImportEdge(path, target) &&
       !exactRpFinancialOriginImportEdge(path, target) &&
+      !exactSharedAppLedgerD1ExportEdge(path, target) &&
       !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
       !exactOriginPublicationExtensionEdge &&
