@@ -232,10 +232,28 @@ A different owner, a missing owner membership or a Workspace bound to another
 Org aborts the issuing batch. The id locates product records and grants no
 payment consent.
 
-Known limitation: there is no owner transfer. If a subject's active binding is
-revoked and the same subject later receives a fresh principal, the Org remains
-owned by the previous principal and that issuance is refused. This fail-closed
-behavior is accepted for staging and must be revisited before production.
+A later login by a subject whose only binding is its active, current root
+binding reuses that same principal and binding: the callback issues a new
+session and credential class on the existing binding and sends only the
+Organization owner guard, which writes nothing and aborts unless the same
+Workspace is bound to the same Org that principal owns. A subject enrolled
+before its Org existed, or whose Workspace now names another Org, is refused
+rather than given a new or transferred Org.
+
+Operator note: enabling a billing realm on a deployment where subjects have
+already enrolled without one leaves each of those subjects refused with
+`session_unavailable` (503) on every later login. There is no automatic
+recovery; materializing their Orgs is a separate, owner-coordinated repair. The batch re-proves the binding, its anchor, target, issuer and
+subject through the credential class guard, so a binding retired or crossed
+after resolution aborts the whole batch. A subject with no binding enrolls a
+fresh principal; when two first logins race, the Auth103 binding trigger lets
+one commit and the other fails closed as `session_unavailable` without retry.
+
+There is no owner transfer and no re-enrollment. A subject whose binding is
+retired, is a successor or proved-legacy binding, or names another native
+target, is refused
+before issuance; its Org stays owned by the previous principal and no second
+Org is created. A successor binding is a separate authority action.
 Workspace bindings are global and set once, and a hold or usage record
 normally creates its Workspace's binding lazily. Accounts issues every
 shared-auth Workspace reference as `wrk_` followed by 32 lowercase hex digits,

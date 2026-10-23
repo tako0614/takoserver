@@ -47,6 +47,7 @@ import {
   type RuntimeInputAuthority,
   RuntimeInputPreparationError,
 } from "./runtime-input-preparations.ts";
+import { type SharedAuthSession, SharedAuthSessionError } from "./shared-auth-session.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import { type SubscriptionPayments, stripeBillingFailure } from "./stripe-billing.ts";
 import {
@@ -258,6 +259,8 @@ export interface CreateControlRoutesOptions {
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
+  /** The owning Server RP's already composed shared-session receiver, when mounted. */
+  readonly sharedAuth?: SharedAuthSession;
   /** Optional provider-backed residual proof; absent means unavailable. */
   readonly nativeResidual?: NativeResidualReader;
   /** Takoserver lifecycle-owned repair; never exposed through the Takoform Host API. */
@@ -309,12 +312,59 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     runtimeInputPolicy,
   } = options;
   const secureCookies = new URL(publicOrigin).protocol === "https:";
+  const sharedAuth = options.sharedAuth;
+  const sharedAuthenticate = sharedAuth?.authenticate;
 
-  const authorization = (request: Request): string | null =>
-    requestAuthorization(request, consoleOrigin);
+  const hasNamedCookie = (request: Request, name: string): boolean =>
+    (request.headers.get("cookie") ?? "")
+      .split(";")
+      .some((part) => part.trim().split("=", 1)[0] === name);
+  const authorization = (request: Request): string | null => {
+    if (request.headers.has("authorization")) return request.headers.get("authorization");
+    // Two automatic session modes cannot silently select either principal.
+    // A named cookie counts even when its value is empty or malformed.
+    if (
+      hasNamedCookie(request, "takoserver_session") &&
+      hasNamedCookie(request, "__Host-takoserver_shared_session")
+    )
+      throw new AuthError("unauthenticated");
+    return requestAuthorization(request, consoleOrigin);
+  };
+
+  const requestActor = async (request: Request): Promise<Actor | null> => {
+    const credential = authorization(request);
+    const actor = await accounts.authenticate(credential);
+    // An explicit header (including an empty one), or a named legacy cookie
+    // (including an empty first value), has already chosen its authority.
+    if (
+      actor ||
+      credential !== null ||
+      request.headers.has("authorization") ||
+      hasNamedCookie(request, "takoserver_session")
+    )
+      return actor;
+    if (!sharedAuthenticate || !consoleOrigin || request.headers.get("origin") !== consoleOrigin)
+      return null;
+    try {
+      const context: Awaited<ReturnType<SharedAuthSession["authenticate"]>> = await Reflect.apply(
+        sharedAuthenticate,
+        sharedAuth,
+        [request],
+      );
+      if (!context) return null;
+      if (context.actor.kind !== "session") controlError("backend_unavailable", 503);
+      return context.actor;
+    } catch (error) {
+      if (error instanceof SharedAuthSessionError) {
+        if (error.code === "session_invalid") throw new AuthError("unauthenticated");
+        if (error.code === "workspace_forbidden") throw new AuthError("permission_denied");
+      }
+      controlError("backend_unavailable", 503);
+    }
+  };
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
-    const actor = await accounts.authenticate(authorization(request));
+    const actor = await requestActor(request);
     if (actor?.kind !== "session") throw new AuthError("unauthenticated");
     await accounts.requireOwner(actor, organizationId);
     return actor;
@@ -326,7 +376,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     organizationId: string,
     scope: ApiKeyScope,
   ): Promise<Actor> => {
-    const actor = await accounts.authenticate(authorization(request));
+    const actor = await requestActor(request);
     if (!actor) throw new AuthError("unauthenticated");
     if (actor.kind === "session") {
       await accounts.requireOwner(actor, organizationId);
@@ -615,14 +665,12 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           : { sessionTtlSeconds: integer(body.sessionTtlSeconds) }),
       });
       if (consoleOrigin && request.headers.get("origin") === consoleOrigin) {
-        return Response.json(
-          { principal },
-          {
-            headers: {
-              "set-cookie": sessionCookie(sessionToken, secureCookies),
-            },
-          },
-        );
+        const headers = new Headers();
+        headers.append("set-cookie", sessionCookie(sessionToken, secureCookies));
+        // A successful browser switch to the local session clears only the
+        // browser's shared cookie. Its Server RP row is not revoked here.
+        if (secureCookies) headers.append("set-cookie", clearSharedSessionCookie());
+        return Response.json({ principal }, { headers });
       }
       return Response.json({ principal, sessionToken });
     }
@@ -632,16 +680,19 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const actor = await accounts.authenticate(credential);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       await accounts.revokeSession(credential);
+      const headers = new Headers();
+      headers.append("set-cookie", clearSessionCookie(secureCookies));
+      // Logout clears the browser's remaining shared mode after the local
+      // revocation is acknowledged; it does not touch the Server RP row.
+      if (secureCookies) headers.append("set-cookie", clearSharedSessionCookie());
       return new Response(null, {
         status: 204,
-        headers: {
-          "set-cookie": clearSessionCookie(secureCookies),
-        },
+        headers,
       });
     }
 
     if (request.method === "GET" && url.pathname === "/v1/me") {
-      const actor = await accounts.authenticate(authorization(request));
+      const actor = await requestActor(request);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       const principal = await accounts.principal(actor.principalId);
       if (!principal) throw new AuthError("unauthenticated");
@@ -2105,6 +2156,10 @@ function clearSessionCookie(secure: boolean): string {
   ]
     .filter(Boolean)
     .join("; ");
+}
+
+function clearSharedSessionCookie(): string {
+  return "__Host-takoserver_shared_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
 }
 
 function organizationOf(actor: Actor): string {

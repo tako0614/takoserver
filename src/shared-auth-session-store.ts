@@ -323,11 +323,25 @@ export function createSharedAuthSessionStore(sql: Sql): SharedAuthSessionStore {
         },
         {
           sql: `UPDATE shared_auth_sessions SET status = 'revocation_pending', version = version + 1
-                WHERE digest = ? AND status IN ('active', 'checking')`,
+                WHERE digest = ? AND status IN ('active', 'checking')
+                RETURNING digest, status`,
           params: [value],
         },
       ]);
-      return result[1]?.changes === 1;
+      // The fenced row is proved by RETURNING, not by the change count: D1
+      // reports changes as the total_changes() delta, which also counts the
+      // credential class that shared_auth_sessions_retire_class_after_status
+      // retires in the same statement.
+      const fenced = result[1];
+      return (
+        fenced !== undefined &&
+        Array.isArray(fenced.rows) &&
+        fenced.rows.length === 1 &&
+        Number.isSafeInteger(fenced.changes) &&
+        fenced.changes >= 1 &&
+        fenced.rows[0]?.digest === value &&
+        fenced.rows[0]?.status === "revocation_pending"
+      );
     },
 
     async queueRevocation(input) {

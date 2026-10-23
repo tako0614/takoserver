@@ -282,6 +282,51 @@ describe("immutable Worker Version binding closure", () => {
     });
   });
 
+  test("binds only the selected Root profile to the exact Accounts financial proof service", () => {
+    const ordinary = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      signing: { currentKeyId: "key-current" },
+    } satisfies DeployTarget;
+    const root = {
+      ...ordinary,
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+    } satisfies DeployTarget;
+    const ordinaryClosure = expectedExactBindingClosure(ordinary);
+    const rootClosure = expectedExactBindingClosure(root);
+    expect(ordinaryClosure.ACCOUNTS_FINANCIAL_PROOF).toBeUndefined();
+    expect(rootClosure.ACCOUNTS_FINANCIAL_PROOF).toEqual({
+      type: "service",
+      fields: {
+        service: "takosumi-auth-staging",
+        entrypoint: "AccountsFinancialProof",
+      },
+    });
+
+    const rootVersion = expectedExactVersionFromClosure(rootClosure);
+    expect(() =>
+      assertExactVersionBindingClosure("preflight", "version-1", rootVersion, rootClosure),
+    ).not.toThrow();
+    expect(() =>
+      assertExactVersionBindingClosure("preflight", "version-1", rootVersion, ordinaryClosure),
+    ).toThrow("exact selected target closure");
+    const wrongService = expectedExactVersionFromClosure({
+      ...rootClosure,
+      ACCOUNTS_FINANCIAL_PROOF: {
+        type: "service",
+        fields: { service: "wrong-accounts-service", entrypoint: "AccountsFinancialProof" },
+      },
+    });
+    expect(() =>
+      assertExactVersionBindingClosure("preflight", "version-1", wrongService, rootClosure),
+    ).toThrow("binds ACCOUNTS_FINANCIAL_PROOF with unexpected service");
+  });
+
   test("omits only the executor service for the exact maintenance target", () => {
     const target = {
       kind: "takoserver.deploy-target@v2",
