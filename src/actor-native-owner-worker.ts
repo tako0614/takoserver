@@ -642,6 +642,7 @@ export function createActorNativeOwner(
       readonly CLASS: unknown;
       readonly [name: string]: unknown;
       readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
+      readonly SOCKET_ADMISSION?: { fetch(request: Request): Promise<Response> };
     };
     private tail: Promise<void> = Promise.resolve();
     private alarmTail: Promise<void> = Promise.resolve();
@@ -674,6 +675,7 @@ export function createActorNativeOwner(
         readonly CLASS: unknown;
         readonly [name: string]: unknown;
         readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
+        readonly SOCKET_ADMISSION?: { fetch(request: Request): Promise<Response> };
       },
     ) {
       this.state = state;
@@ -1836,7 +1838,8 @@ export function createActorNativeOwner(
       readonly generationKey: string;
       readonly epoch: string;
     }> {
-      const admission = this.env.ADMISSION;
+      const admission =
+        this.env.SOCKET_ADMISSION === undefined ? this.env.ADMISSION : this.env.SOCKET_ADMISSION;
       if (!admission || !SafeResponseStatus) throw new Error("Actor socket admission unavailable");
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5_000);
@@ -1881,7 +1884,8 @@ export function createActorNativeOwner(
       }
     }
     private async completeSocketAdmission(attemptNonce: string, deadlineAt: number): Promise<void> {
-      const admission = this.env.ADMISSION;
+      const admission =
+        this.env.SOCKET_ADMISSION === undefined ? this.env.ADMISSION : this.env.SOCKET_ADMISSION;
       if (!admission || !SafeResponseStatus) throw new Error("Actor socket completion unavailable");
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const controller = new AbortController();

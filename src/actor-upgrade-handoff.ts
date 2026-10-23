@@ -17,12 +17,9 @@ const NativeResponseStatusText = Object.getOwnPropertyDescriptor(
   "statusText",
 )?.get;
 const NativeResponseClone = Response.prototype.clone;
-const NativeResponseWebSocket = Object.getOwnPropertyDescriptor(
-  Response.prototype,
-  "webSocket",
-)?.get;
 const NativeHeaders = Headers;
 const NativeHeadersAppend = Headers.prototype.append;
+const NativeHeadersDelete = Headers.prototype.delete;
 const NativeHeadersForEach = Headers.prototype.forEach;
 const NativeObjectDefineProperty = Object.defineProperty;
 const NativeTypeError = TypeError;
@@ -119,6 +116,22 @@ function responseHeaders(response: Response): Headers {
     response,
     [],
   ) as Headers;
+}
+function replaceResponseHeaders(response: Response, snapshot: Headers): void {
+  const target = responseHeaders(response);
+  const names = new NativeSet<string>();
+  NativeReflectApply(NativeHeadersForEach, target, [
+    (_value: string, name: string) => {
+      NativeReflectApply(NativeSetAdd, names, [name]);
+    },
+  ]);
+  for (const name of NativeReflectApply(NativeSetValues, names, []) as Iterable<string>)
+    NativeReflectApply(NativeHeadersDelete, target, [name]);
+  NativeReflectApply(NativeHeadersForEach, snapshot, [
+    (value: string, name: string) => {
+      NativeReflectApply(NativeHeadersAppend, target, [name, value]);
+    },
+  ]);
 }
 
 /**
@@ -447,16 +460,10 @@ export function createActorUpgradeHandoff(
       if (slot.timer !== undefined) NativeClearTimeout(slot.timer);
       const wasAbandoned = (): boolean => slot.state === "abandoned";
       try {
-        // Use captured native getters, not app-mutable ResponseInit accessors.
-        // This response and its native socket never enter application code.
-        const socket = NativeResponseWebSocket
-          ? NativeReflectApply(NativeResponseWebSocket, slot.reservation.response, [])
-          : undefined;
-        const response = new NativeResponse(null, {
-          status: 101,
-          headers,
-          webSocket: socket,
-        } as ResponseInit);
+        // Keep the Host-private sanitized native 101 and its socket identity.
+        // Apply the app's already validated header snapshot without rewrapping.
+        const response = slot.reservation.response;
+        replaceResponseHeaders(response, headers);
         await slot.reservation.commit();
         if (wasAbandoned() || aborted()) {
           await settleAbandoned(slot);

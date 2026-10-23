@@ -349,6 +349,41 @@ test("ordinary headers may be deleted and changed; commit snapshots before yield
   expect(result.headers.get("x-keep")).toBe("before");
 });
 
+test("finish returns the sanitized reservation head with the captured middleware headers", async () => {
+  const cleanHead = new NativeResponse(null, {
+    status: 101,
+    headers: { "x-origin": "old", "set-cookie": "a=1" },
+  });
+  let commits = 0;
+  const handoff = createActorUpgradeHandoff(request(), {
+    async open() {
+      return {
+        response: cleanHead,
+        commit() {
+          commits++;
+        },
+        abandon() {},
+      };
+    },
+  });
+  try {
+    const appResponse = await handoff.actor.fetch(request());
+    appResponse.headers.delete("x-origin");
+    appResponse.headers.append("set-cookie", "b=2");
+    appResponse.headers.set("x-middleware", "before");
+    const finishing = handoff.finish(appResponse);
+    appResponse.headers.set("x-middleware", "after");
+    const published = await finishing;
+    expect(published).toBe(cleanHead);
+    expect(published.headers.has("x-origin")).toBe(false);
+    expect(published.headers.get("x-middleware")).toBe("before");
+    expect(published.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
+    expect(commits).toBe(1);
+  } finally {
+    await handoff.abandon();
+  }
+});
+
 test("abort, expiry, abandonment and failed commit settle every alias", async () => {
   const abort = new AbortController();
   const cases = [

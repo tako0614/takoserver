@@ -22,6 +22,7 @@ function inboundFixture(
   callback?: (request: Request) => Promise<Response>,
   admissionFetch?: (request: Request) => Promise<Response>,
   profile?: ActorAbiProfile,
+  admissionPlacement: "combined" | "socket-only" | "none" = "combined",
 ) {
   type Socket = Parameters<
     InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
@@ -53,6 +54,22 @@ function inboundFixture(
     undefined,
     selectedProfile,
   );
+  const admission = {
+    async fetch(request: Request) {
+      if (admissionFetch) return admissionFetch(request);
+      const body = (await request.json()) as Record<string, unknown>;
+      return body.action === "socket-complete"
+        ? new Response(null, { status: 204 })
+        : Response.json({
+            id: "inbound-owner",
+            attemptNonce: body.attemptNonce,
+            generationKey: "d".repeat(64),
+            epoch: "epoch-1",
+            variantKey: "default",
+            leaseId: "lease",
+          });
+    },
+  };
   const owner = new Owner(
     {
       facets: {
@@ -82,22 +99,8 @@ function inboundFixture(
     {
       CLASS: {},
       CLASS_0: {},
-      ADMISSION: {
-        async fetch(request) {
-          if (admissionFetch) return admissionFetch(request);
-          const body = (await request.json()) as Record<string, unknown>;
-          return body.action === "socket-complete"
-            ? new Response(null, { status: 204 })
-            : Response.json({
-                id: "inbound-owner",
-                attemptNonce: body.attemptNonce,
-                generationKey: "d".repeat(64),
-                epoch: "epoch-1",
-                variantKey: "default",
-                leaseId: "lease",
-              });
-        },
-      },
+      ...(admissionPlacement === "combined" ? { ADMISSION: admission } : {}),
+      ...(admissionPlacement === "socket-only" ? { SOCKET_ADMISSION: admission } : {}),
     },
   );
   return {
@@ -151,6 +154,41 @@ function inboundFixture(
     },
   };
 }
+
+test("socket-only admission completes a callback without an alarm binding", async () => {
+  const actions: string[] = [];
+  const f = inboundFixture(
+    undefined,
+    async (request) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      actions.push(String(body.action));
+      return body.action === "socket-complete"
+        ? new Response(null, { status: 204 })
+        : Response.json({
+            id: "inbound-owner",
+            attemptNonce: body.attemptNonce,
+            generationKey: "d".repeat(64),
+            epoch: "epoch-1",
+            variantKey: "default",
+            leaseId: "socket-only-lease",
+          });
+    },
+    undefined,
+    "socket-only",
+  );
+  await f.owner.webSocketMessage(f.socket("socket-only"), "event");
+  expect(actions).toEqual(["socket", "socket-complete"]);
+  expect(f.delivered).toEqual(["socket-only"]);
+  expect(f.closes).toEqual([]);
+  await Promise.all(f.retained);
+  const denied = inboundFixture(undefined, undefined, undefined, "none");
+  await expect(
+    denied.owner.webSocketMessage(denied.socket("no-socket-admission"), "event"),
+  ).rejects.toThrow("Actor socket completion unavailable");
+  expect(denied.delivered).toEqual([]);
+  expect(denied.closes).toEqual([["no-socket-admission", 1011]]);
+  await Promise.all(denied.retained);
+});
 
 test("v2 socket error is a distinct terminal callback", async () => {
   const actions: string[] = [];
@@ -1716,6 +1754,77 @@ test("native alarm defaults to deny before facet construction and retains its du
         .get(),
     ).toEqual({ obligation: 1, pending: null, retryAt: expect.any(Number) });
     expect(nativeWake).toBeGreaterThan(Date.now());
+  } finally {
+    database.close();
+  }
+});
+
+test("socket-only admission never handles alarm attempts or poisons a retry", async () => {
+  const database = new Database(":memory:");
+  let facetGets = 0;
+  const socketActions: string[] = [];
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  try {
+    const owner = new Owner(
+      {
+        facets: {
+          get() {
+            facetGets++;
+            return { fetch: async () => new Response(null, { status: 204 }) };
+          },
+          abort() {},
+        },
+        storage: {
+          sql: {
+            exec(sql: string, ...params: (string | number | null)[]) {
+              const statement = database.query(sql);
+              if (sql.startsWith("SELECT"))
+                return statement.all(...params) as Record<string, unknown>[];
+              statement.run(...params);
+              return [];
+            },
+          },
+          setAlarm() {},
+          deleteAlarm() {},
+        },
+        waitUntil() {},
+      },
+      {
+        CLASS: {},
+        CLASS_0: {},
+        SOCKET_ADMISSION: {
+          async fetch(request) {
+            const body = (await request.json()) as Record<string, unknown>;
+            socketActions.push(String(body.action));
+            return body.action === "complete"
+              ? new Response(null, { status: 503 })
+              : Response.json({
+                  id: body.id,
+                  attemptNonce: body.attemptNonce,
+                  variantKey: "default",
+                  generationKey: "d".repeat(64),
+                  epoch: "epoch-1",
+                  leaseId: "wrong-alarm-lease",
+                });
+          },
+        },
+      },
+    );
+    database
+      .query("UPDATE actor_alarm_state SET actor_id = ?, pending_at = ? WHERE id = 1")
+      .run("same-id", Date.now() - 1);
+    await expect(owner.alarm()).rejects.toThrow("Actor alarm completion unavailable");
+    database.query("UPDATE actor_alarm_state SET retry_at = ? WHERE id = 1").run(Date.now() - 1);
+    await expect(owner.alarm()).rejects.toThrow("Actor alarm completion unavailable");
+    expect(socketActions).toEqual([]);
+    expect(facetGets).toBe(0);
+    expect(database.query("SELECT obligation FROM actor_alarm_state WHERE id = 1").get()).toEqual({
+      obligation: 1,
+    });
   } finally {
     database.close();
   }
