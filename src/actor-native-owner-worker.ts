@@ -90,7 +90,7 @@ const SafeHeadersHas = Headers.prototype.has;
 const SafeHeadersDelete = Headers.prototype.delete;
 const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
 const SafeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
-const SafeRegExpTest = RegExp.prototype.test;
+const SafeStringCharCodeAt = String.prototype.charCodeAt;
 const SafeStringToLowerCase = String.prototype.toLowerCase;
 const SafeResponseJson = Response.prototype.json;
 const SafeResponseOk = Object.getOwnPropertyDescriptor(Response.prototype, "ok")?.get;
@@ -111,6 +111,7 @@ const SafeSubtle = crypto.subtle;
 const SafeSubtleImportKey = crypto.subtle.importKey;
 const SafeSubtleSign = crypto.subtle.sign;
 const SafeSubtleVerify = crypto.subtle.verify;
+const SafeSubtleDigest = crypto.subtle.digest;
 const SafeCrypto = crypto;
 const SafeCryptoRandomUUID = crypto.randomUUID;
 const SafeCryptoGetRandomValues = crypto.getRandomValues;
@@ -121,6 +122,26 @@ const SafeEncoder = new TextEncoder();
 const SafeEncode = TextEncoder.prototype.encode;
 const SafeUint8Array = Uint8Array;
 const HEX = "0123456789abcdef";
+
+function validReservationOffer(offer: string): boolean {
+  if (offer.length !== 64) return false;
+  for (let index = 0; index < 64; index += 1) {
+    const code = SafeReflectApply(SafeStringCharCodeAt, offer, [index]) as number;
+    if (!(code >= 48 && code <= 57) && !(code >= 97 && code <= 102)) return false;
+  }
+  return true;
+}
+
+async function reservationOfferDigest(offer: string): Promise<string> {
+  const bytes = (await SafeReflectApply(SafeSubtleDigest, SafeSubtle, [
+    "SHA-256",
+    SafeReflectApply(SafeEncode, SafeEncoder, [`actor-socket-offer-v1\n${offer}`]),
+  ])) as ArrayBuffer;
+  let digest = "";
+  for (const byte of new SafeUint8Array(bytes))
+    digest += (HEX[byte >> 4] as string) + (HEX[byte & 15] as string);
+  return digest;
+}
 
 function randomBearer(): string {
   const bytes = new SafeUint8Array(32);
@@ -704,11 +725,10 @@ export function createActorNativeOwner(
         storage.sql.exec(
           "CREATE UNIQUE INDEX IF NOT EXISTS actor_socket_reservations_bearer ON actor_socket_reservations(bearer)",
         );
+        // The deadline describes the original pending reservation. Its hashed
+        // offer receipt remains durable after that deadline to refuse replay.
         storage.sql.exec(
-          "CREATE TABLE IF NOT EXISTS actor_socket_offer_receipts (offer TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)",
-        );
-        storage.sql.exec(
-          "CREATE INDEX IF NOT EXISTS actor_socket_offer_receipts_expiry ON actor_socket_offer_receipts(expires_at)",
+          "CREATE TABLE IF NOT EXISTS actor_socket_offer_receipts (offer_digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)",
         );
         storage.sql.exec(
           "CREATE TABLE IF NOT EXISTS actor_observation_state (id INTEGER PRIMARY KEY CHECK(id = 1), instance TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision >= 0))",
@@ -961,25 +981,12 @@ export function createActorNativeOwner(
       const pendingWake = pending?.expiresAt;
       if (pendingWake !== null && pendingWake !== undefined && !alarmTime(pendingWake))
         throw new Error("Actor socket reservation state corrupt");
-      const offer = this.requireStorage()
-        .sql.exec("SELECT MIN(expires_at) AS expiresAt FROM actor_socket_offer_receipts")
-        [Symbol.iterator]()
-        .next().value;
-      const offerWake = offer?.expiresAt;
-      if (offerWake !== null && offerWake !== undefined && !alarmTime(offerWake))
-        throw new Error("Actor socket reservation state corrupt");
-      const reservationWake =
+      const wake =
         actorWake === null
           ? (pendingWake ?? null)
           : pendingWake === null || pendingWake === undefined
             ? actorWake
             : (SafeReflectApply(SafeMathMin, Math, [actorWake, pendingWake]) as number);
-      const wake =
-        reservationWake === null
-          ? (offerWake ?? null)
-          : offerWake === null || offerWake === undefined
-            ? reservationWake
-            : (SafeReflectApply(SafeMathMin, Math, [reservationWake, offerWake]) as number);
       if (wake === null) await this.requireStorage().deleteAlarm();
       else await this.requireStorage().setAlarm(wake);
     }
@@ -1274,10 +1281,6 @@ export function createActorNativeOwner(
           if (!record) this.deleteSocketAttachment(socketId);
         }
       }
-      this.requireStorage().sql.exec(
-        "DELETE FROM actor_socket_offer_receipts WHERE expires_at <= ?",
-        SafeReflectApply(SafeNow, Date, []) as number,
-      );
       await this.reconcile();
     }
     private reservationControl(request: Request): Promise<Response> {
@@ -2275,7 +2278,7 @@ export function createActorNativeOwner(
         | null;
       if (
         offer !== null &&
-        (!SafeReflectApply(SafeRegExpTest, /^[a-f0-9]{64}$/u, [offer]) ||
+        (!validReservationOffer(offer) ||
           !SafeRequestMethod ||
           SafeReflectApply(SafeRequestMethod, request, []) !== "GET" ||
           SafeReflectApply(
@@ -2541,6 +2544,7 @@ export function createActorNativeOwner(
         if (upgrade) {
           let server: NativeActorWebSocket | undefined;
           try {
+            const offerDigest = offer === null ? null : await reservationOfferDigest(offer);
             const graphAtHandoff = await this.currentGraph();
             if (
               graphAtHandoff.generationKey !== currentGraph.generationKey ||
@@ -2559,9 +2563,12 @@ export function createActorNativeOwner(
             const expiresAt = (SafeReflectApply(SafeNow, Date, []) as number) + RESERVATION_MS;
             const storage = this.requireStorage();
             if (
-              offer !== null &&
+              offerDigest !== null &&
               storage.sql
-                .exec("SELECT 1 FROM actor_socket_offer_receipts WHERE offer = ? LIMIT 1", offer)
+                .exec(
+                  "SELECT 1 FROM actor_socket_offer_receipts WHERE offer_digest = ? LIMIT 1",
+                  offerDigest,
+                )
                 [Symbol.iterator]()
                 .next().value
             )
@@ -2579,10 +2586,10 @@ export function createActorNativeOwner(
             ]) as number;
             await storage.setAlarm(wake);
             this.advanceObservation();
-            if (offer !== null)
+            if (offerDigest !== null)
               storage.sql.exec(
-                "INSERT INTO actor_socket_offer_receipts (offer, expires_at) VALUES (?, ?)",
-                offer,
+                "INSERT INTO actor_socket_offer_receipts (offer_digest, expires_at) VALUES (?, ?)",
+                offerDigest,
                 expiresAt,
               );
             storage.sql.exec(

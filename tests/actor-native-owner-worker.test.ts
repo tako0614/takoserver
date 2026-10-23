@@ -1188,6 +1188,30 @@ test("private offer rejects malformed, duplicated and non-upgrade requests befor
   await Promise.all(f.retained);
 });
 
+test("private offer validation never dispatches its value to tenant RegExp.exec", async () => {
+  const offer = "e".repeat(64);
+  let seenByTenantExec = false;
+  const f = fixture(async () => new Response(null, { status: 204 }));
+  const request = f.request();
+  request.headers.set("upgrade", "websocket");
+  request.headers.set("x-takoserver-private-actor-reservation-offer", offer);
+  const originalExec = RegExp.prototype.exec;
+  try {
+    RegExp.prototype.exec = function (value) {
+      if (value === offer) {
+        seenByTenantExec = true;
+        throw new Error("offer reached tenant RegExp.exec");
+      }
+      return originalExec.call(this, value);
+    };
+    expect((await f.owner.fetch(request)).status).toBe(204);
+  } finally {
+    RegExp.prototype.exec = originalExec;
+  }
+  expect(seenByTenantExec).toBe(false);
+  await Promise.all(f.retained);
+});
+
 test("Host offer is the one pending private bearer, with no bearer on its native 101", async () => {
   const exported = /\nexport \{\n(?: {2}[A-Za-z][A-Za-z0-9]*,?\n)+\};\n?$/u.exec(
     ACTOR_NATIVE_BOOTSTRAP_SOURCE,
@@ -1353,6 +1377,10 @@ test("Host offer is the one pending private bearer, with no bearer on its native
     expect(upgraded.headers.has("x-takoserver-private-actor-upgrade-socket-id")).toBe(false);
     expect(childSawOffer).toBe(false);
     expect(sql.exec("SELECT bearer FROM actor_socket_reservations")).toEqual([{ bearer: offer }]);
+    const receipts = sql.exec("SELECT offer_digest FROM actor_socket_offer_receipts");
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]?.offer_digest).not.toBe(offer);
+    expect(receipts[0]?.offer_digest).toMatch(/^[a-f0-9]{64}$/u);
     await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
     expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 1 }]);
     const wrongActor = request();
@@ -1385,7 +1413,8 @@ test("Host offer is the one pending private bearer, with no bearer on its native
     await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
     sql.exec("UPDATE actor_socket_offer_receipts SET expires_at = ?", Date.now() - 1);
     await owner.alarm();
-    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_offer_receipts")).toEqual([{ n: 0 }]);
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_offer_receipts")).toEqual([{ n: 1 }]);
+    await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
     await Promise.all(retained);
   } finally {
     database.close();
