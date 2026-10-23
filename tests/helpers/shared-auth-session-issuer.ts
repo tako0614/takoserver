@@ -5,8 +5,7 @@ import type { SharedWorkspaceChoice } from "../../src/shared-auth-session.ts";
 export const SESSION_TEST_CONFIG: SharedAuthOidcConfig = {
   environment: "staging",
   issuer: "https://auth-staging.takos.jp",
-  publicOrigin:
-    "https://integration-money-8732b77a789fd563406269261bf09e71.shoutatomiyama0614.workers.dev",
+  publicOrigin: "https://integration-root-ga-573f46e4.shoutatomiyama0614.workers.dev",
   clientId: "takoserver-console-staging-v1",
   clientSecret: "synthetic-test-only:client+credential",
 };

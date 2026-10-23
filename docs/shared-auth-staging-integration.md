@@ -1,8 +1,9 @@
 # Shared Accounts login: staged Takoserver consumer
 
-Status: prepared protocol client and unmounted session/store runtime. No login
-route, schema migration, Console button, deployment configuration or traffic
-cutover is enabled by this change.
+Status: implemented staging-only protocol client, session/store and conditional
+Worker request composition. An owning deployment must provide the selected
+profile, schema and credentials; source availability does not establish an
+active target or a successful login. Console integration is a separate consumer.
 Task 0109 coordinates the remaining owner changes and their release evidence.
 
 ## Implemented protocol boundary
@@ -54,10 +55,10 @@ Organizations, Workspace roles or other product authority are refused. Access
 tokens obtained here are identity-only credentials for the issuer's own
 endpoints, never Takoserver business API keys.
 
-## Prepared session runtime
+## Session runtime
 
-`src/shared-auth-session.ts` supplies the unmounted login, callback, logout and
-session handlers, a server-only authenticated actor/context port, and current
+`src/shared-auth-session.ts` supplies login, callback, logout and session
+handlers, a server-only authenticated actor/context port, and current
 Workspace/Organization resolution. Its required principal projection is an
 owning Takoserver port that preserves proved local actor references; there is
 no email matching or alternate account registry. Organization pins require a
@@ -105,6 +106,20 @@ browser on an issuer outage. The owning maintenance entry must call
 `retryRevocations` with at most two grants per pass; only revocation has a
 retryable lease. A crashed refresh claimant stays denied until login/revoke,
 and is never reclaimed for another refresh.
+
+Only an acknowledged shared callback expires the legacy browser cookie. Shared
+logout expires both cookie names, without revoking a legacy database session.
+A request with only the named legacy cookie is rejected before either cookie
+is expired or a shared session is revoked, so another tab's legacy login cannot
+be cleared by a stale shared logout.
+
+Callback failure diagnostics contain only a closed phase, error class and code.
+Fresh OIDC exchange failures add the closed token/JWKS endpoint and reason;
+Directory bootstrap and billing-organization failures add a closed reason and
+bounded HTTP status or null. These records contain no exception text, token,
+request body or Workspace/Organization identifier. Logging failure cannot alter
+the response, cleanup or existing five-second request deadline. A missing record
+does not establish that an issuer operation was not sent or committed.
 
 The portable native D1 tests use explicitly unadopted test-only DDL. These
 modules do not create tables or select a public migration number. Adopting the
