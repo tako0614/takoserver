@@ -36,9 +36,11 @@ export {
 } from "./actor-namespace-sql-graph.ts";
 export { parseTakoformV2PublicConfig } from "./config.ts";
 export {
+  createV2RetiredConfiguredUpdateDiscard,
   readV2ConfiguredPrivateInputs,
   type V2ConfiguredPrivateInputIdentity,
   type V2ConfiguredPrivateInputs,
+  type V2RetiredConfiguredUpdateInput,
 } from "./configured-private-inputs.ts";
 export { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";
 export {
