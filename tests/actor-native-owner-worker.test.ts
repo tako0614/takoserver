@@ -162,6 +162,7 @@ test("socket-only admission completes a callback without an alarm binding", asyn
   const f = inboundFixture(
     undefined,
     async (request) => {
+      expect(request.headers.get("x-takoserver-private-alarm-admission")).toBe("c".repeat(64));
       const body = (await request.json()) as Record<string, unknown>;
       actions.push(String(body.action));
       return body.action === "socket-complete"
@@ -1108,6 +1109,129 @@ test("structural WfP owner omits admission and control bearers only in dynamic m
     },
   );
   await owner.webSocketMessage(socket, "event");
+});
+
+test("dynamic socket admission keeps both JSON actions headerless in a Workerd text-body model", async () => {
+  // Bun's Request does not add the text-body Content-Type seen in Workerd.
+  // Keep the model limited to that constructor difference; native direct-port
+  // qualification remains separate.
+  class WorkerdTextBodyRequest extends Request {
+    constructor(input: RequestInfo | URL, init?: RequestInit) {
+      const headers = new Headers(init?.headers);
+      if (typeof init?.body === "string" && !headers.has("content-type"))
+        headers.set("content-type", "text/plain;charset=UTF-8");
+      super(input, { ...init, headers });
+    }
+  }
+  class NativeWebSocket {
+    close() {}
+  }
+  const exportStatement = /\nexport \{\n(?: {2}[A-Za-z][A-Za-z0-9]*,?\n)+\};\n?$/u.exec(
+    ACTOR_NATIVE_BOOTSTRAP_SOURCE,
+  );
+  if (!exportStatement || exportStatement.index === undefined)
+    throw new Error("unexpected native bootstrap export syntax");
+  const realm = runInNewContext(
+    `${ACTOR_NATIVE_BOOTSTRAP_SOURCE.slice(0, exportStatement.index)}\n({ createActorNativeOwner });`,
+    {
+      WebSocket: NativeWebSocket,
+      Headers,
+      Request: WorkerdTextBodyRequest,
+      Response,
+      ReadableStream,
+      crypto,
+      TextEncoder,
+      TextDecoder,
+      Uint8Array,
+      ArrayBuffer,
+      AbortController,
+      AbortSignal,
+      DOMException,
+      setTimeout,
+      clearTimeout,
+      atob,
+      btoa,
+    },
+    { timeout: 1_000 },
+  ) as { createActorNativeOwner: typeof createActorNativeOwner };
+  const graph = { generationKey: "d".repeat(64), epoch: "epoch-1", variantKeys: ["selected"] };
+  const actorId = "structural-id";
+  const socket = Object.assign(new NativeWebSocket(), {
+    deserializeAttachment: () => ({ socketId: "socket-1", actorId, attachment: null }),
+    serializeAttachment() {},
+    send() {},
+  }) as unknown as Parameters<
+    InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
+  >[0];
+  const selectedClass = {};
+  const Owner = realm.createActorNativeOwner(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    async () => selectedClass,
+    async () => graph,
+  );
+  const observed: { method: string; path: string; headerNames: string[]; action: unknown }[] = [];
+  let socketNonce: string | undefined;
+  let socketDeadline: number | undefined;
+  const owner = new Owner(
+    {
+      facets: {
+        get() {
+          return { fetch: async () => new Response(null, { status: 204 }) };
+        },
+        abort() {},
+      },
+      getWebSockets: () => [socket],
+      waitUntil() {},
+    },
+    {
+      CLASS: {},
+      SOCKET_ADMISSION: {
+        async fetch(request) {
+          const body = (await request.json()) as Record<string, unknown>;
+          const path = new URL(request.url).pathname;
+          const headerNames = [...request.headers.keys()];
+          observed.push({ method: request.method, path, headerNames, action: body.action });
+          if (request.method !== "POST" || path !== "/" || headerNames.length !== 0)
+            return new Response(null, { status: 404 });
+          if (body.action === "socket-complete")
+            return body.attemptNonce === socketNonce && body.deadlineAt === socketDeadline
+              ? new Response(null, { status: 204 })
+              : new Response(null, { status: 404 });
+          if (
+            body.action !== "socket" ||
+            body.id !== actorId ||
+            typeof body.attemptNonce !== "string" ||
+            !Number.isSafeInteger(body.deadlineAt)
+          )
+            return new Response(null, { status: 404 });
+          socketNonce = body.attemptNonce;
+          socketDeadline = body.deadlineAt as number;
+          return Response.json({
+            id: actorId,
+            attemptNonce: body.attemptNonce,
+            generationKey: graph.generationKey,
+            epoch: graph.epoch,
+            variantKey: "selected",
+            leaseId: "lease",
+          });
+        },
+      },
+    },
+  );
+  let callbackError: unknown;
+  try {
+    await owner.webSocketMessage(socket, "event");
+  } catch (error) {
+    callbackError = error;
+  }
+  expect(observed).toEqual([
+    { method: "POST", path: "/", headerNames: [], action: "socket" },
+    { method: "POST", path: "/", headerNames: [], action: "socket-complete" },
+  ]);
+  if (callbackError !== undefined) throw callbackError;
 });
 
 test("native owner refuses an unreserved WebSocket 101 and still admits the next turn", async () => {

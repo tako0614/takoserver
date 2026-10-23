@@ -118,8 +118,9 @@ const SafeCryptoGetRandomValues = crypto.getRandomValues;
 const SafeNow = Date.now;
 const SafeMathMin = Math.min;
 const SafeJsonStringify = JSON.stringify;
-const SafeEncoder = new TextEncoder();
-const SafeEncode = TextEncoder.prototype.encode;
+const SafeTextEncoder = TextEncoder;
+const SafeEncoder = new SafeTextEncoder();
+const SafeEncode = SafeTextEncoder.prototype.encode;
 const SafeUint8Array = Uint8Array;
 const HEX = "0123456789abcdef";
 
@@ -659,6 +660,10 @@ export function createActorNativeOwner(
     admissionToken === undefined
       ? new SafeHeaders()
       : new SafeHeaders({ "x-takoserver-private-alarm-admission": admissionToken });
+  const socketAdmissionBody = (value: object): Uint8Array<ArrayBuffer> =>
+    SafeReflectApply(SafeEncode, SafeEncoder, [
+      SafeJsonStringify(value),
+    ]) as Uint8Array<ArrayBuffer>;
   if (
     !SafeIsSafeInteger(deadlines.handlerMs) ||
     deadlines.handlerMs <= 0 ||
@@ -1890,7 +1895,7 @@ export function createActorNativeOwner(
           new SafeRequest("http://actor.invalid/", {
             method: "POST",
             headers: admissionHeaders(),
-            body: SafeJsonStringify({ action: "socket", id: actorId, attemptNonce, deadlineAt }),
+            body: socketAdmissionBody({ action: "socket", id: actorId, attemptNonce, deadlineAt }),
             signal: controller.signal,
           }),
         ])) as Response;
@@ -1937,7 +1942,7 @@ export function createActorNativeOwner(
             new SafeRequest("http://actor.invalid/", {
               method: "POST",
               headers: admissionHeaders(),
-              body: SafeJsonStringify({ action: "socket-complete", attemptNonce, deadlineAt }),
+              body: socketAdmissionBody({ action: "socket-complete", attemptNonce, deadlineAt }),
               signal: controller.signal,
             }),
           ])) as Response;
