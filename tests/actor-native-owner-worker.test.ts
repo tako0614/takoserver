@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { runInNewContext } from "node:vm";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import { type ActorAbiProfile, resolveActorAbiProfile } from "../src/actor-class-execution.ts";
 import {
@@ -9,6 +10,7 @@ import {
   createActorNativeSocketPort,
   signActorNativeUpgradeDecision,
 } from "../src/actor-native-owner-worker.ts";
+import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "../src/generated/actor-native-bootstrap.ts";
 import { actorNativeBundleRealm } from "./helpers/actor-native-bundle-realm.ts";
 
 const v2Profile = resolveActorAbiProfile({
@@ -1117,6 +1119,277 @@ test("native owner refuses an unreserved WebSocket 101 and still admits the next
   await expect(f.owner.fetch(f.request())).rejects.toThrow("Actor socket reservation unavailable");
   expect(await (await f.owner.fetch(f.request())).text()).toBe("ordinary");
   await Promise.all(f.retained);
+});
+
+test("private reservation offer never enters an application request even after Headers.delete poisoning", async () => {
+  const offer = "e".repeat(64);
+  let childSawOffer = false;
+  const f = fixture(async (request) => {
+    childSawOffer = request.headers.has("x-takoserver-private-actor-reservation-offer");
+    return new Response(null, { status: 204 });
+  });
+  const request = f.request();
+  request.headers.set("upgrade", "websocket");
+  request.headers.set("x-takoserver-private-actor-reservation-offer", offer);
+  const originalDelete = Headers.prototype.delete;
+  try {
+    Headers.prototype.delete = () => {};
+    expect((await f.owner.fetch(request)).status).toBe(204);
+  } finally {
+    Headers.prototype.delete = originalDelete;
+  }
+  expect(childSawOffer).toBe(false);
+  await Promise.all(f.retained);
+});
+
+test("self-host TOKEN ingress strips a caller-supplied private reservation offer", async () => {
+  const ingress = createActorNativeIngress("selfhost-token");
+  let forwardedOffer = false;
+  const response = await ingress.fetch(
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-token": "selfhost-token",
+        "x-takoserver-private-actor-id": "actor-one",
+        "x-takoserver-private-actor-reservation-offer": "f".repeat(64),
+      },
+    }),
+    {
+      NAMESPACE: {
+        idFromName: (name) => name,
+        get: () => ({
+          async fetch(request) {
+            forwardedOffer = request.headers.has("x-takoserver-private-actor-reservation-offer");
+            return new Response(null, { status: 204 });
+          },
+        }),
+      },
+    },
+  );
+  expect(response.status).toBe(204);
+  expect(forwardedOffer).toBe(false);
+});
+
+test("private offer rejects malformed, duplicated and non-upgrade requests before child dispatch", async () => {
+  let childCalls = 0;
+  const f = fixture(async () => {
+    childCalls++;
+    return new Response(null, { status: 204 });
+  });
+  for (const offer of ["f".repeat(63), "F".repeat(64), `${"f".repeat(64)}, ${"e".repeat(64)}`]) {
+    const request = f.request();
+    request.headers.set("upgrade", "websocket");
+    request.headers.set("x-takoserver-private-actor-reservation-offer", offer);
+    expect(() => f.owner.fetch(request)).toThrow("Actor socket reservation unavailable");
+  }
+  const ordinary = f.request();
+  ordinary.headers.set("x-takoserver-private-actor-reservation-offer", "f".repeat(64));
+  expect(() => f.owner.fetch(ordinary)).toThrow("Actor socket reservation unavailable");
+  expect(childCalls).toBe(0);
+  await Promise.all(f.retained);
+});
+
+test("Host offer is the one pending private bearer, with no bearer on its native 101", async () => {
+  const exported = /\nexport \{\n(?: {2}[A-Za-z][A-Za-z0-9]*,?\n)+\};\n?$/u.exec(
+    ACTOR_NATIVE_BOOTSTRAP_SOURCE,
+  );
+  if (!exported || exported.index === undefined) throw new Error("native artifact export missing");
+  class NativeSocket {
+    private attachment: unknown;
+    close() {}
+    send() {}
+    serializeAttachment(value: unknown) {
+      this.attachment = value;
+    }
+    deserializeAttachment() {
+      return this.attachment;
+    }
+  }
+  class NativePair {
+    readonly 0 = new NativeSocket();
+    readonly 1 = new NativeSocket();
+  }
+  class NativeResponse extends Response {
+    readonly webSocket: NativeSocket | undefined;
+    private readonly nativeStatus: number | undefined;
+    constructor(body?: BodyInit | null, init?: ResponseInit & { webSocket?: NativeSocket }) {
+      super(body, init?.status === 101 ? { ...init, status: 200 } : init);
+      this.nativeStatus = init?.status === 101 ? 101 : undefined;
+      this.webSocket = init?.webSocket;
+    }
+    override get status() {
+      return this.nativeStatus ?? super.status;
+    }
+    override get headers() {
+      return super.headers;
+    }
+    override get ok() {
+      return this.status >= 200 && this.status < 300;
+    }
+  }
+  const realm = runInNewContext(
+    `${ACTOR_NATIVE_BOOTSTRAP_SOURCE.slice(0, exported.index)}\n({ createActorNativeOwner, createActorNativeSocketPort, signActorNativeUpgradeDecision });`,
+    {
+      WebSocket: NativeSocket,
+      WebSocketPair: NativePair,
+      Headers,
+      Request,
+      Response: NativeResponse,
+      ReadableStream,
+      crypto,
+      TextEncoder,
+      TextDecoder,
+      Uint8Array,
+      ArrayBuffer,
+      AbortController,
+      AbortSignal,
+      DOMException,
+      setTimeout,
+      clearTimeout,
+      atob,
+      btoa,
+    },
+    { timeout: 1_000 },
+  ) as {
+    createActorNativeOwner: typeof createActorNativeOwner;
+    createActorNativeSocketPort: typeof createActorNativeSocketPort;
+    signActorNativeUpgradeDecision: typeof signActorNativeUpgradeDecision;
+  };
+  const database = new Database(":memory:");
+  const sql = {
+    exec(statement: string, ...params: (string | number | null)[]) {
+      if (statement.startsWith("SELECT"))
+        return database.query(statement).all(...params) as Record<string, unknown>[];
+      database.query(statement).run(...params);
+      return [];
+    },
+  };
+  const actorId = "private-offer-actor";
+  const offer = "e".repeat(64);
+  const delivery = "a".repeat(64);
+  const secret = "b".repeat(64);
+  const retained: Promise<unknown>[] = [];
+  const sockets: NativeSocket[] = [];
+  let childSawOffer = false;
+  let owner!: InstanceType<ReturnType<typeof realm.createActorNativeOwner>>;
+  const service = { fetch: (request: Request) => owner.fetch(request) };
+  const Owner = realm.createActorNativeOwner(delivery, "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  owner = new Owner(
+    {
+      facets: {
+        get: () => ({
+          async fetch(request) {
+            childSawOffer = request.headers.has("x-takoserver-private-actor-reservation-offer");
+            const nonce = request.headers.get("x-takoserver-private-actor-upgrade-nonce");
+            if (!nonce) throw new Error("missing trusted upgrade nonce");
+            const port = realm.createActorNativeSocketPort(service, secret, actorId, nonce);
+            const socketId = await port.accept();
+            const decision = await realm.signActorNativeUpgradeDecision(
+              delivery,
+              nonce,
+              encodeURIComponent(actorId),
+              socketId,
+            );
+            return new NativeResponse(null, {
+              status: 204,
+              headers: {
+                "x-takoserver-private-actor-upgrade-decision": decision,
+                "x-takoserver-private-actor-upgrade-socket-id": socketId,
+                "x-takoserver-private-actor-reservation": "f".repeat(64),
+                "x-takoserver-private-actor-reservation-offer": "f".repeat(64),
+              },
+            });
+          },
+        }),
+        abort() {},
+      },
+      storage: { sql, setAlarm() {}, deleteAlarm() {} },
+      getWebSockets: () => sockets as never[],
+      acceptWebSocket(socket) {
+        sockets.push(socket as unknown as NativeSocket);
+      },
+      waitUntil(promise) {
+        retained.push(promise);
+      },
+    },
+    {
+      CLASS: {},
+      CLASS_0: {},
+      SOCKET_ADMISSION: {
+        async fetch() {
+          return new NativeResponse(null, { status: 204 });
+        },
+      },
+    },
+  );
+  const request = () =>
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+        "x-takoserver-private-actor-variant": "default",
+        "x-takoserver-private-actor-reservation-offer": offer,
+        upgrade: "websocket",
+        connection: "Upgrade",
+        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "sec-websocket-version": "13",
+      },
+    });
+  try {
+    const originalDelete = Headers.prototype.delete;
+    let upgraded: NativeResponse;
+    try {
+      Headers.prototype.delete = () => {};
+      upgraded = (await owner.fetch(request())) as NativeResponse;
+    } finally {
+      Headers.prototype.delete = originalDelete;
+    }
+    expect(upgraded.status).toBe(101);
+    expect(upgraded.headers.has("x-takoserver-private-actor-reservation")).toBe(false);
+    expect(upgraded.headers.has("x-takoserver-private-actor-reservation-offer")).toBe(false);
+    expect(upgraded.headers.has("x-takoserver-private-actor-upgrade-decision")).toBe(false);
+    expect(upgraded.headers.has("x-takoserver-private-actor-upgrade-socket-id")).toBe(false);
+    expect(childSawOffer).toBe(false);
+    expect(sql.exec("SELECT bearer FROM actor_socket_reservations")).toEqual([{ bearer: offer }]);
+    await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 1 }]);
+    const wrongActor = request();
+    wrongActor.headers.set("x-takoserver-private-actor-id", "other-actor");
+    await expect(owner.fetch(wrongActor)).rejects.toThrow("Actor identity changed");
+    const forgedSettlement = await owner.fetch(
+      new Request("http://actor.invalid/", {
+        method: "POST",
+        headers: {
+          "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+          "x-takoserver-private-actor-reservation": "f".repeat(64),
+          "x-takoserver-private-actor-reservation-action": "commit",
+        },
+      }),
+    );
+    expect(forgedSettlement.status).toBe(404);
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 1 }]);
+    const committed = await owner.fetch(
+      new Request("http://actor.invalid/", {
+        method: "POST",
+        headers: {
+          "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+          "x-takoserver-private-actor-reservation": offer,
+          "x-takoserver-private-actor-reservation-action": "commit",
+        },
+      }),
+    );
+    expect(committed.status).toBe(204);
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 0 }]);
+    await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
+    sql.exec("UPDATE actor_socket_offer_receipts SET expires_at = ?", Date.now() - 1);
+    await owner.alarm();
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_offer_receipts")).toEqual([{ n: 0 }]);
+    await Promise.all(retained);
+  } finally {
+    database.close();
+  }
 });
 
 test("native socket decision is invocation-bound and retires the child before attempting transport", async () => {

@@ -22,6 +22,7 @@ const NativeHeadersAppend = Headers.prototype.append;
 const NativeHeadersDelete = Headers.prototype.delete;
 const NativeHeadersForEach = Headers.prototype.forEach;
 const NativeObjectDefineProperty = Object.defineProperty;
+const NativeObjectCreate = Object.create;
 const NativeTypeError = TypeError;
 const NativeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
 const NativeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
@@ -119,6 +120,33 @@ function responseHeaders(response: Response): Headers {
 }
 function replaceResponseHeaders(response: Response, snapshot: Headers): void {
   const target = responseHeaders(response);
+  const entries = (
+    headers: Headers,
+  ): { readonly values: Record<number, string>; readonly count: number } => {
+    const values = NativeObjectCreate(null) as Record<number, string>;
+    let count = 0;
+    NativeReflectApply(NativeHeadersForEach, headers, [
+      (value: string, name: string) => {
+        values[count] = name;
+        count += 1;
+        values[count] = value;
+        count += 1;
+      },
+    ]);
+    return { values, count };
+  };
+  const original = entries(target);
+  const selected = entries(snapshot);
+  if (original.count === selected.count) {
+    let same = true;
+    for (let i = 0; i < original.count; i += 1) {
+      if (original.values[i] !== selected.values[i]) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return;
+  }
   const names = new NativeSet<string>();
   NativeReflectApply(NativeHeadersForEach, target, [
     (_value: string, name: string) => {
