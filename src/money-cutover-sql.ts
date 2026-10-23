@@ -332,6 +332,80 @@ function assertPublicStatement(statement: SqlStatement): void {
     throw new SqlError("invalid", "money cutover Writer statement is outside the guarded surface");
 }
 
+/** Fresh Auth103 uses the same public SQL surface, without a Money permit or epoch. */
+const freshNativeSqlOrigins = new WeakMap<
+  object,
+  {
+    readonly raw: Sql;
+    readonly methods: readonly [Sql["query"], Sql["run"], Sql["batch"]];
+    readonly rawMethods: readonly [
+      Sql["query"] | undefined,
+      Sql["run"] | undefined,
+      Sql["batch"] | undefined,
+    ];
+  }
+>();
+
+export function assertFreshNativeSqlBackingOrigin(sql: unknown, rawSql: Sql): asserts sql is Sql {
+  const origin =
+    typeof sql === "object" && sql !== null ? freshNativeSqlOrigins.get(sql) : undefined;
+  if (
+    !origin ||
+    origin.raw !== rawSql ||
+    ownDataSqlMethod(sql as Sql, "query") !== origin.methods[0] ||
+    ownDataSqlMethod(sql as Sql, "run") !== origin.methods[1] ||
+    ownDataSqlMethod(sql as Sql, "batch") !== origin.methods[2] ||
+    ownDataSqlMethod(rawSql, "query") !== origin.rawMethods[0] ||
+    ownDataSqlMethod(rawSql, "run") !== origin.rawMethods[1] ||
+    ownDataSqlMethod(rawSql, "batch") !== origin.rawMethods[2]
+  )
+    throw new SqlError("invalid", "fresh native Sql backing origin differs");
+}
+
+/** This wrapper is provisional until Auth103's native origin qualifies Accounts/RP. */
+export function createFreshNativeSql(raw: Sql): Sql {
+  const batch: Sql["batch"] = async (statements) => {
+    statements.forEach(assertPublicStatement);
+    return await raw.batch(statements);
+  };
+  const wrapped: Sql = {
+    async query(sql, params) {
+      const head = sql.trimStart();
+      if (
+        (/^SELECT\b/iu.test(head) || /^PRAGMA\s+table_info\s*\(/iu.test(head)) &&
+        !/;[\s\S]*\S/iu.test(head.replace(/;\s*$/u, ""))
+      ) {
+        if (/^SELECT\b/iu.test(head)) assertPublicStatement({ sql });
+        return await raw.query(sql, params);
+      }
+      if (
+        /^WITH\b/iu.test(head) ||
+        /^UPDATE\s+(?:tf_v2_worker_invocations|tf_v2_operations)\b/iu.test(head)
+      )
+        return (await batch([{ sql, ...(params === undefined ? {} : { params }) }]))[0]?.rows ?? [];
+      throw new SqlError("invalid", "fresh native query is outside the public surface");
+    },
+    async run(sql, params) {
+      assertPublicStatement({ sql, ...(params === undefined ? {} : { params }) });
+      return await raw.run(sql, params);
+    },
+    batch,
+  };
+  freshNativeSqlOrigins.set(
+    wrapped,
+    Object.freeze({
+      raw,
+      methods: [wrapped.query, wrapped.run, wrapped.batch] as const,
+      rawMethods: [
+        ownDataSqlMethod(raw, "query"),
+        ownDataSqlMethod(raw, "run"),
+        ownDataSqlMethod(raw, "batch"),
+      ] as const,
+    }),
+  );
+  return wrapped;
+}
+
 /** All selected-Host mutations are one D1 transaction. A failed batch leaves no permit. */
 export function createMoneyCutoverSql(raw: Sql, writerEpoch: string): Sql {
   if (!MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(writerEpoch))

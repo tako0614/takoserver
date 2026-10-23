@@ -336,51 +336,81 @@ type CallbackFailurePhase =
   | "response"
   | "cleanup";
 
+type FailureClassification = {
+  readonly failureClass: "session" | "oidc" | "unknown";
+  readonly code:
+    | "session_invalid"
+    | "session_unavailable"
+    | "workspace_forbidden"
+    | "oidc_invalid"
+    | "oidc_unavailable"
+    | "unknown";
+};
+
+/** Closed classification only: never an exception's message, stack, name or raw code. */
+function classifyFailure(error: unknown): FailureClassification {
+  if (error instanceof SharedAuthSessionError) {
+    switch (error.code) {
+      case "session_invalid":
+        return { failureClass: "session", code: "session_invalid" };
+      case "session_unavailable":
+        return { failureClass: "session", code: "session_unavailable" };
+      case "workspace_forbidden":
+        return { failureClass: "session", code: "workspace_forbidden" };
+    }
+  } else if (error instanceof SharedAuthOidcError) {
+    switch (error.code) {
+      case "oidc_invalid":
+        return { failureClass: "oidc", code: "oidc_invalid" };
+      case "oidc_unavailable":
+        return { failureClass: "oidc", code: "oidc_unavailable" };
+    }
+  }
+  return { failureClass: "unknown", code: "unknown" };
+}
+
 function reportCallbackFailure(phase: CallbackFailurePhase, error: unknown): void {
   // Diagnostics must not inspect an exception's message, stack, name or raw code.
   // Even a hostile accessor or a failing logger cannot alter callback cleanup.
   try {
-    let failureClass: "session" | "oidc" | "unknown" = "unknown";
-    let code:
-      | "session_invalid"
-      | "session_unavailable"
-      | "workspace_forbidden"
-      | "oidc_invalid"
-      | "oidc_unavailable"
-      | "unknown" = "unknown";
-    if (error instanceof SharedAuthSessionError) {
-      switch (error.code) {
-        case "session_invalid":
-          failureClass = "session";
-          code = "session_invalid";
-          break;
-        case "session_unavailable":
-          failureClass = "session";
-          code = "session_unavailable";
-          break;
-        case "workspace_forbidden":
-          failureClass = "session";
-          code = "workspace_forbidden";
-          break;
-      }
-    } else if (error instanceof SharedAuthOidcError) {
-      switch (error.code) {
-        case "oidc_invalid":
-          failureClass = "oidc";
-          code = "oidc_invalid";
-          break;
-        case "oidc_unavailable":
-          failureClass = "oidc";
-          code = "oidc_unavailable";
-          break;
-      }
-    }
+    const { failureClass, code } = classifyFailure(error);
     console.error(
       JSON.stringify({
         marker: "takoserver.shared_auth.callback.failure.v1",
         phase,
         class: failureClass,
         code,
+      }),
+    );
+  } catch {
+    // Logging is never part of authentication or revocation authority.
+  }
+}
+
+type GrantHealthStep = "refresh" | "introspect" | "userinfo" | "complete";
+
+/**
+ * Names the in-fence step of a failed grant health check. The fence itself is
+ * unchanged; this only records which issuer call or settlement failed, whether
+ * a refresh had already rotated the grant, and how long that step took (a
+ * deadline shows as about 5000 ms). No token, digest or issuer body is logged.
+ */
+function reportGrantHealthFailure(
+  step: GrantHealthStep,
+  refreshed: boolean,
+  error: unknown,
+  stepMs: number,
+): void {
+  try {
+    const { failureClass, code } = classifyFailure(error);
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.grant_health.failure.v1",
+        step,
+        refreshed,
+        class: failureClass,
+        code,
+        stepMs: Number.isSafeInteger(stepMs) && stepMs >= 0 ? stepMs : null,
       }),
     );
   } catch {
@@ -1007,13 +1037,24 @@ export function createSharedAuthSession(options: {
       if (row.grantCheckedAt + healthTtl <= stamp || value.accessExpiresAt <= stamp + 30000) {
         const claimed = await store.claimSession(digest, row.version, stamp);
         if (!claimed) throw new SharedAuthSessionError("session_unavailable");
+        let step: GrantHealthStep = "refresh";
+        let refreshed = false;
+        let stepStartedAt = Date.now();
+        const enter = (next: GrantHealthStep) => {
+          step = next;
+          stepStartedAt = Date.now();
+        };
         try {
-          if (value.accessExpiresAt <= stamp + 30000) value = await client.refresh(value);
-          if (
-            !(await client.active(value)) ||
-            (await client.canonicalAccount(value)).accountId !== row.accountId
-          )
+          if (value.accessExpiresAt <= stamp + 30000) {
+            value = await client.refresh(value);
+            refreshed = true;
+          }
+          enter("introspect");
+          if (!(await client.active(value))) throw new SharedAuthSessionError("session_invalid");
+          enter("userinfo");
+          if ((await client.canonicalAccount(value)).accountId !== row.accountId)
             throw new SharedAuthSessionError("session_invalid");
+          enter("complete");
           const updated = {
             payload: await seal("grant", digest, value),
             grantCheckedAt: now(),
@@ -1023,6 +1064,9 @@ export function createSharedAuthSession(options: {
             throw new SharedAuthSessionError("session_invalid");
           row = { ...row, ...updated, status: "active", version: claimed.version + 1 };
         } catch (error) {
+          // TS narrows `step` to "refresh" here (enter() assigns it in a closure);
+          // the runtime value is the failed step. Do not compare it in this block.
+          reportGrantHealthFailure(step, refreshed, error, Date.now() - stepStartedAt);
           // Never retry refresh or completion after an unknown acknowledgement.
           // This fences even a committed completion and durably retains its
           // rotated grant. The store makes custody and denial one transaction.

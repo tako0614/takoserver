@@ -1992,7 +1992,18 @@ function documentedPaths(): Record<string, Record<string, unknown>> {
     used.add(route.operation);
     const methods = paths[route.pattern] ?? {};
     paths[route.pattern] = methods;
-    methods[route.method] = described;
+    // Only this control-plane family and /v1/me use the composed Server RP
+    // session. Login, operator assertions, AI and Takoform credentials keep
+    // their existing authentication contracts.
+    const acceptsServerSession =
+      route.operation === "readPrincipal" ||
+      route.pattern.startsWith("/v1/organizations/{organizationId}/");
+    methods[route.method] = acceptsServerSession
+      ? {
+          ...described,
+          security: [{ bearerAuth: [] }, { serverSharedSession: [] }],
+        }
+      : described;
   }
   for (const lane of TAKOFORM_LANES) {
     for (const route of TAKOFORM_ROUTES) {
@@ -2037,6 +2048,19 @@ export const openApiDocument = {
         description:
           "A session secret, an organization API key, a tenant-run Space-scoped token, a resource-scoped token, or a purpose-specific operator assertion, " +
           "depending on the route.",
+      },
+      serverSharedSession: {
+        type: "apiKey",
+        in: "cookie",
+        name: "__Host-takoserver_shared_session",
+        description:
+          "The original Server RP session cookie, when that receiver is mounted. " +
+          "Requires the exact configured console Origin on every request. " +
+          "An explicit Authorization header selects that credential, even if invalid. " +
+          "Without it, legacy and shared session cookies together are ambiguous and refused. " +
+          "A selected legacy cookie is never retried as a shared session. " +
+          "It is not a Bearer token, Hosted/issuer cookie, or Org API key. " +
+          "The business request itself checks current Organization ownership; a prior GET is not a grant.",
       },
     },
     schemas: {

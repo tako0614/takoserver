@@ -17,6 +17,7 @@ import { customerTrackedOriginalReadStatement } from "../../src/shared-financial
 import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../../src/sql-d1.ts";
 import { createStripeBillingClient } from "../../src/stripe-billing-client.ts";
 import {
+  assertWorkerRequestFinancialSqlOrigin,
   batchWorkerRequestFinancialCurrentConsentOriginal,
   captureWorkerSharedAuthStaging,
   createWorkerRequestConsumers,
@@ -596,6 +597,20 @@ test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1
   const request = await requestFixture();
   const foreign = await requestFixture();
   try {
+    const before = { ...request.observed };
+    expect(() =>
+      assertWorkerRequestFinancialSqlOrigin(request.connection, request.inputs.sql),
+    ).not.toThrow();
+    expect(() =>
+      assertWorkerRequestFinancialSqlOrigin(request.connection, foreign.inputs.sql),
+    ).toThrow();
+    expect(() =>
+      assertWorkerRequestFinancialSqlOrigin(request.connection, { ...request.inputs.sql }),
+    ).toThrow();
+    expect(() =>
+      assertWorkerRequestFinancialSqlOrigin({ ...request.connection }, request.inputs.sql),
+    ).toThrow();
+    expect(request.observed).toEqual(before);
     const { executor, l1, input } = await selectedCustomerCase(request);
     const readsBefore = request.observed.reads;
     const outcome = await executor.executePhase(l1);

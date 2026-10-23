@@ -4,6 +4,7 @@ import { runChecked, runCommand, wranglerCommand } from "./process.ts";
 import {
   deploymentVariables,
   expectedWorkerSecrets,
+  SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF,
   type WorkerVersionAuthorityProfile,
 } from "./realized-config.ts";
 import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
@@ -242,6 +243,14 @@ export function expectedExactBindingClosure(
     AI: { type: "ai", fields: {} },
     WORKER_VERSION: { type: "version_metadata", fields: {} },
     ...expectedBindingClosureForTarget(target),
+    ...(target.auth103NativeProfile === undefined
+      ? {}
+      : {
+          ACCOUNTS_FINANCIAL_PROOF: {
+            type: "service",
+            fields: SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF,
+          },
+        }),
     ...(target.cloudflareProviderExecutor === undefined || isArtifactBlobIoQuiescedTarget(target)
       ? {}
       : {

@@ -34,8 +34,19 @@ export const SESSION_TEST_ORGANIZATION: SharedWorkspaceChoice = {
   owner: false,
 };
 
-/** Synthetic HTTP issuer with real signatures, PKCE and single-use refreshes. */
-export async function createSharedSessionTestIssuer(now: () => number) {
+/**
+ * Synthetic HTTP issuer with real signatures, PKCE and single-use refreshes.
+ * `accountsRefreshContract` follows the Accounts shared-account refresh grant
+ * (takosumi accounts/service/src/oidc-routes.ts handleRefreshToken and
+ * issueTokenResponse): every refresh returns a signed ID token carrying the
+ * original nonce, sid and auth_time, and a spent refresh revokes the family.
+ * Simplification: email claims are always present and email_verified is true;
+ * Accounts emits them only for the email scope and from a live email proof.
+ */
+export async function createSharedSessionTestIssuer(
+  now: () => number,
+  options: { readonly accountsRefreshContract?: boolean } = {},
+) {
   const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
     "sign",
     "verify",
@@ -51,6 +62,7 @@ export async function createSharedSessionTestIssuer(now: () => number) {
   const codes = new Map<string, { nonce: string; challenge: string }>();
   const accesses = new Map<string, { expiresAt: number; active: boolean }>();
   const refreshes = new Map<string, boolean>();
+  const refreshNonces = new Map<string, string>();
   let sequence = 0;
   const control = {
     userinfoAccount: SESSION_TEST_ACCOUNT,
@@ -77,15 +89,16 @@ export async function createSharedSessionTestIssuer(now: () => number) {
   const issued: { accessToken: string; refreshToken: string }[] = [];
   const revoked: string[] = [];
 
-  async function token(nonce?: string) {
+  async function token(nonce?: string, refreshed = false) {
     sequence += 1;
     const accessToken = `synthetic-access-${sequence}`;
     const refreshToken = `synthetic-refresh-${sequence}`;
     accesses.set(accessToken, { expiresAt: now() + 300_000, active: true });
     refreshes.set(refreshToken, true);
+    if (nonce && options.accountsRefreshContract) refreshNonces.set(refreshToken, nonce);
     issued.push({ accessToken, refreshToken });
     let idToken: string | undefined;
-    if (nonce) {
+    if (nonce && (!refreshed || options.accountsRefreshContract)) {
       const header = base64UrlEncode(
         new TextEncoder().encode(
           JSON.stringify({ alg: "ES256", typ: "JWT", kid: "session-test-key" }),
@@ -102,6 +115,9 @@ export async function createSharedSessionTestIssuer(now: () => number) {
             iat: Math.floor(now() / 1000),
             exp: Math.floor(now() / 1000) + 300,
             nonce,
+            ...(options.accountsRefreshContract
+              ? { email: control.email, email_verified: true }
+              : {}),
           }),
         ),
       );
@@ -204,11 +220,17 @@ export async function createSharedSessionTestIssuer(now: () => number) {
         }
         if (form.get("grant_type") === "refresh_token") {
           const refresh = form.get("refresh_token") ?? "";
-          if (refreshes.get(refresh) !== true)
+          if (refreshes.get(refresh) !== true) {
+            if (options.accountsRefreshContract && refreshes.has(refresh)) {
+              // Accounts revokes the whole hosted grant on a spent refresh.
+              for (const value of accesses.values()) value.active = false;
+              for (const value of refreshes.keys()) refreshes.set(value, false);
+            }
             return Response.json({ error: "invalid_grant" }, { status: 400 });
+          }
           refreshes.set(refresh, false);
           await control.onRefresh?.();
-          return Response.json(await token());
+          return Response.json(await token(refreshNonces.get(refresh), true));
         }
         throw new Error("unknown synthetic grant type");
       }

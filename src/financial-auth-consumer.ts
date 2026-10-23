@@ -51,7 +51,7 @@ export interface FinancialAuthConsumerPort {
 export interface FinancialAuthConsumerContext {
   readonly sql: Sql;
   readonly realm: HostedBillingFinancialRealm;
-  readonly writerEpoch: string;
+  readonly writerEpoch: string | undefined;
   readonly authSchemaRef: string;
   readonly targetRef: string;
 }
