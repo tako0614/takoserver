@@ -138,8 +138,11 @@ async function reservationOfferDigest(offer: string): Promise<string> {
     SafeReflectApply(SafeEncode, SafeEncoder, [`actor-socket-offer-v1\n${offer}`]),
   ])) as ArrayBuffer;
   let digest = "";
-  for (const byte of new SafeUint8Array(bytes))
+  const view = new SafeUint8Array(bytes);
+  for (let index = 0; index < 32; index += 1) {
+    const byte = view[index] as number;
     digest += (HEX[byte >> 4] as string) + (HEX[byte & 15] as string);
+  }
   return digest;
 }
 

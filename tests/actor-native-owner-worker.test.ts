@@ -1411,6 +1411,42 @@ test("Host offer is the one pending private bearer, with no bearer on its native
     expect(committed.status).toBe(204);
     expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 0 }]);
     await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
+    const knownDigest = new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(`actor-socket-offer-v1\n${offer}`),
+      ),
+    );
+    const originalIterator = Object.getOwnPropertyDescriptor(Uint8Array.prototype, Symbol.iterator);
+    let alteredDigestReads = 0;
+    let replayError: unknown;
+    try {
+      Object.defineProperty(Uint8Array.prototype, Symbol.iterator, {
+        configurable: true,
+        value: function* (this: Uint8Array) {
+          let isOfferDigest = this.length === knownDigest.length;
+          for (let index = 0; isOfferDigest && index < knownDigest.length; index += 1)
+            if (this[index] !== knownDigest[index]) isOfferDigest = false;
+          if (isOfferDigest) alteredDigestReads += 1;
+          for (let index = 0; index < this.length; index += 1)
+            yield (this[index] as number) ^ (isOfferDigest ? alteredDigestReads & 1 : 0);
+        },
+      });
+      try {
+        await owner.fetch(request());
+      } catch (error) {
+        replayError = error;
+      }
+    } finally {
+      if (originalIterator)
+        Object.defineProperty(Uint8Array.prototype, Symbol.iterator, originalIterator);
+      else Reflect.deleteProperty(Uint8Array.prototype, Symbol.iterator);
+    }
+    expect(alteredDigestReads).toBe(0);
+    expect((replayError as { message?: unknown } | undefined)?.message).toBe(
+      "Actor socket reservation unavailable",
+    );
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 0 }]);
     sql.exec("UPDATE actor_socket_offer_receipts SET expires_at = ?", Date.now() - 1);
     await owner.alarm();
     expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_offer_receipts")).toEqual([{ n: 1 }]);
