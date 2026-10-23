@@ -10,6 +10,8 @@ import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/m
 import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
 import {
   auth103SourceSchemaReady,
+  boundCurrentPredicate,
+  boundedOriginalShapePredicates,
   compileAuth103NativeImportShapes,
   composeAuth103NativeImportData,
 } from "../scripts/deploy/schema-auth103-native-source.ts";
@@ -238,6 +240,97 @@ test("one original importer preserves the exact recipes and atomically installs 
     }
     expect(auth103SourceSchemaReady(f.state(), f.root, "normal")).toBe(true);
     expect(f.database.query("PRAGMA foreign_key_check").all().length).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("bounded original shape predicates conserve every tuple and reject omissions and extras", () => {
+  const f = fixture();
+  try {
+    const original = JSON.parse(f.shapes.prefixShape) as {
+      type: string;
+      name: string;
+      table: string;
+      sql: string;
+    }[];
+    expect(original.length).toBeGreaterThan(600);
+    const check = (shape: string) =>
+      boundedOriginalShapePredicates(shape).map(
+        (predicate) =>
+          f.database.query<{ valid: number }, []>(`SELECT (${predicate}) AS valid`).get()?.valid,
+      );
+    const baseline = check(f.shapes.prefixShape);
+    expect(baseline.length).toBeGreaterThan(1);
+    expect(baseline.every((valid) => valid === 1)).toBe(true);
+    const variants = [0, Math.floor(original.length / 2), original.length - 1].map((index) => {
+      const rows = original.map((row) => ({ ...row }));
+      const selected = rows[index];
+      if (selected === undefined) throw new Error("opaque source tuple missing");
+      selected.sql += " ";
+      return rows;
+    });
+    variants.push(original.filter((_, index) => index !== Math.floor(original.length / 2)));
+    variants.push([
+      ...original,
+      {
+        type: "table",
+        name: "auth103_bounded_guard_foreign",
+        table: "auth103_bounded_guard_foreign",
+        sql: "CREATE TABLE auth103_bounded_guard_foreign(id TEXT)",
+      },
+    ]);
+    const before = f.checkpoint();
+    for (const rows of variants) {
+      expect(check(`${JSON.stringify(rows)}\n`).some((valid) => valid !== 1)).toBe(true);
+      expect(f.checkpoint()).toBe(before);
+      expect(count(f.database, "d1_migrations")).toBe(100);
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("catalog literal encoding roundtrips exact SQLite UTF8 and refuses token collisions", () => {
+  const f = fixture();
+  try {
+    const catalogJson = `${JSON.stringify(f.shapes.catalog)}\u03a9`;
+    const registration = [
+      f.original.registrationRef,
+      f.original.recipeDigest,
+      f.original.clockSourceDigest,
+      f.original.clockPolicyRef,
+    ];
+    const sql = boundCurrentPredicate(registration, catalogJson);
+    const marker = "json_each(replace(";
+    const start = sql.lastIndexOf(marker);
+    expect(start).toBeGreaterThan(0);
+    let quote = false;
+    let depth = 0;
+    let end = -1;
+    for (let index = start + "json_each(".length; index < sql.length; index++) {
+      const character = sql[index];
+      if (character === "'") {
+        if (quote && sql[index + 1] === "'") {
+          index++;
+        } else {
+          quote = !quote;
+        }
+      } else if (!quote && character === "(") {
+        depth++;
+      } else if (!quote && character === ")") {
+        if (depth === 0) {
+          end = index;
+          break;
+        }
+        depth--;
+      }
+    }
+    expect(end).toBeGreaterThan(start);
+    const expression = sql.slice(start + "json_each(".length, end);
+    const decoded = f.database.query<{ value: string }, []>(`SELECT ${expression} AS value`).get();
+    expect(Buffer.from(decoded?.value ?? "").equals(Buffer.from(catalogJson))).toBe(true);
+    expect(() => boundCurrentPredicate(registration, `${catalogJson}\ue000`)).toThrow();
   } finally {
     f.close();
   }

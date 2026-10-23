@@ -53,6 +53,10 @@ const requiredSourcePaths = Object.freeze([
 const digest = (value: string | Uint8Array): `sha256:${string}` =>
   `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const dataDigest = (value: unknown): `sha256:${string}` => digest(canonicalJson(value));
+export const auth103NativeTargetRef = (
+  target: Pick<DeployTarget, "accountId" | "d1">,
+): `sha256:${string}` =>
+  dataDigest(["takoserver.auth103.native-state-db.v1", target.accountId, target.d1.databaseId]);
 const literal = (value: string): string => `'${value.replaceAll("'", "''")}'`;
 function source(root: string, path: string): string {
   const file = resolve(root, path);
@@ -466,11 +470,7 @@ export function prepareAuth103NativeBuildSource(input: {
         throw preflightError("Auth103 canonical source differs from its owning recipes");
     }
     const catalog = compileCatalog(sources.slice(0, 103));
-    const targetRef = dataDigest([
-      "takoserver.auth103.native-state-db.v1",
-      input.target.accountId,
-      input.target.d1.databaseId,
-    ]);
+    const targetRef = auth103NativeTargetRef(input.target);
     const authSchemaRef = digest(sources[102]!);
     const issuerSourceRef = dataDigest([
       "takoserver.auth103.local-rp-issuer-source.v1",
@@ -631,6 +631,40 @@ export function createAuth103NativeSourceInstallContribution(
     throw preflightError("Auth103 install requires its owned regular Worker bundle");
   const artifactDigest = digest(readFileSync(bundlePath));
   const manifest = original.manifest;
+  return compileAuth103NativeSourceInstallContribution(manifest, artifactDigest);
+}
+
+/** Formats the builder's existing four immutable originals. This function does
+ * not qualify a manifest: the normal builder supplies its opaque capture, and
+ * the current-runtime bridge separately binds a parsed manifest to the exact
+ * live Version/module bytes before calling it. */
+export function compileAuth103NativeSourceInstallContribution(
+  manifest: Auth103NativeSourceManifest,
+  artifactDigest: `sha256:${string}`,
+): string {
+  const record = auth103NativeDeploymentRecord(manifest, artifactDigest);
+  const { deploymentRef, deploymentReceiptRef, rpJson, deploymentJson } = record;
+  const rp = record.rp;
+  // Existing RP configuration originals may be reused only byte-exact. The
+  // mandatory LAST deployment receipt proves both RP rows, so a zero-row
+  // conditional insert or a conflicting partial original cannot commit.
+  return `INSERT INTO auth103_native_rp_registrations(registration_ref,registration_digest,record_json)
+SELECT ${[rp.registrationRef, rp.registrationDigest, rpJson].map(literal).join(",")}
+WHERE NOT EXISTS(SELECT 1 FROM auth103_native_rp_registrations WHERE registration_ref=${literal(rp.registrationRef)}) RETURNING *;
+INSERT INTO auth103_native_rp_registration_receipts(receipt_ref,registration_ref,record_json)
+SELECT ${[rp.receiptRef, rp.registrationRef, rpJson].map(literal).join(",")}
+WHERE NOT EXISTS(SELECT 1 FROM auth103_native_rp_registration_receipts WHERE receipt_ref=${literal(rp.receiptRef)}) RETURNING *;
+INSERT INTO auth103_native_deployments(deployment_ref,target_ref,source_ref,artifact_digest,record_json) VALUES
+(${[deploymentRef, manifest.targetRef, manifest.sourceRef, artifactDigest, deploymentJson].map(literal).join(",")}) RETURNING *;
+INSERT INTO auth103_native_deployment_receipts(receipt_ref,deployment_ref,record_json) VALUES
+(${[deploymentReceiptRef, deploymentRef, deploymentJson].map(literal).join(",")}) RETURNING *;\n`;
+}
+
+/** Deterministic record projection, with no request or mutation authority. */
+export function auth103NativeDeploymentRecord(
+  manifest: Auth103NativeSourceManifest,
+  artifactDigest: `sha256:${string}`,
+) {
   const deploymentRef = dataDigest([
     "takoserver.auth103.native-deployment.v1",
     manifest.targetRef,
@@ -649,17 +683,5 @@ export function createAuth103NativeSourceInstallContribution(
     artifactDigest,
     rpRecordJson: rpJson,
   });
-  // Existing RP configuration originals may be reused only byte-exact. The
-  // mandatory LAST deployment receipt proves both RP rows, so a zero-row
-  // conditional insert or a conflicting partial original cannot commit.
-  return `INSERT INTO auth103_native_rp_registrations(registration_ref,registration_digest,record_json)
-SELECT ${[rp.registrationRef, rp.registrationDigest, rpJson].map(literal).join(",")}
-WHERE NOT EXISTS(SELECT 1 FROM auth103_native_rp_registrations WHERE registration_ref=${literal(rp.registrationRef)}) RETURNING *;
-INSERT INTO auth103_native_rp_registration_receipts(receipt_ref,registration_ref,record_json)
-SELECT ${[rp.receiptRef, rp.registrationRef, rpJson].map(literal).join(",")}
-WHERE NOT EXISTS(SELECT 1 FROM auth103_native_rp_registration_receipts WHERE receipt_ref=${literal(rp.receiptRef)}) RETURNING *;
-INSERT INTO auth103_native_deployments(deployment_ref,target_ref,source_ref,artifact_digest,record_json) VALUES
-(${[deploymentRef, manifest.targetRef, manifest.sourceRef, artifactDigest, deploymentJson].map(literal).join(",")}) RETURNING *;
-INSERT INTO auth103_native_deployment_receipts(receipt_ref,deployment_ref,record_json) VALUES
-(${[deploymentReceiptRef, deploymentRef, deploymentJson].map(literal).join(",")}) RETURNING *;\n`;
+  return Object.freeze({ deploymentRef, deploymentReceiptRef, rp, rpJson, deploymentJson });
 }
