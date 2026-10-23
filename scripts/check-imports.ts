@@ -1035,7 +1035,11 @@ const EXACT_RP_FINANCIAL_ORIGIN_IMPORTS: Readonly<Record<string, readonly string
 
 /** The operator barrel exposes this constructor, never the composition layer. */
 function exactSharedAppLedgerD1ExportEdge(path: string, target: string): boolean {
-  if (path !== "src/index.ts" || target !== "src/shared-app-ledger-d1.ts") return false;
+  if (
+    (path !== "src/index.ts" && path !== "src/provider-extension.ts") ||
+    target !== "src/shared-app-ledger-d1.ts"
+  )
+    return false;
   const source = readFileSync(path, "utf8");
   const references = [...source.matchAll(/(["'`])(\.[^"'`]+)\1/gu)].filter(
     (entry) => normalize(relative(resolve("."), resolve(dirname(path), entry[2] ?? ""))) === target,
