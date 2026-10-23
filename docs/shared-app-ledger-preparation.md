@@ -43,12 +43,15 @@ Existing origin inventory, old-writer fences and owner-qualified drain remain
 required before activation. The prepared driver and cookie helper are not that
 proof, and no browser data-clearing guarantee is introduced.
 
-DDL in the native D1 test is an **unallocated test fixture**, not a real migration
-or an adopted durable schema. Existing 0035 rows, current schema, default release
-hooks, curated package exports and private vendor pin remain unchanged. Durable
-adoption must compose name acceptance with reservation/resource acceptance in
-the same guarded D1 batch, reserve an additive schema number, and rehearse legacy
-adoption without deleting or rewriting original rows. NFKC aliases must refuse
+DDL in the native D1 test is an isolated fixture, not an installed durable
+schema. The operator package barrel now exposes the existing ledger constructor,
+ledger/selection types, staging-name parser and the reserved staging adoption
+constructor/DDL/original type. These exports do not select a target or activate
+the gateway. Existing 0035 rows, current schema and default release hooks remain
+unchanged. Durable adoption must compose name acceptance with
+reservation/resource acceptance in the same guarded D1 batch and rehearse legacy
+adoption without deleting or rewriting original rows. The reserved 0107 source
+below still requires owning registration and application. NFKC aliases must refuse
 ambiguous adoption; invalid historical labels need explicit read/drain handling.
 Released rows retain their historical timestamps and can never become new
 claims. Default legacy expiry/reclaim paths still require the same authority
