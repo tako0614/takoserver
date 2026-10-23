@@ -52,6 +52,40 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
 });
 
+test("failed legacy sign-out clears its local marker while preserving the server error", async () => {
+  installConsoleGlobals();
+  values.clear();
+  const state = await import("../console/src/state.ts");
+  state.session.set(null);
+  state.sessionKind.set(null);
+  state.adoptSession("legacy");
+  state.principal.set({
+    id: "legacy-principal",
+    provider: "local",
+    email: "owner@example.test",
+    displayName: "Owner",
+  });
+  const requests: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push(request);
+      return Response.json({ error: { code: "session_unavailable" } }, { status: 503 });
+    },
+    { preconnect: originalFetch.preconnect },
+  );
+
+  await expect(state.signOut()).rejects.toMatchObject({ status: 503 });
+  expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+    ["DELETE", "/v1/session"],
+  ]);
+  expect(values.has("takoserver.session")).toBe(false);
+  expect(values.has("takoserver.session-kind")).toBe(false);
+  expect(state.session()).toBe(null);
+  expect(state.sessionKind()).toBe(null);
+  expect(state.principal()).toBe(null);
+});
+
 test("shared-auth bootstrap adopts only after the oracle and /v1/me succeed", async () => {
   installConsoleGlobals();
   const state = await import("../console/src/state.ts");
@@ -214,6 +248,17 @@ test("shared-auth bootstrap adopts only after the oracle and /v1/me succeed", as
   expect(new URL(seen.at(-1)?.url ?? "https://api.example.test").pathname).toBe(
     "/auth/oidc/session",
   );
+
+  reset();
+  state.adoptSession("legacy");
+  globalThis.fetch = Object.assign(
+    async () => Response.json({ error: { code: "unauthenticated" } }, { status: 401 }),
+    { preconnect: originalFetch.preconnect },
+  );
+  await expect(state.signOut()).rejects.toMatchObject({ status: 401 });
+  expect(values.has("takoserver.session")).toBe(false);
+  expect(state.session()).toBe(null);
+  expect(state.sessionKind()).toBe(null);
 
   values.set("takoserver.shared-session-return", "billing");
   expect(state.takeSharedSessionReturnPath()).toBe("/billing");

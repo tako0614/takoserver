@@ -34,6 +34,7 @@ export const sessionKind = signal<SessionKind | null>(
       : "legacy",
 );
 export const sharedAuthAvailable = signal<boolean | null>(null);
+let latestSharedAuthAvailabilityProbe = 0;
 export const principal = signal<Principal | null>(null);
 export const organizations = signal<readonly Organization[]>([]);
 export const currentOrganizationId = signal<string | null>(localStorage.getItem(ORG_KEY));
@@ -72,7 +73,23 @@ export function hostV2Base(discovery: HostDiscovery | null): string {
 export function setApiOrigin(origin: string): void {
   const trimmed = origin.replace(/\/+$/u, "");
   localStorage.setItem(ORIGIN_KEY, trimmed);
+  latestSharedAuthAvailabilityProbe += 1;
   apiOrigin.set(trimmed);
+}
+
+/** Only the latest request for the selected API origin may update the sign-in choice. */
+export async function refreshSharedAuthAvailability(clearImmediately = false): Promise<void> {
+  const probe = ++latestSharedAuthAvailabilityProbe;
+  const origin = apiOrigin();
+  if (clearImmediately) sharedAuthAvailable.set(null);
+  try {
+    const available = (await api.sharedAuthSession()).available;
+    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin)
+      sharedAuthAvailable.set(available);
+  } catch {
+    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin)
+      sharedAuthAvailable.set(null);
+  }
 }
 
 function clearSession(): void {
@@ -85,14 +102,17 @@ function clearSession(): void {
 }
 
 export async function signOut(): Promise<void> {
-  if (sessionKind() === "shared-auth") await api.sharedAuthSignOut();
-  else await api.signOut();
-  clearSession();
-  try {
-    sharedAuthAvailable.set((await api.sharedAuthSession()).available);
-  } catch {
-    sharedAuthAvailable.set(null);
+  if (sessionKind() === "shared-auth") {
+    await api.sharedAuthSignOut();
+    clearSession();
+  } else {
+    try {
+      await api.signOut();
+    } finally {
+      clearSession();
+    }
   }
+  await refreshSharedAuthAvailability();
 }
 
 export function adoptSession(kind: SessionKind = "legacy"): void {

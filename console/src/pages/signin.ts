@@ -10,6 +10,7 @@ import {
   api,
   apiOrigin,
   applyTheme,
+  refreshSharedAuthAvailability,
   setApiOrigin,
   sharedAuthAvailable,
   theme,
@@ -465,6 +466,7 @@ function endpointField(reload: () => void): Child {
           type: "button",
           onClick: () => {
             setApiOrigin(input.value.trim());
+            void refreshSharedAuthAvailability(true);
             reload();
             toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
           },
