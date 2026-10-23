@@ -4,7 +4,17 @@ import { beginGoogleSignIn } from "../google.ts";
 import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
 import { mark } from "../mark.ts";
 import { type Resource, resource, signal } from "../reactive.ts";
-import { adoptSession, api, apiOrigin, applyTheme, setApiOrigin, theme } from "../state.ts";
+import { route } from "../router.ts";
+import {
+  adoptSession,
+  api,
+  apiOrigin,
+  applyTheme,
+  refreshSharedAuthAvailability,
+  setApiOrigin,
+  sharedAuthAvailable,
+  theme,
+} from "../state.ts";
 import { beginTakosIdSignIn } from "../takos-id.ts";
 import { explain, ICON, icon, toast } from "../ui.ts";
 
@@ -48,6 +58,7 @@ export function signInPage(): Child {
             "Manage resources declared through Takoform, usage, and billing.",
           ),
         ),
+        sharedSessionRow(),
         live(() => wayIn(providers)),
         h(
           "p",
@@ -63,6 +74,60 @@ export function signInPage(): Child {
       endpointField(providers.reload),
     ),
   );
+}
+
+/** Build the fixed shared-auth entry URL from an API origin, with no query. */
+export function sharedSessionLoginUrl(origin: string): string {
+  const url = new URL(origin);
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (
+    (url.protocol !== "https:" && !(url.protocol === "http:" && local)) ||
+    url.username !== "" ||
+    url.password !== "" ||
+    (url.pathname !== "" && url.pathname !== "/") ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new Error("invalid shared-auth API origin");
+  }
+  return `${url.origin}/auth/oidc/login`;
+}
+
+function sharedSessionRow(): Child {
+  const busy = signal(false);
+  return live(() => {
+    if (sharedAuthAvailable() !== true) return null;
+    return h(
+      "button",
+      {
+        class: "rowbutton",
+        type: "button",
+        ...(busy() ? { disabled: true } : {}),
+        onClick: () => {
+          try {
+            const loginUrl = sharedSessionLoginUrl(apiOrigin());
+            const returnKey = "takoserver.shared-session-return";
+            if (route().path === "/billing") sessionStorage.setItem(returnKey, "billing");
+            else sessionStorage.removeItem(returnKey);
+            busy.set(true);
+            window.location.assign(loginUrl);
+          } catch (error) {
+            busy.set(false);
+            toast(explain(error as Error), "bad");
+          }
+        },
+      },
+      h("span", { class: "rowbutton__glyph" }, "T"),
+      h(
+        "span",
+        { class: "rowbutton__label" },
+        busy()
+          ? tr("アカウントに移動しています…", "Opening your account…")
+          : tr("Takosアカウントで続ける", "Continue with Takos account"),
+      ),
+      h("span", { class: "rowbutton__chevron" }, icon(ICON.chevron, 15)),
+    );
+  });
 }
 
 interface OperatorAssertionSignInClient {
@@ -401,6 +466,7 @@ function endpointField(reload: () => void): Child {
           type: "button",
           onClick: () => {
             setApiOrigin(input.value.trim());
+            void refreshSharedAuthAvailability(true);
             reload();
             toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
           },
