@@ -35,6 +35,28 @@ const exactLegacy = (alias: "OLD" | "NEW", json: "before_json" | "after_json") =
     (column) => `json_extract(w.${json},'$.${column}') IS ${alias}.${column}`,
   ).join(",")})='[${LEGACY_COLUMNS.map(() => "1").join(",")}]'`;
 
+// 0035 v1 has no requested_subdomain. Match the exact staging Host authority,
+// including the web schemes, ASCII Host case, one root dot and a numeric port.
+// A longer hostname or a path is never an alias for this allocated DNS name.
+const legacyOriginForName = (origin: string, name: string): string => {
+  const source = `lower(${origin})`;
+  const host = `(${name} || '.app-staging.takos.jp')`;
+  const bases = ["'http://'", "'https://'"].flatMap((scheme) => [
+    `(${scheme} || ${host})`,
+    `(${scheme} || ${host} || '.')`,
+  ]);
+  return `(${bases
+    .map((base) => {
+      const port = `substr(${source},length(${base})+2)`;
+      return `(${source}=${base} OR
+        (substr(${source},1,length(${base})+1)=${base} || ':'
+          AND length(${source})>length(${base})+1
+          AND ${port} NOT GLOB '*[^0-9]*'
+          AND CAST(${port} AS INTEGER) BETWEEN 0 AND 65535))`;
+    })
+    .join(" OR ")})`;
+};
+
 /** Source candidate for the reserved 0107 slot. It is deliberately unregistered and unapplied. */
 export const SHARED_APP_STAGING_PHYSICAL_DDL: readonly string[] = Object.freeze([
   `CREATE TABLE shared_app_staging_assignments (
@@ -124,7 +146,7 @@ export const SHARED_APP_STAGING_PHYSICAL_DDL: readonly string[] = Object.freeze(
   `CREATE TRIGGER shared_app_staging_legacy_insert_fence BEFORE INSERT ON worker_endpoint_origin_reservations
     WHEN EXISTS (SELECT 1 FROM shared_app_staging_names n
       WHERE n.normalized_name=NEW.requested_subdomain
-        OR NEW.canonical_public_origin='https://' || n.normalized_name || '.app-staging.takos.jp')
+        OR ${legacyOriginForName("NEW.canonical_public_origin", "n.normalized_name")})
       AND NOT EXISTS (SELECT 1 FROM shared_app_staging_carrier_witnesses w
         JOIN shared_app_staging_batch_assertions b ON b.witness=w.witness AND b.ok=1 AND b.apply_effects=1
         JOIN shared_app_staging_assignments a ON a.incarnation=w.incarnation
@@ -141,8 +163,8 @@ export const SHARED_APP_STAGING_PHYSICAL_DDL: readonly string[] = Object.freeze(
   `CREATE TRIGGER shared_app_staging_legacy_update_fence BEFORE UPDATE ON worker_endpoint_origin_reservations
     WHEN EXISTS (SELECT 1 FROM shared_app_staging_names n
       WHERE n.normalized_name IN (OLD.requested_subdomain,NEW.requested_subdomain)
-        OR OLD.canonical_public_origin='https://' || n.normalized_name || '.app-staging.takos.jp'
-        OR NEW.canonical_public_origin='https://' || n.normalized_name || '.app-staging.takos.jp')
+        OR ${legacyOriginForName("OLD.canonical_public_origin", "n.normalized_name")}
+        OR ${legacyOriginForName("NEW.canonical_public_origin", "n.normalized_name")})
       AND NOT EXISTS (SELECT 1 FROM shared_app_staging_carrier_witnesses w
         JOIN shared_app_staging_batch_assertions b ON b.witness=w.witness AND b.ok=1 AND b.apply_effects=1
         JOIN shared_app_staging_assignments a ON a.incarnation=w.incarnation
@@ -165,13 +187,13 @@ export const SHARED_APP_STAGING_PHYSICAL_DDL: readonly string[] = Object.freeze(
   `CREATE TRIGGER shared_app_staging_legacy_delete_fence BEFORE DELETE ON worker_endpoint_origin_reservations
     WHEN EXISTS (SELECT 1 FROM shared_app_staging_names n
       WHERE n.normalized_name=OLD.requested_subdomain
-        OR OLD.canonical_public_origin='https://' || n.normalized_name || '.app-staging.takos.jp')
+        OR ${legacyOriginForName("OLD.canonical_public_origin", "n.normalized_name")})
     BEGIN SELECT RAISE(ABORT,'shared staging name is held'); END`,
   // New head creation refuses unadopted or multiply retained 0035 history.
   `CREATE TRIGGER shared_app_staging_name_history_fence BEFORE INSERT ON shared_app_staging_names
     WHEN EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations l
       WHERE (l.requested_subdomain=NEW.normalized_name
-        OR l.canonical_public_origin='https://' || NEW.normalized_name || '.app-staging.takos.jp')
+        OR ${legacyOriginForName("l.canonical_public_origin", "NEW.normalized_name")})
         AND NOT EXISTS (SELECT 1 FROM shared_app_staging_adoptions a
           WHERE a.incarnation=NEW.incarnation AND a.organization_id=l.organization_id
             AND a.reservation_id=l.reservation_id AND a.name=NEW.normalized_name))
@@ -278,7 +300,7 @@ export function createSharedAppStagingAdoption(options: {
         AND l.state='prepared' AND l.revision=1 AND l.expires_at>?
         AND l.released_at IS NULL AND l.worker_resource_uid IS NULL AND l.endpoint_resource_uid IS NULL
         AND (SELECT count(*) FROM worker_endpoint_origin_reservations h
-          WHERE h.requested_subdomain=? OR h.canonical_public_origin=?)=1
+          WHERE h.requested_subdomain=? OR ${legacyOriginForName("h.canonical_public_origin", "l.requested_subdomain")})=1
         AND NOT EXISTS (SELECT 1 FROM tf_v2_resources r WHERE r.principal=? AND r.space=? AND r.name=?)
         AND NOT EXISTS (SELECT 1 FROM cloudflare_managed_worker_routes r WHERE r.route_kind='host'
           AND (r.route_key=? OR r.route_key=? OR json_extract(r.value_json,'$.hostname')=?))
@@ -291,7 +313,6 @@ export function createSharedAppStagingAdoption(options: {
         host,
         now,
         name,
-        host,
         `org:${organizationId}`,
         organizationId,
         name,

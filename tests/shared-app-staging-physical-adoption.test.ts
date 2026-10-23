@@ -43,8 +43,106 @@ function fixture() {
       NOW - 3_600_000,
     );
   };
-  return { db, sql, adoption, legacy };
+  const legacyV1 = (origin: string, reservationId = "legacy-v1") => {
+    db.query(`INSERT INTO worker_endpoint_origin_reservations (
+      organization_id,reservation_id,reservation_format,legacy_space,legacy_worker_name,
+      legacy_endpoint_name,canonical_public_origin,provider_pack_ref,provider_installation_ref,
+      offering_id,offering_digest,requested_ttl_seconds,expires_at,state,revision,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',1,?,?)`).run(
+      "org-one",
+      reservationId,
+      "takoserver.worker-endpoint-origin-reservation.v1",
+      "legacy-space",
+      "legacy-worker",
+      "legacy-endpoint",
+      origin,
+      "provider-one",
+      "installation-one",
+      "offering-one",
+      DIGEST,
+      3600,
+      NOW + 3_600_000,
+      NOW - 3_600_000,
+      NOW - 3_600_000,
+    );
+  };
+  return { db, sql, adoption, legacy, legacyV1 };
 }
+
+test("retained v1 origin aliases block a new name head and v2 adoption", async () => {
+  for (const origin of [
+    "http://held-app.app-staging.takos.jp",
+    "https://held-app.app-staging.takos.jp:8443",
+    "http://HELD-APP.APP-STAGING.TAKOS.JP.:28988",
+  ]) {
+    const f = fixture();
+    try {
+      f.legacyV1(origin);
+      const ledger = createSharedAppLedger({ environment: "staging", primary: () => f.sql });
+      await expect(
+        ledger.forTrustedOwner({ organizationId: "org-one", product: "takoserver" }).reserve({
+          reservationId: "new-shared-ref",
+          name: "held-app",
+        }),
+      ).rejects.toBeDefined();
+      f.legacy();
+      await expect(
+        f.adoption.adopt({ organizationId: "org-one", reservationId: "original-reservation" }),
+      ).rejects.toBeInstanceOf(SharedAppStagingAdoptionError);
+      expect(f.db.query("SELECT count(*) AS n FROM shared_app_staging_names").get()).toEqual({
+        n: 0,
+      });
+      expect(f.db.query("SELECT count(*) AS n FROM shared_app_staging_adoptions").get()).toEqual({
+        n: 0,
+      });
+    } finally {
+      f.db.close();
+    }
+  }
+});
+
+test("held name fences old v1 insert and update aliases without trapping another Host", async () => {
+  const f = fixture();
+  try {
+    f.legacyV1("http://held-app.app-staging.takos.jp.evil.test", "other-host");
+    f.legacy();
+    await f.adoption.adopt({ organizationId: "org-one", reservationId: "original-reservation" });
+    for (const [index, origin] of [
+      "http://held-app.app-staging.takos.jp",
+      "https://held-app.app-staging.takos.jp:8443",
+      "http://HELD-APP.APP-STAGING.TAKOS.JP.:28988",
+    ].entries()) {
+      expect(() => f.legacyV1(origin, `blocked-${index}`)).toThrow();
+      expect(() =>
+        f.db
+          .query(
+            "UPDATE worker_endpoint_origin_reservations SET canonical_public_origin=? WHERE reservation_id='other-host'",
+          )
+          .run(origin),
+      ).toThrow();
+    }
+    f.db
+      .query(
+        "UPDATE worker_endpoint_origin_reservations SET state='released',released_at=? WHERE reservation_id='other-host'",
+      )
+      .run(NOW);
+    expect(
+      f.db
+        .query(
+          "SELECT canonical_public_origin,state FROM worker_endpoint_origin_reservations WHERE reservation_id='other-host'",
+        )
+        .get(),
+    ).toEqual({
+      canonical_public_origin: "http://held-app.app-staging.takos.jp.evil.test",
+      state: "released",
+    });
+    f.db
+      .query("DELETE FROM worker_endpoint_origin_reservations WHERE reservation_id='other-host'")
+      .run();
+  } finally {
+    f.db.close();
+  }
+});
 
 test("an untouched 0035 original becomes one guarded shared hold without rewriting metadata", async () => {
   const f = fixture();
