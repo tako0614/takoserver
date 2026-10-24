@@ -458,6 +458,85 @@ function openReadonly(root: string): Database {
   return database;
 }
 
+function openPostCrashReadonly(root: string): Database {
+  const recovery = new Database(join(root, "control.sqlite"), {
+    create: false,
+    readwrite: true,
+  });
+  try {
+    recovery.query("SELECT name FROM sqlite_schema LIMIT 1").get();
+  } finally {
+    recovery.close();
+  }
+  return openReadonly(root);
+}
+
+test("readonly persistence observation follows SQLite recovery after a killed writer", async () => {
+  const root = mkdtempSync(join(tmpdir(), "sqlite-crash-recovery-"));
+  const databasePath = join(root, "control.sqlite");
+  const readyPath = join(root, "writer-ready");
+  const setup = new Database(databasePath);
+  setup.exec(
+    "PRAGMA journal_mode = DELETE; CREATE TABLE crash_probe (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)",
+  );
+  const insert = setup.query("INSERT INTO crash_probe (payload) VALUES ('committed')");
+  const seed = setup.transaction(() => {
+    for (let i = 0; i < 64; i++) insert.run();
+  });
+  seed();
+  setup.close();
+
+  const child = Bun.spawn(
+    [
+      process.execPath,
+      "-e",
+      [
+        'import { Database } from "bun:sqlite";',
+        'import { writeFileSync } from "node:fs";',
+        "const database = new Database(process.env.DB_PATH);",
+        'database.exec("PRAGMA journal_mode = DELETE; PRAGMA cache_size = 1; BEGIN IMMEDIATE");',
+        'database.query("UPDATE crash_probe SET payload = zeroblob(4096)").run();',
+        'writeFileSync(process.env.READY_PATH, "ready");',
+        "await new Promise(() => {});",
+      ].join("\n"),
+    ],
+    {
+      stdout: "ignore",
+      stderr: "pipe",
+      env: { ...process.env, DB_PATH: databasePath, READY_PATH: readyPath },
+    },
+  );
+  try {
+    await until(() => existsSync(readyPath), "uncommitted SQLite writer readiness");
+    expect(child.exitCode).toBeNull();
+    const journal = readFileSync(`${databasePath}-journal`);
+    expect(journal.byteLength).toBeGreaterThan(512);
+    expect(journal.subarray(0, 8).some((byte) => byte !== 0)).toBe(true);
+    child.kill("SIGKILL");
+    await child.exited;
+    expect(child.signalCode).toBe("SIGKILL");
+    const writerErrors = await new Response(child.stderr).text();
+    expect(writerErrors).toBe("");
+
+    const persisted = openPostCrashReadonly(root);
+    try {
+      expect(
+        persisted
+          .query("SELECT COUNT(*) AS count FROM crash_probe WHERE payload = 'committed'")
+          .get(),
+      ).toEqual({ count: 64 });
+    } finally {
+      persisted.close();
+    }
+  } finally {
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      await child.exited;
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function intentState(root: string, table: "checkout" | "cancellation", id: string): string {
   const database = openReadonly(root);
   try {
@@ -814,7 +893,7 @@ test("entry-bun automatic payment pass recovers subscription custody after kille
           request.method === "POST" && request.path === "/v1/subscriptions/sub_process_1",
       ),
     ).toHaveLength(1);
-    const persisted = openReadonly(root);
+    const persisted = openPostCrashReadonly(root);
     try {
       expect(
         persisted
