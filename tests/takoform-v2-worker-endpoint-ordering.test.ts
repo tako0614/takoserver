@@ -51,8 +51,8 @@ function harness() {
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
   const sql = createSqliteSql(db);
-  let clockMs = Date.now();
-  const now = () => new Date(clockMs);
+  let clockOffsetMs = 0;
+  const now = () => new Date(Date.now() + clockOffsetMs);
   const fileUrl = "https://artifacts.example.test/ordering/index.html";
   const manifestUrl = "https://artifacts.example.test/ordering/manifest.json";
   const fileBytes = new TextEncoder().encode("<h1>ordering</h1>");
@@ -192,7 +192,7 @@ function harness() {
     engineWith,
     ownerCalls,
     advance(ms: number) {
-      clockMs += ms;
+      clockOffsetMs += ms;
     },
     async foundations(target = engine) {
       const created = async (form: string, name: string, spec: JsonObject) => {
@@ -265,6 +265,9 @@ async function settleAll(h: Harness, engine: Engine, ids: readonly string[]) {
 test("self-host admits only one live or pending WorkerDeployment per Worker", async () => {
   const h = harness();
   try {
+    // Artifact custody's SQLite lease trigger uses the DB clock. A busy test
+    // runner must not leave this fixture's Engine clock frozen behind it.
+    await Bun.sleep(1_100);
     const { deploymentSpec } = await h.foundations();
     const first = await accept(h.engine, WORKER_DEPLOYMENT_FORM_URL, "deployment", deploymentSpec);
     const secondRequest = () =>
