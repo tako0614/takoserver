@@ -189,6 +189,60 @@ describe("owning deploy canonical Hosted TEST configuration", () => {
     expect(await entryConfiguration(projected, expectedWorkerSecrets(target))).toBe(1);
   });
 
+  test("selects the Hosted staging RPC only with the exact native billing prerequisites", () => {
+    const selected = parse({
+      ...descriptor(),
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+      hostedBrowserBillingRpc: "hosted-staging-v1",
+    });
+    expect(selected.hostedBrowserBillingRpc).toBe("hosted-staging-v1");
+    expect(parse(descriptor())).not.toHaveProperty("hostedBrowserBillingRpc");
+
+    for (const selector of ["other", "https://service.example", "hosted-staging-v2"])
+      expect(() =>
+        parse({
+          ...descriptor(),
+          auth103NativeProfile: "root-shared-auth-staging-v1",
+          hostedBrowserBillingRpc: selector,
+        }),
+      ).toThrow();
+
+    expect(() =>
+      parse({
+        ...descriptor(),
+        hostedBrowserBillingRpc: "hosted-staging-v1",
+      }),
+    ).toThrow();
+    expect(() =>
+      parse({
+        ...descriptor(),
+        auth103NativeProfile: "root-shared-auth-staging-v1",
+        hostedBrowserBillingRpc: "hosted-staging-v1",
+        hostedBilling: undefined,
+      }),
+    ).toThrow();
+    expect(() =>
+      parse({
+        ...descriptor(),
+        auth103NativeProfile: "root-shared-auth-staging-v1",
+        hostedBrowserBillingRpc: "hosted-staging-v1",
+        hostedBilling: { ...selection(), stripeMode: "live" },
+      }),
+    ).toThrow();
+    expect(() =>
+      parseDeployTarget(
+        {
+          ...descriptor(),
+          auth103NativeProfile: "root-shared-auth-staging-v1",
+          hostedBrowserBillingRpc: "hosted-staging-v1",
+          environment: "production",
+        },
+        "synthetic-deploy-target.json",
+        "production",
+      ),
+    ).toThrow();
+  });
+
   test("absent selection preserves existing plain and legacy secret requirements", () => {
     const plain = parse(BASE);
     expect(workerCompositionEnv(plain)).toEqual({});

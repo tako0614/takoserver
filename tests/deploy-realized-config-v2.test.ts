@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   effectiveSigningKeyId,
   expectedWorkerSecrets,
+  HOSTED_BROWSER_BILLING_STAGING_RPC,
   writeWorkerConfig,
 } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
@@ -84,6 +85,52 @@ describe("realized Worker configuration", () => {
         binding: "ACCOUNTS_FINANCIAL_PROOF",
         service: "takosumi-auth-staging",
         entrypoint: "AccountsFinancialProof",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("adds the fixed Hosted billing supplier only for its explicit target selection", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-hosted-billing-rpc-"));
+    try {
+      const realized = (selected: DeployTarget, name: string) =>
+        JSON.parse(
+          readFileSync(
+            writeWorkerConfig(selected, {
+              path: join(root, name),
+              main: "worker.js",
+              commit: "a".repeat(40),
+            }),
+            "utf8",
+          ),
+        ) as { services?: readonly Record<string, string>[] };
+      const integration = { ...target, environment: "integration" } satisfies DeployTarget;
+      const hostedSelection = {
+        ...integration,
+        auth103NativeProfile: "root-shared-auth-staging-v1",
+        hostedBilling: {
+          selector: "canonical-test",
+          stripeMode: "test",
+          accountId: "acct_fixture",
+          billingAuthority: "fixture",
+        },
+        hostedBrowserBillingRpc: "hosted-staging-v1",
+      } satisfies DeployTarget;
+      expect(realized(integration, "without-selection.json").services ?? []).not.toContainEqual(
+        expect.objectContaining({ binding: "HOSTED_BROWSER_BILLING_RPC" }),
+      );
+      expect(realized(hostedSelection, "selected.json").services).toEqual([
+        {
+          binding: "ACCOUNTS_FINANCIAL_PROOF",
+          service: "takosumi-auth-staging",
+          entrypoint: "AccountsFinancialProof",
+        },
+        { binding: "HOSTED_BROWSER_BILLING_RPC", ...HOSTED_BROWSER_BILLING_STAGING_RPC },
+      ]);
+      expect(HOSTED_BROWSER_BILLING_STAGING_RPC).toEqual({
+        service: "takosumi-hosted-staging",
+        entrypoint: "HostedBrowserBillingEntrypoint",
       });
     } finally {
       rmSync(root, { recursive: true, force: true });

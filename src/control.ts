@@ -16,6 +16,37 @@ import {
 } from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
 import { errorEnvelope } from "./error-envelope.ts";
+import {
+  assertHostedBrowserBillingBody,
+  type HostedBrowserBillingScope,
+  HostedBrowserContinuationError,
+  hostedBrowserContinuationMetadata,
+  parseHostedBrowserBillingChoice,
+  sameHostedBrowserBillingOriginal,
+  toFinancialHostedBrowserRequestOriginal,
+} from "./financial-hosted-browser-continuation.ts";
+import {
+  createFinancialHostedBrowserRequestAuthorization,
+  FinancialHostedBrowserRequestUnavailable,
+} from "./financial-hosted-browser-request.ts";
+import {
+  createHostedBrowserBillingRpcClient,
+  createHostedBrowserLiveAuthorizationTarget,
+  createHostedBrowserLiveSelectionTarget,
+  type HostedBrowserBillingRead,
+  type HostedBrowserBillingRefusal,
+  type HostedBrowserBillingRpcSupplier,
+  sameHostedBrowserBillingAccepted,
+} from "./financial-hosted-browser-rpc.ts";
+import {
+  createFinancialHostedBrowserSelection,
+  FinancialHostedBrowserSelectionUnavailable,
+} from "./financial-hosted-browser-selection.ts";
+import {
+  HOSTED_BROWSER_CONTINUATION_HEADER,
+  type HostedBrowserSelectorSelection,
+  selectHostedBrowserContinuation,
+} from "./financial-hosted-browser-selector.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError, type Wallet } from "./ledger.ts";
 import { MoneyError, minorToMicros, parseUnsignedMicros } from "./money.ts";
@@ -47,6 +78,7 @@ import {
   type RuntimeInputAuthority,
   RuntimeInputPreparationError,
 } from "./runtime-input-preparations.ts";
+import { type SharedAuthSession, SharedAuthSessionError } from "./shared-auth-session.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import { type SubscriptionPayments, stripeBillingFailure } from "./stripe-billing.ts";
 import {
@@ -258,6 +290,10 @@ export interface CreateControlRoutesOptions {
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
+  /** The owning Server RP's already composed shared-session receiver, when mounted. */
+  readonly sharedAuth?: SharedAuthSession;
+  /** Fixed Hosted native service binding; absence leaves selected browser requests unavailable. */
+  readonly hostedBrowserBillingRpc?: HostedBrowserBillingRpcSupplier;
   /** Optional provider-backed residual proof; absent means unavailable. */
   readonly nativeResidual?: NativeResidualReader;
   /** Takoserver lifecycle-owned repair; never exposed through the Takoform Host API. */
@@ -309,12 +345,64 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     runtimeInputPolicy,
   } = options;
   const secureCookies = new URL(publicOrigin).protocol === "https:";
+  const sharedAuth = options.sharedAuth;
+  const sharedAuthenticate = sharedAuth?.authenticate;
+  const hostedBrowserRpc = options.hostedBrowserBillingRpc
+    ? createHostedBrowserBillingRpcClient(options.hostedBrowserBillingRpc)
+    : null;
+  const sharedObserveFinal = sharedAuth?.observeFinalWorkspaceOrganization;
+  const sharedFinalSelection = sharedAuth?.finalSessionSelection;
 
-  const authorization = (request: Request): string | null =>
-    requestAuthorization(request, consoleOrigin);
+  const hasNamedCookie = (request: Request, name: string): boolean =>
+    (request.headers.get("cookie") ?? "")
+      .split(";")
+      .some((part) => part.trim().split("=", 1)[0] === name);
+  const authorization = (request: Request): string | null => {
+    if (request.headers.has("authorization")) return request.headers.get("authorization");
+    // Two automatic session modes cannot silently select either principal.
+    // A named cookie counts even when its value is empty or malformed.
+    if (
+      hasNamedCookie(request, "takoserver_session") &&
+      hasNamedCookie(request, "__Host-takoserver_shared_session")
+    )
+      throw new AuthError("unauthenticated");
+    return requestAuthorization(request, consoleOrigin);
+  };
+
+  const requestActor = async (request: Request): Promise<Actor | null> => {
+    const credential = authorization(request);
+    const actor = await accounts.authenticate(credential);
+    // An explicit header (including an empty one), or a named legacy cookie
+    // (including an empty first value), has already chosen its authority.
+    if (
+      actor ||
+      credential !== null ||
+      request.headers.has("authorization") ||
+      hasNamedCookie(request, "takoserver_session")
+    )
+      return actor;
+    if (!sharedAuthenticate || !consoleOrigin || request.headers.get("origin") !== consoleOrigin)
+      return null;
+    try {
+      const context: Awaited<ReturnType<SharedAuthSession["authenticate"]>> = await Reflect.apply(
+        sharedAuthenticate,
+        sharedAuth,
+        [request],
+      );
+      if (!context) return null;
+      if (context.actor.kind !== "session") controlError("backend_unavailable", 503);
+      return context.actor;
+    } catch (error) {
+      if (error instanceof SharedAuthSessionError) {
+        if (error.code === "session_invalid") throw new AuthError("unauthenticated");
+        if (error.code === "workspace_forbidden") throw new AuthError("permission_denied");
+      }
+      controlError("backend_unavailable", 503);
+    }
+  };
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
-    const actor = await accounts.authenticate(authorization(request));
+    const actor = await requestActor(request);
     if (actor?.kind !== "session") throw new AuthError("unauthenticated");
     await accounts.requireOwner(actor, organizationId);
     return actor;
@@ -326,7 +414,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     organizationId: string,
     scope: ApiKeyScope,
   ): Promise<Actor> => {
-    const actor = await accounts.authenticate(authorization(request));
+    const actor = await requestActor(request);
     if (!actor) throw new AuthError("unauthenticated");
     if (actor.kind === "session") {
       await accounts.requireOwner(actor, organizationId);
@@ -386,9 +474,412 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     return { organizationId: tenantRun.organizationId, tenantSpace: tenantRun.spaceRef };
   };
 
-  return async (request, url) => {
-    if (!url.pathname.startsWith("/v1/")) return null;
+  const hostedBrowserActor = async (request: Request) => {
+    if (
+      !sharedAuth ||
+      !sharedAuthenticate ||
+      !sharedObserveFinal ||
+      !sharedFinalSelection ||
+      !consoleOrigin ||
+      request.headers.get("origin") !== consoleOrigin ||
+      request.headers.has("authorization") ||
+      hasNamedCookie(request, "takoserver_session") ||
+      !hasNamedCookie(request, "__Host-takoserver_shared_session")
+    )
+      throw new AuthError("unauthenticated");
     try {
+      const context: Awaited<ReturnType<SharedAuthSession["authenticate"]>> = await Reflect.apply(
+        sharedAuthenticate,
+        sharedAuth,
+        [request],
+      );
+      if (context?.actor.kind !== "session") throw new AuthError("unauthenticated");
+      return context;
+    } catch (error) {
+      if (error instanceof AuthError) throw error;
+      if (error instanceof SharedAuthSessionError) {
+        if (error.code === "session_invalid") throw new AuthError("unauthenticated");
+        if (error.code === "workspace_forbidden") throw new AuthError("permission_denied");
+      }
+      controlError("backend_unavailable", 503);
+    }
+  };
+
+  const hostedBrowserOwner = async (
+    request: Request,
+    initial: NonNullable<Awaited<ReturnType<SharedAuthSession["authenticate"]>>>,
+    scope: HostedBrowserBillingScope,
+  ): Promise<void> => {
+    if (!sharedAuth || !sharedObserveFinal || !sharedFinalSelection)
+      controlError("backend_unavailable", 503);
+    try {
+      const observed: Awaited<ReturnType<SharedAuthSession["observeFinalWorkspaceOrganization"]>> =
+        await Reflect.apply(sharedObserveFinal, sharedAuth, [request, scope.workspaceId]);
+      const selected: ReturnType<SharedAuthSession["finalSessionSelection"]> = Reflect.apply(
+        sharedFinalSelection,
+        sharedAuth,
+        [observed],
+      );
+      if (
+        !observed ||
+        !selected ||
+        initial.actor.kind !== "session" ||
+        observed.actor.kind !== "session" ||
+        initial.accountId !== scope.canonicalAccountId ||
+        observed.accountId !== initial.accountId ||
+        selected.accountId !== initial.accountId ||
+        selected.principalId !== initial.actor.principalId ||
+        observed.actor.principalId !== initial.actor.principalId ||
+        selected.identity.issuer !== initial.provenance.issuer ||
+        selected.identity.clientId !== initial.provenance.clientId ||
+        selected.identity.subject !== initial.provenance.subject ||
+        selected.identity.sessionId !== initial.provenance.sessionId ||
+        selected.identity.authTime !== initial.provenance.authTime ||
+        selected.sessionWorkspaceId !== initial.workspace.id ||
+        selected.selectedWorkspaceId !== scope.workspaceId ||
+        observed.workspace.id !== scope.workspaceId ||
+        observed.workspaceRef !== scope.workspaceRef ||
+        observed.organizationId !== scope.organizationId
+      )
+        controlError("backend_unavailable", 503);
+      const principal = await accounts.principal(selected.principalId);
+      if (!principal || principal.id !== selected.principalId)
+        controlError("backend_unavailable", 503);
+      const org = await accounts.requireOwner(observed.actor, scope.organizationId);
+      if (org.ownerPrincipalId !== selected.principalId) throw new AuthError("permission_denied");
+    } catch (error) {
+      if (error instanceof AuthError || error instanceof ControlError) throw error;
+      if (error instanceof SharedAuthSessionError) {
+        if (error.code === "session_invalid") throw new AuthError("unauthenticated");
+        if (error.code === "workspace_forbidden") throw new AuthError("permission_denied");
+      }
+      controlError("backend_unavailable", 503);
+    }
+  };
+
+  const hostedPath = (
+    selection: Extract<HostedBrowserSelectorSelection, { readonly kind: "selected" }>,
+    request: Request,
+    url: URL,
+    selected: HostedBrowserBillingRead,
+  ): void => {
+    if (selection.route === "metadata" || selection.route === "prepare") return;
+    if (selected.kind !== "view" && selected.kind !== "payment")
+      controlError("backend_unavailable", 503);
+    const scope = selected.kind === "view" ? selected.scope : selected.original.scope;
+    const organization = /^\/v1\/organizations\/([^/]+)\//u.exec(url.pathname);
+    if (segment(organization?.[1]) !== scope.organizationId) controlError("invalid_argument", 400);
+    if (url.searchParams.size !== 0) controlError("invalid_argument", 400);
+    if (selection.route === "checkout") {
+      if (
+        selected.kind !== "payment" ||
+        selected.original.action.family !== "topup" ||
+        request.method !== "POST" ||
+        !/^\/v1\/organizations\/[^/]+\/wallet\/checkout$/u.test(url.pathname)
+      )
+        controlError("invalid_argument", 400);
+    } else if (selection.route === "checkout-receipt") {
+      const receipt = /^\/v1\/organizations\/[^/]+\/wallet\/checkout\/([^/]+)$/u.exec(url.pathname);
+      if (
+        selected.kind !== "payment" ||
+        selected.original.action.family !== "topup" ||
+        request.method !== "GET" ||
+        !receipt ||
+        billingPathReference(receipt[1]) !== selected.original.action.claim.reference
+      )
+        controlError("invalid_argument", 400);
+    } else if (selection.route === "subscription") {
+      if (!/^\/v1\/organizations\/[^/]+\/payments\/subscription$/u.test(url.pathname))
+        controlError("invalid_argument", 400);
+      if (
+        request.method !== "GET" &&
+        (selected.kind !== "payment" ||
+          selected.original.action.family !== "subscription" ||
+          request.method !== (selected.original.action.claim.kind === "start" ? "POST" : "PATCH"))
+      )
+        controlError("invalid_argument", 400);
+    } else {
+      if (
+        selected.kind !== "payment" ||
+        selected.original.action.family !== "subscription" ||
+        request.method !== "GET"
+      )
+        controlError("invalid_argument", 400);
+      const kind =
+        selected.original.action.claim.kind === "change-plan"
+          ? "plan-change"
+          : selected.original.action.claim.kind;
+      const receipt =
+        /^\/v1\/organizations\/[^/]+\/payments\/subscription\/commands\/([^/]+)\/([^/]+)$/u.exec(
+          url.pathname,
+        );
+      if (
+        !receipt ||
+        segment(receipt[1]) !== kind ||
+        billingPathReference(receipt[2]) !== selected.original.action.claim.reference
+      )
+        controlError("invalid_argument", 400);
+    }
+  };
+
+  const hostedRefusal = (refusal: HostedBrowserBillingRefusal): never => {
+    if (refusal.kind === "denied") throw new AuthError("permission_denied");
+    if (refusal.kind === "invalid") controlError("invalid_argument", 400);
+    if (refusal.kind === "conflict") controlError("conflict", 409);
+    controlError("backend_unavailable", 503);
+  };
+
+  const hostedSelected = async (
+    request: Request,
+    url: URL,
+    selection: Extract<HostedBrowserSelectorSelection, { readonly kind: "selected" }>,
+  ): Promise<Response> => {
+    if (!hostedBrowserRpc) controlError("backend_unavailable", 503);
+    if (url.href !== request.url) controlError("invalid_argument", 400);
+    const originalMethod = request.method;
+    const originalUrl = request.url;
+    const originalHeaders = [...request.headers];
+    const assertRequest = () => {
+      const current = [...request.headers];
+      if (
+        request.signal.aborted ||
+        request.method !== originalMethod ||
+        request.url !== originalUrl ||
+        current.length !== originalHeaders.length ||
+        current.some(
+          ([key, value], index) =>
+            key !== originalHeaders[index]?.[0] || value !== originalHeaders[index]?.[1],
+        )
+      )
+        controlError("backend_unavailable", 503);
+    };
+    assertRequest();
+    const prepareChoice =
+      selection.route === "prepare"
+        ? parseHostedBrowserBillingChoice(await jsonObject(request.clone()))
+        : null;
+    assertRequest();
+    const initial = await hostedBrowserActor(request);
+    assertRequest();
+    const lookup = { continuationRef: selection.selector, canonicalAccountId: initial.accountId };
+    const selected = await hostedBrowserRpc.read(lookup);
+    assertRequest();
+    if (selected.kind !== "view" && selected.kind !== "payment") return hostedRefusal(selected);
+    const scope = selected.kind === "view" ? selected.scope : selected.original.scope;
+    hostedPath(selection, request, url, selected);
+    await hostedBrowserOwner(request, initial, scope);
+    assertRequest();
+    if (selection.route === "metadata") {
+      return Response.json(hostedBrowserContinuationMetadata(selected), {
+        headers: { "cache-control": "private, no-store" },
+      });
+    }
+    if (selection.route === "prepare") {
+      if (selected.kind !== "view") controlError("conflict", 409);
+      if (!prepareChoice) controlError("backend_unavailable", 503);
+      const choice = prepareChoice;
+      const producer = await createFinancialHostedBrowserSelection({
+        request,
+        scope: selected.scope,
+        choice,
+        sharedAuth: sharedAuth as SharedAuthSession,
+        accounts,
+        qualifiedConsoleOrigin: consoleOrigin as string,
+        checkout: options.checkout,
+        subscriptions: options.subscriptionCustody,
+      });
+      try {
+        const current = await producer.readSelectionCurrent(selected.scope);
+        const remote = await createHostedBrowserLiveSelectionTarget(producer, selected.scope);
+        let prepared: Awaited<ReturnType<typeof hostedBrowserRpc.prepare>>;
+        try {
+          prepared = await hostedBrowserRpc.prepare(lookup, remote.target, {
+            scope: selected.scope,
+            choice,
+            current,
+          });
+        } finally {
+          remote.disposeRemote();
+        }
+        if (!("original" in prepared)) return hostedRefusal(prepared);
+        const confirmed = await hostedBrowserRpc.read(lookup);
+        if (
+          confirmed.kind !== "payment" ||
+          confirmed.custody.phase !== "prepared" ||
+          !sameHostedBrowserBillingOriginal(prepared.original, confirmed.original)
+        )
+          controlError("backend_unavailable", 503);
+        await hostedBrowserOwner(request, initial, prepared.original.scope);
+        assertRequest();
+        return Response.json(hostedBrowserContinuationMetadata(confirmed), {
+          headers: { "cache-control": "private, no-store" },
+        });
+      } finally {
+        producer.dispose();
+      }
+    }
+    if (request.method === "GET") return await route(request, url);
+    if (selected.kind !== "payment") controlError("invalid_argument", 400);
+    if (selected.custody.phase !== "prepared") controlError("conflict", 409);
+    const original = selected.original;
+    const body = await jsonObject(request);
+    assertRequest();
+    const action = assertHostedBrowserBillingBody(request.method, body, original);
+    // A successful Hosted claim is a durable one-use fence. Refuse missing
+    // local effect/receipt ports before asking Hosted to commit that fence.
+    if (action.kind === "topup") {
+      if (!options.checkout?.referenceRequired || !options.checkout.receipt)
+        controlError("backend_unavailable", 503);
+    } else if (action.kind === "plan-change") {
+      if (
+        !options.subscriptionCustody ||
+        !options.subscriptionPlans ||
+        !options.subscriptionCommandReceipts
+      )
+        controlError("backend_unavailable", 503);
+    } else if (!options.subscriptionCustody || !options.subscriptionCommandReceipts) {
+      controlError("backend_unavailable", 503);
+    }
+    const authorization = await createFinancialHostedBrowserRequestAuthorization({
+      request,
+      sharedAuth: sharedAuth as SharedAuthSession,
+      accounts,
+      qualifiedConsoleOrigin: consoleOrigin as string,
+      original: toFinancialHostedBrowserRequestOriginal(original),
+    });
+    assertRequest();
+    try {
+      const remote = await createHostedBrowserLiveAuthorizationTarget(authorization, original);
+      let claim: Awaited<ReturnType<typeof hostedBrowserRpc.claim>>;
+      try {
+        claim = await hostedBrowserRpc.claim(lookup, remote.target, original);
+        assertRequest();
+      } finally {
+        remote.disposeRemote();
+      }
+      if (claim.kind === "accepted-history") controlError("conflict", 409);
+      if (claim.kind !== "fresh-dispatch") return hostedRefusal(claim);
+      const after = await hostedBrowserRpc.read(lookup);
+      assertRequest();
+      if (
+        after.kind !== "payment" ||
+        !sameHostedBrowserBillingOriginal(original, after.original) ||
+        after.custody.phase !== "dispatch-started" ||
+        !sameHostedBrowserBillingAccepted(after.custody.accepted, claim.accepted)
+      )
+        controlError("backend_unavailable", 503);
+      await authorization.assertOriginalCurrent(toFinancialHostedBrowserRequestOriginal(original));
+      assertRequest();
+      let response: Response;
+      let recordedReceipt: Readonly<Record<string, unknown>>;
+      try {
+        if (action.kind === "topup") {
+          if (!options.checkout?.referenceRequired || !options.checkout.receipt)
+            controlError("backend_unavailable", 503);
+          const started = await options.checkout.begin({
+            organizationId: action.organizationId,
+            reference: action.reference,
+            amountMinor: action.amountMinor,
+          });
+          response = Response.json({ checkout: started }, { status: 201 });
+        } else if (action.kind === "subscription-start") {
+          if (!options.subscriptionCustody || !options.subscriptionCommandReceipts)
+            controlError("backend_unavailable", 503);
+          const started = await options.subscriptionCustody.begin({
+            organizationId: action.organizationId,
+            reference: action.reference,
+            planKey: action.planKey,
+          });
+          response = Response.json(
+            { checkout: started },
+            {
+              status: started.state === "pending" ? 202 : started.state === "open" ? 201 : 200,
+            },
+          );
+        } else if (action.kind === "cancel") {
+          if (!options.subscriptionCustody || !options.subscriptionCommandReceipts)
+            controlError("backend_unavailable", 503);
+          const cancellation = await options.subscriptionCustody.change({
+            organizationId: action.organizationId,
+            reference: action.reference,
+            cancelAtPeriodEnd: true,
+            expectedSubscriptionRef: action.expectedSubscriptionRef,
+          });
+          response = Response.json(
+            { cancellation },
+            { status: cancellation.state === "pending" ? 202 : 200 },
+          );
+        } else if (action.kind === "plan-change") {
+          if (!options.subscriptionPlans || !options.subscriptionCommandReceipts)
+            controlError("backend_unavailable", 503);
+          const planChange = await options.subscriptionPlans.change({
+            organizationId: action.organizationId,
+            reference: action.reference,
+            planKey: action.planKey,
+            expectedSubscriptionRef: action.expectedSubscriptionRef,
+          });
+          response = Response.json(
+            { planChange },
+            { status: planChange.state === "pending" ? 202 : 200 },
+          );
+        } else {
+          controlError("backend_unavailable", 503);
+        }
+        const receipt =
+          action.kind === "topup"
+            ? await options.checkout?.receipt?.({
+                organizationId: action.organizationId,
+                reference: action.reference,
+              })
+            : await options.subscriptionCommandReceipts?.read({
+                organizationId: action.organizationId,
+                kind:
+                  action.kind === "subscription-start"
+                    ? "start"
+                    : action.kind === "cancel"
+                      ? "cancel"
+                      : "plan-change",
+                reference: action.reference,
+              });
+        if (!receipt) controlError("backend_unavailable", 503);
+        recordedReceipt = receipt as unknown as Readonly<Record<string, unknown>>;
+      } catch {
+        // Dispatch may already have happened. Retain uncertainty; never replay it.
+        try {
+          await hostedBrowserRpc.record({
+            continuationRef: selection.selector,
+            original,
+            outcome: { kind: "unknown" },
+          });
+        } catch {
+          // The response is still unknown and must not invite a retry.
+        }
+        controlError("backend_unavailable", 503);
+      }
+      // A failed outcome transport is unknown. Never make a second record call.
+      const recorded = await hostedBrowserRpc.record({
+        continuationRef: selection.selector,
+        original,
+        outcome: { kind: original.action.family, receipt: recordedReceipt },
+      });
+      if (recorded.kind !== "recorded" && recorded.kind !== "already-recorded")
+        controlError("backend_unavailable", 503);
+      return response;
+    } finally {
+      authorization.dispose();
+    }
+  };
+
+  return async (request, url) => {
+    if (
+      !url.pathname.startsWith("/v1/") &&
+      !request.headers.has(HOSTED_BROWSER_CONTINUATION_HEADER)
+    )
+      return null;
+    try {
+      const continuation = selectHostedBrowserContinuation(request, url);
+      if (continuation.kind === "invalid") controlError("invalid_argument", 400);
+      if (continuation.kind === "selected") return await hostedSelected(request, url, continuation);
       const response = await route(request, url);
       if (
         response &&
@@ -615,14 +1106,12 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           : { sessionTtlSeconds: integer(body.sessionTtlSeconds) }),
       });
       if (consoleOrigin && request.headers.get("origin") === consoleOrigin) {
-        return Response.json(
-          { principal },
-          {
-            headers: {
-              "set-cookie": sessionCookie(sessionToken, secureCookies),
-            },
-          },
-        );
+        const headers = new Headers();
+        headers.append("set-cookie", sessionCookie(sessionToken, secureCookies));
+        // A successful browser switch to the local session clears only the
+        // browser's shared cookie. Its Server RP row is not revoked here.
+        if (secureCookies) headers.append("set-cookie", clearSharedSessionCookie());
+        return Response.json({ principal }, { headers });
       }
       return Response.json({ principal, sessionToken });
     }
@@ -632,16 +1121,19 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const actor = await accounts.authenticate(credential);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       await accounts.revokeSession(credential);
+      const headers = new Headers();
+      headers.append("set-cookie", clearSessionCookie(secureCookies));
+      // Logout clears the browser's remaining shared mode after the local
+      // revocation is acknowledged; it does not touch the Server RP row.
+      if (secureCookies) headers.append("set-cookie", clearSharedSessionCookie());
       return new Response(null, {
         status: 204,
-        headers: {
-          "set-cookie": clearSessionCookie(secureCookies),
-        },
+        headers,
       });
     }
 
     if (request.method === "GET" && url.pathname === "/v1/me") {
-      const actor = await accounts.authenticate(authorization(request));
+      const actor = await requestActor(request);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       const principal = await accounts.principal(actor.principalId);
       if (!principal) throw new AuthError("unauthenticated");
@@ -1962,6 +2454,15 @@ function classify(error: unknown): { code: string; status: number } {
   const billingFailure = stripeBillingFailure(error);
   if (billingFailure) return { code: billingFailure.code, status: billingFailure.status };
   if (error instanceof ControlError) return { code: error.code, status: error.status };
+  if (error instanceof HostedBrowserContinuationError)
+    return error.code === "invalid"
+      ? { code: "invalid_argument", status: 400 }
+      : { code: "backend_unavailable", status: 503 };
+  if (
+    error instanceof FinancialHostedBrowserSelectionUnavailable ||
+    error instanceof FinancialHostedBrowserRequestUnavailable
+  )
+    return { code: "backend_unavailable", status: 503 };
   if (error instanceof PersonalOrganizationError)
     return { code: "billing_unavailable", status: 503 };
   if (error instanceof SubscriptionCommandReceiptError)
@@ -2105,6 +2606,10 @@ function clearSessionCookie(secure: boolean): string {
   ]
     .filter(Boolean)
     .join("; ");
+}
+
+function clearSharedSessionCookie(): string {
+  return "__Host-takoserver_shared_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
 }
 
 function organizationOf(actor: Actor): string {

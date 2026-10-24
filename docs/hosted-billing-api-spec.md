@@ -87,7 +87,10 @@ ownership. Shared login design does not grant cross-product authorization.
 
 One Organization balance, allowance and subscription cover both products and
 all its Workspaces. A Workspace does not create another balance or free grant.
-Literal Hosted account, Workspace and session identifiers stay in Hosted.
+Hosted sessions and raw grants stay in the owning RP. The optional
+[browser billing continuation](hosted-browser-billing-continuation.md) carries
+the selected canonical account and Workspace/Organization original through a
+published business contract; its locator and DATA do not grant payment authority.
 Existing generated policy still assigns separate retail Stripe authority to
 Hosted: canonical governance adoption and retirement of the predecessor
 retail writer are separate prerequisites for unified live composition.

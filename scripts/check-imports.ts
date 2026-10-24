@@ -558,9 +558,17 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "release-data"],
   },
   {
+    // Pure closed browser-route selector; it imports no runtime authority.
+    name: "domain",
+    match: /^src\/financial-hosted-browser-selector\.ts$/u,
+    may: [],
+  },
+  {
+    // These exact browser route helpers capture request/session/current RPC state.
+    // The selection helper also imports the existing Checkout route type.
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$/u,
+      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$|^src\/financial-hosted-browser-(?:continuation|request|rpc|selection)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "v2-documentation"],
   },
   {

@@ -9,6 +9,7 @@ import {
   createWorkerRequestConsumersWithFinancialAuthSourceClock,
   readWorkerRequestFinancialAuthConsumerPort,
 } from "./financial-auth-consumer.ts";
+import type { HostedBrowserBillingRpcSupplier } from "./financial-hosted-browser-rpc.ts";
 import {
   createCanonicalHostedBillingComposition,
   type HostedBillingComposition,
@@ -140,6 +141,8 @@ export interface WorkerEnv {
   readonly TAKOSERVER_HOSTED_PRICING?: string;
   /** Exact opt-in to the separately qualified Hosted TEST payment composition. */
   readonly TAKOSERVER_HOSTED_BILLING?: string;
+  /** Fixed Hosted service capability for the code-selected native Auth103 source. */
+  readonly HOSTED_BROWSER_BILLING_RPC?: HostedBrowserBillingRpcSupplier;
   /** Explicit inline terms/card-flow JSON; accepted only with canonical-test. */
   readonly TAKOSERVER_HOSTED_BILLING_ON_DEMAND?: string;
   /** Non-secret deployment-selected account and stable billing authority. */
@@ -1032,6 +1035,16 @@ async function requireV2PrivateInputSchema(sql: ReturnType<typeof createD1Sql>):
   }
 }
 
+/** Project only the code-selected native service binding into App ports. */
+export function hostedBrowserBillingPorts(
+  nativeAuthSelected: boolean,
+  env: Pick<WorkerEnv, "HOSTED_BROWSER_BILLING_RPC">,
+): Pick<AppPorts, "hostedBrowserBillingRpc"> {
+  if (!nativeAuthSelected) return {};
+  const binding = env.HOSTED_BROWSER_BILLING_RPC;
+  return binding === undefined ? {} : { hostedBrowserBillingRpc: binding };
+}
+
 async function composeApp(
   env: WorkerEnv,
   origin: string,
@@ -1473,6 +1486,7 @@ async function composeApp(
       hostedPaidFreeExclusion: Boolean(hostedPricing),
       // The financial brand and buildApp's one PaymentEventContext share this exact clock.
       ...(hostedBilling ? { hostedBilling, clock } : {}),
+      ...hostedBrowserBillingPorts(nativeAuthSelected, env),
       ...(!hostedBilling && checkout ? { checkout } : {}),
       ...(!hostedBilling && paymentEvents ? { paymentEvents } : {}),
       ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),

@@ -118,6 +118,9 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
     ...(target.auth103NativeProfile === undefined
       ? []
       : [{ binding: "ACCOUNTS_FINANCIAL_PROOF", ...SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF }]),
+    ...(target.hostedBrowserBillingRpc === undefined
+      ? []
+      : [{ binding: "HOSTED_BROWSER_BILLING_RPC", ...HOSTED_BROWSER_BILLING_STAGING_RPC }]),
     ...(target.cloudflareProviderExecutor === undefined || isArtifactBlobIoQuiescedTarget(target)
       ? []
       : [
@@ -368,6 +371,12 @@ function exactPublicWorkerProvenance(
 export const SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF = Object.freeze({
   service: "takosumi-auth-staging",
   entrypoint: "AccountsFinancialProof",
+} as const);
+
+/** The optional Hosted browser billing supplier (same account, fixed entrypoint). */
+export const HOSTED_BROWSER_BILLING_STAGING_RPC = Object.freeze({
+  service: "takosumi-hosted-staging",
+  entrypoint: "HostedBrowserBillingEntrypoint",
 } as const);
 
 /** Names only; Cloudflare never returns or receives secret bytes here. */

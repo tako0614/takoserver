@@ -388,6 +388,98 @@ describe("immutable Worker Version binding closure", () => {
     ).toThrow("binds TAKOSERVER_SOURCE_COMMIT with unexpected text");
   });
 
+  test("Hosted supplier uses the declared one-binding transition with strict predecessor and mounted closure", () => {
+    const root = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      signing: { currentKeyId: "key-current" },
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+      hostedBrowserBillingRpc: "hosted-staging-v1",
+    } satisfies DeployTarget;
+    const targetClosure = expectedExactBindingClosure(root);
+    expect(targetClosure.ACCOUNTS_FINANCIAL_PROOF).toEqual({
+      type: "service",
+      fields: { service: "takosumi-auth-staging", entrypoint: "AccountsFinancialProof" },
+    });
+    expect(targetClosure.HOSTED_BROWSER_BILLING_RPC).toEqual({
+      type: "service",
+      fields: { service: "takosumi-hosted-staging", entrypoint: "HostedBrowserBillingEntrypoint" },
+    });
+    const mounted = expectedExactVersionFromClosure(targetClosure);
+    const predecessor = {
+      resources: {
+        bindings: mounted.resources.bindings.filter(
+          (binding) => binding.name !== "HOSTED_BROWSER_BILLING_RPC",
+        ),
+      },
+    };
+    const delta = normalizedWorkerClosureDelta({
+      retiredVars: [],
+      addedVars: [],
+      refreshedVars: [],
+      addedBindings: ["HOSTED_BROWSER_BILLING_RPC"],
+      addedSecrets: [],
+      rotatedSecrets: [],
+    });
+    const admit = (version: unknown) =>
+      assertSurfaceTransitionPredecessor("preflight", "version-old", version, {
+        delta,
+        environment: "integration",
+        targetClosure,
+      });
+    expect(() => admit(predecessor)).not.toThrow();
+    expect(() => admit(mounted)).toThrow("outside the declared delta");
+    expect(() =>
+      assertExactVersionBindingClosure("verification", "version-new", predecessor, targetClosure),
+    ).toThrow("does not declare the HOSTED_BROWSER_BILLING_RPC binding");
+    expect(() =>
+      assertExactVersionBindingClosure("verification", "version-new", mounted, targetClosure),
+    ).not.toThrow();
+    const wrong = {
+      resources: {
+        bindings: mounted.resources.bindings.map((binding) =>
+          binding.name === "HOSTED_BROWSER_BILLING_RPC"
+            ? { ...binding, service: "wrong-hosted" }
+            : binding,
+        ),
+      },
+    };
+    expect(() =>
+      assertExactVersionBindingClosure("verification", "version-new", wrong, targetClosure),
+    ).toThrow("unexpected service");
+    expect(() =>
+      admit({
+        resources: {
+          bindings: predecessor.resources.bindings.filter((binding) => binding.name !== "STATE_DB"),
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      admit({
+        resources: {
+          bindings: predecessor.resources.bindings.filter(
+            (binding) => binding.name !== "ACCOUNTS_FINANCIAL_PROOF",
+          ),
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      admit({
+        resources: {
+          bindings: [
+            ...predecessor.resources.bindings,
+            { name: "FOREIGN", type: "plain_text", text: "1" },
+          ],
+        },
+      }),
+    ).toThrow("outside the declared delta");
+  });
+
   test("legacy predecessor closure requires exactly the pre-version-metadata shape", () => {
     const target = {
       kind: "takoserver.deploy-target@v2",

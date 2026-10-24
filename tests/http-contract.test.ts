@@ -156,6 +156,7 @@ function completeHandler() {
 const PATH_SAMPLES: Readonly<Record<string, string>> = {
   organizationId: "org_probe",
   reference: "run:probe",
+  continuationRef: "a".repeat(64),
   deploymentId: "dep_probe",
   resourceUid: "uid_probe",
   uid: "uid_probe",

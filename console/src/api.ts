@@ -36,6 +36,10 @@ export interface Organization {
   readonly createdAt: string;
 }
 
+export type SharedAuthSessionStatus =
+  | { readonly available: true; readonly authenticated: boolean }
+  | { readonly available: false; readonly authenticated: false };
+
 /**
  * The v2 base a Host names, only in the one shape a Host builds it: an HTTPS
  * origin (plain HTTP only on this machine) and the exact v2 path. The console
@@ -209,6 +213,97 @@ export interface TopUpReceipt {
 export type SubscriptionCancellationReceipt =
   | { readonly state: "pending"; readonly subscriptionRef: string }
   | { readonly state: "verified"; readonly subscriptionRef: string; readonly effectiveAt: string };
+
+export interface HostedBillingContinuationView {
+  readonly continuationRef: string;
+  readonly kind: "view";
+  readonly workspaceId: string;
+  readonly workspaceRef: string;
+  readonly organizationId: string;
+  readonly operation: null;
+  readonly phase: null;
+}
+
+export type HostedBillingContinuationOperation =
+  | {
+      readonly action: "topup";
+      readonly method: "POST";
+      readonly path: `/v1/organizations/${string}/wallet/checkout`;
+      readonly body: { readonly reference: string; readonly amountMinor: number };
+    }
+  | {
+      readonly action: "subscription-start";
+      readonly method: "POST";
+      readonly path: `/v1/organizations/${string}/payments/subscription`;
+      readonly body: { readonly reference: string; readonly planKey: string };
+    }
+  | {
+      readonly action: "cancel";
+      readonly method: "PATCH";
+      readonly path: `/v1/organizations/${string}/payments/subscription`;
+      readonly body: {
+        readonly reference: string;
+        readonly cancelAtPeriodEnd: true;
+        readonly expectedSubscriptionRef: string;
+      };
+    }
+  | {
+      readonly action: "plan-change";
+      readonly method: "PATCH";
+      readonly path: `/v1/organizations/${string}/payments/subscription`;
+      readonly body: {
+        readonly reference: string;
+        readonly planKey: string;
+        readonly expectedSubscriptionRef: string;
+      };
+    };
+
+export interface HostedBillingContinuationPayment {
+  readonly continuationRef: string;
+  readonly kind: "payment";
+  readonly workspaceId: string;
+  readonly workspaceRef: string;
+  readonly organizationId: string;
+  readonly operation: HostedBillingContinuationOperation;
+  readonly phase: "prepared" | "dispatch-started" | "outcome-recorded";
+}
+
+export type HostedBillingContinuation =
+  | HostedBillingContinuationView
+  | HostedBillingContinuationPayment;
+
+export type HostedBillingContinuationPreparation =
+  | {
+      readonly kind: "topup";
+      readonly amountMinor: number;
+      readonly checkoutConsent: "interactive-checkout";
+    }
+  | {
+      readonly kind: "start";
+      readonly planKey: string;
+      readonly consent: "subscription-checkout";
+      readonly reconcileOriginalConsent?:
+        | "retry-original-subscription"
+        | "check-original-subscription";
+    }
+  | { readonly kind: "cancel"; readonly consent: "cancel-subscription" }
+  | {
+      readonly kind: "change-plan";
+      readonly planKey: string;
+      readonly consent: "change-subscription-plan";
+    };
+
+export type HostedPlanChangeResult =
+  | { readonly state: "pending"; readonly subscriptionRef: string }
+  | {
+      readonly state: "verified";
+      readonly subscriptionRef: string;
+      readonly pendingChange: {
+        readonly planKey: string;
+        readonly pricingRevision: string;
+        readonly effectiveAt: string;
+      };
+    };
 
 export interface Offering {
   readonly id: string;
@@ -543,19 +638,318 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === keys.length &&
+    keys.every((key) => key in value)
+  );
+}
+
+function isExactJsonRecord(
+  value: unknown,
+  keys: readonly string[],
+  ownKeys: readonly PropertyKey[],
+): boolean {
+  if (!isRecord(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return (
+    (prototype === Object.prototype || prototype === null) &&
+    ownKeys.length === keys.length &&
+    ownKeys.every((key) => typeof key === "string" && keys.includes(key)) &&
+    keys.every((key) => Object.getOwnPropertyDescriptor(value, key)?.enumerable === true)
+  );
+}
+
+function matchesEntire(value: unknown, pattern: RegExp): value is string {
+  if (typeof value !== "string") return false;
+  const match = pattern.exec(value);
+  return match?.[0] === value;
+}
+
+function isContinuationRef(value: unknown): value is string {
+  return matchesEntire(value, /^[0-9a-f]{64}$/u);
+}
+
+function isHostedReference(value: unknown): value is string {
+  return matchesEntire(value, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u);
+}
+
+function isHostedOrganizationId(value: unknown): value is string {
+  return matchesEntire(value, /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/u);
+}
+
+function hostedTopUpPath(organizationId: string): `/v1/organizations/${string}/wallet/checkout` {
+  return `/v1/organizations/${organizationId}/wallet/checkout`;
+}
+
+function hostedSubscriptionPath(
+  organizationId: string,
+): `/v1/organizations/${string}/payments/subscription` {
+  return `/v1/organizations/${organizationId}/payments/subscription`;
+}
+
+function hostedSelectionOrganizationPath(
+  organizationId: string,
+  route: "wallet" | "payments/subscription",
+): string {
+  const encoded = `/v1/organizations/${encodeURIComponent(organizationId)}/${route}`;
+  if (!isHostedOrganizationId(organizationId)) throw new ApiError("invalid_request", 0, encoded);
+  return `/v1/organizations/${organizationId}/${route}`;
+}
+
+function isHostedPlanKey(value: unknown): value is string {
+  return typeof value === "string" && value.length >= 1 && value.length <= 64;
+}
+
+function isHostedSelectionPlanKey(value: unknown): value is string {
+  return matchesEntire(value, /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/u);
+}
+
+function snapshotHostedBillingContinuationPreparation(
+  value: unknown,
+): HostedBillingContinuationPreparation | null {
+  try {
+    if (!isRecord(value)) return null;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const ownKeys = Reflect.ownKeys(value);
+    const kind = Reflect.get(value, "kind");
+    if (kind === "topup") {
+      if (!isExactJsonRecord(value, ["kind", "amountMinor", "checkoutConsent"], ownKeys))
+        return null;
+      const amountMinor = Reflect.get(value, "amountMinor");
+      const checkoutConsent = Reflect.get(value, "checkoutConsent");
+      if (!isSafeIntegerAtLeast(amountMinor, 1) || checkoutConsent !== "interactive-checkout")
+        return null;
+      return { kind, amountMinor, checkoutConsent };
+    }
+    if (kind === "start") {
+      const hasReconcileConsent = ownKeys.includes("reconcileOriginalConsent");
+      if (
+        !isExactJsonRecord(
+          value,
+          hasReconcileConsent
+            ? ["kind", "planKey", "consent", "reconcileOriginalConsent"]
+            : ["kind", "planKey", "consent"],
+          ownKeys,
+        )
+      )
+        return null;
+      const planKey = Reflect.get(value, "planKey");
+      const consent = Reflect.get(value, "consent");
+      const reconcileOriginalConsent = hasReconcileConsent
+        ? Reflect.get(value, "reconcileOriginalConsent")
+        : undefined;
+      if (!isHostedSelectionPlanKey(planKey) || consent !== "subscription-checkout") return null;
+      if (!hasReconcileConsent) return { kind, planKey, consent };
+      if (reconcileOriginalConsent === "retry-original-subscription")
+        return { kind, planKey, consent, reconcileOriginalConsent };
+      if (reconcileOriginalConsent === "check-original-subscription")
+        return { kind, planKey, consent, reconcileOriginalConsent };
+      return null;
+    }
+    if (kind === "cancel") {
+      if (!isExactJsonRecord(value, ["kind", "consent"], ownKeys)) return null;
+      const consent = Reflect.get(value, "consent");
+      return consent === "cancel-subscription" ? { kind, consent } : null;
+    }
+    if (kind === "change-plan") {
+      if (!isExactJsonRecord(value, ["kind", "planKey", "consent"], ownKeys)) return null;
+      const planKey = Reflect.get(value, "planKey");
+      const consent = Reflect.get(value, "consent");
+      if (!isHostedSelectionPlanKey(planKey) || consent !== "change-subscription-plan") return null;
+      return { kind, planKey, consent };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function preparationMatchesHostedPayment(
+  preparation: HostedBillingContinuationPreparation,
+  continuation: HostedBillingContinuation,
+): continuation is HostedBillingContinuationPayment {
+  if (continuation.kind !== "payment" || continuation.phase !== "prepared") return false;
+  switch (preparation.kind) {
+    case "topup":
+      return (
+        continuation.operation.action === "topup" &&
+        continuation.operation.body.amountMinor === preparation.amountMinor
+      );
+    case "start":
+      return (
+        continuation.operation.action === "subscription-start" &&
+        continuation.operation.body.planKey === preparation.planKey
+      );
+    case "cancel":
+      return continuation.operation.action === "cancel";
+    case "change-plan":
+      return (
+        continuation.operation.action === "plan-change" &&
+        continuation.operation.body.planKey === preparation.planKey
+      );
+  }
+}
+
+function isHostedSubscriptionRef(value: unknown): value is string {
+  return matchesEntire(value, /^sra_[0-9a-f]{64}$/u);
+}
+
+function decodeHostedBillingContinuation(
+  payload: unknown,
+  selector: string,
+): HostedBillingContinuation | null {
+  if (!isExactRecord(payload, ["continuation"])) return null;
+  const continuation = payload.continuation;
+  if (
+    !isExactRecord(continuation, [
+      "contractVersion",
+      "continuationRef",
+      "kind",
+      "workspaceId",
+      "workspaceRef",
+      "organizationId",
+      "operation",
+      "phase",
+    ]) ||
+    continuation.contractVersion !== "hosted-browser-v1" ||
+    continuation.continuationRef !== selector ||
+    !isContinuationRef(continuation.continuationRef) ||
+    typeof continuation.workspaceId !== "string" ||
+    continuation.workspaceId.length < 1 ||
+    continuation.workspaceId.length > 128 ||
+    !isHostedReference(continuation.workspaceRef) ||
+    typeof continuation.organizationId !== "string" ||
+    continuation.organizationId.length < 1 ||
+    continuation.organizationId.length > 128
+  )
+    return null;
+
+  if (continuation.kind === "view") {
+    if (continuation.operation !== null || continuation.phase !== null) return null;
+    return {
+      continuationRef: selector,
+      kind: "view",
+      workspaceId: continuation.workspaceId,
+      workspaceRef: continuation.workspaceRef,
+      organizationId: continuation.organizationId,
+      operation: null,
+      phase: null,
+    };
+  }
+
+  if (
+    continuation.kind !== "payment" ||
+    typeof continuation.phase !== "string" ||
+    !["prepared", "dispatch-started", "outcome-recorded"].includes(continuation.phase) ||
+    !isExactRecord(continuation.operation, ["action", "method", "path", "body"])
+  )
+    return null;
+
+  const candidate = continuation.operation;
+  const rawBody = candidate.body;
+  if (!isRecord(rawBody) || !isHostedOrganizationId(continuation.organizationId)) return null;
+  let operation: HostedBillingContinuationOperation;
+  if (
+    candidate.action === "topup" &&
+    candidate.method === "POST" &&
+    candidate.path === hostedTopUpPath(continuation.organizationId) &&
+    isExactRecord(rawBody, ["reference", "amountMinor"]) &&
+    isHostedReference(rawBody.reference) &&
+    isSafeIntegerAtLeast(rawBody.amountMinor, 1)
+  ) {
+    operation = {
+      action: "topup",
+      method: "POST",
+      path: hostedTopUpPath(continuation.organizationId),
+      body: { reference: rawBody.reference, amountMinor: rawBody.amountMinor },
+    };
+  } else if (
+    candidate.action === "subscription-start" &&
+    candidate.method === "POST" &&
+    candidate.path === hostedSubscriptionPath(continuation.organizationId) &&
+    isExactRecord(rawBody, ["reference", "planKey"]) &&
+    isHostedReference(rawBody.reference) &&
+    isHostedPlanKey(rawBody.planKey)
+  ) {
+    operation = {
+      action: "subscription-start",
+      method: "POST",
+      path: hostedSubscriptionPath(continuation.organizationId),
+      body: { reference: rawBody.reference, planKey: rawBody.planKey },
+    };
+  } else if (
+    candidate.action === "cancel" &&
+    candidate.method === "PATCH" &&
+    candidate.path === hostedSubscriptionPath(continuation.organizationId) &&
+    isExactRecord(rawBody, ["reference", "cancelAtPeriodEnd", "expectedSubscriptionRef"]) &&
+    isHostedReference(rawBody.reference) &&
+    rawBody.cancelAtPeriodEnd === true &&
+    isHostedSubscriptionRef(rawBody.expectedSubscriptionRef)
+  ) {
+    operation = {
+      action: "cancel",
+      method: "PATCH",
+      path: hostedSubscriptionPath(continuation.organizationId),
+      body: {
+        reference: rawBody.reference,
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: rawBody.expectedSubscriptionRef,
+      },
+    };
+  } else if (
+    candidate.action === "plan-change" &&
+    candidate.method === "PATCH" &&
+    candidate.path === hostedSubscriptionPath(continuation.organizationId) &&
+    isExactRecord(rawBody, ["reference", "planKey", "expectedSubscriptionRef"]) &&
+    isHostedReference(rawBody.reference) &&
+    isHostedPlanKey(rawBody.planKey) &&
+    isHostedSubscriptionRef(rawBody.expectedSubscriptionRef)
+  ) {
+    operation = {
+      action: "plan-change",
+      method: "PATCH",
+      path: hostedSubscriptionPath(continuation.organizationId),
+      body: {
+        reference: rawBody.reference,
+        planKey: rawBody.planKey,
+        expectedSubscriptionRef: rawBody.expectedSubscriptionRef,
+      },
+    };
+  } else {
+    return null;
+  }
+
+  return {
+    continuationRef: selector,
+    kind: "payment",
+    workspaceId: continuation.workspaceId,
+    workspaceRef: continuation.workspaceRef,
+    organizationId: continuation.organizationId,
+    operation,
+    phase: continuation.phase as HostedBillingContinuationPayment["phase"],
+  };
+}
+
 export function createApi(options: ApiOptions) {
   const request = async <Result>(
     method: string,
     path: string,
     body?: unknown,
     extra: Record<string, string> = {},
+    clearSessionOnUnauthorized = true,
+    includeAuthorization = true,
+    cache?: RequestCache,
   ): Promise<{ readonly status: number; readonly payload: Result }> => {
-    const token = options.token();
+    const token = includeAuthorization ? options.token() : null;
     let response: Response;
     try {
       response = await fetch(`${options.origin}${path}`, {
         method,
         credentials: "include",
+        ...(cache === undefined ? {} : { cache }),
         headers: {
           ...(token ? { authorization: `Bearer ${token}` } : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -589,7 +983,7 @@ export function createApi(options: ApiOptions) {
         path,
         typeof detail === "string" && detail.length > 0 && detail.length <= 1024 ? detail : null,
       );
-      if (failure.isExpiredSession) options.onSessionLost();
+      if (failure.isExpiredSession && clearSessionOnUnauthorized) options.onSessionLost();
       throw failure;
     }
     return { status: response.status, payload: payload as Result };
@@ -600,7 +994,31 @@ export function createApi(options: ApiOptions) {
     path: string,
     body?: unknown,
     extra: Record<string, string> = {},
-  ): Promise<Result> => (await request<Result>(method, path, body, extra)).payload;
+    clearSessionOnUnauthorized = true,
+  ): Promise<Result> =>
+    (await request<Result>(method, path, body, extra, clearSessionOnUnauthorized)).payload;
+
+  const continuationEffectOptions = (selector: string | undefined, path: string) => {
+    if (selector === undefined)
+      return { extra: {}, clearSession: true, includeAuthorization: true };
+    if (!isContinuationRef(selector)) throw new ApiError("invalid_request", 0, path);
+    return {
+      extra: { "Takoserver-Billing-Continuation": `hosted-browser-v1.${selector}` },
+      clearSession: false,
+      includeAuthorization: false,
+    };
+  };
+
+  const billingEffectPath = (
+    organizationId: string,
+    route: "wallet/checkout" | "payments/subscription",
+    selector: string | undefined,
+  ) => {
+    const encoded = `/v1/organizations/${encodeURIComponent(organizationId)}/${route}`;
+    if (selector === undefined) return encoded;
+    if (!isHostedOrganizationId(organizationId)) throw new ApiError("invalid_request", 0, encoded);
+    return `/v1/organizations/${organizationId}/${route}`;
+  };
 
   const operation = (
     payload: unknown,
@@ -658,6 +1076,119 @@ export function createApi(options: ApiOptions) {
     identityProviders: () =>
       call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),
 
+    /** Reads a Hosted-selected continuation using only the real shared-session cookie. */
+    async hostedBillingContinuation(selector: string): Promise<HostedBillingContinuation> {
+      const path = `/v1/billing/hosted-continuations/${encodeURIComponent(selector)}`;
+      if (!isContinuationRef(selector)) throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>(
+        "GET",
+        path,
+        undefined,
+        {},
+        false,
+        false,
+        "no-store",
+      );
+      const continuation = decodeHostedBillingContinuation(payload, selector);
+      if (status !== 200 || !continuation) throw new ApiError("invalid_response", status, path);
+      return continuation;
+    },
+
+    /** Prepares one closed, explicit Hosted choice without dispatching its billing effect. */
+    async prepareHostedBillingContinuation(
+      selector: string,
+      preparation: HostedBillingContinuationPreparation,
+    ): Promise<HostedBillingContinuationPayment> {
+      const path = `/v1/billing/hosted-continuations/${selector}`;
+      if (!isContinuationRef(selector)) throw new ApiError("invalid_request", 0, path);
+      const snapshot = snapshotHostedBillingContinuationPreparation(preparation);
+      if (!snapshot) throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>(
+        "POST",
+        path,
+        snapshot,
+        {},
+        false,
+        false,
+        "no-store",
+      );
+      const continuation = decodeHostedBillingContinuation(payload, selector);
+      if (
+        status !== 200 ||
+        !continuation ||
+        !preparationMatchesHostedPayment(snapshot, continuation)
+      )
+        throw new ApiError("invalid_response", status, path);
+      return continuation;
+    },
+
+    /**
+     * The shared-auth session oracle is a separate authentication surface.
+     * It must not receive this Console API's bearer token; the browser's
+     * HttpOnly cookie is the only credential it is allowed to inspect.
+     */
+    async sharedAuthSession(): Promise<SharedAuthSessionStatus> {
+      const path = "/auth/oidc/session";
+      let response: Response;
+      try {
+        response = await fetch(`${options.origin}${path}`, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+        });
+      } catch {
+        throw new ApiError("unreachable", 0, path);
+      }
+      const payload = await response
+        .json()
+        .catch(() => null as unknown as Record<string, unknown> | null);
+      if (response.status === 404) return { available: false, authenticated: false };
+      if (response.status === 200 || response.status === 401) {
+        if (
+          isRecord(payload) &&
+          Object.keys(payload).sort().join() === "authenticated" &&
+          payload.authenticated === (response.status === 200)
+        ) {
+          return { available: true, authenticated: payload.authenticated as boolean };
+        }
+        throw new ApiError("invalid_response", response.status, path);
+      }
+      if (!response.ok) {
+        const code = isRecord(payload) && isRecord(payload.error) ? payload.error.code : null;
+        throw new ApiError(
+          typeof code === "string" ? code : `http_${response.status}`,
+          response.status,
+          path,
+        );
+      }
+      throw new ApiError("invalid_response", response.status, path);
+    },
+
+    /** Logout through the shared RP's cookie owner; only a real 204 succeeds. */
+    async sharedAuthSignOut(): Promise<void> {
+      const path = "/auth/oidc/logout";
+      let response: Response;
+      try {
+        response = await fetch(`${options.origin}${path}`, {
+          method: "POST",
+          credentials: "include",
+          cache: "no-store",
+        });
+      } catch {
+        throw new ApiError("unreachable", 0, path);
+      }
+      if (response.status === 204) return;
+      const payload = await response
+        .json()
+        .catch(() => null as unknown as Record<string, unknown> | null);
+      const code = isRecord(payload) && isRecord(payload.error) ? payload.error.code : null;
+      throw new ApiError(
+        typeof code === "string" ? code : `http_${response.status}`,
+        response.status,
+        path,
+      );
+    },
+
     signIn: (
       provider: string,
       assertion: string,
@@ -673,8 +1204,48 @@ export function createApi(options: ApiOptions) {
 
     signOut: () => call<void>("DELETE", "/v1/session"),
 
-    me: () =>
-      call<{ principal: Principal; organizations: readonly Organization[] }>("GET", "/v1/me"),
+    async me(): Promise<{ principal: Principal; organizations: readonly Organization[] }> {
+      const path = "/v1/me";
+      const { payload, status } = await request<unknown>("GET", path);
+      try {
+        if (
+          !isRecord(payload) ||
+          !isRecord(payload.principal) ||
+          !Array.isArray(payload.organizations)
+        )
+          throw new TypeError("invalid identity response");
+        const identity = payload.principal;
+        if (
+          typeof identity.id !== "string" ||
+          identity.id === "" ||
+          typeof identity.provider !== "string" ||
+          identity.provider === "" ||
+          typeof identity.email !== "string" ||
+          typeof identity.displayName !== "string"
+        )
+          throw new TypeError("invalid principal");
+        const decodedOrganizations = payload.organizations.map((value) => {
+          if (
+            !isRecord(value) ||
+            typeof value.id !== "string" ||
+            value.id === "" ||
+            typeof value.name !== "string" ||
+            value.name === "" ||
+            typeof value.ownerPrincipalId !== "string" ||
+            value.ownerPrincipalId === "" ||
+            typeof value.createdAt !== "string"
+          )
+            throw new TypeError("invalid organization");
+          return value as unknown as Organization;
+        });
+        return {
+          principal: identity as unknown as Principal,
+          organizations: decodedOrganizations,
+        };
+      } catch {
+        throw new ApiError("invalid_response", status, path);
+      }
+    },
 
     createOrganization: (name: string) =>
       call<{ organization: Organization }>("POST", "/v1/organizations", { name }),
@@ -705,6 +1276,18 @@ export function createApi(options: ApiOptions) {
       const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet`;
       const result = await request<unknown>("GET", path);
       try {
+        return { wallet: decodeWallet(result.payload, organizationId) };
+      } catch {
+        throw new ApiError("invalid_response", result.status, path);
+      }
+    },
+
+    /** Reads a selected continuation's wallet using its finite canonical Org path and shared cookie. */
+    hostedBillingSelectionWallet: async (organizationId: string): Promise<{ wallet: Wallet }> => {
+      const path = hostedSelectionOrganizationPath(organizationId, "wallet");
+      const result = await request<unknown>("GET", path, undefined, {}, false, false, "no-store");
+      try {
+        if (result.status !== 200) throw new TypeError("unexpected wallet status");
         return { wallet: decodeWallet(result.payload, organizationId) };
       } catch {
         throw new ApiError("invalid_response", result.status, path);
@@ -796,16 +1379,60 @@ export function createApi(options: ApiOptions) {
       return { subscription: payload.subscription, planTable, billingCapabilities };
     },
 
+    /** Reads selected continuation billing facts without a bearer token or encoded Org segment. */
+    async hostedBillingSelectionSubscription(
+      organizationId: string,
+    ): Promise<OrganizationSubscription> {
+      const path = hostedSelectionOrganizationPath(organizationId, "payments/subscription");
+      const { payload, status } = await request<unknown>(
+        "GET",
+        path,
+        undefined,
+        {},
+        false,
+        false,
+        "no-store",
+      );
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        !(
+          payload.subscription === null ||
+          isHostedSubscriptionProjection(payload.subscription, organizationId)
+        )
+      )
+        throw new ApiError("invalid_response", status, path);
+      const planTable = decodeHostedPlanTable(payload.planTable);
+      if (!planTable) throw new ApiError("invalid_response", status, path);
+      if (payload.billingCapabilities === undefined)
+        return { subscription: payload.subscription, planTable };
+      const billingCapabilities = decodeBillingCapabilities(payload.billingCapabilities);
+      if (!billingCapabilities) throw new ApiError("invalid_response", status, path);
+      return { subscription: payload.subscription, planTable, billingCapabilities };
+    },
+
     /** Replays one durable caller reference against one Host-configured plan key. */
     async beginSubscription(
       organizationId: string,
       reference: string,
       planKey: string,
+      continuationRef?: string,
     ): Promise<SubscriptionCheckoutStart> {
-      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
-      if (!isBillingReference(reference) || !isPlanKey(planKey))
+      const path = billingEffectPath(organizationId, "payments/subscription", continuationRef);
+      const continuation = continuationEffectOptions(continuationRef, path);
+      if (
+        !isBillingReference(reference) ||
+        !(continuationRef === undefined ? isPlanKey(planKey) : isHostedPlanKey(planKey))
+      )
         throw new ApiError("invalid_request", 0, path);
-      const { payload, status } = await request<unknown>("POST", path, { reference, planKey });
+      const { payload, status } = await request<unknown>(
+        "POST",
+        path,
+        { reference, planKey },
+        continuation.extra,
+        continuation.clearSession,
+        continuation.includeAuthorization,
+      );
       if (!isRecord(payload) || !isRecord(payload.checkout))
         throw new ApiError("invalid_response", status, path);
       const checkout = payload.checkout;
@@ -856,15 +1483,24 @@ export function createApi(options: ApiOptions) {
       organizationId: string,
       reference: string,
       expectedSubscriptionRef: string,
+      continuationRef?: string,
     ): Promise<SubscriptionCancellationReceipt> {
-      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
+      const path = billingEffectPath(organizationId, "payments/subscription", continuationRef);
+      const continuation = continuationEffectOptions(continuationRef, path);
       if (!isBillingReference(reference) || !isSubscriptionRef(expectedSubscriptionRef))
         throw new ApiError("invalid_request", 0, path);
-      const { payload, status } = await request<unknown>("PATCH", path, {
-        reference,
-        cancelAtPeriodEnd: true,
-        expectedSubscriptionRef,
-      });
+      const { payload, status } = await request<unknown>(
+        "PATCH",
+        path,
+        {
+          reference,
+          cancelAtPeriodEnd: true,
+          expectedSubscriptionRef,
+        },
+        continuation.extra,
+        continuation.clearSession,
+        continuation.includeAuthorization,
+      );
       if (!isRecord(payload) || !isRecord(payload.cancellation))
         throw new ApiError("invalid_response", status, path);
       const cancellation = payload.cancellation;
@@ -891,6 +1527,65 @@ export function createApi(options: ApiOptions) {
       throw new ApiError("invalid_response", status, path);
     },
 
+    /** Changes the plan only for the exact selected continuation target. */
+    async changeSubscriptionPlan(
+      organizationId: string,
+      reference: string,
+      planKey: string,
+      expectedSubscriptionRef: string,
+      continuationRef: string,
+    ): Promise<HostedPlanChangeResult> {
+      const path = billingEffectPath(organizationId, "payments/subscription", continuationRef);
+      if (!isContinuationRef(continuationRef)) throw new ApiError("invalid_request", 0, path);
+      const continuation = continuationEffectOptions(continuationRef, path);
+      if (
+        !isBillingReference(reference) ||
+        !isHostedPlanKey(planKey) ||
+        !isSubscriptionRef(expectedSubscriptionRef)
+      )
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>(
+        "PATCH",
+        path,
+        { reference, planKey, expectedSubscriptionRef },
+        continuation.extra,
+        continuation.clearSession,
+        continuation.includeAuthorization,
+      );
+      if (!isExactRecord(payload, ["planChange"]) || !isRecord(payload.planChange))
+        throw new ApiError("invalid_response", status, path);
+      const planChange = payload.planChange;
+      if (
+        status === 202 &&
+        isExactRecord(planChange, ["state", "subscriptionRef"]) &&
+        planChange.state === "pending" &&
+        planChange.subscriptionRef === expectedSubscriptionRef
+      )
+        return { state: "pending", subscriptionRef: expectedSubscriptionRef };
+      if (
+        status === 200 &&
+        isExactRecord(planChange, ["state", "subscriptionRef", "pendingChange"]) &&
+        planChange.state === "verified" &&
+        planChange.subscriptionRef === expectedSubscriptionRef &&
+        isExactRecord(planChange.pendingChange, ["planKey", "pricingRevision", "effectiveAt"]) &&
+        typeof planChange.pendingChange.planKey === "string" &&
+        planChange.pendingChange.planKey.length >= 1 &&
+        planChange.pendingChange.planKey.length <= 64 &&
+        isHostedReference(planChange.pendingChange.pricingRevision) &&
+        isCanonicalIsoTimestamp(planChange.pendingChange.effectiveAt)
+      )
+        return {
+          state: "verified",
+          subscriptionRef: expectedSubscriptionRef,
+          pendingChange: {
+            planKey: planChange.pendingChange.planKey,
+            pricingRevision: planChange.pendingChange.pricingRevision,
+            effectiveAt: planChange.pendingChange.effectiveAt,
+          },
+        };
+      throw new ApiError("invalid_response", status, path);
+    },
+
     /**
      * Starts a legacy self-host payment. Answers 404 where this deployment
      * cannot take one, which is how the console knows not to offer it. Hosted
@@ -912,11 +1607,20 @@ export function createApi(options: ApiOptions) {
       organizationId: string,
       reference: string,
       amountMinor: number,
+      continuationRef?: string,
     ): Promise<TopUpCheckoutStart> {
-      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout`;
+      const path = billingEffectPath(organizationId, "wallet/checkout", continuationRef);
+      const continuation = continuationEffectOptions(continuationRef, path);
       if (!isBillingReference(reference) || !isSafeIntegerAtLeast(amountMinor, 1))
         throw new ApiError("invalid_request", 0, path);
-      const { payload, status } = await request<unknown>("POST", path, { reference, amountMinor });
+      const { payload, status } = await request<unknown>(
+        "POST",
+        path,
+        { reference, amountMinor },
+        continuation.extra,
+        continuation.clearSession,
+        continuation.includeAuthorization,
+      );
       if (
         status !== 201 ||
         !isRecord(payload) ||

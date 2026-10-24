@@ -70,6 +70,700 @@ test("usage percent preserves the server basis points, including zero allowance 
   }
 });
 
+test("shared-auth session oracle uses only the cookie and accepts its exact status envelopes", async () => {
+  const authenticated = transport(() => Response.json({ authenticated: true }));
+  expect(await client().sharedAuthSession()).toEqual({ available: true, authenticated: true });
+  expect(new URL(authenticated[0]?.url ?? origin).pathname).toBe("/auth/oidc/session");
+  expect(new URL(authenticated[0]?.url ?? origin).search).toBe("");
+  expect(authenticated[0]?.method).toBe("GET");
+  expect(authenticated[0]?.credentials).toBe("include");
+  expect(authenticated[0]?.cache).toBe("no-store");
+  expect(authenticated[0]?.headers.has("authorization")).toBe(false);
+
+  transport(() => Response.json({ authenticated: false }, { status: 401 }));
+  expect(await client().sharedAuthSession()).toEqual({ available: true, authenticated: false });
+
+  transport(() => Response.json({ error: { code: "not_found" } }, { status: 404 }));
+  expect(await client().sharedAuthSession()).toEqual({ available: false, authenticated: false });
+
+  for (const [status, code] of [
+    [400, "session_invalid"],
+    [503, "session_unavailable"],
+  ] as const) {
+    transport(() => Response.json({ error: { code } }, { status }));
+    await expect(client().sharedAuthSession()).rejects.toMatchObject({ code, status });
+  }
+
+  for (const [status, payload] of [
+    [200, { authenticated: false }],
+    [200, { authenticated: true, subject: "must-not-be-consumed" }],
+    [401, { authenticated: true }],
+    [401, { authenticated: false, subject: "must-not-be-consumed" }],
+  ] as const) {
+    transport(() => Response.json(payload, { status }));
+    await expect(client().sharedAuthSession()).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
+
+test("shared-auth logout uses only its cookie endpoint and accepts only 204", async () => {
+  const seen = transport(() => new Response(null, { status: 204 }));
+  await client().sharedAuthSignOut();
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe("/auth/oidc/logout");
+  expect(new URL(seen[0]?.url ?? origin).search).toBe("");
+  expect(seen[0]?.method).toBe("POST");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.headers.has("authorization")).toBe(false);
+
+  transport(() => Response.json({ error: { code: "session_unavailable" } }, { status: 503 }));
+  await expect(client().sharedAuthSignOut()).rejects.toMatchObject({
+    code: "session_unavailable",
+    status: 503,
+  });
+});
+
+test("Hosted continuation metadata is closed, cookie-only, no-store, and selector-bound", async () => {
+  const selector = "a".repeat(64);
+  const envelope = {
+    continuation: {
+      contractVersion: "hosted-browser-v1",
+      continuationRef: selector,
+      kind: "payment",
+      workspaceId: "workspace-17",
+      workspaceRef: "wbr_opaque-17",
+      organizationId: "org-17",
+      operation: {
+        action: "topup",
+        method: "POST",
+        path: "/v1/organizations/org-17/wallet/checkout",
+        body: { reference: "topup-ref-17", amountMinor: 4200 },
+      },
+      phase: "prepared",
+    },
+  };
+  const seen = transport(() => Response.json(envelope));
+  expect(await client().hostedBillingContinuation(selector)).toEqual({
+    continuationRef: selector,
+    kind: "payment",
+    workspaceId: "workspace-17",
+    workspaceRef: "wbr_opaque-17",
+    organizationId: "org-17",
+    operation: {
+      action: "topup",
+      method: "POST",
+      path: "/v1/organizations/org-17/wallet/checkout",
+      body: { reference: "topup-ref-17", amountMinor: 4200 },
+    },
+    phase: "prepared",
+  });
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe(
+    `/v1/billing/hosted-continuations/${selector}`,
+  );
+  expect(seen[0]?.method).toBe("GET");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.cache).toBe("no-store");
+  expect(seen[0]?.headers.has("authorization")).toBe(false);
+
+  for (const invalid of [
+    { continuation: { ...envelope.continuation, extra: true } },
+    { continuation: { ...envelope.continuation, continuationRef: "b".repeat(64) } },
+    { continuation: { ...envelope.continuation, phase: null } },
+    { continuation: { ...envelope.continuation, phase: ["prepared"] } },
+    { continuation: { ...envelope.continuation, phase: { value: "prepared" } } },
+    { continuation: { ...envelope.continuation, phase: 17 } },
+    {
+      continuation: {
+        ...envelope.continuation,
+        operation: { ...envelope.continuation.operation, method: "GET" },
+      },
+    },
+    {
+      continuation: {
+        ...envelope.continuation,
+        operation: {
+          ...envelope.continuation.operation,
+          body: { ...envelope.continuation.operation.body, extra: true },
+        },
+      },
+    },
+    { continuation: { ...envelope.continuation, phase: "unknown" } },
+  ]) {
+    transport(() => Response.json(invalid));
+    await expect(client().hostedBillingContinuation(selector)).rejects.toMatchObject({
+      code: "invalid_response",
+      status: 200,
+    });
+  }
+  await expect(client().hostedBillingContinuation(`${selector}\n`)).rejects.toMatchObject({
+    code: "invalid_request",
+    status: 0,
+  });
+});
+
+test("Hosted continuation preparation posts only the four closed explicit choices and accepts matching prepared metadata", async () => {
+  const selector = "a".repeat(64);
+  const choices = [
+    {
+      kind: "topup",
+      amountMinor: 4200,
+      checkoutConsent: "interactive-checkout",
+    },
+    { kind: "start", planKey: "pro-tier", consent: "subscription-checkout" },
+    { kind: "cancel", consent: "cancel-subscription" },
+    { kind: "change-plan", planKey: "team-next", consent: "change-subscription-plan" },
+  ] as const;
+  const operations = [
+    {
+      action: "topup",
+      method: "POST",
+      path: "/v1/organizations/org-17/wallet/checkout",
+      body: { reference: "topup-ref-17", amountMinor: 4200 },
+    },
+    {
+      action: "subscription-start",
+      method: "POST",
+      path: "/v1/organizations/org-17/payments/subscription",
+      body: { reference: "start-ref-17", planKey: "pro-tier" },
+    },
+    {
+      action: "cancel",
+      method: "PATCH",
+      path: "/v1/organizations/org-17/payments/subscription",
+      body: {
+        reference: "cancel-ref-17",
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: `sra_${"b".repeat(64)}`,
+      },
+    },
+    {
+      action: "plan-change",
+      method: "PATCH",
+      path: "/v1/organizations/org-17/payments/subscription",
+      body: {
+        reference: "change-ref-17",
+        planKey: "team-next",
+        expectedSubscriptionRef: `sra_${"c".repeat(64)}`,
+      },
+    },
+  ] as const;
+
+  for (const [index, choice] of choices.entries()) {
+    const seen = transport(() =>
+      Response.json({
+        continuation: {
+          contractVersion: "hosted-browser-v1",
+          continuationRef: selector,
+          kind: "payment",
+          workspaceId: "workspace-17",
+          workspaceRef: "wbr_opaque-17",
+          organizationId: "org-17",
+          operation: operations[index],
+          phase: "prepared",
+        },
+      }),
+    );
+    expect(await client().prepareHostedBillingContinuation(selector, choice)).toMatchObject({
+      continuationRef: selector,
+      kind: "payment",
+      phase: "prepared",
+      operation: { action: operations[index]?.action },
+    });
+    expect(new URL(seen[0]?.url ?? origin).pathname).toBe(
+      `/v1/billing/hosted-continuations/${selector}`,
+    );
+    expect(new URL(seen[0]?.url ?? origin).search).toBe("");
+    expect(seen[0]?.method).toBe("POST");
+    expect(seen[0]?.credentials).toBe("include");
+    expect(seen[0]?.cache).toBe("no-store");
+    expect(seen[0]?.headers.has("authorization")).toBe(false);
+    expect(await seen[0]?.json()).toEqual(choice);
+    expect(seen).toHaveLength(1);
+  }
+
+  const startWithReconciliationChoice = {
+    kind: "start",
+    planKey: "pro-tier",
+    consent: "subscription-checkout",
+    reconcileOriginalConsent: "check-original-subscription",
+  } as const;
+  const reconcileSeen = transport(() =>
+    Response.json({
+      continuation: {
+        contractVersion: "hosted-browser-v1",
+        continuationRef: selector,
+        kind: "payment",
+        workspaceId: "workspace-17",
+        workspaceRef: "wbr_opaque-17",
+        organizationId: "org-17",
+        operation: operations[1],
+        phase: "prepared",
+      },
+    }),
+  );
+  await client().prepareHostedBillingContinuation(selector, startWithReconciliationChoice);
+  expect(await reconcileSeen[0]?.json()).toEqual(startWithReconciliationChoice);
+  expect(reconcileSeen).toHaveLength(1);
+});
+
+test("Hosted continuation preparation refuses malformed or scoped choices before fetch", async () => {
+  const selector = "b".repeat(64);
+  const seen = transport(() => Response.json({}));
+  const api = client();
+  const invalidChoices: unknown[] = [
+    { kind: "topup", amountMinor: 0, checkoutConsent: "interactive-checkout" },
+    { kind: "topup", amountMinor: 4200, checkoutConsent: "other" },
+    { kind: "topup", amountMinor: 4200, checkoutConsent: "interactive-checkout", orgId: "org-17" },
+    Object.assign(Object.create({ kind: "topup" }), {
+      amountMinor: 4200,
+      checkoutConsent: "interactive-checkout",
+      unexpected: true,
+    }),
+    {
+      kind: "topup",
+      amountMinor: 4200,
+      checkoutConsent: "interactive-checkout",
+      accountId: "account-17",
+      workspaceId: "workspace-17",
+      organizationId: "org-17",
+      target: "subscription-target",
+      reference: "client-reference",
+      commandKey: "client-command-key",
+    },
+    { kind: "start", planKey: "bad/key", consent: "subscription-checkout" },
+    { kind: "start", planKey: "pro", consent: "subscription-checkout", reference: "client-ref" },
+    {
+      kind: "start",
+      planKey: "pro",
+      consent: "subscription-checkout",
+      reconcileOriginalConsent: "new-reference",
+    },
+    { kind: "cancel", consent: "cancel-subscription", workspaceId: "workspace-17" },
+    { kind: "change-plan", planKey: "pro", consent: "cancel-subscription" },
+    { kind: "unknown", consent: "subscription-checkout" },
+    null,
+  ];
+  for (const choice of invalidChoices) {
+    await expect(
+      api.prepareHostedBillingContinuation(selector, choice as never),
+    ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  }
+  await expect(
+    api.prepareHostedBillingContinuation(`${selector}\n`, {
+      kind: "cancel",
+      consent: "cancel-subscription",
+    }),
+  ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  expect(seen).toHaveLength(0);
+});
+
+test("Hosted continuation preparation only accepts the same selector's matching prepared payment response", async () => {
+  const selector = "c".repeat(64);
+  const choice = {
+    kind: "topup",
+    amountMinor: 4200,
+    checkoutConsent: "interactive-checkout",
+  } as const;
+  const base = {
+    contractVersion: "hosted-browser-v1",
+    continuationRef: selector,
+    kind: "payment",
+    workspaceId: "workspace-17",
+    workspaceRef: "wbr_opaque-17",
+    organizationId: "org-17",
+    operation: {
+      action: "topup",
+      method: "POST",
+      path: "/v1/organizations/org-17/wallet/checkout",
+      body: { reference: "topup-ref-17", amountMinor: 4200 },
+    },
+    phase: "prepared",
+  };
+  const invalidResponses = [
+    { continuation: { ...base, kind: "view", operation: null, phase: null } },
+    { continuation: { ...base, phase: "dispatch-started" } },
+    { continuation: { ...base, continuationRef: "d".repeat(64) } },
+    {
+      continuation: {
+        ...base,
+        operation: { ...base.operation, body: { reference: "topup-ref-17", amountMinor: 4201 } },
+      },
+    },
+    {
+      continuation: {
+        ...base,
+        operation: {
+          action: "subscription-start",
+          method: "POST",
+          path: "/v1/organizations/org-17/payments/subscription",
+          body: { reference: "start-ref-17", planKey: "pro" },
+        },
+      },
+    },
+  ];
+  for (const payload of invalidResponses) {
+    transport(() => Response.json(payload));
+    await expect(client().prepareHostedBillingContinuation(selector, choice)).rejects.toMatchObject(
+      {
+        code: "invalid_response",
+        status: 200,
+      },
+    );
+  }
+});
+
+test("Hosted continuation preparation never retries an unknown network result", async () => {
+  let calls = 0;
+  globalThis.fetch = Object.assign(
+    async () => {
+      calls += 1;
+      throw new TypeError("connection lost");
+    },
+    { preconnect: originalFetch.preconnect },
+  );
+  await expect(
+    client().prepareHostedBillingContinuation("e".repeat(64), {
+      kind: "cancel",
+      consent: "cancel-subscription",
+    }),
+  ).rejects.toMatchObject({ code: "unreachable", status: 0 });
+  expect(calls).toBe(1);
+});
+
+function preparedHostedResponse(selector: string, action: string, path: string, body: unknown) {
+  return Response.json({
+    continuation: {
+      contractVersion: "hosted-browser-v1",
+      continuationRef: selector,
+      kind: "payment",
+      workspaceId: "workspace-17",
+      workspaceRef: "wbr_opaque-17",
+      organizationId: "org-17",
+      operation: {
+        action,
+        method: action === "topup" || action === "subscription-start" ? "POST" : "PATCH",
+        path,
+        body,
+      },
+      phase: "prepared",
+    },
+  });
+}
+
+test("Hosted continuation preparation rejects hidden toJSON without invoking it", async () => {
+  const selector = "f".repeat(64);
+  let toJsonCalls = 0;
+  const withHiddenToJson = {
+    kind: "topup",
+    amountMinor: 4200,
+    checkoutConsent: "interactive-checkout",
+  };
+  Object.defineProperty(withHiddenToJson, "toJSON", {
+    value: () => {
+      toJsonCalls += 1;
+      return { kind: "cancel", consent: "cancel-subscription" };
+    },
+  });
+  const hiddenMethodSeen = transport(() =>
+    preparedHostedResponse(selector, "topup", "/v1/organizations/org-17/wallet/checkout", {
+      reference: "topup-ref-17",
+      amountMinor: 4200,
+    }),
+  );
+  await expect(
+    client().prepareHostedBillingContinuation(selector, withHiddenToJson as never),
+  ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  expect(hiddenMethodSeen).toHaveLength(0);
+  expect(toJsonCalls).toBe(0);
+});
+
+test("Hosted continuation preparation snapshots a getter value once for body and response matching", async () => {
+  const selector = "f".repeat(64);
+  let amount = 4200;
+  let amountReads = 0;
+  const topupChoice = {
+    kind: "topup" as const,
+    get amountMinor() {
+      amountReads += 1;
+      return amountReads === 1 ? amount : amount + 1;
+    },
+    checkoutConsent: "interactive-checkout" as const,
+  };
+  const topupSeen = transport(() => {
+    amount = 9000;
+    return preparedHostedResponse(selector, "topup", "/v1/organizations/org-17/wallet/checkout", {
+      reference: "topup-ref-17",
+      amountMinor: 4200,
+    });
+  });
+  await client().prepareHostedBillingContinuation(selector, topupChoice);
+  expect(amountReads).toBe(1);
+  expect(await topupSeen[0]?.json()).toEqual({
+    kind: "topup",
+    amountMinor: 4200,
+    checkoutConsent: "interactive-checkout",
+  });
+});
+
+test("Hosted continuation preparation does not reread original plan choice after sending", async () => {
+  const selector = "f".repeat(64);
+  const startChoice = {
+    kind: "start" as const,
+    planKey: "pro-tier",
+    consent: "subscription-checkout" as const,
+  };
+  const startSeen = transport(() => {
+    startChoice.planKey = "mutated-after-send";
+    return preparedHostedResponse(
+      selector,
+      "subscription-start",
+      "/v1/organizations/org-17/payments/subscription",
+      { reference: "start-ref-17", planKey: "pro-tier" },
+    );
+  });
+  await client().prepareHostedBillingContinuation(selector, startChoice);
+  expect(await startSeen[0]?.json()).toEqual({
+    kind: "start",
+    planKey: "pro-tier",
+    consent: "subscription-checkout",
+  });
+});
+
+test("Hosted continuation accepts only action-specific concrete paths for its selected Organization", async () => {
+  const selector = "a".repeat(64);
+  const base = {
+    contractVersion: "hosted-browser-v1",
+    continuationRef: selector,
+    kind: "payment",
+    workspaceId: "workspace-17",
+    workspaceRef: "wbr_opaque-17",
+    organizationId: "org:17",
+    phase: "prepared",
+  };
+  const operations = [
+    {
+      action: "topup",
+      method: "POST",
+      path: "/v1/organizations/org:17/wallet/checkout",
+      body: { reference: "topup-ref-17", amountMinor: 4200 },
+    },
+    {
+      action: "subscription-start",
+      method: "POST",
+      path: "/v1/organizations/org:17/payments/subscription",
+      body: { reference: "subscription-ref-17", planKey: "pro" },
+    },
+    {
+      action: "cancel",
+      method: "PATCH",
+      path: "/v1/organizations/org:17/payments/subscription",
+      body: {
+        reference: "cancel-ref-17",
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: `sra_${"b".repeat(64)}`,
+      },
+    },
+    {
+      action: "plan-change",
+      method: "PATCH",
+      path: "/v1/organizations/org:17/payments/subscription",
+      body: {
+        reference: "plan-change-ref-17",
+        planKey: "pro",
+        expectedSubscriptionRef: `sra_${"c".repeat(64)}`,
+      },
+    },
+  ] as const;
+
+  for (const operation of operations) {
+    transport(() => Response.json({ continuation: { ...base, operation } }));
+    const result = await client().hostedBillingContinuation(selector);
+    expect(result.kind).toBe("payment");
+    if (result.kind === "payment") expect(result.operation).toEqual(operation);
+  }
+
+  const operation = operations[0];
+  for (const path of [
+    "/v1/organizations/other-org/wallet/checkout",
+    "/v1/organizations/org:17/payments/subscription",
+    "https://api.example.test/v1/organizations/org:17/wallet/checkout",
+    "/v1/organizations/org:17/wallet/checkout?next=/",
+    "/v1/organizations/org:17/wallet/checkout\n",
+    "/v1/organizations/{organizationId}/wallet/checkout",
+  ]) {
+    transport(() =>
+      Response.json({ continuation: { ...base, operation: { ...operation, path } } }),
+    );
+    await expect(client().hostedBillingContinuation(selector)).rejects.toMatchObject({
+      code: "invalid_response",
+      status: 200,
+    });
+  }
+});
+
+test("Hosted continuation effects keep existing route and exact body while using selector header and cookie only", async () => {
+  const selector = "b".repeat(64);
+  const seen = transport(() =>
+    Response.json({ checkout: { url: "https://checkout.stripe.com/c/pay/test" } }, { status: 201 }),
+  );
+  expect(await client().beginTopUp("org:17", "topup-ref-17", 4200, selector)).toEqual({
+    checkout: { url: "https://checkout.stripe.com/c/pay/test" },
+  });
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe("/v1/organizations/org:17/wallet/checkout");
+  expect(seen[0]?.method).toBe("POST");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.headers.get("Takoserver-Billing-Continuation")).toBe(
+    `hosted-browser-v1.${selector}`,
+  );
+  expect(seen[0]?.headers.has("authorization")).toBe(false);
+  expect(await seen[0]?.json()).toEqual({ reference: "topup-ref-17", amountMinor: 4200 });
+});
+
+test("Hosted continuation effects use raw canonical Organization segments for all four actions", async () => {
+  const selector = "e".repeat(64);
+  const target = `sra_${"f".repeat(64)}`;
+  const expectedPath = "/v1/organizations/org:17/payments/subscription";
+
+  const topup = transport(() =>
+    Response.json({ checkout: { url: "https://checkout.stripe.com/c/pay/test" } }, { status: 201 }),
+  );
+  await client().beginTopUp("org:17", "topup-ref-17", 4200, selector);
+  expect(new URL(topup[0]?.url ?? origin).pathname).toBe(
+    "/v1/organizations/org:17/wallet/checkout",
+  );
+
+  const subscription = transport(() =>
+    Response.json(
+      {
+        checkout: {
+          state: "open",
+          id: "cs_test_console_1",
+          url: "https://checkout.stripe.com/c/pay/test",
+        },
+      },
+      { status: 201 },
+    ),
+  );
+  await client().beginSubscription("org:17", "subscription-ref-17", "pro", selector);
+  expect(new URL(subscription[0]?.url ?? origin).pathname).toBe(expectedPath);
+
+  const cancellation = transport(() =>
+    Response.json(
+      {
+        cancellation: {
+          state: "verified",
+          subscriptionRef: target,
+          effectiveAt: "2026-11-01T00:00:00.000Z",
+        },
+      },
+      { status: 200 },
+    ),
+  );
+  await client().cancelSubscription("org:17", "cancel-ref-17", target, selector);
+  expect(new URL(cancellation[0]?.url ?? origin).pathname).toBe(expectedPath);
+
+  const planChange = transport(() =>
+    Response.json(
+      {
+        planChange: {
+          state: "pending",
+          subscriptionRef: target,
+        },
+      },
+      { status: 202 },
+    ),
+  );
+  await client().changeSubscriptionPlan("org:17", "plan-ref-17", "pro", target, selector);
+  expect(new URL(planChange[0]?.url ?? origin).pathname).toBe(expectedPath);
+});
+
+test("Hosted continuation effects reject Organization IDs outside the server segment contract before fetch", async () => {
+  const selector = "f".repeat(64);
+  const target = `sra_${"a".repeat(64)}`;
+  const seen = transport(() => Response.json({}));
+  const api = client();
+
+  await expect(api.beginTopUp("org/slash", "topup-ref-17", 4200, selector)).rejects.toMatchObject({
+    code: "invalid_request",
+    status: 0,
+  });
+  await expect(
+    api.beginSubscription("org%2Fslash", "subscription-ref-17", "pro", selector),
+  ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  await expect(
+    api.cancelSubscription("org?query", "cancel-ref-17", target, selector),
+  ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  await expect(
+    api.changeSubscriptionPlan("org#fragment", "plan-ref-17", "pro", target, selector),
+  ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  expect(seen).toHaveLength(0);
+});
+
+test("Hosted plan change confirmation uses only its closed existing PATCH body and receipt", async () => {
+  const selector = "c".repeat(64);
+  const target = `sra_${"d".repeat(64)}`;
+  const seen = transport(() =>
+    Response.json(
+      {
+        planChange: {
+          state: "verified",
+          subscriptionRef: target,
+          pendingChange: {
+            planKey: "team-next",
+            pricingRevision: "rev_2026-10",
+            effectiveAt: "2026-11-01T00:00:00.000Z",
+          },
+        },
+      },
+      { status: 200 },
+    ),
+  );
+  expect(
+    await client().changeSubscriptionPlan("org-17", "plan-ref-17", "team-next", target, selector),
+  ).toEqual({
+    state: "verified",
+    subscriptionRef: target,
+    pendingChange: {
+      planKey: "team-next",
+      pricingRevision: "rev_2026-10",
+      effectiveAt: "2026-11-01T00:00:00.000Z",
+    },
+  });
+  expect(seen[0]?.method).toBe("PATCH");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.headers.get("Takoserver-Billing-Continuation")).toBe(
+    `hosted-browser-v1.${selector}`,
+  );
+  expect(seen[0]?.headers.has("authorization")).toBe(false);
+  expect(await seen[0]?.json()).toEqual({
+    reference: "plan-ref-17",
+    planKey: "team-next",
+    expectedSubscriptionRef: target,
+  });
+});
+
+test("Hosted-only plan-change method refuses a missing or malformed selector before fetch", async () => {
+  const seen = transport(() => Response.json({}));
+  const api = client();
+  await expect(
+    api.changeSubscriptionPlan(
+      "org-17",
+      "plan-ref-17",
+      "team-next",
+      `sra_${"d".repeat(64)}`,
+      undefined as unknown as string,
+    ),
+  ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  await expect(
+    api.changeSubscriptionPlan(
+      "org-17",
+      "plan-ref-17",
+      "team-next",
+      `sra_${"d".repeat(64)}`,
+      `${"c".repeat(64)}\n`,
+    ),
+  ).rejects.toMatchObject({ code: "invalid_request", status: 0 });
+  expect(seen).toHaveLength(0);
+});
+
 test("usage summary refuses unknown, foreign or invalid units and utilization instead of showing zero", async () => {
   const valid = {
     organizationId: org,
@@ -354,6 +1048,40 @@ test("wallet rejects numeric, unsafe or nonconserving money responses", async ()
   await expect(client().wallet(org)).rejects.toMatchObject({ code: "invalid_response" });
 });
 
+test("Hosted selection wallet uses a raw finite Org segment, shared cookie, and no bearer token", async () => {
+  const organizationId = "org:17";
+  const wallet = {
+    organizationId,
+    currency: "USD",
+    settledMicros: "10000000",
+    heldMicros: "0",
+    availableMicros: "10000000",
+    entries: [],
+  };
+  const seen = transport(() => Response.json({ wallet }));
+  expect(await client().hostedBillingSelectionWallet(organizationId)).toEqual({ wallet });
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe("/v1/organizations/org:17/wallet");
+  expect(seen[0]?.method).toBe("GET");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.cache).toBe("no-store");
+  expect(seen[0]?.headers.has("authorization")).toBe(false);
+
+  const ordinary = transport(() => Response.json({ wallet }));
+  await client().wallet(organizationId);
+  expect(new URL(ordinary[0]?.url ?? origin).pathname).toBe("/v1/organizations/org%3A17/wallet");
+
+  let sent = 0;
+  transport(() => {
+    sent += 1;
+    return Response.json({ wallet });
+  });
+  for (const invalid of ["org/a", "org?17", "org#17", "org%17", "org:17\n"])
+    await expect(client().hostedBillingSelectionWallet(invalid)).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+  expect(sent).toBe(0);
+});
+
 function client(onSessionLost: () => void = () => undefined) {
   return createApi({ origin, token: () => "session", onSessionLost });
 }
@@ -603,6 +1331,50 @@ test("canonical subscription read accepts the finalized two-tier hosted plan tab
   expect(await client().subscription(org)).toEqual({ subscription: null, planTable });
 });
 
+test("Hosted selection subscription read validates colon Org and remains cookie-only", async () => {
+  const organizationId = "org:17";
+  const planTable = finalizedHostedPlanTable();
+  const capabilities = {
+    contractVersion: "hosted-billing-v1",
+    topUps: true,
+    subscriptionStart: true,
+    subscriptionCancellation: true,
+    subscriptionPlanChange: true,
+  };
+  const seen = transport(() =>
+    Response.json({ subscription: null, planTable, billingCapabilities: capabilities }),
+  );
+  expect(await client().hostedBillingSelectionSubscription(organizationId)).toEqual({
+    subscription: null,
+    planTable,
+    billingCapabilities: capabilities,
+  });
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe(
+    "/v1/organizations/org:17/payments/subscription",
+  );
+  expect(seen[0]?.method).toBe("GET");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.cache).toBe("no-store");
+  expect(seen[0]?.headers.has("authorization")).toBe(false);
+
+  const ordinary = transport(() => Response.json({ subscription: null, planTable }));
+  await client().subscription(organizationId);
+  expect(new URL(ordinary[0]?.url ?? origin).pathname).toBe(
+    "/v1/organizations/org%3A17/payments/subscription",
+  );
+
+  let sent = 0;
+  transport(() => {
+    sent += 1;
+    return Response.json({ subscription: null, planTable });
+  });
+  for (const invalid of ["org/a", "org?17", "org#17", "org%17", "org:17\n"])
+    await expect(client().hostedBillingSelectionSubscription(invalid)).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+  expect(sent).toBe(0);
+});
+
 test("canonical subscription read validates every paid row and rejects extra tiers", async () => {
   const planTable = finalizedHostedPlanTable();
   const invalidRows = [
@@ -662,6 +1434,9 @@ test("subscription Checkout uses the selected configured key and preserves statu
       url: "https://checkout.stripe.com/c/pay/test",
     },
   });
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe(
+    "/v1/organizations/org%2Fexample%3Fx%3D1%23%25/payments/subscription",
+  );
   expect(await seen[0]?.json()).toEqual({
     reference: "checkout-ref-1",
     planKey: "configured-subscription",

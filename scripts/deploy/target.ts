@@ -99,6 +99,8 @@ export interface DeployTarget {
   /** Optional whole-Host source-only maintenance profile for an exact pending schema wave. */
   /** Code-owned Root RP profile selection only; never registration/readiness authority. */
   readonly auth103NativeProfile?: "root-shared-auth-staging-v1";
+  /** Explicit optional supplier selection for canonical Hosted TEST browser billing. */
+  readonly hostedBrowserBillingRpc?: "hosted-staging-v1";
   readonly schemaMaintenanceMode?:
     | "pre-0058-quiesced"
     | "pre-v2-0088-quiesced"
@@ -413,6 +415,7 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "integrationE2eCredentialAuthority",
   "artifactBlobIoMode",
   "auth103NativeProfile",
+  "hostedBrowserBillingRpc",
   "schemaMaintenanceMode",
   "moneyCutoverWriterPolicy",
   "moneyCutoverWriterEpoch",
@@ -585,6 +588,7 @@ export function parseDeployTarget(
     ...(value.takoformV2 === undefined ? {} : { takoformV2: takoformV2(value.takoformV2) }),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
     ...auth103NativeProfile(value.auth103NativeProfile),
+    ...hostedBrowserBillingRpc(value.hostedBrowserBillingRpc),
     ...schemaMaintenanceMode(value.schemaMaintenanceMode),
     ...(value.moneyCutoverWriterPolicy === undefined
       ? {}
@@ -677,6 +681,17 @@ export function parseDeployTarget(
   }
   if (target.auth103NativeProfile !== undefined && environment !== "integration")
     throw preflightError("Root shared Auth103 native profile is integration-only");
+  if (
+    target.hostedBrowserBillingRpc !== undefined &&
+    (environment !== "integration" ||
+      target.auth103NativeProfile !== "root-shared-auth-staging-v1" ||
+      target.hostedBilling?.selector !== "canonical-test" ||
+      target.hostedBilling.stripeMode !== "test")
+  ) {
+    throw preflightError(
+      "Hosted browser billing RPC requires integration, Root shared Auth103 and canonical Hosted TEST billing",
+    );
+  }
   if (target.schemaMaintenanceMode === "pre-auth103-quiesced" && environment !== "integration") {
     throw preflightError("Auth103 source maintenance is integration-only");
   }
@@ -1810,6 +1825,15 @@ function auth103NativeProfile(value: unknown): {
   if (value !== "root-shared-auth-staging-v1")
     throw preflightError("deploy target Auth103 native profile is unsupported");
   return { auth103NativeProfile: value };
+}
+
+function hostedBrowserBillingRpc(value: unknown): {
+  readonly hostedBrowserBillingRpc?: "hosted-staging-v1";
+} {
+  if (value === undefined) return {};
+  if (value !== "hosted-staging-v1")
+    throw preflightError("deploy target Hosted browser billing RPC selector is unsupported");
+  return { hostedBrowserBillingRpc: value };
 }
 
 function schemaMaintenanceMode(value: unknown): {

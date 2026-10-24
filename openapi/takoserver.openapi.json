@@ -21,6 +21,12 @@
         "type": "http",
         "scheme": "bearer",
         "description": "A session secret, an organization API key, a tenant-run Space-scoped token, a resource-scoped token, or a purpose-specific operator assertion, depending on the route."
+      },
+      "serverSharedSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-takoserver_shared_session",
+        "description": "The original Server RP session cookie, when that receiver is mounted. Requires the exact configured console Origin on every request. An explicit Authorization header selects that credential, even if invalid. Without it, legacy and shared session cookies together are ambiguous and refused. A selected legacy cookie is never retried as a shared session. It is not a Bearer token, Hosted/issuer cookie, or Org API key. The business request itself checks current Organization ownership; a prior GET is not a grant."
       }
     },
     "schemas": {
@@ -237,6 +243,349 @@
                 ]
               }
             }
+          }
+        }
+      },
+      "PrepareHostedBrowserBillingContinuationRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "amountMinor",
+              "checkoutConsent"
+            ],
+            "properties": {
+              "kind": {
+                "const": "topup"
+              },
+              "amountMinor": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "checkoutConsent": {
+                "const": "interactive-checkout"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "planKey",
+              "consent"
+            ],
+            "properties": {
+              "kind": {
+                "const": "start"
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+              },
+              "consent": {
+                "const": "subscription-checkout"
+              },
+              "reconcileOriginalConsent": {
+                "type": "string",
+                "enum": [
+                  "retry-original-subscription",
+                  "check-original-subscription"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "consent"
+            ],
+            "properties": {
+              "kind": {
+                "const": "cancel"
+              },
+              "consent": {
+                "const": "cancel-subscription"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "planKey",
+              "consent"
+            ],
+            "properties": {
+              "kind": {
+                "const": "change-plan"
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$"
+              },
+              "consent": {
+                "const": "change-subscription-plan"
+              }
+            }
+          }
+        ]
+      },
+      "HostedBrowserBillingContinuationOperation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "method",
+              "path",
+              "body"
+            ],
+            "properties": {
+              "action": {
+                "const": "topup"
+              },
+              "method": {
+                "const": "POST"
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^/v1/organizations/[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}/wallet/checkout$"
+              },
+              "body": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "reference",
+                  "amountMinor"
+                ],
+                "properties": {
+                  "reference": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128,
+                    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                    "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+                  },
+                  "amountMinor": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "method",
+              "path",
+              "body"
+            ],
+            "properties": {
+              "action": {
+                "const": "subscription-start"
+              },
+              "method": {
+                "const": "POST"
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^/v1/organizations/[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}/payments/subscription$"
+              },
+              "body": {
+                "$ref": "#/components/schemas/BeginSubscriptionRequest"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "method",
+              "path",
+              "body"
+            ],
+            "properties": {
+              "action": {
+                "const": "cancel"
+              },
+              "method": {
+                "const": "PATCH"
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^/v1/organizations/[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}/payments/subscription$"
+              },
+              "body": {
+                "$ref": "#/components/schemas/ChangeSubscriptionRequest"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "action",
+              "method",
+              "path",
+              "body"
+            ],
+            "properties": {
+              "action": {
+                "const": "plan-change"
+              },
+              "method": {
+                "const": "PATCH"
+              },
+              "path": {
+                "type": "string",
+                "pattern": "^/v1/organizations/[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}/payments/subscription$"
+              },
+              "body": {
+                "$ref": "#/components/schemas/SubscriptionPlanChangeRequest"
+              }
+            }
+          }
+        ]
+      },
+      "HostedBrowserBillingContinuation": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "contractVersion",
+              "continuationRef",
+              "kind",
+              "workspaceId",
+              "workspaceRef",
+              "organizationId",
+              "operation",
+              "phase"
+            ],
+            "properties": {
+              "contractVersion": {
+                "const": "hosted-browser-v1"
+              },
+              "continuationRef": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Opaque Hosted browser continuation selector."
+              },
+              "kind": {
+                "const": "view"
+              },
+              "workspaceId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "workspaceRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+              },
+              "organizationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "operation": {
+                "type": "null"
+              },
+              "phase": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "contractVersion",
+              "continuationRef",
+              "kind",
+              "workspaceId",
+              "workspaceRef",
+              "organizationId",
+              "operation",
+              "phase"
+            ],
+            "properties": {
+              "contractVersion": {
+                "const": "hosted-browser-v1"
+              },
+              "continuationRef": {
+                "type": "string",
+                "minLength": 64,
+                "maxLength": 64,
+                "pattern": "^[0-9a-f]{64}$",
+                "description": "Opaque Hosted browser continuation selector."
+              },
+              "kind": {
+                "const": "payment"
+              },
+              "workspaceId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "workspaceRef": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+              },
+              "organizationId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              "operation": {
+                "$ref": "#/components/schemas/HostedBrowserBillingContinuationOperation"
+              },
+              "phase": {
+                "type": "string",
+                "enum": [
+                  "prepared",
+                  "dispatch-started",
+                  "outcome-recorded"
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "HostedBrowserBillingContinuationResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "continuation"
+        ],
+        "properties": {
+          "continuation": {
+            "$ref": "#/components/schemas/HostedBrowserBillingContinuation"
           }
         }
       },
@@ -4656,7 +5005,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/ai/models": {
@@ -4860,7 +5217,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "get": {
         "summary": "List the organization's live API keys",
@@ -4868,7 +5233,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/worker-endpoint-origin-reservations/{reservationId}": {
@@ -5552,6 +5925,14 @@
               "pattern": "^(?![\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff])(?![\\s\\S]*[/\\u0000-\\u001f\\u007f-\\u009f])(?![\\s\\S]*[\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]$)[\\s\\S]+$"
             }
           }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -5562,7 +5943,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/execution-evidence": {
@@ -5674,7 +6063,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual": {
@@ -5818,7 +6215,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/artifact-consumer-repairs/{deploymentId}": {
@@ -5907,7 +6312,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "post": {
         "summary": "Apply one exact provider-backed artifact-consumer repair plan",
@@ -6025,7 +6438,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": {
@@ -6035,7 +6456,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "post": {
         "summary": "Plan a migration against an exact commercial reservation",
@@ -6043,7 +6472,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}": {
@@ -6053,7 +6490,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute": {
@@ -6063,7 +6508,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover": {
@@ -6073,7 +6526,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback": {
@@ -6083,7 +6544,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel": {
@@ -6093,7 +6562,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/attachments": {
@@ -6103,7 +6580,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "post": {
         "summary": "Resolve and create a Resource Attachment",
@@ -6111,7 +6596,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/attachments/{attachmentId}": {
@@ -6121,7 +6614,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "delete": {
         "summary": "Delete one Resource Attachment",
@@ -6129,7 +6630,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/operations": {
@@ -6139,7 +6648,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/api-keys/{apiKeyId}": {
@@ -6149,7 +6666,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/wallet": {
@@ -6211,6 +6736,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6305,6 +6838,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6367,6 +6908,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6494,6 +7043,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6577,6 +7134,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "patch": {
@@ -6678,6 +7243,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6751,6 +7324,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6854,6 +7435,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6949,6 +7538,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7043,6 +7640,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7145,6 +7750,14 @@
         },
         "x-required-scopes": [
           "wallet:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7259,6 +7872,14 @@
         },
         "x-required-scopes": [
           "wallet:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7343,6 +7964,14 @@
         ],
         "x-required-scopes": [
           "wallet:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7437,6 +8066,14 @@
         ],
         "x-required-scopes": [
           "usage:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "post": {
@@ -7528,6 +8165,14 @@
         },
         "x-required-scopes": [
           "usage:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7547,7 +8192,7 @@
             }
           },
           "400": {
-            "description": "Invalid amount, reference, fields or configured bounds",
+            "description": "Invalid amount, reference, fields, configured bounds, or Hosted continuation selector",
             "content": {
               "application/json": {
                 "schema": {
@@ -7597,7 +8242,7 @@
             }
           },
           "503": {
-            "description": "Processor, schema or readback unavailable",
+            "description": "Processor, schema, readback, or Hosted continuation supplier unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -7617,6 +8262,16 @@
               "minLength": 1,
               "maxLength": 128
             }
+          },
+          {
+            "name": "Takoserver-Billing-Continuation",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^hosted-browser-v1\\.[0-9a-f]{64}$"
+            },
+            "description": "Optional Hosted browser continuation selector. When present, this request uses the Hosted continuation branch and must not fall back to the independent HTTP lane. Duplicate, malformed, or unsupported values are rejected."
           }
         ],
         "requestBody": {
@@ -7631,6 +8286,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7650,7 +8313,7 @@
             }
           },
           "400": {
-            "description": "Malformed purchase reference",
+            "description": "Malformed purchase reference or Hosted continuation selector",
             "content": {
               "application/json": {
                 "schema": {
@@ -7700,7 +8363,7 @@
             }
           },
           "503": {
-            "description": "Processor or durable receipt unavailable",
+            "description": "Processor, durable receipt, or Hosted continuation supplier unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -7732,10 +8395,220 @@
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
               "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
             }
+          },
+          {
+            "name": "Takoserver-Billing-Continuation",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^hosted-browser-v1\\.[0-9a-f]{64}$"
+            },
+            "description": "Optional Hosted browser continuation selector. When present, this request uses the Hosted continuation branch and must not fall back to the independent HTTP lane. Duplicate, malformed, or unsupported values are rejected."
           }
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
+      }
+    },
+    "/v1/billing/hosted-continuations/{continuationRef}": {
+      "get": {
+        "summary": "Read the exact Hosted-selected Workspace billing continuation for the signed-in Server user",
+        "description": "Requires the actual Takoserver shared RP session and exact configured Console Origin. The current request's canonical account and current Organization owner permission are checked before selected-operation details are returned. This read-only view performs no billing action. A missing Hosted continuation supplier is unavailable; the response never substitutes a locally reconstructed operation.",
+        "responses": {
+          "200": {
+            "description": "Closed selected-Workspace continuation metadata and its exact original operation, if any",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostedBrowserBillingContinuationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed Hosted continuation reference",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authenticated Server shared RP session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current Workspace or Hosted authorization denies this request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization is absent or not currently owned by this user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Hosted continuation is unknown, missing, or its supplier/current billing authority or matching account/session/Workspace scope is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "continuationRef",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "Opaque Hosted browser continuation selector."
+            }
+          }
+        ],
+        "security": [
+          {
+            "serverSharedSession": []
+          }
+        ]
+      },
+      "post": {
+        "summary": "Prepare an explicit Hosted-selected Workspace billing continuation",
+        "description": "Requires the actual Takoserver shared RP session and exact configured Console Origin. The closed choice contains only the user's action, amount or plan selection, and explicit consent. The Server resolves the current account, Workspace, Organization, and subscription target from its live request; the browser supplies no account/scope, target, original reference, or command key. The operation prepares or returns the same Hosted continuation metadata without dispatching a billing effect. If the result is unknown, read the same selector; do not generate another selector or retry under a new key.",
+        "responses": {
+          "200": {
+            "description": "Prepared or already-prepared continuation metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostedBrowserBillingContinuationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed selector or closed Hosted continuation choice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authenticated Server shared RP session required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Current Workspace or Hosted authorization denies this preparation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization is absent or not currently owned by this user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The same selector conflicts with another retained original choice",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Hosted continuation supplier, current billing authority, or matching account/session/Workspace scope unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "continuationRef",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 64,
+              "maxLength": 64,
+              "pattern": "^[0-9a-f]{64}$",
+              "description": "Opaque Hosted browser continuation selector."
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PrepareHostedBrowserBillingContinuationRequest"
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7746,7 +8619,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/payments/stripe/webhook": {
@@ -7914,6 +8795,16 @@
               }
             }
           },
+          "400": {
+            "description": "Malformed Hosted continuation selector",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "401": {
             "description": "Authentication required",
             "content": {
@@ -7945,7 +8836,7 @@
             }
           },
           "503": {
-            "description": "Billing schema or processor unavailable",
+            "description": "Billing schema, processor, or Hosted continuation supplier unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -7965,10 +8856,28 @@
               "minLength": 1,
               "maxLength": 128
             }
+          },
+          {
+            "name": "Takoserver-Billing-Continuation",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^hosted-browser-v1\\.[0-9a-f]{64}$"
+            },
+            "description": "Optional Hosted browser continuation selector. When present, this request uses the Hosted continuation branch and must not fall back to the independent HTTP lane. Duplicate, malformed, or unsupported values are rejected."
           }
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "post": {
@@ -8064,7 +8973,7 @@
             }
           },
           "400": {
-            "description": "Invalid reference or configured plan key",
+            "description": "Invalid reference, configured plan key, or Hosted continuation selector",
             "content": {
               "application/json": {
                 "schema": {
@@ -8114,7 +9023,7 @@
             }
           },
           "503": {
-            "description": "Processor unavailable",
+            "description": "Processor or Hosted continuation supplier unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -8134,6 +9043,16 @@
               "minLength": 1,
               "maxLength": 128
             }
+          },
+          {
+            "name": "Takoserver-Billing-Continuation",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^hosted-browser-v1\\.[0-9a-f]{64}$"
+            },
+            "description": "Optional Hosted browser continuation selector. When present, this request uses the Hosted continuation branch and must not fall back to the independent HTTP lane. Duplicate, malformed, or unsupported values are rejected."
           }
         ],
         "requestBody": {
@@ -8148,6 +9067,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "patch": {
@@ -8227,7 +9154,7 @@
             }
           },
           "400": {
-            "description": "Invalid request",
+            "description": "Invalid request or Hosted continuation selector",
             "content": {
               "application/json": {
                 "schema": {
@@ -8277,7 +9204,7 @@
             }
           },
           "503": {
-            "description": "Processor unavailable",
+            "description": "Processor or Hosted continuation supplier unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -8297,6 +9224,16 @@
               "minLength": 1,
               "maxLength": 128
             }
+          },
+          {
+            "name": "Takoserver-Billing-Continuation",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^hosted-browser-v1\\.[0-9a-f]{64}$"
+            },
+            "description": "Optional Hosted browser continuation selector. When present, this request uses the Hosted continuation branch and must not fall back to the independent HTTP lane. Duplicate, malformed, or unsupported values are rejected."
           }
         ],
         "requestBody": {
@@ -8318,6 +9255,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -8337,7 +9282,7 @@
             }
           },
           "400": {
-            "description": "Invalid kind, encoded reference or query parameter",
+            "description": "Invalid kind, encoded reference, query parameter, or Hosted continuation selector",
             "content": {
               "application/json": {
                 "schema": {
@@ -8377,7 +9322,7 @@
             }
           },
           "503": {
-            "description": "Saved command schema or proof unavailable",
+            "description": "Saved command schema, proof, or Hosted continuation supplier unavailable",
             "content": {
               "application/json": {
                 "schema": {
@@ -8422,10 +9367,28 @@
               "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
               "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
             }
+          },
+          {
+            "name": "Takoserver-Billing-Continuation",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^hosted-browser-v1\\.[0-9a-f]{64}$"
+            },
+            "description": "Optional Hosted browser continuation selector. When present, this request uses the Hosted continuation branch and must not fall back to the independent HTTP lane. Duplicate, malformed, or unsupported values are rejected."
           }
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
