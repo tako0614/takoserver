@@ -118,6 +118,8 @@ const dispatched = new Set<string>();
 const sessions = new Map<string, TopUpSession>();
 const processor = { create: 0, read: 0, recover: 0 };
 const prepared = new Map<string, ReturnType<typeof originalFor>>();
+const TOP_UP_COMMAND_READBACK_SQL =
+  "SELECT org_id, reference, state, command_json, dispatched_at FROM stripe_top_up_commands";
 const hostedFixtureState: {
   callback: { continuationRef: string; scope: HostedBrowserBillingScope; choice: unknown } | null;
   callbackAttempted: boolean;
@@ -276,6 +278,11 @@ export class Hosted extends WorkerEntrypoint<Env> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/test/topup-command-readback") {
+      return Response.json(
+        await env.AUTH_DB.withSession("first-primary").prepare(TOP_UP_COMMAND_READBACK_SQL).all(),
+      );
+    }
     if (url.pathname === "/test/processor") return Response.json(processor);
     if (url.pathname === "/test/hosted") return Response.json(await env.HOSTED.fixtureState());
     const testOrigin = request.headers.get("x-test-origin");

@@ -485,17 +485,17 @@ async function fixture() {
         return (await response.json()) as { create: number; read: number; recover: number };
       },
       async commands() {
-        return database
-          .prepare(
-            "SELECT org_id, reference, state, command_json, dispatched_at FROM stripe_top_up_commands",
-          )
-          .all<{
+        const response = await send("/test/topup-command-readback", { method: "POST" });
+        if (!response.ok) throw new Error(`native command readback failed: ${response.status}`);
+        return (await response.json()) as {
+          results: {
             org_id: string;
             reference: string;
             state: string;
             command_json: string;
             dispatched_at: string | null;
-          }>();
+          }[];
+        };
       },
     };
   } catch (error) {
