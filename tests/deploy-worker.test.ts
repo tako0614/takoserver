@@ -1902,6 +1902,82 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
+  test("Worker owner gate receives only an exact selected test worker count", async () => {
+    const previous = process.env.TAKOSERVER_TEST_WORKERS;
+    try {
+      for (const selected of [undefined, "4", "99"]) {
+        if (selected === undefined) delete process.env.TAKOSERVER_TEST_WORKERS;
+        else process.env.TAKOSERVER_TEST_WORKERS = selected;
+        const current = fixture({ diff: "src/auth.ts\n", selectedTarget: v2Target });
+        const gateReached = new Error("owner gate intercepted");
+        let gateEnvironment: Readonly<Record<string, string>> | undefined;
+        const result = await runWorker(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          v2Target,
+          {
+            ...current,
+            run: async (command, options) => {
+              if (command.join(" ") === "bun run check") {
+                gateEnvironment = options?.env;
+                throw gateReached;
+              }
+              expect(options?.env?.TAKOSERVER_TEST_WORKERS).toBeUndefined();
+              return current.run(command, options);
+            },
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "fixture-token" },
+            integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
+          },
+        ).catch((error: unknown) => error);
+        expect(result).toBe(gateReached);
+        expect(gateEnvironment).toEqual(
+          selected === undefined ? undefined : { TAKOSERVER_TEST_WORKERS: selected },
+        );
+      }
+    } finally {
+      if (previous === undefined) delete process.env.TAKOSERVER_TEST_WORKERS;
+      else process.env.TAKOSERVER_TEST_WORKERS = previous;
+    }
+  });
+
+  test("Worker owner gate rejects malformed test worker counts before child execution", async () => {
+    const previous = process.env.TAKOSERVER_TEST_WORKERS;
+    try {
+      for (const selected of ["0", "01", "100", "4 ", "-1", "secret-value"]) {
+        process.env.TAKOSERVER_TEST_WORKERS = selected;
+        const current = fixture({ diff: "src/auth.ts\n", selectedTarget: v2Target });
+        const failure = await runWorker(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action: "apply",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          v2Target,
+          {
+            ...current,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "fixture-token" },
+            integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
+          },
+        ).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(DeployError);
+        expect((failure as DeployError).phase).toBe("preflight");
+        expect((failure as Error).message).not.toContain(selected);
+        expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
+        expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.TAKOSERVER_TEST_WORKERS;
+      else process.env.TAKOSERVER_TEST_WORKERS = previous;
+    }
+  });
+
   test("integration authority status uses the selected Wrangler for default remote D1 readers", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-private-wrangler-"));
     const authorityTarget = {

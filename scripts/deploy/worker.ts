@@ -1033,7 +1033,19 @@ export async function runWorker(
       );
     }
 
-    await checked(run, "preflight", "scoped owner gate `bun run check`", ["bun", "run", "check"]);
+    const selectedTestWorkers = process.env.TAKOSERVER_TEST_WORKERS;
+    if (selectedTestWorkers !== undefined && !/^[1-9][0-9]?$/u.test(selectedTestWorkers)) {
+      throw preflightError("TAKOSERVER_TEST_WORKERS must be a worker count from 1 to 99");
+    }
+    await checked(
+      run,
+      "preflight",
+      "scoped owner gate `bun run check`",
+      ["bun", "run", "check"],
+      selectedTestWorkers === undefined
+        ? undefined
+        : { env: { TAKOSERVER_TEST_WORKERS: selectedTestWorkers } },
+    );
     // The owner gate can outlive a Wrangler OAuth access token (about one hour;
     // Wrangler refreshes only an already expired token). No Cloudflare read or
     // write after the gate reuses a bearer resolved before it.
@@ -1876,8 +1888,9 @@ async function checked(
   phase: DeployPhase,
   description: string,
   command: readonly string[],
+  options?: { readonly env: Readonly<Record<string, string>> },
 ): Promise<string> {
-  const result = await run(command);
+  const result = options === undefined ? await run(command) : await run(command, options);
   if (result.exitCode !== 0) {
     throw new DeployError(
       phase,
