@@ -1601,9 +1601,11 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/financial0104-schema-shape.ts",
         "scripts/deploy/root0105-recipe.ts",
         "scripts/deploy/root0106-recipe.ts",
+        "scripts/deploy/root0107-recipe.ts",
         "scripts/deploy/post-auth103-recipes.ts",
         "src/root-0105-org-capture-triggers.ts",
         "src/takoform-v2/forward-worker-native-schema.ts",
+        "src/shared-app-staging-adoption.ts",
         "scripts/deploy/schema-money-unit-cutover.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
@@ -1649,6 +1651,10 @@ export const DEPLOY_CONTRACT = {
           "Separate integration-only 0106 selection then appends the pinned Forward native custody " +
           "recipe after exact105; its guarded import requires the exact predecessor native catalog " +
           "and finishes at exact106 ledger, schema and native catalog with another once-only dispatch. " +
+          "Separate integration-only 0107 selection adds the exact pinned shared staging tables " +
+          "and old-writer fences after exact106; it must finish at the exact107 ledger, full schema " +
+          "and physical FK/check state with its own once-only dispatch. It does not adopt old rows " +
+          "or prove the incumbent staging target and old deployed writers drained. " +
           "Optional fresh-origin input: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
           "selects the existing protected custody locator reader only for integration 0093/0094. " +
           "The same money declaration then requires originalOrigin with the original exact six-field " +

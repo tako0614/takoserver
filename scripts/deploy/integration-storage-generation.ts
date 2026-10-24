@@ -947,12 +947,13 @@ async function verifyGeneratedStorageTarget(
       const complete = readMigrationArtifact(migrationDirectory);
       const applied = migrationState.applied.length;
       const chain =
-        applied === 104 || applied === 105 || applied === 106
+        applied === 104 || applied === 105 || applied === 106 || applied === 107
           ? readFinancial0104CanonicalMigrationSource(sourceRoot)
           : undefined;
       const canonical = chain ?? readAuth103CanonicalMigrationSource(sourceRoot);
       const canonicalDigest =
-        chain !== undefined && (applied === 104 || applied === 105 || applied === 106)
+        chain !== undefined &&
+        (applied === 104 || applied === 105 || applied === 106 || applied === 107)
           ? chain.artifactFor(applied).digest
           : canonical.artifact.digest;
       try {

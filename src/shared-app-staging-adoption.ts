@@ -57,7 +57,7 @@ const legacyOriginForName = (origin: string, name: string): string => {
     .join(" OR ")})`;
 };
 
-/** Source candidate for the reserved 0107 slot. It is deliberately unregistered and unapplied. */
+/** Physical staging DDL pinned by Root 0107; this module does not apply it or grant runtime selection. */
 export const SHARED_APP_STAGING_PHYSICAL_DDL: readonly string[] = Object.freeze([
   `CREATE TABLE shared_app_staging_assignments (
     incarnation TEXT PRIMARY KEY CHECK(length(incarnation)=32 AND incarnation NOT GLOB '*[^0-9a-f]*'),

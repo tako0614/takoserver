@@ -3274,7 +3274,7 @@ export function readAuditedMigrationSourcePrefix100(
 /** Existing consumers retain their exact audited100 projection. The ONLY
  * supported source extension is machine-equal to the fixed Root101/102/103
  * recipes, optionally followed by an exact prefix of the Root post-Auth103
- * chain (Financial0104, Root0105, Forward0106); neither ordinary apply nor a fresh
+ * chain (Financial0104, Root0105, Forward0106, Shared0107); neither ordinary apply nor a fresh
  * payload inherits that suffix. */
 export function readCurrentAuditedMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
@@ -3290,7 +3290,8 @@ export function readCurrentAuditedMigrationSourceArtifact(
     (artifact.files.length !== 103 &&
       artifact.files.length !== 104 &&
       artifact.files.length !== 105 &&
-      artifact.files.length !== 106) ||
+      artifact.files.length !== 106 &&
+      artifact.files.length !== 107) ||
     !isPostAuth103RecipeSuffix(artifact.files.slice(103)) ||
     artifact.files.slice(100, 103).some((file, index) => {
       const expected = owner.files[index];
