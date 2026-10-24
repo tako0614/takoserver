@@ -2107,6 +2107,8 @@ describe("durable deferred Takoform operations", () => {
   });
 
   test("holds an executed update receipt until its exact logical revision is repaired", async () => {
+    // This tests the revision fence, independent of a wall-clock execution lease expiring.
+    const fixtureNow = Date.parse("2026-09-01T00:00:00.000Z");
     const providerEntered = deferred();
     const releaseProvider = deferred();
     const memory = new InMemoryTakoformResourceDriver();
@@ -2125,7 +2127,7 @@ describe("durable deferred Takoform operations", () => {
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
     };
-    const opened = persistentHarness(undefined, driver).open();
+    const opened = persistentHarness(() => new Date(fixtureNow), driver).open();
     const current = await createNow(opened.host, "update-fence");
     const desired = desiredResource("update-fence", "provider-update");
     const review = await prepareReview(opened.host, desired, {
