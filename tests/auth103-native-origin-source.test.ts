@@ -42,6 +42,10 @@ import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 const root = resolve(import.meta.dir, "..");
 const hash = (value: string): `sha256:${string}` =>
   `sha256:${createHash("sha256").update(value).digest("hex")}`;
+const fresh9dOrigin =
+  "https://integration-root-ga-9d9c84f4281649c884e0579d93e5c926.shoutatomiyama0614.workers.dev";
+const old8732Origin =
+  "https://integration-money-8732b77a789fd563406269261bf09e71.shoutatomiyama0614.workers.dev";
 const target = {
   kind: "takoserver.deploy-target@v2",
   environment: "integration",
@@ -442,20 +446,21 @@ test("artifact construction refuses alternating run and config accessors without
   }
 });
 
-test("an explicit Root profile refuses absent source and an ordinary Host cannot activate its transport", async () => {
+test("the selected fresh Root origin reaches source qualification while old and foreign origins refuse", async () => {
   const directory = mkdtempSync(resolve(tmpdir(), "auth103-profile-source-"));
   try {
     mkdirSync(resolve(directory, "migrations"));
+    const selected = {
+      ...target,
+      publicOrigin: fresh9dOrigin,
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+    } satisfies DeployTarget;
     let failure: unknown;
     try {
       prepareAuth103NativeBuildSource({
         sourceRoot: directory,
         commit: "a".repeat(40),
-        target: {
-          ...target,
-          publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
-          auth103NativeProfile: "root-shared-auth-staging-v1",
-        },
+        target: selected,
       });
     } catch (error) {
       failure = error;
@@ -466,6 +471,16 @@ test("an explicit Root profile refuses absent source and an ordinary Host cannot
     expect(failure.message).toBe(
       "selected Auth103 profile requires its original canonical source registration",
     );
+    expect(SHARED_AUTH_STAGING_PROFILE.publicOrigin).toBe(fresh9dOrigin);
+    for (const publicOrigin of [old8732Origin, "https://foreign-auth.example.test"]) {
+      expect(() =>
+        prepareAuth103NativeBuildSource({
+          sourceRoot: directory,
+          commit: "a".repeat(40),
+          target: { ...selected, publicOrigin },
+        }),
+      ).toThrow("Auth103 selected profile must retain its actual Root staging origin");
+    }
     let transport: unknown;
     try {
       await captureAuth103NativeRpTransportInputs();

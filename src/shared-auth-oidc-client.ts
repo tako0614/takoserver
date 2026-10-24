@@ -6,7 +6,7 @@ export const SHARED_AUTH_STAGING_PROFILE = Object.freeze({
   environment: "staging",
   issuer: "https://auth-staging.takos.jp",
   publicOrigin:
-    "https://integration-money-8732b77a789fd563406269261bf09e71.shoutatomiyama0614.workers.dev",
+    "https://integration-root-ga-9d9c84f4281649c884e0579d93e5c926.shoutatomiyama0614.workers.dev",
   consoleOrigin: "https://takoserver-console-integration.shoutatomiyama0614.workers.dev",
   clientId: "takoserver-console-staging-v1",
 } as const);
