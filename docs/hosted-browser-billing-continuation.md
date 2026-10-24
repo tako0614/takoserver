@@ -113,18 +113,19 @@ Hosted retains its separate business/source guards.
 
 The reader requires an actual **Server** Shared RP Request. A Hosted account ID,
 its RP witness DATA, or an Organization read key cannot construct that Request
-or its Actor. The published one-argument native read contract below does not
-transport this owner-reader callable. A native Hosted composition must connect
-the owning current-user source explicitly; this module does not mount it or
-change the RPC contract. The existing Worker `wallet:read` transport and its
-selected private key binding remain separate from human read authorization.
+or its Actor. The ordinary one-argument native read remains separate from this source. The
+opt-in current-owner callback below transports only a request-scoped assertion,
+not the Request or its credentials. A native composition still needs an actual
+Server GET caller; creating a callback does not mount that caller. The existing
+Worker `wallet:read` transport and its selected private key binding remain
+separate from human read authorization.
 
 ## Published native business contract
 
 The optional operator-composed named Hosted entrypoint supplies:
 
 - `prepareBrowserBillingContinuation(lookup, liveServerSelection)`
-- `readBrowserBillingContinuation({continuationRef, canonicalAccountId})`
+- `readBrowserBillingContinuation({continuationRef, canonicalAccountId}, liveRead?)`
 - `claimBrowserBillingContinuation(lookup, liveServerAuthorization)`
 - `recordBrowserBillingContinuationOutcome({continuationRef, original, outcome})`
 
@@ -149,6 +150,60 @@ these methods from public HTTP or accepts a browser-provided authorization
 object. Server source does not import Hosted internals or its session store.
 No Cookie, raw grant, reusable user token or replacement billing key crosses
 this contract.
+
+## Request-scoped current-owner read callback
+
+The Server client keeps `read(lookup)` as the existing one-argument metadata
+read. Its opt-in `readWithCurrentOwner(lookup, ownerRead, originalRequest)` uses
+the same named RPC with an optional second native argument. The target exposes
+one prototype method:
+
+```ts
+assertReadCurrent(scope: HostedBrowserBillingScope): Promise<void>
+```
+
+`createFinancialHostedOwnerRead` and `createHostedBrowserBillingRpcClient` are
+available from `@takoserver/core/financial-request-origin` for the owning Worker
+composition. The general Node-capable package entry is not needed. The private
+target state is not a general callback registration interface.
+
+The target accepts only the module-owned `FinancialHostedOwnerRead` and its
+original Server GET Request. It binds the lookup's selector/account before
+awaiting and pins the first complete continuation scope. Each callback runs the
+actual same-Request Shared RP selection and Accounts Owner assertion. The
+underlying human assertion uses only the four ownership fields; the remaining
+continuation/source fields retain their separate Hosted-original meaning.
+Neither a structural lookalike nor a cloned Request can construct this source.
+
+The guarded client accepts positive `view` or `payment` DATA only after a
+successful callback for exactly the returned full scope. An older one-argument
+supplier that ignores the target cannot make that guarded read succeed. Missing,
+failed, incomplete or in-flight-disposed callbacks refuse; a callback failure
+observed by Root is retained even if the remote supplier catches it. A native release after
+the callback has completed closes later calls without erasing its completed
+scope observation. Explicit parent closure still refuses positive validation.
+Refusal DATA gives no permission.
+The wrapper closes in the client's `finally` and cannot authorize another HTTP
+Request or later Dashboard read. It returns no Actor, Cookie, token, reusable
+permission or payment grant.
+
+Hosted must await this assertion from its GET-only financial reader guard
+before and after the existing wallet/subscription requests, while preserving its
+own RP, Workspace and source checks. Hosted must propagate its own RPC failures,
+including a post-release stub rejection that cannot execute on Root; it must
+not catch that rejection and return successful facts from an earlier assertion.
+The native callback is not proof that those
+remote calls actually occurred or that a Hosted supplier followed that ordering;
+the paired implementation and its native regression remain required. These
+cross-service reads are not an atomic ownership snapshot.
+
+The existing Console metadata/receipt path continues to call `read(lookup)` and
+its existing local current-owner checks. This opt-in source does not introduce a
+new public HTTP route or default caller. Root owns the actual GET callsite using
+its selected Request/Shared RP/Accounts graph, and Hosted owns its counterpart
+and default composition. No default mount or native/live qualification follows
+from this source interface alone. Command preparation, final claim callbacks and
+all payment effect fences are unchanged.
 
 ## Currentness and one-way acceptance
 

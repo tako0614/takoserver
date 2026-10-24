@@ -1,4 +1,4 @@
-/** Original captures and guarded installed-source Auth readers, never NEW/consent permission. */
+/** Original captures and guarded Auth/Owner readers, never NEW/consent permission. */
 
 export type {
   FinancialAuthConsumerContext,
@@ -13,6 +13,20 @@ export {
   readWorkerRequestFinancialAuthConsumerContext,
   readWorkerRequestFinancialAuthConsumerPort,
 } from "./financial-auth-consumer.ts";
+export {
+  createHostedBrowserBillingRpcClient,
+  type HostedBrowserBillingLookup,
+  type HostedBrowserBillingRead,
+  type HostedBrowserBillingRpcClient,
+  type HostedBrowserBillingRpcSupplier,
+  type HostedBrowserLiveReadTarget,
+} from "./financial-hosted-browser-rpc.ts";
+export {
+  createFinancialHostedOwnerRead,
+  type FinancialHostedOwnerRead,
+  type FinancialHostedOwnerReadScope,
+  FinancialHostedOwnerReadUnavailable,
+} from "./financial-hosted-owner-read.ts";
 
 export type {
   WorkerRequestFinancialInputs,

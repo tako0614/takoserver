@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { createAccounts } from "../src/auth.ts";
 import {
+  assertFinancialHostedOwnerReadSource,
   createFinancialHostedOwnerRead,
   type FinancialHostedOwnerReadScope,
   FinancialHostedOwnerReadUnavailable,
@@ -233,6 +234,37 @@ test("scope values must be own data and accessors are never invoked", async () =
     FinancialHostedOwnerReadUnavailable,
   );
   expect(invoked).toBe(0);
+});
+
+test("native read source requires the actual GET Request and held account", async () => {
+  const f = await fixture();
+  const request = f.request();
+  const read = await createFinancialHostedOwnerRead({
+    request,
+    sharedAuth: f.sharedAuth,
+    accounts: f.accounts,
+    qualifiedConsoleOrigin: SESSION_TEST_CONSOLE,
+  });
+  expect(() =>
+    assertFinancialHostedOwnerReadSource(read, request, SESSION_TEST_ACCOUNT),
+  ).not.toThrow();
+  expect(() =>
+    assertFinancialHostedOwnerReadSource(read, request.clone(), SESSION_TEST_ACCOUNT),
+  ).toThrow(FinancialHostedOwnerReadUnavailable);
+  expect(() => assertFinancialHostedOwnerReadSource(read, request, "foreign-account")).toThrow(
+    FinancialHostedOwnerReadUnavailable,
+  );
+  expect(() =>
+    assertFinancialHostedOwnerReadSource(
+      { accountId: SESSION_TEST_ACCOUNT, assertCurrent: read.assertCurrent },
+      request,
+      SESSION_TEST_ACCOUNT,
+    ),
+  ).toThrow(FinancialHostedOwnerReadUnavailable);
+  request.headers.set("x-changed", "1");
+  expect(() => assertFinancialHostedOwnerReadSource(read, request, SESSION_TEST_ACCOUNT)).toThrow(
+    FinancialHostedOwnerReadUnavailable,
+  );
 });
 
 test("Request headers changed during the real observer await are refused", async () => {
