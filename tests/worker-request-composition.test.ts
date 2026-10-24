@@ -623,11 +623,14 @@ describe("official read-only Financial request origin", () => {
     const { inputs, runtime } = await f.consumers();
     const before = f.sessions.map((session) => session.queries.length);
     expect(Object.keys(financialRequestOrigin)).toEqual([
+      "FinancialHostedOwnerReadUnavailable",
       "assertFinancialAuthConsumerPort",
       "assertWorkerRequestFinancialAuthConsumerPort",
       "captureWorkerRequestFinancialAuthRpRequest",
       "captureWorkerRequestRetainedDirectOwnerSession",
       "captureWorkerRequestRetainedRpSession",
+      "createFinancialHostedOwnerRead",
+      "createHostedBrowserBillingRpcClient",
       "financialAuthConsumerSourceCurrentness",
       "loadWorkerRequestRetainedRpFinancialIdentityProofOriginal",
       "proveWorkerRequestRetainedRpFinancialIdentityOriginal",
