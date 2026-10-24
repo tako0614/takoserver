@@ -1600,8 +1600,10 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/financial0104-recipe.ts",
         "scripts/deploy/financial0104-schema-shape.ts",
         "scripts/deploy/root0105-recipe.ts",
+        "scripts/deploy/root0106-recipe.ts",
         "scripts/deploy/post-auth103-recipes.ts",
         "src/root-0105-org-capture-triggers.ts",
+        "src/takoform-v2/forward-worker-native-schema.ts",
         "scripts/deploy/schema-money-unit-cutover.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
@@ -1644,6 +1646,9 @@ export const DEPLOY_CONTRACT = {
           "Separate integration-only 0105 selection then appends only Root's exact pinned 0105 Org " +
           "capture recipe after that exact104 state and must end at the exact105 ledger, post105 shape, " +
           "Financial catalog and Root 0105 objects, with its own once-only dispatch record. " +
+          "Separate integration-only 0106 selection then appends the pinned Forward native custody " +
+          "recipe after exact105; its guarded import requires the exact predecessor native catalog " +
+          "and finishes at exact106 ledger, schema and native catalog with another once-only dispatch. " +
           "Optional fresh-origin input: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
           "selects the existing protected custody locator reader only for integration 0093/0094. " +
           "The same money declaration then requires originalOrigin with the original exact six-field " +

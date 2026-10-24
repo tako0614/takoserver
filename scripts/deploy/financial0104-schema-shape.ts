@@ -9,6 +9,14 @@ import {
   moneyCutoverStripeCustomerGuardDefinitions,
 } from "../../src/money-cutover-sql.ts";
 import { ROOT_0105_OBJECTS } from "../../src/root-0105-org-capture-triggers.ts";
+import {
+  forwardWorkerNativePredecessorReady,
+  forwardWorkerNativeSchemaReady,
+} from "../../src/takoform-v2/forward-worker-native-schema.ts";
+import {
+  V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_NAME,
+  V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_SQL,
+} from "../../src/takoform-v2/operation-generation-index.ts";
 import { applicationSchemaMatches } from "./application-schema-shape.ts";
 import { sqlLiteral } from "./d1.ts";
 import { preflightError } from "./errors.ts";
@@ -228,6 +236,85 @@ export function root0105CatalogPredicate(): string {
   )`;
 }
 
+const forward106ChangedTriggers = Object.freeze([
+  "queue_v2_batch_execution_send_guard",
+  "tf_v2_worker_cron_match_insert_guard",
+  "tf_v2_worker_native_deletion_presend_absence_guard",
+  "tf_v2_worker_native_deletion_send_guard",
+  "tf_v2_worker_native_deletion_stage_guard",
+  "tf_v2_worker_native_effect_insert_guard",
+]);
+
+/** The existing native recipe changes exactly six guards and adds one index. */
+export function compileRoot0106ImportShapes(
+  auth103: MigrationArtifact,
+  artifact104: MigrationArtifact,
+  artifact105: MigrationArtifact,
+  artifact106: MigrationArtifact,
+  profile: Financial0104Profile,
+) {
+  if (
+    artifact106.files.length !== 106 ||
+    artifact106.files
+      .slice(0, 105)
+      .some(
+        (file, index) =>
+          file.digest !== artifact105.files[index]?.digest ||
+          file.bytes !== artifact105.files[index]?.bytes,
+      )
+  )
+    throw preflightError("Root0106 shapes require the exact post-105 predecessor");
+  const at105 = compileRoot0105ImportShapes(auth103, artifact104, artifact105, profile);
+  const ordinary105 = compileAuth103NativeImportShapes(artifact105);
+  const ordinary106 = compileAuth103NativeImportShapes(artifact106);
+  const before = new Map(rows(ordinary105.postShape).map((row) => [key(row), row]));
+  const changed: ShapeRow[] = [];
+  const added: ShapeRow[] = [];
+  for (const row of rows(ordinary106.postShape)) {
+    const prior = before.get(key(row));
+    if (prior === undefined) added.push(row);
+    else if (canonicalJson(prior) !== canonicalJson(row)) changed.push(row);
+    before.delete(key(row));
+  }
+  if (
+    before.size !== 0 ||
+    canonicalJson(changed.map((row) => row.name).sort(binary)) !==
+      canonicalJson([...forward106ChangedTriggers]) ||
+    added.length !== 1 ||
+    added[0]?.type !== "index" ||
+    added[0]?.name !== V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_NAME ||
+    added[0]?.table !== "tf_v2_operations" ||
+    added[0]?.sql !== V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_SQL
+  )
+    throw preflightError("Root0106 shape delta differs from the native recipe");
+  const replacements = new Map(changed.map((row) => [key(row), row]));
+  const profileRows = rows(at105.postShape);
+  if (added.some((row) => profileRows.some((prior) => key(prior) === key(row))))
+    throw preflightError("Root0106 collides with a post-105 object");
+  return Object.freeze({
+    prefixShape: at105.postShape,
+    postShape:
+      profile === "ordinary"
+        ? ordinary106.postShape
+        : project(
+            [...profileRows.map((row) => replacements.get(key(row)) ?? row), ...added].sort(
+              byTypeName,
+            ),
+          ),
+    predecessorAuth103Catalog: at105.auth103Catalog,
+    auth103Catalog: ordinary106.catalog,
+    financialCatalog: at105.financialCatalog,
+  });
+}
+
+export function root0106PredecessorPredicate(): string {
+  return forwardWorkerNativePredecessorReady();
+}
+
+export function root0106CatalogPredicate(): string {
+  return forwardWorkerNativeSchemaReady();
+}
+
 /** Read-only SQL predicate: the Financial catalog is EXACTLY the recipe (plus
  * the Money guard's Stripe fences on the 0104 link table when Money-preserved). */
 export function financial0104CatalogPredicate(profile: Financial0104Profile = "ordinary"): string {
@@ -251,7 +338,7 @@ export function financial0104CatalogPredicate(profile: Financial0104Profile = "o
 const compiledCache = new Map<string, { readonly postShape: string }>();
 
 /** Schema readiness DATA only: every Auth103 state keeps its own owner check;
- * the only additions are the exact104/exact105 ledgers plus their exact
+ * the only additions are the exact104/exact105/exact106 ledgers plus their exact
  * post-chain shapes. A physical successor beyond the applied ledger leaves it
  * pending for a normal Host. */
 export function financial0104SourceSchemaReady(
@@ -266,7 +353,7 @@ export function financial0104SourceSchemaReady(
   profile: Financial0104Profile = "ordinary",
 ): boolean {
   const count = input.applied.length;
-  if (count !== 104 && count !== 105)
+  if (count !== 104 && count !== 105 && count !== 106)
     return auth103SourceSchemaReady(input, sourceRoot, mode, profile);
   try {
     if (input.shape === undefined || input.shapeDigest === undefined) return false;
@@ -285,12 +372,20 @@ export function financial0104SourceSchemaReady(
         expected =
           count === 104
             ? compileFinancial0104ImportShapes(source.auth103, source.artifact, profile)
-            : compileRoot0105ImportShapes(
-                source.auth103,
-                source.artifact,
-                source.artifact105,
-                profile,
-              );
+            : count === 105
+              ? compileRoot0105ImportShapes(
+                  source.auth103,
+                  source.artifact,
+                  source.artifact105,
+                  profile,
+                )
+              : compileRoot0106ImportShapes(
+                  source.auth103,
+                  source.artifact,
+                  source.artifact105,
+                  source.artifact106,
+                  profile,
+                );
         if (compiledCache.size >= 4) compiledCache.clear();
         compiledCache.set(cacheKey, expected);
       }
@@ -307,7 +402,7 @@ export function financial0104SourceSchemaReady(
   }
 }
 
-/** Exact104/exact105 projection for pending selection: a physical checkout
+/** Exact104/exact105/exact106 projection for pending selection: a physical checkout
  * that stops before the applied chain has no pending migration once D1
  * carries that exact Root post-Auth103 ledger. */
 export function financial0104LedgerApplied(
@@ -317,8 +412,11 @@ export function financial0104LedgerApplied(
 ): boolean {
   const count = applied.length;
   if (
-    (count !== 104 && count !== 105) ||
-    (local.length !== 100 && local.length !== 103 && local.length !== 104) ||
+    (count !== 104 && count !== 105 && count !== 106) ||
+    (local.length !== 100 &&
+      local.length !== 103 &&
+      local.length !== 104 &&
+      local.length !== 105) ||
     local.length >= count
   )
     return false;

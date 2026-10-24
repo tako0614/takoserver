@@ -8,6 +8,7 @@ import { financial0104RootRecipe } from "./financial0104-recipe.ts";
 import { type MigrationArtifact, readMigrationArtifact } from "./migrations.ts";
 import type { PostAuth103Count } from "./post-auth103-recipes.ts";
 import { root0105Recipe } from "./root0105-recipe.ts";
+import { root0106Recipe } from "./root0106-recipe.ts";
 
 const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
   Object.freeze({
@@ -20,8 +21,8 @@ const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
 /**
  * Materializes the Root post-Auth103 chain candidates: the UNCHANGED Auth103
  * artifact (audited100 + generated 0101/0102/0103) followed by the exact
- * Financial0104 recipe (the 104 artifact) and then Root's exact 0105 (the 105
- * artifact). The Auth103 artifact, digest and receipts are returned as-is;
+ * Financial0104 recipe (the 104 artifact), Root's exact 0105, then the pinned
+ * Forward native 0106 recipe. The Auth103 artifact, digest and receipts remain;
  * each successor artifact is a distinct digest and never replaces it.
  */
 export function readFinancial0104CanonicalMigrationSource(
@@ -33,6 +34,7 @@ export function readFinancial0104CanonicalMigrationSource(
   try {
     const recipe = financial0104RootRecipe();
     const recipe105 = root0105Recipe();
+    const recipe106 = root0106Recipe();
     if (
       auth103.artifact.files.length !== 103 ||
       JSON.stringify(auth103.artifact.names.slice(100)) !==
@@ -55,8 +57,10 @@ export function readFinancial0104CanonicalMigrationSource(
     };
     const generated104 = generate("104", [recipe]);
     const generated105 = generate("105", [recipe, recipe105]);
+    const generated106 = generate("106", [recipe, recipe105, recipe106]);
     const artifact = generated104.artifact;
     const artifact105 = generated105.artifact;
+    const artifact106 = generated106.artifact;
     const unchangedPrefix = (value: MigrationArtifact) =>
       value.files
         .slice(0, 103)
@@ -74,15 +78,29 @@ export function readFinancial0104CanonicalMigrationSource(
       JSON.stringify(artifact105.names) === JSON.stringify([...artifact.names, recipe105.name]) &&
       unchangedPrefix(artifact105) &&
       artifact105.files[103]?.digest === recipe.digest &&
-      artifact105.files[104]?.digest === recipe105.digest;
+      artifact105.files[104]?.digest === recipe105.digest &&
+      artifact106.files.length === 106 &&
+      JSON.stringify(artifact106.names) ===
+        JSON.stringify([...artifact105.names, recipe106.name]) &&
+      unchangedPrefix(artifact106) &&
+      artifact106.files
+        .slice(0, 105)
+        .every(
+          (file, index) =>
+            file.digest === artifact105.files[index]?.digest &&
+            file.bytes === artifact105.files[index]?.bytes,
+        ) &&
+      artifact106.files[105]?.digest === recipe106.digest;
     if (!exact()) throw preflightError("post-Auth103 generated source differs from its recipes");
     const assertCurrent = () => {
       auth103.assertCurrent();
       financial0104RootRecipe();
       root0105Recipe();
+      root0106Recipe();
       if (
         readMigrationArtifact(generated104.directory).digest !== artifact.digest ||
-        readMigrationArtifact(generated105.directory).digest !== artifact105.digest
+        readMigrationArtifact(generated105.directory).digest !== artifact105.digest ||
+        readMigrationArtifact(generated106.directory).digest !== artifact106.digest
       )
         throw preflightError("post-Auth103 generated source changed during read");
     };
@@ -95,9 +113,11 @@ export function readFinancial0104CanonicalMigrationSource(
       recipe,
       artifact105,
       recipe105,
+      artifact106,
+      recipe106,
       /** The generated chain artifact whose ledger has exactly `count` names. */
       artifactFor: (count: PostAuth103Count): MigrationArtifact =>
-        count === 104 ? artifact : artifact105,
+        count === 104 ? artifact : count === 105 ? artifact105 : artifact106,
       physicalNames: auth103.physicalNames,
       physicalDigest: auth103.physicalDigest,
       assertCurrent,

@@ -24,7 +24,7 @@ const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
  * Materializes one source-owned 103 candidate from immutable audited100 bytes
  * and the existing Auth/Container/Worker recipe owner. A physical checkout may
  * contain 100, the exact owner103 files or those plus an exact prefix of the
- * Root post-Auth103 chain (Financial0104, then Root0105), but no path supplies foreign
+ * Root post-Auth103 chain (Financial0104, Root0105, Forward0106), but no path supplies foreign
  * successor SQL or treats scratch as native dispatch/history authority.
  */
 export function readAuth103CanonicalMigrationSource(sourceRoot: string, scratchBase = tmpdir()) {
@@ -38,7 +38,8 @@ export function readAuth103CanonicalMigrationSource(sourceRoot: string, scratchB
       (current.files.length !== 100 &&
         current.files.length !== 103 &&
         current.files.length !== 104 &&
-        current.files.length !== 105) ||
+        current.files.length !== 105 &&
+        current.files.length !== 106) ||
       current.digest !== physical.digest ||
       readAuditedMigrationSourcePrefix100(directory).digest !== prefix.digest ||
       JSON.stringify(current.names.slice(100, 103)) !==
