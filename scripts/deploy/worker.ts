@@ -1648,6 +1648,7 @@ async function inspectSelectedAuth103WorkerModules(
     identity.commit,
     identity.bundleDigestHex,
     version,
+    inspection.history,
   );
 }
 

@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { canonicalJson } from "../../src/json.ts";
+import { readAuth103HistoricalPublication } from "./auth103-historical-publication.ts";
 import { type DeployPhase, preflightError, verificationError } from "./errors.ts";
 import {
   inspectMoneyNativeBuildDependencyTree,
@@ -412,6 +413,54 @@ export function assertExactOriginalModuleBytes(
  * carry the one exact JavaScript module.
  */
 export function verifySelectedAuth103WorkerModules(
+  phase: Extract<DeployPhase, "preflight" | "verification">,
+  target: DeployTarget,
+  sourceCommit: string,
+  annotatedBundleDigestHex: string,
+  versionValue: unknown,
+  history: { readonly versionId: string; readonly deploymentId: string },
+): void {
+  const selected = selectedTargetBytes(target);
+  const historical = readAuth103HistoricalPublication({
+    phase,
+    target,
+    targetDigest: digest(selected.bytes),
+    sourceCommit,
+    versionId: history.versionId,
+    deploymentId: history.deploymentId,
+  });
+  if (historical !== null) {
+    const before = originalCheckout(sourceCommit);
+    assertExactOriginalModuleBytes(phase, versionValue, historical, annotatedBundleDigestHex);
+    const after = originalCheckout(sourceCommit);
+    if (before.root !== after.root) {
+      throw phase === "preflight"
+        ? preflightError("Auth103 historical original source changed during read")
+        : verificationError("Auth103 historical original source changed during read");
+    }
+    assertOriginalDependencyReplayUnchanged(
+      { selected: before.selectedDependencies, current: before.currentDependencies },
+      { selected: after.selectedDependencies, current: after.currentDependencies },
+    );
+    if (
+      targetFileIdentity(lstatSync(selected.path, { bigint: true })) !== selected.identity ||
+      !readFileSync(selected.path).equals(selected.bytes) ||
+      canonicalJson(loadTarget(selected.path, "integration")) !== canonicalJson(target)
+    ) {
+      throw phase === "preflight"
+        ? preflightError("Auth103 historical original target changed during read")
+        : verificationError("Auth103 historical original target changed during read");
+    }
+    historical.assertUnchanged();
+    return;
+  }
+  const capture = buildAuth103OriginalWorkerModules(target, sourceCommit);
+  verifyAuth103OriginalModuleClosure(phase, versionValue, capture, annotatedBundleDigestHex);
+}
+
+/** An uploaded but not yet deployed Version has no deployment identity and
+ * cannot select retained historical publication bytes. */
+export function verifyUnpublishedAuth103WorkerModules(
   phase: Extract<DeployPhase, "preflight" | "verification">,
   target: DeployTarget,
   sourceCommit: string,

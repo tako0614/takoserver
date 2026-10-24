@@ -21,7 +21,10 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parseRuntimeInputSealKeyRing } from "../../src/runtime-input-seal-keyring.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
-import { verifySelectedAuth103WorkerModules } from "./auth103-original-worker-modules.ts";
+import {
+  verifySelectedAuth103WorkerModules,
+  verifyUnpublishedAuth103WorkerModules,
+} from "./auth103-original-worker-modules.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -1524,7 +1527,7 @@ async function runOriginalMoneyMaintenanceSuccessor(
           "preflight",
           target,
           state,
-          { versionId },
+          { versionId, unpublished: true },
           version,
           invocation.commit,
           target.signing.currentKeyId,
@@ -1645,7 +1648,7 @@ async function runOriginalMoneyMaintenanceSuccessor(
       "verification",
       target,
       state,
-      { versionId: publication.versionId },
+      { versionId: publication.versionId, deploymentId: publication.deploymentId },
       afterCleanupVersion,
       invocation.commit,
       target.signing.currentKeyId,
@@ -2599,7 +2602,9 @@ async function inspectVersion(
   phase: "preflight" | "verification",
   target: DeployTarget,
   state: IntegrationWorkerBootstrapState,
-  history: Pick<WorkerDeploymentHistory, "versionId">,
+  history:
+    | Pick<WorkerDeploymentHistory, "versionId" | "deploymentId">
+    | { readonly versionId: string; readonly unpublished: true },
   version: unknown,
   selectedCommit: string,
   signingKeyId: string,
@@ -2662,13 +2667,24 @@ async function inspectVersion(
   assertImmutableVersion(phase, version);
   let moduleDigest: string;
   if (freshAuth103QuiescedBootstrap(target)) {
-    verifySelectedAuth103WorkerModules(
-      phase,
-      target,
-      identity.commit,
-      identity.bundleDigestHex,
-      version,
-    );
+    if ("unpublished" in history) {
+      verifyUnpublishedAuth103WorkerModules(
+        phase,
+        target,
+        identity.commit,
+        identity.bundleDigestHex,
+        version,
+      );
+    } else {
+      verifySelectedAuth103WorkerModules(
+        phase,
+        target,
+        identity.commit,
+        identity.bundleDigestHex,
+        version,
+        history,
+      );
+    }
     moduleDigest = identity.bundleDigestHex;
   } else {
     moduleDigest = exactModuleDigest(phase, version);
