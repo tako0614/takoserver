@@ -20,6 +20,9 @@ import { TakoformHostError } from "../src/takoform/types.ts";
 import { createConfiguredHistoricalTakoformHost } from "./helpers/historical-takoform-host.ts";
 
 const lane = "/apis/forms.takoform.com/v1beta4";
+// These state-transition cases explicitly expire leases when needed; wall-clock
+// delays from other native tests must not turn a live 1s lease into a recovery.
+const stableStateTransitionClock = () => new Date("2026-09-01T00:00:00.000Z");
 const form: InstalledTakoformForm = {
   identity: {
     formRef: {
@@ -503,7 +506,7 @@ describe("durable deferred Takoform operations", () => {
     const providerEntered = deferred();
     const releaseProvider = deferred();
     const memory = new InMemoryTakoformResourceDriver();
-    const harness = persistentHarness(undefined, {
+    const harness = persistentHarness(stableStateTransitionClock, {
       ...memory,
       selectApply: (input) => memory.selectApply(input),
       apply: async (input) => {
@@ -664,7 +667,7 @@ describe("durable deferred Takoform operations", () => {
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
     };
-    const opened = persistentHarness(undefined, driver).open();
+    const opened = persistentHarness(stableStateTransitionClock, driver).open();
     const operationId = await acceptCreate(
       opened.host,
       "provider-plan-retry",
@@ -1974,9 +1977,11 @@ describe("durable deferred Takoform operations", () => {
   });
 
   test("a deferred no-op preserves the live Resource's committed claim", async () => {
-    const opened = persistentHarness(undefined, new InMemoryTakoformResourceDriver(), [
-      claimedForm,
-    ]).open();
+    const opened = persistentHarness(
+      stableStateTransitionClock,
+      new InMemoryTakoformResourceDriver(),
+      [claimedForm],
+    ).open();
     const desired = (name: string) => ({
       apiVersion: claimedForm.identity.formRef.apiVersion,
       kind: claimedForm.identity.formRef.kind,
@@ -2974,7 +2979,7 @@ describe("durable deferred Takoform operations", () => {
       observe: (input) => memory.observe(input),
       delete: (input) => memory.delete(input),
     };
-    const opened = persistentHarness(undefined, driver).open();
+    const opened = persistentHarness(stableStateTransitionClock, driver).open();
     const desired = desiredResource("refused-create", "nothing-was-mutated");
     const review = await prepareReview(opened.host, desired);
     const path = `${lane}/resources/example.forms.invalid/DeferredThing/refused-create`;
@@ -3121,7 +3126,7 @@ describe("durable deferred Takoform operations", () => {
       import: (input) => memory.import?.(input),
       delete: (input) => memory.delete(input),
     };
-    const opened = persistentHarness(undefined, driver, [form], {
+    const opened = persistentHarness(stableStateTransitionClock, driver, [form], {
       shouldDefer: () => true,
       pollsBeforeCommit: 1,
       executeOnAccept: true,
