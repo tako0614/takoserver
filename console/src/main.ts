@@ -9,6 +9,7 @@ import {
 } from "./i18n.ts";
 import { wordmark } from "./mark.ts";
 import { billingPage } from "./pages/billing.ts";
+import { hostedBillingContinuationPage } from "./pages/hosted-billing-continuation.ts";
 import { keysPage } from "./pages/keys.ts";
 import { overviewPage } from "./pages/overview.ts";
 import { resourceDetailPage } from "./pages/resource-detail.ts";
@@ -25,10 +26,10 @@ import {
   currentOrganization,
   organizations,
   principal,
+  resolveSharedSessionReturnPath,
   selectOrganization,
   session,
   signOut,
-  takeSharedSessionReturnPath,
   theme,
 } from "./state.ts";
 import { readTakosIdReturn } from "./takos-id.ts";
@@ -132,7 +133,7 @@ export async function resolveInitialSession(
     if (session() === null && !hasProviderReturn) {
       try {
         if (await bootstrapSharedSession()) {
-          navigate(takeSharedSessionReturnPath(), { replace: true });
+          navigate(resolveSharedSessionReturnPath(window.location.pathname), { replace: true });
         }
       } catch (error) {
         toast(explain(error as Error), "bad");
@@ -338,6 +339,24 @@ function createOrganization(): void {
 /** The page for the current URL, or an honest account of why there is none. */
 function page(): Child {
   const here = route();
+  if (here.segments[0] === "billing" && here.segments[1] === "hosted-continuations") {
+    const selector = here.segments[2];
+    const exactSelector =
+      here.segments.length === 3 &&
+      typeof selector === "string" &&
+      selector.length === 64 &&
+      /^[0-9a-f]{64}$/u.exec(selector)?.[0] === selector;
+    return exactSelector
+      ? hostedBillingContinuationPage(selector as string)
+      : card(
+          null,
+          empty(
+            tr("続行情報が無効です", "Invalid continuation"),
+            tr("このリンクから続行できません。", "This continuation link is invalid."),
+            h("a", { class: "btn", ...linkProps("/") }, tr("概要へ戻る", "Return to overview")),
+          ),
+        );
+  }
   const organization = currentOrganization();
 
   if (!organization) {

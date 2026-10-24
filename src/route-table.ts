@@ -300,6 +300,16 @@ export const ROUTES: readonly RouteDeclaration[] = [
     operation: "readWalletCheckoutReceipt",
   },
   {
+    method: "get",
+    pattern: "/v1/billing/hosted-continuations/{continuationRef}",
+    operation: "readHostedBrowserBillingContinuation",
+  },
+  {
+    method: "post",
+    pattern: "/v1/billing/hosted-continuations/{continuationRef}",
+    operation: "prepareHostedBrowserBillingContinuation",
+  },
+  {
     method: "post",
     pattern: "/v1/organizations/{organizationId}/wallet/funding",
     operation: "creditWalletFromSettlement",

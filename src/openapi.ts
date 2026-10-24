@@ -77,6 +77,27 @@ const SUBSCRIPTION_REF_SCHEMA = {
   pattern: "^sra_[0-9a-f]{64}$",
   description: "Opaque expected subscription target; not an authorization credential.",
 } as const;
+const HOSTED_BILLING_CONTINUATION_REF_SCHEMA = {
+  type: "string",
+  minLength: 64,
+  maxLength: 64,
+  pattern: "^[0-9a-f]{64}$",
+  description: "Opaque Hosted browser continuation selector.",
+} as const;
+const HOSTED_BILLING_CONTINUATION_HEADER = {
+  name: "Takoserver-Billing-Continuation",
+  in: "header",
+  required: false,
+  schema: {
+    type: "string",
+    pattern: "^hosted-browser-v1\\.[0-9a-f]{64}$",
+  },
+  description:
+    "Optional Hosted browser continuation selector. When present, this request uses the Hosted continuation branch and must not fall back to the independent HTTP lane. Duplicate, malformed, or unsupported values are rejected.",
+} as const;
+const HOSTED_ORGANIZATION_ROUTE_ID_PATTERN = "[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}";
+const HOSTED_TOPUP_PATH_PATTERN = `^/v1/organizations/${HOSTED_ORGANIZATION_ROUTE_ID_PATTERN}/wallet/checkout$`;
+const HOSTED_SUBSCRIPTION_PATH_PATTERN = `^/v1/organizations/${HOSTED_ORGANIZATION_ROUTE_ID_PATTERN}/payments/subscription$`;
 function subscriptionReceiptResponseSchema(
   component: "SubscriptionCheckoutResponse" | "SubscriptionCancellationResponse",
   field: "checkout" | "cancellation",
@@ -246,6 +267,194 @@ const BILLING_ATTRIBUTION_PROPERTIES = {
 } as const;
 
 const HOSTED_BILLING_SCHEMAS = {
+  PrepareHostedBrowserBillingContinuationRequest: {
+    oneOf: [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "amountMinor", "checkoutConsent"],
+        properties: {
+          kind: { const: "topup" },
+          amountMinor: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+          checkoutConsent: { const: "interactive-checkout" },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "planKey", "consent"],
+        properties: {
+          kind: { const: "start" },
+          planKey: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+            pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+          },
+          consent: { const: "subscription-checkout" },
+          reconcileOriginalConsent: {
+            type: "string",
+            enum: ["retry-original-subscription", "check-original-subscription"],
+          },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "consent"],
+        properties: {
+          kind: { const: "cancel" },
+          consent: { const: "cancel-subscription" },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["kind", "planKey", "consent"],
+        properties: {
+          kind: { const: "change-plan" },
+          planKey: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+            pattern: "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$",
+          },
+          consent: { const: "change-subscription-plan" },
+        },
+      },
+    ],
+  },
+  HostedBrowserBillingContinuationOperation: {
+    oneOf: [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["action", "method", "path", "body"],
+        properties: {
+          action: { const: "topup" },
+          method: { const: "POST" },
+          path: {
+            type: "string",
+            pattern: HOSTED_TOPUP_PATH_PATTERN,
+          },
+          body: {
+            type: "object",
+            additionalProperties: false,
+            required: ["reference", "amountMinor"],
+            properties: {
+              reference: BILLING_REFERENCE_SCHEMA,
+              amountMinor: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+            },
+          },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["action", "method", "path", "body"],
+        properties: {
+          action: { const: "subscription-start" },
+          method: { const: "POST" },
+          path: {
+            type: "string",
+            pattern: HOSTED_SUBSCRIPTION_PATH_PATTERN,
+          },
+          body: { $ref: "#/components/schemas/BeginSubscriptionRequest" },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["action", "method", "path", "body"],
+        properties: {
+          action: { const: "cancel" },
+          method: { const: "PATCH" },
+          path: {
+            type: "string",
+            pattern: HOSTED_SUBSCRIPTION_PATH_PATTERN,
+          },
+          body: { $ref: "#/components/schemas/ChangeSubscriptionRequest" },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["action", "method", "path", "body"],
+        properties: {
+          action: { const: "plan-change" },
+          method: { const: "PATCH" },
+          path: {
+            type: "string",
+            pattern: HOSTED_SUBSCRIPTION_PATH_PATTERN,
+          },
+          body: { $ref: "#/components/schemas/SubscriptionPlanChangeRequest" },
+        },
+      },
+    ],
+  },
+  HostedBrowserBillingContinuation: {
+    oneOf: [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "contractVersion",
+          "continuationRef",
+          "kind",
+          "workspaceId",
+          "workspaceRef",
+          "organizationId",
+          "operation",
+          "phase",
+        ],
+        properties: {
+          contractVersion: { const: "hosted-browser-v1" },
+          continuationRef: HOSTED_BILLING_CONTINUATION_REF_SCHEMA,
+          kind: { const: "view" },
+          workspaceId: IDENTIFIER_SCHEMA,
+          workspaceRef: BILLING_REFERENCE_SCHEMA,
+          organizationId: IDENTIFIER_SCHEMA,
+          operation: { type: "null" },
+          phase: { type: "null" },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "contractVersion",
+          "continuationRef",
+          "kind",
+          "workspaceId",
+          "workspaceRef",
+          "organizationId",
+          "operation",
+          "phase",
+        ],
+        properties: {
+          contractVersion: { const: "hosted-browser-v1" },
+          continuationRef: HOSTED_BILLING_CONTINUATION_REF_SCHEMA,
+          kind: { const: "payment" },
+          workspaceId: IDENTIFIER_SCHEMA,
+          workspaceRef: BILLING_REFERENCE_SCHEMA,
+          organizationId: IDENTIFIER_SCHEMA,
+          operation: { $ref: "#/components/schemas/HostedBrowserBillingContinuationOperation" },
+          phase: {
+            type: "string",
+            enum: ["prepared", "dispatch-started", "outcome-recorded"],
+          },
+        },
+      },
+    ],
+  },
+  HostedBrowserBillingContinuationResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["continuation"],
+    properties: {
+      continuation: { $ref: "#/components/schemas/HostedBrowserBillingContinuation" },
+    },
+  },
   CreatePersonalOrganizationRequest: {
     type: "object",
     additionalProperties: false,
@@ -1493,7 +1702,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
   }),
   beginWalletCheckout: described("Begin an idempotent purchased-credit Checkout", {
     "x-required-scopes": ["payments:write"],
-    parameters: [ORGANIZATION_ID_PARAMETER],
+    parameters: [ORGANIZATION_ID_PARAMETER, HOSTED_BILLING_CONTINUATION_HEADER],
     description:
       "Hosted composition requires reference and amountMinor, payments:write or an owner session, and a qualified durable customer/realm adapter. The independent legacy lane accepts amountMinor only and remains owner-session-only. Current operator bounds govern new purchases; exact Hosted retries preserve the original command and URL even after bounds change. Return URLs are operator-configured; the request does not fund credit. An unknown outcome beyond the idempotency safety window requires reconciliation.",
     requestBody: billingRequest("BeginWalletCheckoutRequest"),
@@ -1502,14 +1711,18 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         "Original Checkout URL, including an exact Hosted replay",
         "WalletCheckoutResponse",
       ),
-      "400": errorResponse("Invalid amount, reference, fields or configured bounds"),
+      "400": errorResponse(
+        "Invalid amount, reference, fields, configured bounds, or Hosted continuation selector",
+      ),
       "401": errorResponse("Authentication required; legacy lane requires an owner session"),
       "403": errorResponse("Wrong Organization or payments:write scope"),
       "404": errorResponse("Qualified Checkout capability is absent"),
       "409": errorResponse(
         "Conflicting purchase, expired Checkout or unresolved processor outcome",
       ),
-      "503": errorResponse("Processor, schema or readback unavailable"),
+      "503": errorResponse(
+        "Processor, schema, readback, or Hosted continuation supplier unavailable",
+      ),
     },
   }),
   readWalletCheckoutReceipt: described("Read one durable purchased-credit Checkout receipt", {
@@ -1517,6 +1730,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     parameters: [
       ORGANIZATION_ID_PARAMETER,
       { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+      HOSTED_BILLING_CONTINUATION_HEADER,
     ],
     description:
       "The read can reconcile the original processor object, but it never grants credit. Checkout is null until an acknowledged original URL exists. Payment still settles through the existing verified webhook and funding authority.",
@@ -1525,14 +1739,74 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         "Original command status and acknowledged URL",
         "WalletCheckoutReceipt",
       ),
-      "400": errorResponse("Malformed purchase reference"),
+      "400": errorResponse("Malformed purchase reference or Hosted continuation selector"),
       "401": errorResponse("Authentication required"),
       "403": errorResponse("Wrong Organization or wallet:read scope"),
       "404": errorResponse("Purchase reference or durable Checkout capability absent"),
       "409": errorResponse("Readback conflicts with the frozen purchase"),
-      "503": errorResponse("Processor or durable receipt unavailable"),
+      "503": errorResponse(
+        "Processor, durable receipt, or Hosted continuation supplier unavailable",
+      ),
     },
   }),
+  readHostedBrowserBillingContinuation: described(
+    "Read the exact Hosted-selected Workspace billing continuation for the signed-in Server user",
+    {
+      description:
+        "Requires the actual Takoserver shared RP session and exact configured Console Origin. The current request's canonical account and current Organization owner permission are checked before selected-operation details are returned. This read-only view performs no billing action. A missing Hosted continuation supplier is unavailable; the response never substitutes a locally reconstructed operation.",
+      parameters: [
+        {
+          name: "continuationRef",
+          in: "path",
+          required: true,
+          schema: HOSTED_BILLING_CONTINUATION_REF_SCHEMA,
+        },
+      ],
+      responses: {
+        "200": billingResponse(
+          "Closed selected-Workspace continuation metadata and its exact original operation, if any",
+          "HostedBrowserBillingContinuationResponse",
+        ),
+        "400": errorResponse("Malformed Hosted continuation reference"),
+        "401": errorResponse("Authenticated Server shared RP session required"),
+        "403": errorResponse("Current Workspace or Hosted authorization denies this request"),
+        "404": errorResponse("Organization is absent or not currently owned by this user"),
+        "503": errorResponse(
+          "Hosted continuation is unknown, missing, or its supplier/current billing authority or matching account/session/Workspace scope is unavailable",
+        ),
+      },
+    },
+  ),
+  prepareHostedBrowserBillingContinuation: described(
+    "Prepare an explicit Hosted-selected Workspace billing continuation",
+    {
+      description:
+        "Requires the actual Takoserver shared RP session and exact configured Console Origin. The closed choice contains only the user's action, amount or plan selection, and explicit consent. The Server resolves the current account, Workspace, Organization, and subscription target from its live request; the browser supplies no account/scope, target, original reference, or command key. The operation prepares or returns the same Hosted continuation metadata without dispatching a billing effect. If the result is unknown, read the same selector; do not generate another selector or retry under a new key.",
+      parameters: [
+        {
+          name: "continuationRef",
+          in: "path",
+          required: true,
+          schema: HOSTED_BILLING_CONTINUATION_REF_SCHEMA,
+        },
+      ],
+      requestBody: billingRequest("PrepareHostedBrowserBillingContinuationRequest"),
+      responses: {
+        "200": billingResponse(
+          "Prepared or already-prepared continuation metadata",
+          "HostedBrowserBillingContinuationResponse",
+        ),
+        "400": errorResponse("Malformed selector or closed Hosted continuation choice"),
+        "401": errorResponse("Authenticated Server shared RP session required"),
+        "403": errorResponse("Current Workspace or Hosted authorization denies this preparation"),
+        "404": errorResponse("Organization is absent or not currently owned by this user"),
+        "409": errorResponse("The same selector conflicts with another retained original choice"),
+        "503": errorResponse(
+          "Hosted continuation supplier, current billing authority, or matching account/session/Workspace scope unavailable",
+        ),
+      },
+    },
+  ),
   readSubscriptionCommandReceipt: described("Read one saved subscription command descriptor", {
     "x-required-scopes": ["wallet:read"],
     parameters: [
@@ -1549,6 +1823,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         required: true,
         schema: BILLING_REFERENCE_SCHEMA,
       },
+      HOSTED_BILLING_CONTINUATION_HEADER,
     ],
     description:
       "Qualified Hosted composition only. Reads the saved original command and its local workflow proof without resuming it, registering pricing, refreshing native objects or writing financial state. Start lifecycle and scheduled cancellation do not prove the target ended. A missing command is not proof of no effect or completed reconciliation. No query parameters are accepted. Source epoch and payer authority are qualified separately.",
@@ -1557,20 +1832,24 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         "Saved original command descriptor",
         "SubscriptionCommandReceiptResponse",
       ),
-      "400": errorResponse("Invalid kind, encoded reference or query parameter"),
+      "400": errorResponse(
+        "Invalid kind, encoded reference, query parameter, or Hosted continuation selector",
+      ),
       "401": errorResponse("Authentication required"),
       "403": errorResponse("Wrong Organization or wallet:read scope"),
       "404": errorResponse(
         "Qualified receipt capability or stored command absent; no terminal proof",
       ),
-      "503": errorResponse("Saved command schema or proof unavailable"),
+      "503": errorResponse(
+        "Saved command schema, proof, or Hosted continuation supplier unavailable",
+      ),
     },
   }),
   readSubscription: described(
     "Read hosted subscription coverage and the shared configured plan table",
     {
       "x-required-scopes": ["wallet:read"],
-      parameters: [ORGANIZATION_ID_PARAMETER],
+      parameters: [ORGANIZATION_ID_PARAMETER, HOSTED_BILLING_CONTINUATION_HEADER],
       responses: {
         "200": {
           description:
@@ -1579,10 +1858,13 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
             "application/json": { schema: { $ref: "#/components/schemas/SubscriptionResponse" } },
           },
         },
+        "400": errorResponse("Malformed Hosted continuation selector"),
         "401": errorResponse("Authentication required"),
         "403": errorResponse("Wrong Organization or scope"),
         "404": errorResponse("Hosted billing is disabled"),
-        "503": errorResponse("Billing schema or processor unavailable"),
+        "503": errorResponse(
+          "Billing schema, processor, or Hosted continuation supplier unavailable",
+        ),
       },
     },
   ),
@@ -1590,7 +1872,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     "Begin monthly subscription Checkout in the configured Stripe realm using a plan key",
     {
       "x-required-scopes": ["payments:write"],
-      parameters: [ORGANIZATION_ID_PARAMETER],
+      parameters: [ORGANIZATION_ID_PARAMETER, HOSTED_BILLING_CONTINUATION_HEADER],
       description:
         "Host sets Stripe Price, Organization/customer binding, tariff revision and return URLs. This operation grants no credit. Replay the same reference. Custody returns open/pending/associated/expired receipts; pending is 202 and retains the original command in every deployment mode. Commercial Hosted composition additionally requires its qualified financial adapter.",
       requestBody: billingRequest("BeginSubscriptionRequest"),
@@ -1631,12 +1913,14 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
             },
           },
         },
-        "400": errorResponse("Invalid reference or configured plan key"),
+        "400": errorResponse(
+          "Invalid reference, configured plan key, or Hosted continuation selector",
+        ),
         "401": errorResponse("Authentication required"),
         "403": errorResponse("Wrong Organization or payments:write scope"),
         "404": errorResponse("Hosted billing is disabled"),
         "409": errorResponse("Subscription exists or payment command needs reconciliation"),
-        "503": errorResponse("Processor unavailable"),
+        "503": errorResponse("Processor or Hosted continuation supplier unavailable"),
       },
     },
   ),
@@ -1644,7 +1928,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     "Schedule exclusive next-period plan change or subscription cancellation",
     {
       "x-required-scopes": ["payments:write"],
-      parameters: [ORGANIZATION_ID_PARAMETER],
+      parameters: [ORGANIZATION_ID_PARAMETER, HOSTED_BILLING_CONTINUATION_HEADER],
       description:
         "Cancellation requires cancelAtPeriodEnd=true and expectedSubscriptionRef from GET in every deployment mode, and returns a durable cancellation receipt. A qualified plan action instead requires planKey and the same expected target; it schedules next-period terms without proration or an immediate charge/grant. Actions are mutually exclusive. Missing plan qualification is refused. Pending outcomes retain their reference and recover by readback rather than another Stripe POST.",
       requestBody: {
@@ -1695,12 +1979,12 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
             },
           },
         },
-        "400": errorResponse("Invalid request"),
+        "400": errorResponse("Invalid request or Hosted continuation selector"),
         "401": errorResponse("Authentication required"),
         "403": errorResponse("Wrong Organization or payments:write scope"),
         "404": errorResponse("Subscription or capability absent"),
         "409": errorResponse("Expected subscription changed or reference conflicts"),
-        "503": errorResponse("Processor unavailable"),
+        "503": errorResponse("Processor or Hosted continuation supplier unavailable"),
       },
     },
   ),
@@ -1998,12 +2282,16 @@ function documentedPaths(): Record<string, Record<string, unknown>> {
     const acceptsServerSession =
       route.operation === "readPrincipal" ||
       route.pattern.startsWith("/v1/organizations/{organizationId}/");
-    methods[route.method] = acceptsServerSession
-      ? {
-          ...described,
-          security: [{ bearerAuth: [] }, { serverSharedSession: [] }],
-        }
-      : described;
+    methods[route.method] =
+      route.operation === "readHostedBrowserBillingContinuation" ||
+      route.operation === "prepareHostedBrowserBillingContinuation"
+        ? { ...described, security: [{ serverSharedSession: [] }] }
+        : acceptsServerSession
+          ? {
+              ...described,
+              security: [{ bearerAuth: [] }, { serverSharedSession: [] }],
+            }
+          : described;
   }
   for (const lane of TAKOFORM_LANES) {
     for (const route of TAKOFORM_ROUTES) {

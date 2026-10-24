@@ -260,10 +260,30 @@ test("shared-auth bootstrap adopts only after the oracle and /v1/me succeed", as
   expect(state.session()).toBe(null);
   expect(state.sessionKind()).toBe(null);
 
-  values.set("takoserver.shared-session-return", "billing");
+  state.storeSharedSessionReturnPath("/billing");
+  expect(values.get("takoserver.shared-session-return")).toBe("billing");
   expect(state.takeSharedSessionReturnPath()).toBe("/billing");
   expect(values.has("takoserver.shared-session-return")).toBe(false);
-  values.set("takoserver.shared-session-return", "https://outside.example/");
+  const selector = "abcdef0123456789".repeat(4);
+  state.storeSharedSessionReturnPath(`/billing/hosted-continuations/${selector}`);
+  expect(values.get("takoserver.shared-session-return")).toBe(`hosted-continuation:${selector}`);
+  expect(state.takeSharedSessionReturnPath()).toBe(`/billing/hosted-continuations/${selector}`);
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  for (const malformedPath of [
+    `/billing/hosted-continuations/${selector.toUpperCase()}`,
+    `/billing/hosted-continuations/${selector}?returnTo=/settings`,
+    `/billing/hosted-continuations/${selector}\n`,
+    "https://outside.example/",
+  ]) {
+    state.storeSharedSessionReturnPath(malformedPath);
+    expect(values.has("takoserver.shared-session-return")).toBe(false);
+    expect(state.takeSharedSessionReturnPath()).toBe("/");
+  }
+  values.set("takoserver.shared-session-return", `hosted-continuation:${selector.toUpperCase()}`);
+  expect(state.takeSharedSessionReturnPath()).toBe("/");
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+  values.set("takoserver.shared-session-return", `hosted-continuation:${selector}\n`);
   expect(state.takeSharedSessionReturnPath()).toBe("/");
   expect(values.has("takoserver.shared-session-return")).toBe(false);
 });
@@ -321,4 +341,113 @@ test("Console callback startup suppresses shared probing and always releases its
   expect(fetches).toBe(0);
   expect(values.has("takoserver.session")).toBe(false);
   Object.assign(globalThis, { sessionStorage: storage });
+});
+
+test("markerless deep Hosted continuation wins over stale storage; fixed root callback consumes only a closed return", async () => {
+  installConsoleGlobals();
+  values.clear();
+  const state = await import("../console/src/state.ts");
+  const main = await import("../console/src/main.ts");
+  const location = (globalThis as { window: { location: Location } }).window.location;
+  const selector = "abcdef0123456789".repeat(4);
+  const deepPath = `/billing/hosted-continuations/${selector}`;
+  const reset = (): void => {
+    values.clear();
+    state.session.set(null);
+    state.principal.set(null);
+    state.organizations.set([]);
+  };
+  const setLocation = (path: string): void => {
+    const url = new URL(path, location.origin);
+    location.pathname = url.pathname;
+    location.search = url.search;
+    location.hash = url.hash;
+    location.href = url.toString();
+  };
+  const startBootstrap = async (): Promise<void> => {
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) =>
+        new URL(String(input)).pathname === "/auth/oidc/session"
+          ? Response.json({ authenticated: true })
+          : Response.json({
+              principal: {
+                id: "host-principal",
+                provider: "local",
+                email: "owner@example.test",
+                displayName: "Owner",
+              },
+              organizations: [],
+            }),
+      { preconnect: originalFetch.preconnect },
+    );
+    await main.resolveInitialSession({ kind: "none" }, { set: () => undefined });
+  };
+
+  reset();
+  setLocation(`${deepPath}?returnTo=https://outside.example/`);
+  await startBootstrap();
+  expect(location.pathname).toBe(deepPath);
+  expect(location.search).toBe("");
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  reset();
+  state.storeSharedSessionReturnPath("/billing");
+  setLocation(deepPath);
+  await startBootstrap();
+  expect(location.pathname).toBe(deepPath);
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  reset();
+  const storedSelector = "fedcba9876543210".repeat(4);
+  const storedPath = `/billing/hosted-continuations/${storedSelector}`;
+  state.storeSharedSessionReturnPath(storedPath);
+  setLocation(deepPath);
+  await startBootstrap();
+  expect(location.pathname).toBe(deepPath);
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  reset();
+  values.set("takoserver.shared-session-return", "https://outside.example/");
+  setLocation(deepPath);
+  await startBootstrap();
+  expect(location.pathname).toBe(deepPath);
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  reset();
+  state.storeSharedSessionReturnPath(storedPath);
+  setLocation("/");
+  await startBootstrap();
+  expect(location.pathname).toBe(storedPath);
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  reset();
+  values.set("takoserver.shared-session-return", "https://outside.example/");
+  setLocation("/");
+  await startBootstrap();
+  expect(location.pathname).toBe("/");
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  reset();
+  state.storeSharedSessionReturnPath(storedPath);
+  setLocation(`${deepPath}/`);
+  await startBootstrap();
+  expect(location.pathname).toBe("/");
+  expect(values.has("takoserver.shared-session-return")).toBe(false);
+
+  reset();
+  const originalSessionStorage = globalThis.sessionStorage;
+  Object.assign(globalThis, {
+    sessionStorage: {
+      getItem: () => {
+        throw new Error("blocked storage");
+      },
+      removeItem: () => {
+        throw new Error("blocked storage");
+      },
+    },
+  });
+  setLocation(deepPath);
+  await startBootstrap();
+  expect(location.pathname).toBe(deepPath);
+  Object.assign(globalThis, { sessionStorage: originalSessionStorage });
 });
