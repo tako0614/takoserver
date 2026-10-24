@@ -174,6 +174,21 @@ function targetFileIdentity(stat: BigIntStats): string {
   );
 }
 
+/** Build a child environment with no inherited credential or Worker binding. */
+export function isolatedAuth103OriginalBuildEnvironment(
+  source: NodeJS.ProcessEnv,
+  temporary: string,
+): NodeJS.ProcessEnv {
+  const child = { ...source };
+  for (const key of Object.keys(child)) delete child[key];
+  child.PATH = source.PATH ?? "/usr/bin:/bin";
+  child.TMPDIR = temporary;
+  child.HOME = temporary;
+  child.CI = "1";
+  child.NO_COLOR = "1";
+  return child;
+}
+
 /** Replays only the original registered local builder from the exact Git
  * checkout selected by the immutable Version's commit. A caller supplies no
  * release path, SQL, digest or proof DTO. The selected private target is read
@@ -224,13 +239,7 @@ try {
     writeFileSync(childPath, child, { flag: "wx", mode: 0o600 });
     const built = spawnSync(process.execPath, [childPath], {
       cwd: root,
-      env: {
-        PATH: process.env.PATH ?? "/usr/bin:/bin",
-        TMPDIR: temporary,
-        HOME: temporary,
-        CI: "1",
-        NO_COLOR: "1",
-      },
+      env: isolatedAuth103OriginalBuildEnvironment(process.env, temporary),
       stdio: "ignore",
       timeout: 180_000,
     });

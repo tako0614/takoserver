@@ -4,6 +4,7 @@ import {
   assertBuiltAuth103ModuleClosure,
   assertExactOriginalModuleBytes,
   assertOriginalDependencyReplayUnchanged,
+  isolatedAuth103OriginalBuildEnvironment,
   originalAuth103ModuleMode,
 } from "../scripts/deploy/auth103-original-worker-modules.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -27,6 +28,25 @@ const version = () => ({
 });
 
 describe("original Auth103 Worker module byte closure", () => {
+  test("original builder child receives only the finite local build environment", () => {
+    const source = {
+      ...process.env,
+      PATH: "/test-bin",
+      CF_API_TOKEN: "test-credential-must-not-pass",
+      AUTH103_TEST_WORKER_BINDING: "test-binding-must-not-pass",
+    };
+    const child = isolatedAuth103OriginalBuildEnvironment(source, "/private-build");
+    expect(Object.keys(child).sort()).toEqual(["CI", "HOME", "NO_COLOR", "PATH", "TMPDIR"]);
+    expect(child).toEqual({
+      PATH: "/test-bin",
+      TMPDIR: "/private-build",
+      HOME: "/private-build",
+      CI: "1",
+      NO_COLOR: "1",
+    });
+    expect(source.CF_API_TOKEN).toBe("test-credential-must-not-pass");
+  });
+
   test("original release config determines module mode before provider inventory", () => {
     expect(originalAuth103ModuleMode({ main: "worker.js" })).toBe("historical-two-module");
     expect(originalAuth103ModuleMode({ main: "worker.js", find_additional_modules: false })).toBe(
