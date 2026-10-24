@@ -37,6 +37,8 @@ import {
   createAuth103NativeSourceInstallContribution,
   prepareAuth103NativeBuildSource,
   readAuth103NativeBuildDefine,
+  readAuth103NativeBuildProfileDefine,
+  readAuth103NativeTargetSourceProfile,
 } from "./auth103-native-source.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { memoByContent } from "./compile-memo.ts";
@@ -1077,15 +1079,33 @@ export async function runD1SchemaAuth103(
     });
     const initial = await readD1SchemaState(database);
     assertTarget();
-    const moneyPreserved = target.moneyCutoverWriterPolicy !== undefined;
+    const sourceProfile = readAuth103NativeTargetSourceProfile(target);
+    if (sourceProfile === null)
+      throw preflightError("Auth103 selected source profile differs from its target lineage");
+    const moneyPreserved = sourceProfile === "money-preserved";
     if (
       moneyPreserved &&
       (target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
         !/^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? ""))
     )
       throw preflightError("Auth103 Money profile is not the exact fenced writer policy");
-    if (moneyPreserved && initial.applied.length !== 100 && initial.applied.length !== 103)
-      throw preflightError("Auth103 original Money state is neither exact100 nor exact103");
+    if (initial.applied.length !== 100 && initial.applied.length !== 103)
+      throw preflightError("Auth103 original D1 state is neither exact100 nor exact103");
+    let buildProfile: unknown;
+    try {
+      buildProfile = JSON.parse(
+        readAuth103NativeBuildProfileDefine(original, target, invocation.commit, REPOSITORY),
+      );
+    } catch {
+      throw preflightError("Auth103 selected source profile is unavailable");
+    }
+    if (
+      buildProfile === null ||
+      typeof buildProfile !== "object" ||
+      Object.getOwnPropertyDescriptor(buildProfile, "profile")?.value !== AUTH103_NATIVE_PROFILE ||
+      Object.getOwnPropertyDescriptor(buildProfile, "sourceProfile")?.value !== sourceProfile
+    )
+      throw preflightError("Auth103 selected source profile differs from its D1 lineage");
     const moneyThrough = initial.applied.length === 100 ? 100 : 103;
     const moneySelection = moneyPreserved
       ? await readOriginalMoneySelection(target, moneyThrough)
@@ -1183,12 +1203,14 @@ export async function runD1SchemaAuth103(
       manifest.targetRef,
       manifest.sourceRef,
       `sha256:${artifact.bundleDigestHex}`,
+      sourceProfile,
     ]);
     const rpJson = canonicalJson(auth103RpRegistrationRecord(manifest));
     const deploymentJson = canonicalJson({
       receiptRef: dataDigest(["takoserver.auth103.native-deployment-receipt.v1", deploymentRef]),
       manifest,
       artifactDigest: `sha256:${artifact.bundleDigestHex}`,
+      sourceProfile,
       rpRecordJson: rpJson,
     });
     const currentness = boundPredicate(
@@ -1371,7 +1393,7 @@ export async function runD1SchemaAuth103(
           deploymentRef,
         ]),
         rpReceiptRef: manifest.rpRegistration.receiptRef,
-        sourceProfile: moneyPreserved ? "money-preserved" : "ordinary",
+        sourceProfile,
       });
       return result;
     }

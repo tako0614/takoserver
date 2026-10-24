@@ -157,6 +157,53 @@ test("native prepare awaits the actual current selection and records the exact T
       request: { amountMinor: 125 },
       claim: { amountMinor: 125 },
     });
+    expect((await f.hostedState()).readCallback).toEqual({
+      callbackCount: 0,
+      callbackRejected: false,
+      scope: null,
+    });
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("only continuation-selected financial GETs use the request-bound Owner read callback", async () => {
+  const f = await fixture();
+  try {
+    expect((await f.metadata("0")).status).toBe(200);
+    expect((await f.hostedState()).readCallback).toMatchObject({ callbackCount: 0 });
+
+    const checkoutReceipt = `/v1/organizations/${ORGANIZATION}/wallet/checkout/${REFERENCE}`;
+    const selectedGet = await f.selectedGet(checkoutReceipt, "a");
+    // No local receipt was created; reaching its ordinary 404 proves that the
+    // native current-owner callback completed before the local read route.
+    expect(selectedGet.status).toBe(404);
+    expect((await f.hostedState()).readCallback).toMatchObject({
+      callbackCount: 1,
+      callbackRejected: false,
+      scope: {
+        continuationRef: "a".repeat(64),
+        canonicalAccountId: SESSION_TEST_ACCOUNT,
+        organizationId: ORGANIZATION,
+      },
+    });
+
+    const mismatched = await f.selectedGet(checkoutReceipt, "1");
+    expect(mismatched.status).toBe(503);
+    expect((await f.hostedState()).readCallback).toMatchObject({
+      callbackCount: 2,
+      callbackRejected: true,
+      scope: { organizationId: "different-native-organization" },
+    });
+
+    // Existing metadata POST preparation remains on the one-argument read.
+    const prepare = await f.prepare("0", {
+      kind: "topup",
+      amountMinor: 125,
+      checkoutConsent: "interactive-checkout",
+    });
+    expect(prepare.status).toBe(200);
+    expect((await f.hostedState()).readCallback).toMatchObject({ callbackCount: 2 });
   } finally {
     await f.runtime.dispose();
   }
@@ -392,6 +439,16 @@ async function fixture() {
           body: JSON.stringify(body),
         });
       },
+      selectedGet(path: string, selector: "a" | "1") {
+        return send(path, {
+          method: "GET",
+          headers: {
+            cookie: browserCookie,
+            "x-test-origin": SESSION_TEST_CONSOLE,
+            "Takoserver-Billing-Continuation": `hosted-browser-v1.${selector.repeat(64)}`,
+          },
+        });
+      },
       async hostedState() {
         const response = await send("/test/hosted");
         return (await response.json()) as {
@@ -402,6 +459,11 @@ async function fixture() {
           } | null;
           callbackAttempted: boolean;
           callbackRejected: boolean;
+          readCallback: {
+            callbackCount: number;
+            callbackRejected: boolean;
+            scope: Record<string, unknown> | null;
+          };
           preparedOriginal: Record<string, unknown> | null;
         };
       },
@@ -477,6 +539,11 @@ test("native selected Console request reaches real TopUp command and same-origin
         },
       },
     ]);
+    expect((await f.hostedState()).readCallback).toEqual({
+      callbackCount: 0,
+      callbackRejected: false,
+      scope: null,
+    });
   } finally {
     await f.runtime.dispose();
   }

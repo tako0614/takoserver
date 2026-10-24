@@ -9,6 +9,7 @@ import { parseHostedBrowserBillingOriginal } from "../../src/financial-hosted-br
 import type {
   HostedBrowserBillingLookup,
   HostedBrowserLiveAuthorizationTarget,
+  HostedBrowserLiveReadTarget,
   HostedBrowserLiveSelectionTarget,
 } from "../../src/financial-hosted-browser-rpc.ts";
 import { createOrgTopUps, type TopUpSession } from "../../src/org-top-up.ts";
@@ -99,7 +100,10 @@ interface Env {
       input: HostedBrowserBillingLookup,
       selection: HostedBrowserLiveSelectionTarget,
     ): Promise<unknown>;
-    readBrowserBillingContinuation(input: HostedBrowserBillingLookup): Promise<unknown>;
+    readBrowserBillingContinuation(
+      input: HostedBrowserBillingLookup,
+      liveRead?: HostedBrowserLiveReadTarget,
+    ): Promise<unknown>;
     claimBrowserBillingContinuation(
       input: HostedBrowserBillingLookup,
       authorization: HostedBrowserLiveAuthorizationTarget,
@@ -123,6 +127,11 @@ const hostedFixtureState: {
   callbackAttempted: false,
   callbackRejected: false,
 };
+const hostedReadFixtureState: {
+  callbackCount: number;
+  callbackRejected: boolean;
+  scope: HostedBrowserBillingScope | null;
+} = { callbackCount: 0, callbackRejected: false, scope: null };
 
 /** Named native Hosted counterpart with closed DATA, not a product implementation. */
 export class Hosted extends WorkerEntrypoint<Env> {
@@ -164,33 +173,60 @@ export class Hosted extends WorkerEntrypoint<Env> {
   async fixtureState() {
     return {
       ...hostedFixtureState,
+      readCallback: hostedReadFixtureState,
       preparedOriginal: prepared.get("0".repeat(64)) ?? null,
     };
   }
 
-  async readBrowserBillingContinuation(input: HostedBrowserBillingLookup) {
+  async readBrowserBillingContinuation(
+    input: HostedBrowserBillingLookup,
+    liveRead?: HostedBrowserLiveReadTarget,
+  ) {
     const kind = input.continuationRef[0] ?? "";
     const saved = prepared.get(input.continuationRef);
-    if (saved)
-      return {
+    let result: unknown;
+    let selectedScope: HostedBrowserBillingScope;
+    if (saved) {
+      selectedScope = saved.scope;
+      result = {
         kind: "payment",
         original: saved,
         custody: dispatched.has(input.continuationRef)
           ? { phase: "dispatch-started", accepted: acceptedFor(kind, saved) }
           : { phase: "prepared" },
       };
-    if (kind === "0" || kind === "1")
-      return { kind: "view", contractVersion: "hosted-browser-v1", scope: scopeFor(kind) };
-    const original = originalFor(kind);
-    if (kind === "d")
-      return { kind: "view", contractVersion: "hosted-browser-v1", scope: original.scope };
-    return {
-      kind: "payment",
-      original,
-      custody: dispatched.has(input.continuationRef)
-        ? { phase: "dispatch-started", accepted: acceptedFor(kind) }
-        : { phase: "prepared" },
-    };
+    } else if (kind === "0" || kind === "1") {
+      selectedScope = scopeFor(kind);
+      result = { kind: "view", contractVersion: "hosted-browser-v1", scope: selectedScope };
+    } else {
+      const original = originalFor(kind);
+      selectedScope = original.scope;
+      result =
+        kind === "d"
+          ? { kind: "view", contractVersion: "hosted-browser-v1", scope: selectedScope }
+          : {
+              kind: "payment",
+              original,
+              custody: dispatched.has(input.continuationRef)
+                ? { phase: "dispatch-started", accepted: acceptedFor(kind) }
+                : { phase: "prepared" },
+            };
+    }
+    if (liveRead) {
+      const callbackScope =
+        kind === "1"
+          ? { ...selectedScope, organizationId: "different-native-organization" }
+          : selectedScope;
+      hostedReadFixtureState.callbackCount++;
+      hostedReadFixtureState.scope = callbackScope;
+      try {
+        await liveRead.assertReadCurrent(callbackScope);
+      } catch {
+        hostedReadFixtureState.callbackRejected = true;
+        throw new Error("fixture live Owner read callback rejected");
+      }
+    }
+    return result;
   }
 
   async claimBrowserBillingContinuation(

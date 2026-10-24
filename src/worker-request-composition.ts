@@ -94,10 +94,14 @@ export interface WorkerSharedAuthStaging {
 /** A request-local connection, constructed here rather than supplied as generic Sql. */
 export interface WorkerRequestSql {
   readonly sql: Sql;
-  readonly moneyGuard: MoneyCutoverGuardState | "fresh-native";
+  readonly moneyGuard: MoneyCutoverGuardState | "fresh-native" | "not-selected";
 }
 
-type WorkerRequestOriginPurpose = "native-primary" | "shared-auth-staging" | "auth103-fresh-native";
+type WorkerRequestOriginPurpose =
+  | "native-primary"
+  | "shared-auth-staging"
+  | "auth103-fresh-native"
+  | "ordinary-native-primary";
 const requestOrigins = new WeakMap<
   WorkerRequestSql,
   {
@@ -109,6 +113,7 @@ const requestOrigins = new WeakMap<
     readonly prepare: unknown;
     readonly batch: unknown;
     readonly rawSql: Sql;
+    readonly sqlMethods: readonly unknown[];
   }
 >();
 
@@ -125,14 +130,24 @@ export async function createWorkerPrimaryRequestSql(options: {
   return await constructWorkerPrimaryRequestSql(options, "native-primary");
 }
 
+/** An ordinary native Auth request owns the same first-primary, without Money custody. */
+export async function createWorkerOrdinaryPrimaryRequestSql(options: {
+  readonly database: WorkerRequestDatabase;
+}): Promise<WorkerRequestSql> {
+  return await constructWorkerPrimaryRequestSql(options, "ordinary-native-primary");
+}
+
 async function constructWorkerPrimaryRequestSql(
   options: {
     readonly database: WorkerRequestDatabase;
-    readonly writerEpoch: string;
+    readonly writerEpoch?: string;
   },
   purpose: WorkerRequestOriginPurpose,
 ): Promise<WorkerRequestSql> {
+  const ordinary = purpose === "ordinary-native-primary";
   const diagnostic = purpose === "shared-auth-staging" ? "shared-login Worker" : "Worker";
+  if (ordinary !== (options.writerEpoch === undefined))
+    throw new TypeError("Worker request Money writer selection differs");
   const database = options.database;
   const withSession = database?.withSession;
   if (typeof withSession !== "function")
@@ -149,10 +164,20 @@ async function constructWorkerPrimaryRequestSql(
   const prepare = dataMethod(nativeSession, "prepare");
   const batch = dataMethod(nativeSession, "batch");
   const writerEpoch = options.writerEpoch;
-  const moneyGuard = await inspectMoneyCutoverGuard(rawSql, writerEpoch);
-  const sql = createMoneyCutoverSql(rawSql, writerEpoch);
-  assertMoneyCutoverSqlBackingOrigin(sql, { rawSql, writerEpoch });
-  const connection = Object.freeze({ sql, moneyGuard });
+  let moneyGuard: MoneyCutoverGuardState | "not-selected";
+  let sql: Sql;
+  if (ordinary) {
+    moneyGuard = "not-selected";
+    sql = rawSql;
+  } else {
+    if (writerEpoch === undefined)
+      throw new TypeError("Worker request Money writer selection differs");
+    moneyGuard = await inspectMoneyCutoverGuard(rawSql, writerEpoch);
+    sql = createMoneyCutoverSql(rawSql, writerEpoch);
+    assertMoneyCutoverSqlBackingOrigin(sql, { rawSql, writerEpoch });
+  }
+  const connection = Object.freeze({ sql: Object.freeze(sql), moneyGuard });
+  const sqlMethods = Object.freeze(["query", "run", "batch"].map((key) => dataMethod(sql, key)));
   requestOrigins.set(
     connection,
     Object.freeze({
@@ -164,6 +189,7 @@ async function constructWorkerPrimaryRequestSql(
       prepare,
       batch,
       rawSql,
+      sqlMethods,
     }),
   );
   return connection;
@@ -201,6 +227,7 @@ export function createWorkerFreshNativeRequestSql(
   const prepare = dataMethod(session, "prepare");
   const batch = dataMethod(session, "batch");
   const sql = createFreshNativeSql(rawSql);
+  const sqlMethods = Object.freeze(["query", "run", "batch"].map((key) => dataMethod(sql, key)));
   assertFreshNativeSqlBackingOrigin(sql, rawSql);
   const connection: WorkerRequestSql = Object.freeze({ sql, moneyGuard: "fresh-native" });
   requestOrigins.set(
@@ -214,6 +241,7 @@ export function createWorkerFreshNativeRequestSql(
       prepare,
       batch,
       rawSql,
+      sqlMethods,
     }),
   );
   return connection;
@@ -303,6 +331,8 @@ function readWorkerFinancialCurrentConsentNativeOriginal(
   expectedKind: "query" | "batch",
 ) {
   const origin = assertWorkerRequestBacking(connection);
+  if (origin.writerEpoch === undefined)
+    throw new SqlError("invalid", "Financial current consent requires the selected Money writer");
   const inputs = readWorkerRequestFinancialInputs(connection);
   const original = readFinancialCurrentConsentNativeOriginal(operation, expectedKind);
   if (
@@ -353,7 +383,7 @@ export async function batchWorkerRequestFinancialCurrentConsentOriginal(
   );
   if (
     original.kind !== "batch" ||
-    (connection.moneyGuard !== "ready" && connection.moneyGuard !== "fresh-native") ||
+    (connection.moneyGuard !== "ready" && connection.moneyGuard !== "not-selected") ||
     original.plan.phase !== original.phase ||
     original.plan.statements.length !== (original.phase === "L1" ? 7 : 6)
   )
@@ -913,11 +943,24 @@ export function readWorkerRequestConsumers(connection: WorkerRequestSql): Worker
   const origin = requestOrigins.get(connection);
   if (
     !consumers ||
-    (origin?.purpose !== "shared-auth-staging" && origin?.purpose !== "auth103-fresh-native") ||
+    (origin?.purpose !== "shared-auth-staging" &&
+      origin?.purpose !== "auth103-fresh-native" &&
+      origin?.purpose !== "ordinary-native-primary") ||
     consumers.sql !== connection.sql
   )
     throw new TypeError("Worker request consumers have not been constructed");
-  assertWorkerRequestFinancialSqlOrigin(connection, consumers.sql);
+  if (origin.purpose === "auth103-fresh-native") {
+    if (connection.moneyGuard !== "fresh-native")
+      throw new TypeError("Worker request fresh-native origin differs");
+    assertFreshNativeSqlBackingOrigin(consumers.sql, origin.rawSql);
+  } else if (origin.purpose === "ordinary-native-primary") {
+    if (origin.writerEpoch !== undefined || connection.moneyGuard !== "not-selected")
+      throw new TypeError("Worker request Money writer selection differs");
+  } else {
+    if (origin.writerEpoch === undefined || connection.moneyGuard === "not-selected")
+      throw new TypeError("Worker request Money writer selection differs");
+    assertMoneyCutoverSqlOrigin(consumers.sql, { writerEpoch: origin.writerEpoch });
+  }
   assertAuthTokenCaptureReader(consumers.accounts, { sql: consumers.sql });
   assertHostedBillingFinancialRealm(consumers.realm, {
     sql: consumers.sql,
@@ -1055,14 +1098,19 @@ export function assertWorkerRequestFinancialSqlOrigin(
     if (connection.moneyGuard !== "fresh-native" || !requestConsumers.has(connection))
       throw new SqlError("invalid", "fresh Auth103 Financial origin is not qualified");
     assertFreshNativeSqlBackingOrigin(sql, origin.rawSql);
-  } else {
-    if (connection.moneyGuard !== "ready" || origin.writerEpoch === undefined)
-      throw new SqlError("invalid", "Money Financial origin is not ready");
-    assertMoneyCutoverSqlBackingOrigin(sql, {
-      rawSql: origin.rawSql,
-      writerEpoch: origin.writerEpoch,
-    });
+    return;
   }
+  if (origin.purpose === "ordinary-native-primary") {
+    if (connection.moneyGuard !== "not-selected" || !requestConsumers.has(connection))
+      throw new SqlError("invalid", "ordinary Auth103 Financial origin is not qualified");
+    return;
+  }
+  if (connection.moneyGuard !== "ready" || origin.writerEpoch === undefined)
+    throw new SqlError("invalid", "Money Financial origin is not ready");
+  assertMoneyCutoverSqlBackingOrigin(sql, {
+    rawSql: origin.rawSql,
+    writerEpoch: origin.writerEpoch,
+  });
 }
 
 /** Match the actual platform binding without exposing the private native origin. */
@@ -1073,6 +1121,13 @@ export function assertWorkerRequestNativeBinding(
   const original = assertWorkerRequestBacking(connection);
   if (original.database !== expectedPlatformDatabase)
     throw new TypeError("Worker request platform database binding differs");
+}
+
+/** Private source assertion input; undefined is an exact ordinary-origin value. */
+export function readWorkerRequestWriterEpochOrigin(
+  connection: WorkerRequestSql,
+): string | undefined {
+  return assertWorkerRequestBacking(connection).writerEpoch;
 }
 
 function assertWorkerRequestBacking(connection: WorkerRequestSql) {
@@ -1090,8 +1145,19 @@ function assertWorkerRequestBacking(connection: WorkerRequestSql) {
     if (connection.moneyGuard !== "fresh-native" || origin.writerEpoch !== undefined)
       throw new TypeError("fresh Auth103 request backing differs");
     assertFreshNativeSqlBackingOrigin(connection.sql, origin.rawSql);
+  } else if (origin.purpose === "ordinary-native-primary") {
+    if (
+      connection.moneyGuard !== "not-selected" ||
+      origin.writerEpoch !== undefined ||
+      connection.sql !== origin.rawSql ||
+      origin.sqlMethods.some((method, index) => {
+        const name = (["query", "run", "batch"] as const)[index];
+        return name === undefined || dataMethod(connection.sql, name) !== method;
+      })
+    )
+      throw new TypeError("Worker request ordinary primary origin differs");
   } else {
-    if (origin.writerEpoch === undefined || connection.moneyGuard === "fresh-native")
+    if (origin.writerEpoch === undefined || connection.moneyGuard === "not-selected")
       throw new TypeError("Money request backing differs");
     assertMoneyCutoverSqlBackingOrigin(connection.sql, {
       rawSql: origin.rawSql,
@@ -1203,10 +1269,15 @@ export function initializeWorkerRequestNativeInputs(options: WorkerRequestConsum
   ) as unknown as WorkerRequestConsumerOptions;
   const origin = assertWorkerRequestBacking(selected.connection);
   if (
-    (origin.purpose !== "shared-auth-staging" && origin.purpose !== "auth103-fresh-native") ||
+    (origin.purpose !== "shared-auth-staging" &&
+      origin.purpose !== "auth103-fresh-native" &&
+      origin.purpose !== "ordinary-native-primary") ||
     selected.sql !== selected.connection.sql ||
-    (selected.connection.moneyGuard !== "ready" &&
-      selected.connection.moneyGuard !== "fresh-native") ||
+    (origin.purpose === "auth103-fresh-native"
+      ? selected.connection.moneyGuard !== "fresh-native" || origin.writerEpoch !== undefined
+      : origin.purpose === "ordinary-native-primary"
+        ? selected.connection.moneyGuard !== "not-selected" || origin.writerEpoch !== undefined
+        : selected.connection.moneyGuard !== "ready" || origin.writerEpoch === undefined) ||
     selected.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
     selected.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin ||
     nativeInitializations.has(selected.connection) ||
@@ -1357,10 +1428,15 @@ function constructWorkerRequestConsumers(
   const origin = requestOrigins.get(options.connection);
   const { sql, client, realm, clock, randomId } = options;
   if (
-    (origin?.purpose !== "shared-auth-staging" && origin?.purpose !== "auth103-fresh-native") ||
+    (origin?.purpose !== "shared-auth-staging" &&
+      origin?.purpose !== "auth103-fresh-native" &&
+      origin?.purpose !== "ordinary-native-primary") ||
     options.connection.sql !== sql ||
-    (options.connection.moneyGuard !== "ready" &&
-      options.connection.moneyGuard !== "fresh-native") ||
+    (origin.purpose === "auth103-fresh-native"
+      ? options.connection.moneyGuard !== "fresh-native" || origin.writerEpoch !== undefined
+      : origin.purpose === "ordinary-native-primary"
+        ? options.connection.moneyGuard !== "not-selected" || origin.writerEpoch !== undefined
+        : options.connection.moneyGuard !== "ready" || origin.writerEpoch === undefined) ||
     options.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
     options.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin
   )
@@ -1369,6 +1445,9 @@ function constructWorkerRequestConsumers(
     if (qualified === null)
       throw new TypeError("fresh Auth103 consumers require the qualified native original");
     assertFreshNativeSqlBackingOrigin(sql, origin.rawSql);
+  } else if (origin.purpose === "ordinary-native-primary") {
+    if (qualified === null)
+      throw new TypeError("ordinary native Auth requires its original native source");
   } else {
     if (origin.writerEpoch === undefined)
       throw new TypeError("Money request Writer epoch is absent");

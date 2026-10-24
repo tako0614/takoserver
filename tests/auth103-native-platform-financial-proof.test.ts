@@ -1,16 +1,20 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import { AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES } from "../src/auth103-native-source-contract.ts";
 import {
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+  MONEY_CUTOVER_WRITER_POLICY,
+  moneyCutoverGuardObjectNames,
 } from "../src/money-cutover-sql.ts";
 import type { SqlParam, SqlStatement } from "../src/ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import type { D1StatementLike } from "../src/sql-d1.ts";
 import {
+  createWorkerOrdinaryPrimaryRequestSql,
   createWorkerRequestSql,
   type WorkerRequestDatabase,
 } from "../src/worker-request-composition.ts";
@@ -19,6 +23,9 @@ import { createHostedBillingRealmTestDatabase } from "./helpers/hosted-billing-r
 // Runs only in a dedicated child: mock.module("cloudflare:workers") is process-wide,
 // and another file's earlier mock without `env` would otherwise satisfy the import.
 const child = process.env.AUTH103_NATIVE_PLATFORM_FINANCIAL_PROOF_CHILD === "1";
+test("native source contract owns the immutable Money physical guard catalog", () => {
+  expect(moneyCutoverGuardObjectNames()).toEqual(AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES);
+});
 if (child) {
   // Mechanical component only: a synthetic module-load ACCOUNTS_FINANCIAL_PROOF value
   // and local SQLite primary. No deployed RPC, Accounts origin or genuine proof follows.
@@ -31,18 +38,29 @@ if (child) {
     close.clear();
   });
 
-  async function nativeDatabase(): Promise<WorkerRequestDatabase> {
+  async function nativeDatabase(
+    sourceProfile: "ordinary" | "money-preserved" = "money-preserved",
+  ): Promise<WorkerRequestDatabase> {
+    if (sourceProfile === "money-preserved") {
+      platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY = MONEY_CUTOVER_WRITER_POLICY;
+      platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH = WRITER;
+    } else {
+      delete platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY;
+      delete platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH;
+    }
     const database = await createHostedBillingRealmTestDatabase();
     close.add(() => database.db.close());
-    for (const ddl of [
-      MONEY_CUTOVER_FREEZE_DDL,
-      MONEY_CUTOVER_PERMIT_DDL,
-      MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
-      MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
-      moneyFenceInstallSql("0094"),
-    ])
-      database.db.exec(ddl);
-    await database.sql.run("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)", [WRITER]);
+    if (sourceProfile === "money-preserved") {
+      for (const ddl of [
+        MONEY_CUTOVER_FREEZE_DDL,
+        MONEY_CUTOVER_PERMIT_DDL,
+        MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+        MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+        moneyFenceInstallSql("0094"),
+      ])
+        database.db.exec(ddl);
+      await database.sql.run("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)", [WRITER]);
+    }
     return {
       prepare() {
         throw new Error("native proof fixture used the root binding");
@@ -87,8 +105,23 @@ if (child) {
 
   // Each variant is a fresh module instance, so each captures its own module-load binding.
   type PlatformOrigin = typeof import("../src/auth103-native-platform-origin.ts");
-  const loadPlatform = (variant: string): Promise<PlatformOrigin> =>
-    import(`../src/auth103-native-platform-origin.ts?${variant}`);
+  const loadPlatform = async (
+    variant: string,
+    sourceProfile: "ordinary" | "money-preserved" = "money-preserved",
+  ): Promise<PlatformOrigin> => {
+    const name = "__TAKOSERVER_AUTH103_NATIVE_PROFILE__";
+    const prior = Object.getOwnPropertyDescriptor(globalThis, name);
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      value: { profile: "root-shared-auth-staging-v1", sourceProfile },
+    });
+    try {
+      return await import(`../src/auth103-native-platform-origin.ts?${variant}`);
+    } finally {
+      if (prior === undefined) delete (globalThis as Record<string, unknown>)[name];
+      else Object.defineProperty(globalThis, name, prior);
+    }
+  };
 
   const reference = {
     v: 1,
@@ -159,6 +192,59 @@ if (child) {
       platform.readAuth103NativeFinancialProofReceiver(foreign, "unused-commit"),
     ).toThrow();
     expect(calls).toHaveLength(2);
+  });
+
+  test("native platform origin requires exact installed Money policy and epoch presence", async () => {
+    const database = await nativeDatabase();
+    platformEnv.STATE_DB = database;
+    delete platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY;
+    delete platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH;
+    const ordinaryPlatform = await loadPlatform("money-selection-ordinary", "ordinary");
+    const ordinary = await createWorkerOrdinaryPrimaryRequestSql({ database });
+    ordinaryPlatform.assertAuth103NativePlatformOrigin(ordinary, "unused-commit");
+    const money = await connect(database);
+    expect(() =>
+      ordinaryPlatform.assertAuth103NativePlatformOrigin(money, "unused-commit"),
+    ).toThrow();
+
+    platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY = MONEY_CUTOVER_WRITER_POLICY;
+    platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH = WRITER;
+    const moneyPlatform = await loadPlatform("money-selection-preserved", "money-preserved");
+    moneyPlatform.assertAuth103NativePlatformOrigin(money, "unused-commit");
+    expect(() =>
+      moneyPlatform.assertAuth103NativePlatformOrigin(ordinary, "unused-commit"),
+    ).toThrow();
+  });
+
+  test("ordinary source rejects Money physical guards even when all runtime Money bindings are absent", async () => {
+    const database = await nativeDatabase();
+    platformEnv.STATE_DB = database;
+    delete platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY;
+    delete platformEnv.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH;
+    const ordinaryPlatform = await loadPlatform("ordinary-source-on-money-d1", "ordinary");
+    const ordinary = await createWorkerOrdinaryPrimaryRequestSql({ database });
+
+    // The module-load selection and request origin agree; only the actual D1
+    // schema exposes that this database still carries Money custody.
+    expect(() =>
+      ordinaryPlatform.assertAuth103NativePlatformOrigin(ordinary, "unused-commit"),
+    ).not.toThrow();
+    await expect(
+      ordinaryPlatform.assertAuth103NativeSourceProfileSchema(ordinary, "unused-commit"),
+    ).rejects.toMatchObject({ code: "unavailable" });
+  });
+
+  test("ordinary source accepts the ordinary physical profile", async () => {
+    const database = await nativeDatabase("ordinary");
+    platformEnv.STATE_DB = database;
+    const ordinaryPlatform = await loadPlatform("ordinary-source-on-ordinary-d1", "ordinary");
+    const ordinary = await createWorkerOrdinaryPrimaryRequestSql({ database });
+    expect(() =>
+      ordinaryPlatform.assertAuth103NativePlatformOrigin(ordinary, "unused-commit"),
+    ).not.toThrow();
+    await expect(
+      ordinaryPlatform.assertAuth103NativeSourceProfileSchema(ordinary, "unused-commit"),
+    ).resolves.toBeUndefined();
   });
 
   test("a binding without load/current exposes prove only", async () => {
@@ -260,7 +346,7 @@ if (child) {
       exit: 0,
       diagnostics: "",
     });
-    expect(stderr).toContain("4 pass");
+    expect(stderr).toContain("8 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }

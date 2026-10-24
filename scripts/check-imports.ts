@@ -624,7 +624,8 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
-    name: "domain",
+    // Plain schema/build DATA and fixed predicates are shared below adapters/app.
+    name: "core",
     match: /^src\/auth103-native-source-contract\.ts$/u,
     may: ["core"],
   },

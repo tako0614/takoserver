@@ -1,8 +1,17 @@
 import { env } from "cloudflare:workers";
+import {
+  AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES,
+  AUTH103_NATIVE_MONEY_STRIPE_CUSTOMER_TABLES,
+  AUTH103_NATIVE_MONEY_WRITER_EPOCH_PATTERN,
+  AUTH103_NATIVE_MONEY_WRITER_POLICY,
+  AUTH103_NATIVE_PROFILE,
+  type Auth103NativeBuildProfile,
+} from "./auth103-native-source-contract.ts";
 import { SqlError } from "./ports.ts";
 import type { SharedAuthFinancialProofReceiver } from "./shared-auth-session.ts";
 import {
   assertWorkerRequestNativeBinding,
+  readWorkerRequestWriterEpochOrigin,
   type WorkerRequestSql,
 } from "./worker-request-composition.ts";
 
@@ -19,6 +28,55 @@ const originalArtifactDigest =
   artifactProperty !== undefined && "value" in artifactProperty
     ? artifactProperty.value
     : undefined;
+const moneyPolicyProperty = Object.getOwnPropertyDescriptor(
+  env,
+  "TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY",
+);
+const originalMoneyPolicy =
+  moneyPolicyProperty !== undefined && "value" in moneyPolicyProperty
+    ? moneyPolicyProperty.value
+    : undefined;
+const moneyEpochProperty = Object.getOwnPropertyDescriptor(
+  env,
+  "TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH",
+);
+const moneySelectionDescriptorsAreData =
+  (moneyPolicyProperty === undefined || "value" in moneyPolicyProperty) &&
+  (moneyEpochProperty === undefined || "value" in moneyEpochProperty);
+const originalMoneyEpoch =
+  moneyEpochProperty !== undefined && "value" in moneyEpochProperty
+    ? moneyEpochProperty.value
+    : undefined;
+declare const __TAKOSERVER_AUTH103_NATIVE_PROFILE__: unknown;
+const selectedProfileLiteral =
+  typeof __TAKOSERVER_AUTH103_NATIVE_PROFILE__ === "undefined"
+    ? null
+    : __TAKOSERVER_AUTH103_NATIVE_PROFILE__;
+function captureSelectedSourceProfile(): Auth103NativeBuildProfile | null {
+  if (
+    selectedProfileLiteral === null ||
+    typeof selectedProfileLiteral !== "object" ||
+    Array.isArray(selectedProfileLiteral) ||
+    Object.keys(selectedProfileLiteral).length !== 2
+  )
+    return null;
+  const profile = Object.getOwnPropertyDescriptor(selectedProfileLiteral, "profile");
+  const sourceProfile = Object.getOwnPropertyDescriptor(selectedProfileLiteral, "sourceProfile");
+  if (
+    profile === undefined ||
+    !("value" in profile) ||
+    profile.value !== AUTH103_NATIVE_PROFILE ||
+    sourceProfile === undefined ||
+    !("value" in sourceProfile) ||
+    (sourceProfile.value !== "ordinary" && sourceProfile.value !== "money-preserved")
+  )
+    return null;
+  return Object.freeze({
+    profile: AUTH103_NATIVE_PROFILE,
+    sourceProfile: sourceProfile.value,
+  });
+}
+const selectedSourceProfile = captureSelectedSourceProfile();
 
 // This logical binding is projected only by the private selected Host recipe.
 // Capture the module-load platform value before any request-scoped withEnv().
@@ -220,6 +278,55 @@ export function assertAuth103NativePlatformOrigin(
   )
     throw new SqlError("unavailable", "Auth103 native platform origin is unavailable");
   assertWorkerRequestNativeBinding(connection, originalDatabase);
+  const writerEpoch = readWorkerRequestWriterEpochOrigin(connection);
+  if (
+    selectedSourceProfile === null ||
+    !moneySelectionDescriptorsAreData ||
+    (selectedSourceProfile.sourceProfile === "ordinary"
+      ? writerEpoch !== undefined ||
+        originalMoneyPolicy !== undefined ||
+        originalMoneyEpoch !== undefined
+      : originalMoneyPolicy !== AUTH103_NATIVE_MONEY_WRITER_POLICY ||
+        typeof originalMoneyEpoch !== "string" ||
+        !AUTH103_NATIVE_MONEY_WRITER_EPOCH_PATTERN.test(originalMoneyEpoch) ||
+        writerEpoch !== originalMoneyEpoch)
+  )
+    throw new SqlError("unavailable", "Auth103 native Money writer selection differs");
+}
+
+/** The selected code profile also pins the physical D1 Money guard generation. */
+export async function assertAuth103NativeSourceProfileSchema(
+  connection: WorkerRequestSql,
+  sourceCommit: string,
+): Promise<void> {
+  assertAuth103NativePlatformOrigin(connection, sourceCommit);
+  const names = AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES;
+  const rows = await connection.sql.query(
+    `SELECT name FROM main.sqlite_schema WHERE name IN (${names.map(() => "?").join(",")}) ORDER BY name`,
+    names,
+  );
+  const present = new Set(rows.map((row) => row.name));
+  if (selectedSourceProfile?.sourceProfile === "ordinary" && present.size !== 0) {
+    throw new SqlError("unavailable", "Auth103 ordinary source profile differs from D1");
+  }
+  if (selectedSourceProfile?.sourceProfile === "money-preserved") {
+    const optionalStripe = new Set(
+      AUTH103_NATIVE_MONEY_STRIPE_CUSTOMER_TABLES.flatMap((table) =>
+        ["insert", "update", "delete"].map((verb) => `money_cutover_fence_${table}_${verb}`),
+      ),
+    );
+    const required = names.filter((name) => !optionalStripe.has(name));
+    const stripePresent = [...optionalStripe].filter((name) => present.has(name));
+    if (
+      originalMoneyEpoch === undefined ||
+      required.some((name) => !present.has(name)) ||
+      (stripePresent.length !== 0 && stripePresent.length !== optionalStripe.size)
+    )
+      throw new SqlError("unavailable", "Auth103 Money source profile differs from D1");
+  } else if (selectedSourceProfile?.sourceProfile !== "ordinary") {
+    throw new SqlError("unavailable", "Auth103 Money source profile differs from D1");
+  }
+  assertAuth103NativePlatformOrigin(connection, sourceCommit);
 }
 
 /** Captured from the owning final config; never accepts a caller ref argument. */

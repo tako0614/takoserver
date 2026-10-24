@@ -1,12 +1,13 @@
 import {
-  AUTH103_NATIVE_CURRENT_PREDICATE,
   AUTH103_NATIVE_DEPLOYMENT_QUERY,
-  AUTH103_NATIVE_INSTALL_CURRENT_PREDICATE,
   AUTH103_NATIVE_PROFILE,
   AUTH103_NATIVE_PROJECTED_CATALOG_QUERY,
   AUTH103_NATIVE_REGISTRATION_QUERY,
   AUTH103_NATIVE_RP_REGISTRATION_QUERY,
+  type Auth103NativeBuildProfile,
   type Auth103NativeSourceManifest,
+  type Auth103NativeStorageSourceProfile,
+  auth103NativeCurrentnessSql,
   auth103RpRegistrationRecord,
 } from "./auth103-native-source-contract.ts";
 import { readAuth103SourceClock } from "./auth103-source-clock.ts";
@@ -33,6 +34,29 @@ const selected =
     ? null
     : __TAKOSERVER_AUTH103_NATIVE_SOURCE__;
 
+function selectedBuildProfile(): Auth103NativeBuildProfile | null {
+  if (
+    selectedProfile === null ||
+    typeof selectedProfile !== "object" ||
+    Array.isArray(selectedProfile) ||
+    Object.keys(selectedProfile).length !== 2
+  )
+    return null;
+  const profile = Object.getOwnPropertyDescriptor(selectedProfile, "profile");
+  const sourceProfile = Object.getOwnPropertyDescriptor(selectedProfile, "sourceProfile");
+  if (
+    profile === undefined ||
+    !("value" in profile) ||
+    profile.value !== AUTH103_NATIVE_PROFILE ||
+    sourceProfile === undefined ||
+    !("value" in sourceProfile) ||
+    (sourceProfile.value !== "ordinary" && sourceProfile.value !== "money-preserved")
+  )
+    return null;
+  return Object.freeze({ profile: profile.value, sourceProfile: sourceProfile.value });
+}
+const originalBuildProfile = selectedBuildProfile();
+
 export interface Auth103NativeRequestOrigin {
   readonly opaqueAuth103NativeRequestOrigin: unique symbol;
 }
@@ -50,6 +74,10 @@ interface Original {
   readonly batch: Sql["batch"];
   readonly manifest: Auth103NativeSourceManifest;
   readonly assertPlatform: (connection: WorkerRequestSql, sourceCommit: string) => void;
+  readonly assertProfileSchema: (
+    connection: WorkerRequestSql,
+    sourceCommit: string,
+  ) => Promise<void>;
   readonly catalogSnapshotJson: string;
   readonly readInputs: (connection: WorkerRequestSql) => WorkerRequestFinancialInputs;
   readonly artifactDigest: string;
@@ -131,9 +159,15 @@ function manifest(): Auth103NativeSourceManifest {
 /** Code-selected branch only, never a caller permission/ready flag. */
 export function auth103NativeSourceCodeSelected(): boolean {
   if (selectedProfile === null) return false;
-  if (selectedProfile !== AUTH103_NATIVE_PROFILE) return unavailable();
+  if (originalBuildProfile === null) return unavailable();
   manifest();
   return true;
+}
+
+/** Original storage lineage selected by the exact owning build, never by a request. */
+export function auth103NativeStorageSourceProfile(): Auth103NativeStorageSourceProfile | null {
+  if (!auth103NativeSourceCodeSelected()) return null;
+  return originalBuildProfile?.sourceProfile ?? unavailable();
 }
 
 function assertOriginal(original: Original): void {
@@ -182,11 +216,14 @@ async function query(
   params?: readonly SqlParam[],
 ) {
   assertOriginal(original);
+  await original.assertProfileSchema(original.connection, original.manifest.sourceCommit);
+  assertOriginal(original);
   const result = await Reflect.apply(
     original.query,
     original.inputs.sql,
     params === undefined ? [sql] : [sql, params],
   );
+  await original.assertProfileSchema(original.connection, original.manifest.sourceCommit);
   assertOriginal(original);
   return rows(result, keys);
 }
@@ -206,7 +243,7 @@ function currentness(original: Original, catalogJson: string) {
   const { registrationRef, recipeDigest, clockSourceDigest, clockPolicyRef, rpRegistration } =
     original.manifest;
   return Object.freeze({
-    sql: `(${AUTH103_NATIVE_CURRENT_PREDICATE}) AND (${AUTH103_NATIVE_INSTALL_CURRENT_PREDICATE})`,
+    sql: auth103NativeCurrentnessSql(originalBuildProfile?.sourceProfile ?? unavailable()),
     params: Object.freeze([
       registrationRef,
       recipeDigest,
@@ -249,6 +286,7 @@ export async function qualifyAuth103NativeRequestOrigin(
       batch: batchMethod,
       manifest: selectedManifest,
       assertPlatform: platform.assertAuth103NativePlatformOrigin,
+      assertProfileSchema: platform.assertAuth103NativeSourceProfileSchema,
       catalogSnapshotJson: "",
       readInputs: composition.readWorkerRequestNativeInitializationInputs,
       artifactDigest: platform.readAuth103NativePlatformArtifactDigest(
@@ -265,6 +303,7 @@ export async function qualifyAuth103NativeRequestOrigin(
       selectedManifest.targetRef,
       selectedManifest.sourceRef,
       initial.artifactDigest,
+      originalBuildProfile?.sourceProfile ?? unavailable(),
     ]);
     assertOriginal(initial);
     const deploymentReceiptRef = await canonicalDigest([
@@ -277,6 +316,7 @@ export async function qualifyAuth103NativeRequestOrigin(
       receiptRef: deploymentReceiptRef,
       manifest: selectedManifest,
       artifactDigest: initial.artifactDigest,
+      sourceProfile: originalBuildProfile?.sourceProfile ?? unavailable(),
       rpRecordJson,
     });
     const original: Original = Object.freeze({

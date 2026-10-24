@@ -10,10 +10,16 @@ import {
   AUTH103_NATIVE_PROFILE,
   AUTH103_NATIVE_PROFILE_DEFINE,
   AUTH103_NATIVE_REGISTRATION_QUERY,
+  type Auth103NativeBuildProfile,
   type Auth103NativeSourceManifest,
+  type Auth103NativeStorageSourceProfile,
   auth103RpRegistrationRecord,
 } from "../../src/auth103-native-source-contract.ts";
 import { canonicalJson } from "../../src/json.ts";
+import {
+  MONEY_CUTOVER_WRITER_EPOCH_PATTERN,
+  MONEY_CUTOVER_WRITER_POLICY,
+} from "../../src/money-cutover-sql.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { frameHostMigrationSql } from "../../src/sqlite-migration-policy.ts";
 import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
@@ -31,11 +37,13 @@ export { createAuth103CanonicalSourceArtifacts } from "./auth103-canonical-recip
 const clockPath = "src/auth103-source-clock.ts";
 const requiredSourcePaths = Object.freeze([
   clockPath,
+  "src/auth103-native-platform-origin.ts",
   "src/auth103-native-origin-source.ts",
   "src/auth103-native-source-contract.ts",
-  "src/auth103-native-platform-origin.ts",
   "src/entry-cloudflare-worker.ts",
+  "src/entry-worker.ts",
   "src/worker-request-composition.ts",
+  "src/money-cutover-sql.ts",
   "src/auth-authority-schema-plan.ts",
   "src/auth-principal-schema-plan.ts",
   "src/auth-rp-storage-schema-plan.ts",
@@ -387,12 +395,37 @@ interface BuildOriginal {
   readonly accountId: string;
   readonly databaseId: string;
   readonly profile: typeof AUTH103_NATIVE_PROFILE | null;
+  readonly sourceProfile: Auth103NativeStorageSourceProfile | null;
   readonly sources: readonly { readonly path: string; readonly digest: string }[];
   readonly manifest: Auth103NativeSourceManifest | null;
   readonly closure: ReturnType<typeof captureRegisteredBuildClosure> | null;
   readonly canonicalArtifactDigest: string | null;
 }
 const builds = new WeakMap<object, BuildOriginal>();
+
+export function readAuth103NativeTargetSourceProfile(
+  target: DeployTarget,
+): Auth103NativeStorageSourceProfile | null {
+  if ((target.auth103NativeProfile ?? null) !== AUTH103_NATIVE_PROFILE) return null;
+  const storageLineage = target.takoformV2?.storageLineage;
+  const appliedSchemaLineage = target.takoformV2?.appliedSchemaLineage;
+  const moneyLineage =
+    storageLineage === "v2-0092" ||
+    storageLineage === "v2-0100-money-preserved" ||
+    appliedSchemaLineage === "v2-0092";
+  const exactMoneySelection =
+    target.moneyCutoverWriterPolicy === MONEY_CUTOVER_WRITER_POLICY &&
+    MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(target.moneyCutoverWriterEpoch ?? "");
+  if (moneyLineage) return exactMoneySelection ? "money-preserved" : null;
+  if (
+    storageLineage === "v2-0100" &&
+    appliedSchemaLineage === undefined &&
+    target.moneyCutoverWriterPolicy === undefined &&
+    target.moneyCutoverWriterEpoch === undefined
+  )
+    return "ordinary";
+  return null;
+}
 
 export function prepareAuth103NativeBuildSource(input: {
   readonly sourceRoot: string;
@@ -410,6 +443,9 @@ export function prepareAuth103NativeBuildSource(input: {
       input.target.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin)
   )
     throw preflightError("Auth103 selected profile must retain its actual Root staging origin");
+  const sourceProfile = readAuth103NativeTargetSourceProfile(input.target);
+  if (profile !== null && sourceProfile === null)
+    throw preflightError("Auth103 selected Money source profile is invalid");
   const origin = {
     sourceRoot: resolve(input.sourceRoot),
     commit: input.commit,
@@ -417,6 +453,7 @@ export function prepareAuth103NativeBuildSource(input: {
     accountId: input.target.accountId,
     databaseId: input.target.d1.databaseId,
     profile,
+    sourceProfile,
   };
   const retain = (
     manifest: Auth103NativeSourceManifest | null,
@@ -565,7 +602,8 @@ export function readAuth103NativeBuildDefine(
     original.sourceRoot !== resolve(sourceRoot) ||
     target.accountId !== original.accountId ||
     target.d1.databaseId !== original.databaseId ||
-    (target.auth103NativeProfile ?? null) !== original.profile
+    (target.auth103NativeProfile ?? null) !== original.profile ||
+    readAuth103NativeTargetSourceProfile(target) !== original.sourceProfile
   )
     throw preflightError("Auth103 build origin does not match the owning config");
   original.closure?.assertCurrent();
@@ -610,7 +648,14 @@ export function readAuth103NativeBuildProfileDefine(
   readAuth103NativeBuildDefine(capture, target, commit, sourceRoot);
   const original = builds.get(capture);
   if (original === undefined) throw preflightError("Auth103 profile requires its original build");
-  return JSON.stringify(original.profile);
+  if (original.profile === null) return "null";
+  if (original.sourceProfile === null)
+    throw preflightError("Auth103 source profile requires its original target");
+  const selected: Auth103NativeBuildProfile = Object.freeze({
+    profile: original.profile,
+    sourceProfile: original.sourceProfile,
+  });
+  return JSON.stringify(selected);
 }
 
 export { AUTH103_NATIVE_DEFINE, AUTH103_NATIVE_PROFILE_DEFINE };
@@ -631,7 +676,10 @@ export function createAuth103NativeSourceInstallContribution(
     throw preflightError("Auth103 install requires its owned regular Worker bundle");
   const artifactDigest = digest(readFileSync(bundlePath));
   const manifest = original.manifest;
-  return compileAuth103NativeSourceInstallContribution(manifest, artifactDigest);
+  const sourceProfile = original.sourceProfile;
+  if (sourceProfile === null)
+    throw preflightError("Auth103 install requires its selected source profile");
+  return compileAuth103NativeSourceInstallContribution(manifest, artifactDigest, sourceProfile);
 }
 
 /** Formats the builder's existing four immutable originals. This function does
@@ -641,8 +689,9 @@ export function createAuth103NativeSourceInstallContribution(
 export function compileAuth103NativeSourceInstallContribution(
   manifest: Auth103NativeSourceManifest,
   artifactDigest: `sha256:${string}`,
+  sourceProfile: Auth103NativeStorageSourceProfile,
 ): string {
-  const record = auth103NativeDeploymentRecord(manifest, artifactDigest);
+  const record = auth103NativeDeploymentRecord(manifest, artifactDigest, sourceProfile);
   const { deploymentRef, deploymentReceiptRef, rpJson, deploymentJson } = record;
   const rp = record.rp;
   // Existing RP configuration originals may be reused only byte-exact. The
@@ -664,12 +713,14 @@ INSERT INTO auth103_native_deployment_receipts(receipt_ref,deployment_ref,record
 export function auth103NativeDeploymentRecord(
   manifest: Auth103NativeSourceManifest,
   artifactDigest: `sha256:${string}`,
+  sourceProfile: Auth103NativeStorageSourceProfile,
 ) {
   const deploymentRef = dataDigest([
     "takoserver.auth103.native-deployment.v1",
     manifest.targetRef,
     manifest.sourceRef,
     artifactDigest,
+    sourceProfile,
   ]);
   const deploymentReceiptRef = dataDigest([
     "takoserver.auth103.native-deployment-receipt.v1",
@@ -681,6 +732,7 @@ export function auth103NativeDeploymentRecord(
     receiptRef: deploymentReceiptRef,
     manifest,
     artifactDigest,
+    sourceProfile,
     rpRecordJson: rpJson,
   });
   return Object.freeze({ deploymentRef, deploymentReceiptRef, rp, rpJson, deploymentJson });

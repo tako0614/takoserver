@@ -9,6 +9,7 @@ import {
   assertVerifiedLocalPrincipalIssuanceReader,
 } from "../src/auth.ts";
 import { additiveAuthDDL, additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
+import { createAuth103SourceClock } from "../src/auth103-source-clock.ts";
 import { createCredentialAuthorityClassStore } from "../src/credential-authority-class.ts";
 import { createWorkerEntry, type WorkerEnv } from "../src/entry-worker.ts";
 import { FinancialAuthConsumerUnavailable } from "../src/financial-auth-consumer.ts";
@@ -41,21 +42,24 @@ import {
   captureWorkerRequestRetainedDirectOwnerSession,
   captureWorkerRequestRetainedRpSession,
   captureWorkerSharedAuthStaging,
-  createWorkerFreshNativeRequestSql,
+  createWorkerOrdinaryPrimaryRequestSql,
   createWorkerPrimaryRequestSql,
   createWorkerRequestConsumers,
   createWorkerRequestConsumersWithUnregisteredLocalIssuer,
   createWorkerRequestSql,
+  initializeWorkerRequestNativeInputs,
   loadWorkerRequestRetainedRpFinancialIdentityProofOriginal,
   observeWorkerRequestAuthSchema,
   proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   readWorkerRequestConsumers,
   readWorkerRequestFinancialAuthSchemaObservation,
   readWorkerRequestFinancialInputs,
+  readWorkerRequestNativeInitializationInputs,
   readWorkerRequestRetainedCredentialInputs,
   readWorkerRequestRetainedRpCapture,
   readWorkerRequestRetainedRpPrincipalBindingInputs,
   readWorkerRequestVerifiedLocalPrincipalIssuanceInputs,
+  readWorkerRequestWriterEpochOrigin,
   verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
@@ -140,19 +144,22 @@ async function fixture(
   shape?: (result: SqlWrite, originalStatementSql: string) => D1ResultLike,
   selectedSharedAuth?: WorkerSharedAuthStaging,
   selectedClock?: Clock,
+  includeMoneyTables = true,
 ) {
   const database = await createHostedBillingRealmTestDatabase();
   close.add(() => database.db.close());
   for (const ddl of SHARED_AUTH_TEST_ONLY_DDL) database.db.exec(ddl);
-  for (const ddl of [
-    MONEY_CUTOVER_FREEZE_DDL,
-    MONEY_CUTOVER_PERMIT_DDL,
-    MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
-    MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
-    moneyFenceInstallSql("0094"),
-  ])
-    database.db.exec(ddl);
-  await database.sql.run("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)", [WRITER]);
+  if (includeMoneyTables) {
+    for (const ddl of [
+      MONEY_CUTOVER_FREEZE_DDL,
+      MONEY_CUTOVER_PERMIT_DDL,
+      MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+      MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+      moneyFenceInstallSql("0094"),
+    ])
+      database.db.exec(ddl);
+    await database.sql.run("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)", [WRITER]);
+  }
   await seedHostedBillingRealmTestPin(database.sql, {
     accountId: ACCOUNT,
     billingAuthority: AUTHORITY,
@@ -323,7 +330,7 @@ async function fixture(
     },
     ...pricing.environment,
   };
-  return { ...database, binding, sessions, connect, consumers, profile, env };
+  return { ...database, binding, sessions, connect, consumers, profile, client, env };
 }
 
 function processorReads() {
@@ -837,20 +844,25 @@ describe("post-graph shared-auth request observation", () => {
   });
 });
 
-test("post-observer validation rejects actual Sql method substitution after await", async () => {
+test("post-observer cannot substitute frozen actual Sql methods after await", async () => {
   const f = await fixture();
   const processor = processorReads();
-  const restore: (() => void)[] = [];
-  let substitutions = 0;
+  let substitutionAttempts = 0;
   let replacementCalls = 0;
   const entry = createWorkerEntry({
     sharedAuthStaging: f.profile,
     async observeSharedAuthRequest(connection) {
       const inputs = financialRequestOrigin.readWorkerRequestFinancialInputs(connection);
       const descriptor = Object.getOwnPropertyDescriptor(inputs.sql, "query");
-      if (!descriptor || !("value" in descriptor) || descriptor.configurable !== true)
-        throw new Error("actual request Sql query is not the expected mutable data method");
+      if (
+        !descriptor ||
+        !("value" in descriptor) ||
+        descriptor.configurable !== false ||
+        descriptor.writable !== false
+      )
+        throw new Error("actual request Sql query is not a frozen data method");
       await Promise.resolve();
+      substitutionAttempts += 1;
       Object.defineProperty(inputs.sql, "query", {
         ...descriptor,
         value() {
@@ -858,8 +870,6 @@ test("post-observer validation rejects actual Sql method substitution after awai
           throw new Error("substituted request method must never run");
         },
       });
-      restore.push(() => Object.defineProperty(inputs.sql, "query", descriptor));
-      substitutions += 1;
     },
   });
   try {
@@ -869,7 +879,7 @@ test("post-observer validation rejects actual Sql method substitution after awai
     );
     expect(response.status).toBe(503);
     expect(await response.text()).toContain("operator shared-login request observation failed");
-    expect(substitutions).toBe(1);
+    expect(substitutionAttempts).toBe(1);
     const failure: unknown = await entry.scheduled({}, f.env).then(
       () => undefined,
       (error: unknown) => error,
@@ -879,16 +889,11 @@ test("post-observer validation rejects actual Sql method substitution after awai
     const stageCause = failure.cause;
     expect(stageCause).toBeInstanceOf(TypeError);
     if (!(stageCause instanceof TypeError)) throw new Error("post-observer cause is absent");
-    expect(stageCause.cause).toMatchObject({
-      code: "invalid",
-      message: "money cutover Sql origin differs",
-    });
-    expect(substitutions).toBe(2);
+    expect(substitutionAttempts).toBe(2);
     expect(replacementCalls).toBe(0);
     expect(f.sessions).toHaveLength(2);
     expect(await f.sql.query("SELECT COUNT(*) AS n FROM shared_auth_attempts")).toEqual([{ n: 0 }]);
   } finally {
-    for (const original of restore) original();
     processor.restore();
   }
 });
@@ -951,15 +956,63 @@ describe("Worker primary Auth schema observations", () => {
     ).toThrow();
   });
 
-  test("fresh native request keeps one first-primary and cannot publish consumers before qualification", async () => {
+  test("ordinary native request keeps one first-primary and cannot publish consumers before qualification", async () => {
     const f = await fixture();
-    const connection = createWorkerFreshNativeRequestSql(f.binding);
+    const connection = await createWorkerOrdinaryPrimaryRequestSql({ database: f.binding });
     expect(f.sessions).toHaveLength(1);
-    expect(connection.moneyGuard).toBe("fresh-native");
+    expect(connection.moneyGuard).toBe("not-selected");
     expect(() => assertWorkerRequestBackingOrigin(connection)).not.toThrow();
     expect(() => readWorkerRequestConsumers(connection)).toThrow();
     expect(() => assertWorkerRequestFinancialSqlOrigin(connection, connection.sql)).toThrow();
     expect(() => assertMoneyCutoverSqlOrigin(connection.sql, { writerEpoch: WRITER })).toThrow();
+  });
+
+  test("ordinary native primary keeps first-primary custody without selecting Money", async () => {
+    const f = await fixture(undefined, undefined, undefined, false);
+    const connection = await createWorkerOrdinaryPrimaryRequestSql({ database: f.binding });
+    expect(connection.moneyGuard).toBe("not-selected");
+    expect(readWorkerRequestWriterEpochOrigin(connection)).toBeUndefined();
+    expect(f.sessions).toEqual([{ constraint: "first-primary", queries: [] }]);
+    expect(() => readWorkerRequestFinancialInputs(connection)).toThrow();
+  });
+
+  test("ordinary native primary retains the real realm without epoch or unqualified RP fallback", async () => {
+    const f = await fixture(undefined, undefined, undefined, false);
+    const connection = await createWorkerOrdinaryPrimaryRequestSql({ database: f.binding });
+    const realm = await verifyHostedBillingFinancialRealm({
+      sql: connection.sql,
+      reader: { client: f.client },
+      expected: { accountId: ACCOUNT, billingAuthority: AUTHORITY, mode: "test" },
+      prices: [{ priceId: PRICE, monthlyAmountMinor: 1000 }],
+    });
+    const options = {
+      connection,
+      sql: connection.sql,
+      realm,
+      client: f.client,
+      sharedAuth: f.profile,
+      identity: {
+        async verify(): Promise<never> {
+          throw new Error("test grants no identity");
+        },
+      },
+      clock: createAuth103SourceClock(),
+      randomId: () => crypto.randomUUID(),
+      publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+      consoleOrigin: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
+    };
+    initializeWorkerRequestNativeInputs(options);
+    const nativeInputs = readWorkerRequestNativeInitializationInputs(connection);
+    expect(nativeInputs).toEqual({
+      sql: connection.sql,
+      client: f.client,
+      realm,
+      clock: options.clock,
+      writerEpoch: undefined,
+    });
+    expect(() => createWorkerRequestConsumers(options)).toThrow(
+      "ordinary native Auth requires its original native source",
+    );
   });
 
   test("missing Auth catalog rejects before publishing a capture or retrying", async () => {
@@ -1832,7 +1885,13 @@ describe("Worker original retained credential inputs", () => {
     test(`actual direct read refuses ${mutation} query substitution`, async () => {
       const r = await retainedDirectRequestFixture();
       const descriptor = Object.getOwnPropertyDescriptor(r.inputs.sql, "query");
-      if (!descriptor || !("value" in descriptor)) throw new Error("original query missing");
+      if (
+        !descriptor ||
+        !("value" in descriptor) ||
+        descriptor.configurable !== false ||
+        descriptor.writable !== false
+      )
+        throw new Error("original query is not a frozen data method");
       let changed = false;
       let substitutedCalls = 0;
       r.control.onResult = () => {
@@ -1862,12 +1921,12 @@ describe("Worker original retained credential inputs", () => {
       };
       const before = r.queries().length;
       try {
-        await expect(r.capture()).rejects.toMatchObject({ code: "invalid" });
+        await expect(r.capture()).rejects.toThrow();
         expect(changed).toBe(true);
         expect(substitutedCalls).toBe(0);
         expect(directRequestReadCounts(r.queries().slice(before))).toEqual([1, 0, 0, 0]);
       } finally {
-        Object.defineProperty(r.inputs.sql, "query", descriptor);
+        expect(Object.getOwnPropertyDescriptor(r.inputs.sql, "query")).toEqual(descriptor);
       }
     });
   }
@@ -2626,6 +2685,22 @@ describe("Worker verified local Principal issuance origin", () => {
       const descriptor = Object.getOwnPropertyDescriptor(receiver, method);
       if (!descriptor) throw new Error("original method missing");
       let reads = 0;
+      if (descriptor.configurable === false) {
+        expect(() =>
+          Object.defineProperty(receiver, method, {
+            configurable: true,
+            get(): never {
+              reads++;
+              throw new Error("replacement getter");
+            },
+          }),
+        ).toThrow();
+        expect(reads).toBe(0);
+        expect(
+          readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, r.issued),
+        ).not.toBeNull();
+        return;
+      }
       Object.defineProperty(receiver, method, {
         configurable: true,
         get(): never {

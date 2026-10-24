@@ -621,7 +621,10 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     const initial = await hostedBrowserActor(request);
     assertRequest();
     const lookup = { continuationRef: selection.selector, canonicalAccountId: initial.accountId };
-    const selected = await hostedBrowserRpc.read(lookup);
+    const selected =
+      request.method === "GET" && selection.route !== "metadata"
+        ? await hostedBrowserRpc.readWithCurrentOwner(lookup, initial, request)
+        : await hostedBrowserRpc.read(lookup);
     assertRequest();
     if (selected.kind !== "view" && selected.kind !== "payment") return hostedRefusal(selected);
     const scope = selected.kind === "view" ? selected.scope : selected.original.scope;

@@ -1,6 +1,10 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import {
+  type Auth103NativeSourceManifest,
+  auth103RpRegistrationRecord,
+} from "../../src/auth103-native-source-contract.ts";
 import { canonicalJson } from "../../src/json.ts";
 import { type DeployPhase, preflightError, verificationError } from "./errors.ts";
 import { readAuth103OriginalCustodyDirectory } from "./schema-auth103-native-source.ts";
@@ -35,6 +39,52 @@ const MAX = new Map<string, number>([
 ]);
 const hash = (bytes: Uint8Array | string) =>
   `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+const dataDigest = (value: unknown) => hash(canonicalJson(value));
+const literal = (value: string) => `'${value.replaceAll("'", "''")}'`;
+
+/** Exact retained pre-sourceProfile compiler projection. DATA only: its caller
+ * must still prove the reviewed release and live Version bytes separately. */
+function historicalAuth103OriginalContribution(
+  manifest: Auth103NativeSourceManifest,
+  artifactDigest: `sha256:${string}`,
+) {
+  const deploymentRef = dataDigest([
+    "takoserver.auth103.native-deployment.v1",
+    manifest.targetRef,
+    manifest.sourceRef,
+    artifactDigest,
+  ]);
+  const deploymentReceiptRef = dataDigest([
+    "takoserver.auth103.native-deployment-receipt.v1",
+    deploymentRef,
+  ]);
+  const rp = auth103RpRegistrationRecord(manifest);
+  const rpJson = canonicalJson(rp);
+  const deploymentJson = canonicalJson({
+    receiptRef: deploymentReceiptRef,
+    manifest,
+    artifactDigest,
+    rpRecordJson: rpJson,
+  });
+  const sql = `INSERT INTO auth103_native_rp_registrations(registration_ref,registration_digest,record_json)
+SELECT ${[rp.registrationRef, rp.registrationDigest, rpJson].map(literal).join(",")}
+WHERE NOT EXISTS(SELECT 1 FROM auth103_native_rp_registrations WHERE registration_ref=${literal(rp.registrationRef)}) RETURNING *;
+INSERT INTO auth103_native_rp_registration_receipts(receipt_ref,registration_ref,record_json)
+SELECT ${[rp.receiptRef, rp.registrationRef, rpJson].map(literal).join(",")}
+WHERE NOT EXISTS(SELECT 1 FROM auth103_native_rp_registration_receipts WHERE receipt_ref=${literal(rp.receiptRef)}) RETURNING *;
+INSERT INTO auth103_native_deployments(deployment_ref,target_ref,source_ref,artifact_digest,record_json) VALUES
+(${[deploymentRef, manifest.targetRef, manifest.sourceRef, artifactDigest, deploymentJson].map(literal).join(",")}) RETURNING *;
+INSERT INTO auth103_native_deployment_receipts(receipt_ref,deployment_ref,record_json) VALUES
+(${[deploymentReceiptRef, deploymentRef, deploymentJson].map(literal).join(",")}) RETURNING *;\n`;
+  return Object.freeze({
+    deploymentRef,
+    deploymentReceiptRef,
+    rp,
+    rpJson,
+    deploymentJson,
+    sql,
+  });
+}
 
 type Phase = Extract<DeployPhase, "preflight" | "verification">;
 type FileName = (typeof FILES)[number];
@@ -135,6 +185,7 @@ export interface HistoricalPublicationSelection {
     readonly accountId: string;
     readonly d1: { readonly databaseName: string; readonly databaseId: string };
     readonly r2: { readonly bucketName: string };
+    readonly moneyCutoverWriterPolicy?: string;
   };
   /** Digest of the exact selected private descriptor's raw bytes. */
   readonly targetDigest: string;
@@ -363,6 +414,12 @@ export function readAuth103HistoricalPublication(input: HistoricalPublicationSel
       !sql.includes(Buffer.from(workerDigest))
     )
       refuse(phase, "Auth103 historical publication release differs from its selected source");
+    const original = historicalAuth103OriginalContribution(
+      manifest as unknown as Auth103NativeSourceManifest,
+      workerDigest as `sha256:${string}`,
+    );
+    if (!sql.equals(Buffer.from(original.sql)))
+      refuse(phase, "Auth103 historical publication SQL differs from its original compiler");
     const assertUnchanged = () => {
       for (const name of FILES) saved(name).assertUnchanged();
       releaseUnchanged();

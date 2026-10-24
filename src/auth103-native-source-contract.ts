@@ -33,6 +33,62 @@ export interface Auth103NativeSourceManifest {
   readonly rpRegistration: Auth103NativeRpRegistration;
 }
 
+/** Internal code-selected storage lineage carried by the owning build profile. */
+export type Auth103NativeStorageSourceProfile = "ordinary" | "money-preserved";
+export interface Auth103NativeBuildProfile {
+  readonly profile: typeof AUTH103_NATIVE_PROFILE;
+  readonly sourceProfile: Auth103NativeStorageSourceProfile;
+}
+
+/** Immutable Money catalog names needed to compare the selected D1 lineage. */
+export const AUTH103_NATIVE_MONEY_WRITER_POLICY = "transaction-fenced-usd-micros-v1" as const;
+export const AUTH103_NATIVE_MONEY_WRITER_EPOCH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+export const AUTH103_NATIVE_MONEY_FINANCIAL_TABLES = [
+  "ledger",
+  "wallet_credit_lots",
+  "wallet_credit_allocations",
+  "wallet_allocation_guards",
+  "quotes",
+  "reservations",
+  "usage_statements",
+  "usage_events",
+  "idempotency",
+  "reseller_settlement_intents",
+  "reseller_settlement_guards",
+  "stripe_events",
+  "org_wallet_holds",
+  "org_wallet_usage_records",
+  "org_wallet_grant_snapshots",
+  "org_wallet_pricing_revisions",
+  "org_wallet_monthly_tariffs",
+  "sponsorship_tenants",
+  "sponsorship_resources",
+  "sponsorship_credential_issuance_operations",
+] as const;
+export const AUTH103_NATIVE_MONEY_STRIPE_CUSTOMER_TABLES = [
+  "stripe_billing_customers",
+  "stripe_billing_customer_commands",
+  "stripe_customer_admission_links",
+] as const;
+export const AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES: readonly string[] = Object.freeze([
+  "money_cutover_freeze",
+  "money_cutover_writer_permit",
+  "money_cutover_authorized_epoch",
+  "money_cutover_permit_epoch_guard",
+  ...[...AUTH103_NATIVE_MONEY_FINANCIAL_TABLES, "wallet_credit_lot_classification_proofs"].flatMap(
+    (table) => ["insert", "update", "delete"].map((verb) => `money_cutover_fence_${table}_${verb}`),
+  ),
+  ...AUTH103_NATIVE_MONEY_STRIPE_CUSTOMER_TABLES.flatMap((table) =>
+    ["insert", "update", "delete"].map((verb) => `money_cutover_fence_${table}_${verb}`),
+  ),
+]);
+/** Static, no-bind physical exclusion used only by ordinary-profile currentness. */
+export const AUTH103_NATIVE_ORDINARY_MONEY_GUARD_ABSENT_PREDICATE = `NOT EXISTS (
+  SELECT 1 FROM main.sqlite_schema WHERE name IN (
+    ${AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES.map((name) => `'${name}'`).join(",\n    ")}
+  )
+)`;
+
 export const AUTH103_NATIVE_DEFINE = "__TAKOSERVER_AUTH103_NATIVE_SOURCE__";
 export const AUTH103_NATIVE_PROFILE_DEFINE = "__TAKOSERVER_AUTH103_NATIVE_PROFILE__";
 export const AUTH103_NATIVE_PROFILE = "root-shared-auth-staging-v1";
@@ -255,6 +311,19 @@ JOIN auth103_native_rp_registration_receipts receipt ON receipt.registration_ref
  AND receipt.receipt_ref=json_extract(original.record_json,'$.receiptRef')
 WHERE original.registration_ref=? AND original.registration_digest=? AND original.record_json=?
 )`;
+
+/** Same ten bind slots in both profiles; Money-preserved keeps the original SQL bytes. */
+export function auth103NativeCurrentnessSql(
+  sourceProfile: Auth103NativeStorageSourceProfile,
+): string {
+  if (sourceProfile !== "ordinary" && sourceProfile !== "money-preserved")
+    throw new TypeError("Auth103 native currentness source profile is invalid");
+  const ordinaryGuard =
+    sourceProfile === "ordinary"
+      ? ` AND (${AUTH103_NATIVE_ORDINARY_MONEY_GUARD_ABSENT_PREDICATE})`
+      : "";
+  return `(${AUTH103_NATIVE_CURRENT_PREDICATE}${ordinaryGuard}) AND (${AUTH103_NATIVE_INSTALL_CURRENT_PREDICATE})`;
+}
 
 /** Stable internal row encoding; this data helper is not a registration factory. */
 export function auth103RpRegistrationRecord(manifest: Auth103NativeSourceManifest) {
