@@ -248,6 +248,10 @@ export function createFinancialCurrentConsentCustomerExecutor(
 ) {
   const graph = readWorkerRequestConsumers(connection);
   const inputs = readWorkerRequestFinancialInputs(connection);
+  // Existing Customer history and 0104 fences are Money-only. An ordinary
+  // native Auth origin does not supply the missing Financial writer authority.
+  const writerEpoch = inputs.writerEpoch;
+  if (typeof writerEpoch !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(writerEpoch)) unavailable();
   const port = readWorkerRequestFinancialAuthConsumerPort(connection);
   if (!port) unavailable();
   if (graph.sql !== inputs.sql || graph.realm !== inputs.realm) unavailable();
@@ -272,6 +276,7 @@ export function createFinancialCurrentConsentCustomerExecutor(
     if (
       readWorkerRequestConsumers(connection) !== graph ||
       readWorkerRequestFinancialInputs(connection) !== inputs ||
+      inputs.writerEpoch !== writerEpoch ||
       Object.getOwnPropertyDescriptor(inputs.sql, "query")?.value !== query ||
       Object.getOwnPropertyDescriptor(inputs.sql, "batch")?.value !== batch ||
       Object.getOwnPropertyDescriptor(inputs.sql, "run")?.value !== run ||
@@ -365,8 +370,8 @@ export function createFinancialCurrentConsentCustomerExecutor(
       phase.admission.original.realmJson !== actualCustomer.realmJson ||
       phase.admission.original.requestJson !== actualCustomer.requestJson ||
       originalCustomer.financialRealm !== inputs.realm.financialRealm ||
-      phase.writerEpoch !== inputs.writerEpoch ||
-      r1Original.scopeRealm.writerEpoch !== inputs.writerEpoch ||
+      phase.writerEpoch !== writerEpoch ||
+      r1Original.scopeRealm.writerEpoch !== writerEpoch ||
       consent.source.ref !== r1Original.actionSource.ref ||
       consent.source.digest !== r1Original.actionSource.digest ||
       consent.source.registrationRef !== r1Original.actionSource.registrationRef ||

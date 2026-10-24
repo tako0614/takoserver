@@ -1975,6 +1975,9 @@ async function readFinancialRequestBoundR1HistoryWithCaptures(
   const challenge = ref(challengeRef);
   try {
     const inputs = readWorkerRequestFinancialInputs(connection);
+    // This retained R1 family is epoch-bound even on an ordinary Auth primary.
+    // Refuse before observing RP or reading SQL, rather than inventing an epoch.
+    const writerEpoch = digest(inputs.writerEpoch);
     const port = readWorkerRequestFinancialAuthConsumerPort(connection);
     if (!port) fail("unavailable");
     const context = readWorkerRequestFinancialAuthConsumerContext(connection, port);
@@ -1982,7 +1985,7 @@ async function readFinancialRequestBoundR1HistoryWithCaptures(
       !context ||
       context.sql !== inputs.sql ||
       context.realm !== inputs.realm ||
-      context.writerEpoch !== inputs.writerEpoch
+      context.writerEpoch !== writerEpoch
     )
       fail("unavailable");
     const descriptor = Object.getOwnPropertyDescriptor(inputs.sql, "query");
@@ -1995,6 +1998,7 @@ async function readFinancialRequestBoundR1HistoryWithCaptures(
         readWorkerRequestFinancialAuthConsumerPort(connection) !== port ||
         readWorkerRequestFinancialAuthConsumerContext(connection, port) !== context ||
         readWorkerRequestFinancialInputs(connection) !== inputs ||
+        inputs.writerEpoch !== writerEpoch ||
         Object.getOwnPropertyDescriptor(inputs.sql, "query")?.value !== query
       )
         fail("unavailable");
@@ -2154,7 +2158,7 @@ async function readFinancialRequestBoundR1HistoryWithCaptures(
       storedScope.mode !== inputs.realm.mode ||
       storedScope.billingAuthority !== inputs.realm.billingAuthority ||
       storedScope.financialRealm !== inputs.realm.financialRealm ||
-      storedScope.writerEpoch !== inputs.writerEpoch
+      storedScope.writerEpoch !== writerEpoch
     )
       fail("unavailable");
     const scope: FinancialPreproofScope = Object.freeze({
@@ -2171,7 +2175,7 @@ async function readFinancialRequestBoundR1HistoryWithCaptures(
       client: inputs.client,
       realm: inputs.realm,
       clock: inputs.clock,
-      writerEpoch: digest(inputs.writerEpoch),
+      writerEpoch,
       receiverRef: ref(storedScope.receiverRef),
       targetRef: ref(storedScope.targetRef),
       scope,
@@ -2383,6 +2387,8 @@ export function createFinancialActionConsentR1Reader(
   const workspaceId = ref(selectedWorkspaceId);
   try {
     const inputs = readWorkerRequestFinancialInputs(connection);
+    // Ordinary request qualification is separate from this Money-only R1 family.
+    const writerEpoch = digest(inputs.writerEpoch);
     const port = readWorkerRequestFinancialAuthConsumerPort(connection);
     if (!port) fail("unavailable");
     const context = readWorkerRequestFinancialAuthConsumerContext(connection, port);
@@ -2407,7 +2413,8 @@ export function createFinancialActionConsentR1Reader(
         !context ||
         context.sql !== inputs.sql ||
         context.realm !== inputs.realm ||
-        context.writerEpoch !== inputs.writerEpoch ||
+        context.writerEpoch !== writerEpoch ||
+        inputs.writerEpoch !== writerEpoch ||
         readWorkerRequestFinancialInputs(connection) !== inputs ||
         readWorkerRequestFinancialAuthConsumerPort(connection) !== port ||
         readWorkerRequestFinancialAuthConsumerContext(connection, port) !== context ||
