@@ -551,7 +551,7 @@ const LAYERS: readonly Layer[] = [
     // The selection helper also imports the existing Checkout route type.
     name: "routes",
     match:
-      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$|^src\/financial-hosted-browser-(?:continuation|request|rpc|selection)\.ts$/u,
+      /^src\/(?:router|control|data-storage|data-ai|openapi|landing|provisioner-endpoint)\.ts$|^src\/takoform\/(?:routes|host)\.ts$|^src\/financial-hosted-browser-(?:continuation|request|rpc|selection)\.ts$|^src\/financial-hosted-owner-read\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "v2-documentation"],
   },
   {

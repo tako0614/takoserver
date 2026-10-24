@@ -90,6 +90,35 @@ request never falls back to ordinary authentication or payment when the native
 supplier is absent or unknown. Header absence preserves the independent Server
 HTTP lane.
 
+## Financial same-request owner reader
+
+`src/financial-hosted-owner-read.ts:createFinancialHostedOwnerRead` captures the
+actual Server `Request`, code-selected Shared RP/Accounts receivers and Console
+Origin. It authenticates once and returns only `accountId` DATA plus
+`assertCurrent(originalRequest, {canonicalAccountId, workspaceId, workspaceRef,
+organizationId})`. The assertion observes the actual final
+RP selection, compares the original account/Principal/issuer/session and exact
+Workspace/Organization, then calls the real `Accounts.requireOwner`. It pins the
+first account/Workspace/Organization tuple and rechecks captured callables and Request headers around its
+awaits. A different Request, source substitution, owner loss or scope change
+denies the read. No Actor or reusable user credential is returned.
+
+The selected Control path uses this literal reader for its existing initial
+authentication and current-owner checks. Those checks retain the existing
+observer/Owner sequence; the separate final command authorization and effect
+fence still decide payment dispatch. This reader does not grant consent or
+acceptance permission. A continuation selector, billing source reference or
+source epoch is not an additional requirement for this owner-read assertion;
+Hosted retains its separate business/source guards.
+
+The reader requires an actual **Server** Shared RP Request. A Hosted account ID,
+its RP witness DATA, or an Organization read key cannot construct that Request
+or its Actor. The published one-argument native read contract below does not
+transport this owner-reader callable. A native Hosted composition must connect
+the owning current-user source explicitly; this module does not mount it or
+change the RPC contract. The existing Worker `wallet:read` transport and its
+selected private key binding remain separate from human read authorization.
+
 ## Published native business contract
 
 The optional operator-composed named Hosted entrypoint supplies:
