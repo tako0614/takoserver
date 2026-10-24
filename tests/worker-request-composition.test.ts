@@ -17,6 +17,7 @@ import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import { base64UrlEncode, bytesDigest } from "../src/json.ts";
 import {
+  assertMoneyCutoverSqlOrigin,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
   MONEY_CUTOVER_PERMIT_DDL,
@@ -35,9 +36,12 @@ import { createSharedPrincipalAuthorityStore } from "../src/shared-principal-aut
 import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../src/sql-d1.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
+  assertWorkerRequestBackingOrigin,
+  assertWorkerRequestFinancialSqlOrigin,
   captureWorkerRequestRetainedDirectOwnerSession,
   captureWorkerRequestRetainedRpSession,
   captureWorkerSharedAuthStaging,
+  createWorkerFreshNativeRequestSql,
   createWorkerPrimaryRequestSql,
   createWorkerRequestConsumers,
   createWorkerRequestConsumersWithUnregisteredLocalIssuer,
@@ -619,11 +623,14 @@ describe("official read-only Financial request origin", () => {
     const { inputs, runtime } = await f.consumers();
     const before = f.sessions.map((session) => session.queries.length);
     expect(Object.keys(financialRequestOrigin)).toEqual([
+      "FinancialHostedOwnerReadUnavailable",
       "assertFinancialAuthConsumerPort",
       "assertWorkerRequestFinancialAuthConsumerPort",
       "captureWorkerRequestFinancialAuthRpRequest",
       "captureWorkerRequestRetainedDirectOwnerSession",
       "captureWorkerRequestRetainedRpSession",
+      "createFinancialHostedOwnerRead",
+      "createHostedBrowserBillingRpcClient",
       "financialAuthConsumerSourceCurrentness",
       "loadWorkerRequestRetainedRpFinancialIdentityProofOriginal",
       "proveWorkerRequestRetainedRpFinancialIdentityOriginal",
@@ -942,6 +949,17 @@ describe("Worker primary Auth schema observations", () => {
     expect(() =>
       readWorkerRequestFinancialAuthSchemaObservation(connection, observation),
     ).toThrow();
+  });
+
+  test("fresh native request keeps one first-primary and cannot publish consumers before qualification", async () => {
+    const f = await fixture();
+    const connection = createWorkerFreshNativeRequestSql(f.binding);
+    expect(f.sessions).toHaveLength(1);
+    expect(connection.moneyGuard).toBe("fresh-native");
+    expect(() => assertWorkerRequestBackingOrigin(connection)).not.toThrow();
+    expect(() => readWorkerRequestConsumers(connection)).toThrow();
+    expect(() => assertWorkerRequestFinancialSqlOrigin(connection, connection.sql)).toThrow();
+    expect(() => assertMoneyCutoverSqlOrigin(connection.sql, { writerEpoch: WRITER })).toThrow();
   });
 
   test("missing Auth catalog rejects before publishing a capture or retrying", async () => {
@@ -1604,7 +1622,7 @@ describe("Worker original RP final-touch retained DATA", () => {
 
 // The existing request fixture plus the real local verifier/issuer. This keeps
 // candidate target DATA explicit and supplies no qualified target, Clock or human.
-async function retainedDirectRequestFixture() {
+async function retainedDirectRequestFixture(sharedAuth?: WorkerSharedAuthStaging) {
   const now = Date.now();
   const control: {
     onResult?: (result: SqlWrite, originalStatementSql: string) => D1ResultLike | undefined;
@@ -1617,7 +1635,7 @@ async function retainedDirectRequestFixture() {
   const f = await fixture(
     (result, originalStatementSql) =>
       control.onResult?.(result, originalStatementSql) ?? acknowledgement(result),
-    undefined,
+    sharedAuth,
     clock,
   );
   f.db.exec(additiveAuthTokenDDL);
@@ -2156,6 +2174,111 @@ describe("App original Worker request graph opt-in", () => {
     expect(login.status).toBe(303);
     expect(r.f.sessions).toHaveLength(1);
     expect(original.accounts).toBe(r.accounts);
+  });
+
+  test("same composed RP receiver authenticates owner GET and POST through App HTTP", async () => {
+    // Local mechanical connection only: the signed fixture issuer and explicit
+    // principal projection do not qualify a deployed or native RP producer.
+    const now = Date.now();
+    const issuer = await createSharedSessionTestIssuer(() => now);
+    issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
+    let ownerPrincipalId: string | undefined;
+    const sharedAuth: WorkerSharedAuthStaging = {
+      kind: "shared-auth-staging-v1",
+      clientSecret: SESSION_TEST_CONFIG.clientSecret,
+      encryptionKey: new Uint8Array(32).fill(53),
+      principals: {
+        async resolve(input) {
+          if (input.accountId !== SESSION_TEST_ACCOUNT || !ownerPrincipalId)
+            throw new Error("local RP projection has no selected owner");
+          return { accountId: input.accountId, principalId: ownerPrincipalId };
+        },
+      },
+      organizations: {
+        async pin(input) {
+          return input;
+        },
+      },
+      fetch: issuer.send,
+    };
+    const r = await retainedDirectRequestFixture(sharedAuth);
+    ownerPrincipalId = r.issued.principal.id;
+    const app = buildApp(originalRequestAppPorts(r));
+    const login = await app.fetch(new Request(`${r.inputs.publicOrigin}/auth/oidc/login`));
+    expect(login.status).toBe(303);
+    const location = login.headers.get("location");
+    if (!location) throw new Error("local RP login omitted its authorization URL");
+    const attemptCookie = login.headers
+      .getSetCookie()
+      .map((value) => value.split(";")[0] ?? "")
+      .find((value) => value.startsWith("__Host-takoserver_oidc_attempt="));
+    if (!attemptCookie) throw new Error("local RP login omitted its attempt cookie");
+    const callback = await app.fetch(
+      new Request(issuer.authorize(location), { headers: { cookie: attemptCookie } }),
+    );
+    expect(callback.status).toBe(303);
+    const sharedCookie = callback.headers
+      .getSetCookie()
+      .map((value) => value.split(";")[0] ?? "")
+      .find((value) => value.startsWith("__Host-takoserver_shared_session="));
+    if (!sharedCookie) throw new Error("local RP callback omitted its session cookie");
+
+    const owner = await r.accounts.authenticate(r.authorization);
+    if (owner?.kind !== "session") throw new Error("local Accounts owner session is missing");
+    const organization = await r.accounts.createOrganization({ actor: owner, name: "RP owner" });
+    const headers = { cookie: sharedCookie, origin: r.inputs.consoleOrigin };
+    const keysPath = `/v1/organizations/${organization.id}/api-keys`;
+    expect(
+      (await app.fetch(new Request(`${r.inputs.publicOrigin}${keysPath}`, { headers }))).status,
+    ).toBe(200);
+    const created = await app.fetch(
+      new Request(`${r.inputs.publicOrigin}${keysPath}`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({
+          name: "RP owner key",
+          scopes: ["resources:read"],
+          expiresInSeconds: 3600,
+        }),
+      }),
+    );
+    expect(created.status).toBe(201);
+
+    expect(
+      (
+        await app.fetch(
+          new Request(`${r.inputs.publicOrigin}${keysPath}`, {
+            headers: { origin: r.inputs.consoleOrigin },
+          }),
+        )
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await app.fetch(
+          new Request(`${r.inputs.publicOrigin}${keysPath}`, {
+            headers: {
+              origin: r.inputs.consoleOrigin,
+              cookie: "__Host-takoserver_shared_session=unknown",
+            },
+          }),
+        )
+      ).status,
+    ).toBe(401);
+
+    const otherOwner = await r.issueFresh("crossed-rp-owner");
+    const otherActor = await r.accounts.authenticate(`Bearer ${otherOwner.sessionToken}`);
+    if (otherActor?.kind !== "session") throw new Error("second local owner session is missing");
+    const otherOrganization = await r.accounts.createOrganization({
+      actor: otherActor,
+      name: "Other owner",
+    });
+    const crossed = await app.fetch(
+      new Request(`${r.inputs.publicOrigin}/v1/organizations/${otherOrganization.id}/api-keys`, {
+        headers,
+      }),
+    );
+    expect(crossed.status).toBe(404);
   });
 
   test("refuses graph clones and mismatched connection, Sql, client, realm, Clock and origin without IO", async () => {

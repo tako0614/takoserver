@@ -87,6 +87,7 @@ import {
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 import {
   captureWorkerSharedAuthStaging,
+  createWorkerFreshNativeRequestSql,
   createWorkerPrimaryRequestSql,
   createWorkerRequestSql,
   readWorkerRequestFinancialInputs,
@@ -1703,23 +1704,29 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         let selectedOrigin: string | undefined;
         if (requestSqlSelected()) {
           selectedOrigin = startupStage("public-origin", () => requirePublicOrigin(env));
-          if (moneyPolicy === null)
+          if (
+            moneyPolicy === null &&
+            !(sharedAuthStaging === undefined && auth103NativeSourceCodeSelected())
+          )
             throw new TypeError(
               sharedAuthStaging === undefined
                 ? "Container Worker requires the selected Money writer for its native request origin"
                 : "shared-login Worker requires the selected Money writer",
             );
-          connection = !sharedRequestSelected()
-            ? await createWorkerPrimaryRequestSql({
-                database: env.STATE_DB,
-                writerEpoch: moneyPolicy,
-              })
-            : await createWorkerRequestSql({
-                database: env.STATE_DB,
-                writerEpoch: moneyPolicy,
-                publicOrigin: selectedOrigin,
-                consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
-              });
+          connection =
+            moneyPolicy === null
+              ? createWorkerFreshNativeRequestSql(env.STATE_DB)
+              : !sharedRequestSelected()
+                ? await createWorkerPrimaryRequestSql({
+                    database: env.STATE_DB,
+                    writerEpoch: moneyPolicy,
+                  })
+                : await createWorkerRequestSql({
+                    database: env.STATE_DB,
+                    writerEpoch: moneyPolicy,
+                    publicOrigin: selectedOrigin,
+                    consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+                  });
           if (connection.moneyGuard === "frozen") return moneyCutoverFrozenResponse();
         } else if (moneyPolicy !== null) {
           const guard = await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), moneyPolicy);
@@ -1782,23 +1789,29 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       let selectedOrigin: string | undefined;
       if (requestSqlSelected()) {
         selectedOrigin = requirePublicOrigin(env);
-        if (writerEpoch === null)
+        if (
+          writerEpoch === null &&
+          !(sharedAuthStaging === undefined && auth103NativeSourceCodeSelected())
+        )
           throw new TypeError(
             sharedAuthStaging === undefined
               ? "Container Worker requires the selected Money writer for its native request origin"
               : "shared-login Worker requires the selected Money writer",
           );
-        connection = !sharedRequestSelected()
-          ? await createWorkerPrimaryRequestSql({
-              database: env.STATE_DB,
-              writerEpoch,
-            })
-          : await createWorkerRequestSql({
-              database: env.STATE_DB,
-              writerEpoch,
-              publicOrigin: selectedOrigin,
-              consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
-            });
+        connection =
+          writerEpoch === null
+            ? createWorkerFreshNativeRequestSql(env.STATE_DB)
+            : !sharedRequestSelected()
+              ? await createWorkerPrimaryRequestSql({
+                  database: env.STATE_DB,
+                  writerEpoch,
+                })
+              : await createWorkerRequestSql({
+                  database: env.STATE_DB,
+                  writerEpoch,
+                  publicOrigin: selectedOrigin,
+                  consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+                });
         if (connection.moneyGuard === "frozen") return;
       } else if (writerEpoch !== null) {
         if ((await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), writerEpoch)) === "frozen")

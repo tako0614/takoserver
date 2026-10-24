@@ -185,6 +185,31 @@ async function fixture() {
           body: JSON.stringify({ reference: `takosumi:topup:${"a".repeat(64)}`, amountMinor: 50 }),
         });
       },
+      read(
+        mode:
+          | "a0"
+          | "a1"
+          | "a2"
+          | "a3"
+          | "a4"
+          | "a5"
+          | "a6"
+          | "a7"
+          | "a8"
+          | "a9"
+          | "b0"
+          | "b1"
+          | "b2"
+          | "b3"
+          | "b4"
+          | "b5"
+          | "b6"
+          | "b7",
+      ) {
+        return send(`/test/read/${mode}`, {
+          headers: { cookie: browserCookie, "x-test-origin": SESSION_TEST_CONSOLE },
+        });
+      },
     };
   } catch (error) {
     await runtime.dispose();
@@ -203,6 +228,139 @@ test("named native Hosted RPC invokes the real prototype callback; closing its w
       producerAfterRemote: "current",
       closedRemote: "unavailable",
       closedProducer: "unavailable",
+    });
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native read target accepts actual signed RP and D1 Owner for exact view and payment scopes", async () => {
+  const f = await fixture();
+  try {
+    for (const [mode, kind] of [
+      ["a0", "view"],
+      ["a1", "payment"],
+      ["a9", "denied"],
+    ] as const) {
+      const response = await f.read(mode);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ result: kind });
+    }
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("completed native release preserves the exact positive read and closes later callbacks", async () => {
+  const f = await fixture();
+  try {
+    const response = await f.read("b7");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ result: "view" });
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native positive read fails for scope mismatch, ignored callback, and cloned source", async () => {
+  const f = await fixture();
+  try {
+    for (const mode of ["a3", "a4", "a5", "b0", "b1", "b2"] as const) {
+      const response = await f.read(mode);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ result: "unavailable" });
+    }
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native callback cannot reuse earlier success after current D1 Owner loss", async () => {
+  const f = await fixture();
+  try {
+    const response = await f.read("a6");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ result: "unavailable" });
+    expect(f.completedRevocations()).toBe(1);
+    const owner = await f.database
+      .prepare("SELECT role FROM org_memberships WHERE org_id = ?")
+      .bind(ORGANIZATION)
+      .first<{ role: string }>();
+    expect(owner?.role).toBe("member");
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native callback denies D1 Owner loss before its first read", async () => {
+  const f = await fixture();
+  try {
+    const response = await f.read("a2");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ result: "unavailable" });
+    expect(f.completedRevocations()).toBe(1);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native prototype read callback refuses in-flight and later wrapper disposal", async () => {
+  const f = await fixture();
+  try {
+    for (const mode of ["a7", "a8"] as const) {
+      const response = await f.read(mode);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        result: "unavailable",
+        prototypeVisible: true,
+        completed: false,
+      });
+    }
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+for (const [mode, label] of [
+  ["b3", "lookup mutation"],
+  ["b4", "Request header mutation"],
+] as const) {
+  test(`native awaited read refuses ${label}`, async () => {
+    const f = await fixture();
+    try {
+      const response = await f.read(mode);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ result: "unavailable" });
+    } finally {
+      await f.runtime.dispose();
+    }
+  }, 30_000);
+}
+
+test("native read callback rejects scope mutation during await", async () => {
+  const f = await fixture();
+  try {
+    const response = await f.read("b5");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      result: "unavailable",
+      prototypeVisible: true,
+      completed: false,
+    });
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("duplicate in-flight native callback poisons a prior pending read", async () => {
+  const f = await fixture();
+  try {
+    const response = await f.read("b6");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      result: "allowed/unavailable",
+      prototypeVisible: true,
+      completed: false,
     });
   } finally {
     await f.runtime.dispose();

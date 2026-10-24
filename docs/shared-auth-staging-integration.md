@@ -1,8 +1,9 @@
 # Shared Accounts login: staged Takoserver consumer
 
-Status: prepared protocol client and unmounted session/store runtime. No login
-route, schema migration, Console button, deployment configuration or traffic
-cutover is enabled by this change.
+Status: implemented staging-only protocol client, session/store and conditional
+Worker request composition. An owning deployment must provide the selected
+profile, schema and credentials; source availability does not establish an
+active target or a successful login. Console integration is a separate consumer.
 Task 0109 coordinates the remaining owner changes and their release evidence.
 
 ## Implemented protocol boundary
@@ -54,10 +55,10 @@ Organizations, Workspace roles or other product authority are refused. Access
 tokens obtained here are identity-only credentials for the issuer's own
 endpoints, never Takoserver business API keys.
 
-## Prepared session runtime
+## Session runtime
 
-`src/shared-auth-session.ts` supplies the unmounted login, callback, logout and
-session handlers, a server-only authenticated actor/context port, and current
+`src/shared-auth-session.ts` supplies login, callback, logout and session
+handlers, a server-only authenticated actor/context port, and current
 Workspace/Organization resolution. Its required principal projection is an
 owning Takoserver port that preserves proved local actor references; there is
 no email matching or alternate account registry. Organization pins require a
@@ -106,11 +107,27 @@ browser on an issuer outage. The owning maintenance entry must call
 retryable lease. A crashed refresh claimant stays denied until login/revoke,
 and is never reclaimed for another refresh.
 
-The portable native D1 tests use explicitly unadopted test-only DDL. These
-modules do not create tables or select a public migration number. Adopting the
-forward schema, principal projection, maintenance entry, Console flow and
-protected composition remains an owner-coordinated change. The current
-factory cannot enable an authentication surface by itself.
+Only an acknowledged shared callback expires the legacy browser cookie. Shared
+logout expires both cookie names, without revoking a legacy database session.
+A request with only the named legacy cookie is rejected before either cookie
+is expired or a shared session is revoked, so another tab's legacy login cannot
+be cleared by a stale shared logout.
+
+Callback failure diagnostics contain only a closed phase, error class and code.
+Fresh OIDC exchange failures add the closed token/JWKS endpoint and reason;
+Directory bootstrap and billing-organization failures add a closed reason and
+bounded HTTP status or null. These records contain no exception text, token,
+request body or Workspace/Organization identifier. Logging failure cannot alter
+the response, cleanup or existing five-second request deadline. A missing record
+does not establish that an issuer operation was not sent or committed.
+
+The RP component fixtures use explicitly unadopted test-only DDL. The separate
+served-schema D1 tests use the existing Auth103, Financial0104 and Root0105
+contracts. RP modules do not create tables or select a migration number.
+Source includes the principal projection, request-local Worker composition,
+protected Control routes and OpenAPI cookie alternative. Installing the schema,
+selecting the realized staging profile and wiring the Console remain owning
+release work; the factory cannot activate a deployment by itself.
 
 ### Private final-session observation
 
@@ -122,16 +139,17 @@ or retry. The ordinary factory keeps its boolean touch and rejects zero-row
 results from its own selected-row method.
 
 The dedicated factory is accepted only in the owning strict-connected common
-primary composition: the actual explicit-result native driver, the existing
-money wrapper applied once, and the same final Sql/native client/realm used by
-Auth, RP and Financial under a fresh first-primary request. A generic Sql
-object, the factory name, or a configuration flag cannot supply that
-qualification. The adopted driver source contract uses
+request composition: the explicit-result native driver, the selected Money or
+fresh-native wrapper applied once, and the same final Sql/native client/realm
+used by Auth, RP and Financial under one first-primary D1 session. The Worker
+entry and common factory implement this source path. A generic Sql object,
+the factory name, or a configuration flag cannot supply native qualification.
+The driver source contract uses
 `createD1Sql(database, { acknowledgement: "explicit-d1-result" })` and preserves
 legacy/default behavior elsewhere. Its raw success, result array and change
 metadata must survive explicit validation; unknown metadata cannot become a
-known zero. Actual driver and common-factory native qualification remain
-separate owner work.
+known zero. Local D1 tests cover driver and common-factory acknowledgement
+mechanics; qualification of a deployed native request remains separate.
 
 `touchSessionAndSelect` performs one guarded primary `UPDATE ... RETURNING *`
 and validates the actual count and returned image. A complete, genuinely
@@ -184,11 +202,10 @@ WeakMap.
 The authored component tests target the adopted strict-driver option and
 exercise actual native D1 one-zero/one-reload/one-retouch, real post-commit
 acknowledgement loss, second misses and malformed images. Outer response-loss
-injection is synthetic and labelled. They require the owning driver changes
-before execution; source preparation or TypeScript casts do not qualify
-native acknowledgement semantics, a fake store or a common-primary graph.
-No driver, entry, schema or Financial source change is implemented in these
-RP files.
+injection is synthetic and labelled. They use the existing explicit-result
+driver; TypeScript casts or a fake store cannot qualify its acknowledgement
+semantics or a common request graph. The driver, entry and Financial guard
+integration live in their owning modules, not in these RP files.
 
 ## Workspace billing Organization
 
@@ -217,10 +234,29 @@ A different owner, a missing owner membership or a Workspace bound to another
 Org aborts the issuing batch. The id locates product records and grants no
 payment consent.
 
-Known limitation: there is no owner transfer. If a subject's active binding is
-revoked and the same subject later receives a fresh principal, the Org remains
-owned by the previous principal and that issuance is refused. This fail-closed
-behavior is accepted for staging and must be revisited before production.
+A later login by a subject whose only binding is its active, current root
+binding reuses that same principal and binding: the callback issues a new
+session and credential class on the existing binding and sends only the
+Organization owner guard, which writes nothing and aborts unless the same
+Workspace is bound to the same Org that principal owns. A subject enrolled
+before its Org existed, or whose Workspace now names another Org, is refused
+rather than given a new or transferred Org.
+
+Operator note: enabling a billing realm on a deployment where subjects have
+already enrolled without one leaves each of those subjects refused with
+`session_unavailable` (503) on every later login. There is no automatic
+recovery; materializing their Orgs is a separate, owner-coordinated repair.
+The batch re-proves the binding, its anchor, target, issuer and
+subject through the credential class guard, so a binding retired or crossed
+after resolution aborts the whole batch. A subject with no binding enrolls a
+fresh principal; when two first logins race, the Auth103 binding trigger lets
+one commit and the other fails closed as `session_unavailable` without retry.
+
+There is no owner transfer and no re-enrollment. A subject whose binding is
+retired, is a successor or proved-legacy binding, or names another native
+target, is refused before issuance; its Org stays owned by the previous
+principal and no second
+Org is created. A successor binding is a separate authority action.
 Workspace bindings are global and set once, and a hold or usage record
 normally creates its Workspace's binding lazily. Accounts issues every
 shared-auth Workspace reference as `wrk_` followed by 32 lowercase hex digits,
@@ -259,33 +295,37 @@ through this route or the browser's existing `console/src/takos-id.ts` flow.
 exclusive. This preparation does not change those self-host and operator
 recovery paths.
 
-## Required integration order
+## Source integration and release order
+
+The server adapter, store, Root request composition, protected Control routes
+and OpenAPI wiring below are implemented source. This checklist describes the
+dependencies a realized deployment must satisfy, not a claim that its schema,
+issuer, keys, native registration or Console have been deployed. Console source
+and Auth103 registration tooling have their separate owning publication units.
 
 1. Accounts owner publishes the registered staging client, canonical account
    profile and the current-account/Workspace directory contract. Token
    introspection must reject a disabled or merged-away account and revoked
    session/family. Confirm the canonical subject with that owner's authenticated
    UserInfo/introspection contract; do not invent a parallel account registry.
-2. Agree with Takoserver's protected-path owner on the source integration,
-   schema and exact realized staging surfaces. Add the protocol module to the
-   domain classification in `scripts/check-imports.ts` only after that owner
-   agrees. The prepared hunk adds one exact module name, without exempting a
-   directory or changing permitted dependency directions.
-3. Adopt the prepared trusted server session adapter, with a durable
-   single-use login attempt and a host-only `__Host-` HttpOnly Secure cookie.
-   Validate exact request origin, duplicate callback parameters, state, optional
-   response issuer and the attempt's nonce/verifier. Atomically consume the
-   attempt before exchange. Never accept caller-supplied claims, an incoming
-   identity header or the email as a login binding.
-4. Adopt the prepared durable local session store and explicit account-to-principal
-   binding. One canonical Accounts ID can bind at most one local actor; preserve
+2. Keep source integration, schema and exact realized staging surfaces with
+   their owning paths. `scripts/check-imports.ts` classifies the protocol by
+   exact module name without exempting a directory or changing permitted
+   dependency directions.
+3. The trusted server adapter keeps a durable single-use login attempt and a
+   host-only `__Host-` HttpOnly Secure cookie. It validates exact request origin,
+   duplicate callback parameters, state, optional response issuer and the
+   attempt's nonce/verifier, then atomically consumes the attempt before
+   exchange. Caller-supplied claims, an incoming identity header or email cannot
+   substitute for the login binding.
+4. The durable session store and Root principal projection enforce the explicit
+   account-to-principal binding. One canonical Accounts ID can bind at most one
+   local actor; preserve
    existing local principal, Organization, API-key and billing references when
    adopting a proved legacy account. Newly provisioned product actors require
    an agreed new provider/projection contract, not a fake `google` or `takos-id`
-   value. A migration that expands `principals.provider` and adds binding,
-   attempt and session state must preserve prior rows and the migration
-   lineage. Do not reserve or author a migration number here: the schema owner
-   must allocate it after the billing and dispatch migrations.
+   value. Schema installation must use the owning Auth103 contract and preserve
+   prior rows and the migration lineage. This document allocates no migration.
 5. Keep grants encrypted under an operator-managed local session key, with
    associated data binding the environment, issuer, client, API and Console origins.
    Cookie secrets are random; only their digests are indexed. Keep idle and
@@ -294,9 +334,11 @@ recovery paths.
    acknowledgement or a crashed refresh claimant requires login; never retry
    the old refresh token. Logout revokes the local session before upstream
    revocation. Confirm recovery and key rotation before enabling this adapter.
-6. Wire `src/auth.ts`/`src/app.ts` and the protected `src/control.ts` and owning
-   `src/entry-*` composition only after review of the above schema and ports.
-   Advertise the route in the owning OpenAPI and Console contracts. The Console
+6. `src/app.ts` passes the original request graph's RP service to
+   `src/control.ts`; the owning Worker entry selects the original request
+   composition. OpenAPI describes the cookie alternative only for the admitted
+   owner routes. A realized deployment and its Console must use those reviewed
+   schema and port contracts. The Console
    starts a server redirect and never receives client secrets, access tokens or
    refresh tokens. Its normal APIs use the product's local session. Preserve
    direct Google and operator sign-in until staging proves the new path.

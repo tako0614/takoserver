@@ -323,8 +323,146 @@ export class SharedAuthSessionError extends Error {
   }
 }
 
+type CallbackFailurePhase =
+  | "attempt"
+  | "exchange"
+  | "issuer"
+  | "bootstrap"
+  | "workspace"
+  | "organization"
+  | "principal"
+  | "prior_session"
+  | "session_write"
+  | "response"
+  | "cleanup";
+
+type FailureClassification = {
+  readonly failureClass: "session" | "oidc" | "unknown";
+  readonly code:
+    | "session_invalid"
+    | "session_unavailable"
+    | "workspace_forbidden"
+    | "oidc_invalid"
+    | "oidc_unavailable"
+    | "unknown";
+};
+
+/** Closed classification only: never an exception's message, stack, name or raw code. */
+function classifyFailure(error: unknown): FailureClassification {
+  if (error instanceof SharedAuthSessionError) {
+    switch (error.code) {
+      case "session_invalid":
+        return { failureClass: "session", code: "session_invalid" };
+      case "session_unavailable":
+        return { failureClass: "session", code: "session_unavailable" };
+      case "workspace_forbidden":
+        return { failureClass: "session", code: "workspace_forbidden" };
+    }
+  } else if (error instanceof SharedAuthOidcError) {
+    switch (error.code) {
+      case "oidc_invalid":
+        return { failureClass: "oidc", code: "oidc_invalid" };
+      case "oidc_unavailable":
+        return { failureClass: "oidc", code: "oidc_unavailable" };
+    }
+  }
+  return { failureClass: "unknown", code: "unknown" };
+}
+
+function reportCallbackFailure(phase: CallbackFailurePhase, error: unknown): void {
+  // Diagnostics must not inspect an exception's message, stack, name or raw code.
+  // Even a hostile accessor or a failing logger cannot alter callback cleanup.
+  try {
+    const { failureClass, code } = classifyFailure(error);
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.callback.failure.v1",
+        phase,
+        class: failureClass,
+        code,
+      }),
+    );
+  } catch {
+    // Logging is never part of authentication or revocation authority.
+  }
+}
+
+type GrantHealthStep = "refresh" | "introspect" | "userinfo" | "complete";
+
+/**
+ * Names the in-fence step of a failed grant health check. The fence itself is
+ * unchanged; this only records which issuer call or settlement failed, whether
+ * a refresh had already rotated the grant, and how long that step took (a
+ * deadline shows as about 5000 ms). No token, digest or issuer body is logged.
+ */
+function reportGrantHealthFailure(
+  step: GrantHealthStep,
+  refreshed: boolean,
+  error: unknown,
+  stepMs: number,
+): void {
+  try {
+    const { failureClass, code } = classifyFailure(error);
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.grant_health.failure.v1",
+        step,
+        refreshed,
+        class: failureClass,
+        code,
+        stepMs: Number.isSafeInteger(stepMs) && stepMs >= 0 ? stepMs : null,
+      }),
+    );
+  } catch {
+    // Logging is never part of authentication or revocation authority.
+  }
+}
+
+type DirectoryRequestFailureReason = "deadline" | "transport" | "aborted" | "http_non_ok";
+
+function reportBootstrapRequestFailure(
+  reason: DirectoryRequestFailureReason,
+  status: number | null,
+): void {
+  try {
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+        reason,
+        status:
+          status !== null && Number.isInteger(status) && status >= 0 && status <= 599
+            ? status
+            : null,
+      }),
+    );
+  } catch {
+    // Diagnostics cannot change the original Directory rejection or cleanup.
+  }
+}
+
+function reportOrganizationFailure(
+  reason: DirectoryRequestFailureReason | "source_drift",
+  status: number | null,
+): void {
+  try {
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.shared_auth.organization.failure.v1",
+        reason,
+        status:
+          status !== null && Number.isInteger(status) && status >= 0 && status <= 599
+            ? status
+            : null,
+      }),
+    );
+  } catch {
+    // A private diagnostic cannot change the callback failure or grant cleanup.
+  }
+}
+
 const attemptCookie = "__Host-takoserver_oidc_attempt";
 const sessionCookie = "__Host-takoserver_shared_session";
+const legacySessionCookie = "takoserver_session";
 const directoryPath = "/api/v1/account/shared-workspaces";
 const attemptTtl = 5 * 60 * 1000;
 const idleTtl = 12 * 60 * 60 * 1000;
@@ -535,12 +673,18 @@ export function createSharedAuthSession(options: {
     value: SharedAuthGrant,
     path: string,
     post = false,
+    freshCallback = false,
   ): Promise<Record<string, unknown>> {
     const controller = new AbortController();
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let failureReason: DirectoryRequestFailureReason | undefined;
+    let failureStatus: number | null = null;
+    let rejected = false;
+    let rejection: unknown;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
+        failureReason ??= "deadline";
         controller.abort();
         void reader?.cancel().catch(() => {});
         reject(new SharedAuthSessionError("session_unavailable"));
@@ -566,21 +710,39 @@ export function createSharedAuthSession(options: {
               }),
             );
           } catch {
+            failureReason ??= "transport";
             throw new SharedAuthSessionError("session_unavailable");
           }
           if (controller.signal.aborted) {
             void response.body?.cancel().catch(() => {});
+            failureReason ??= "aborted";
             throw new SharedAuthSessionError("session_unavailable");
           }
           if (!response.ok) {
             void response.body?.cancel().catch(() => {});
-            throw new SharedAuthSessionError(
+            const failure = new SharedAuthSessionError(
               response.status === 401
                 ? "session_invalid"
                 : response.status === 403 || response.status === 404
                   ? "workspace_forbidden"
                   : "session_unavailable",
             );
+            if (failure.code === "session_unavailable") {
+              failureReason ??= "http_non_ok";
+              try {
+                const observedStatus = response.status;
+                if (
+                  typeof observedStatus === "number" &&
+                  Number.isInteger(observedStatus) &&
+                  observedStatus >= 0 &&
+                  observedStatus <= 599
+                )
+                  failureStatus = observedStatus;
+              } catch {
+                // Reading status for diagnostics cannot replace the mapped error.
+              }
+            }
+            throw failure;
           }
           if (
             response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() !==
@@ -620,8 +782,27 @@ export function createSharedAuthSession(options: {
           }
         })(),
       ]);
+    } catch (error) {
+      rejected = true;
+      rejection = error;
+      throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      if (freshCallback && rejected && failureReason) {
+        try {
+          if (
+            rejection instanceof SharedAuthSessionError &&
+            rejection.code === "session_unavailable"
+          ) {
+            if (path === "/bootstrap" && post)
+              reportBootstrapRequestFailure(failureReason, failureStatus);
+            else if (!post && path.endsWith("/billing-organization"))
+              reportOrganizationFailure(failureReason, failureStatus);
+          }
+        } catch {
+          // A hostile error accessor cannot replace the original rejection.
+        }
+      }
     }
   }
   async function currentWorkspace(
@@ -856,13 +1037,24 @@ export function createSharedAuthSession(options: {
       if (row.grantCheckedAt + healthTtl <= stamp || value.accessExpiresAt <= stamp + 30000) {
         const claimed = await store.claimSession(digest, row.version, stamp);
         if (!claimed) throw new SharedAuthSessionError("session_unavailable");
+        let step: GrantHealthStep = "refresh";
+        let refreshed = false;
+        let stepStartedAt = Date.now();
+        const enter = (next: GrantHealthStep) => {
+          step = next;
+          stepStartedAt = Date.now();
+        };
         try {
-          if (value.accessExpiresAt <= stamp + 30000) value = await client.refresh(value);
-          if (
-            !(await client.active(value)) ||
-            (await client.canonicalAccount(value)).accountId !== row.accountId
-          )
+          if (value.accessExpiresAt <= stamp + 30000) {
+            value = await client.refresh(value);
+            refreshed = true;
+          }
+          enter("introspect");
+          if (!(await client.active(value))) throw new SharedAuthSessionError("session_invalid");
+          enter("userinfo");
+          if ((await client.canonicalAccount(value)).accountId !== row.accountId)
             throw new SharedAuthSessionError("session_invalid");
+          enter("complete");
           const updated = {
             payload: await seal("grant", digest, value),
             grantCheckedAt: now(),
@@ -872,6 +1064,9 @@ export function createSharedAuthSession(options: {
             throw new SharedAuthSessionError("session_invalid");
           row = { ...row, ...updated, status: "active", version: claimed.version + 1 };
         } catch (error) {
+          // TS narrows `step` to "refresh" here (enter() assigns it in a closure);
+          // the runtime value is the failed step. Do not compare it in this block.
+          reportGrantHealthFailure(step, refreshed, error, Date.now() - stepStartedAt);
           // Never retry refresh or completion after an unknown acknowledgement.
           // This fences even a committed completion and durably retains its
           // rotated grant. The store makes custody and denial one transaction.
@@ -1329,6 +1524,10 @@ export function createSharedAuthSession(options: {
         headers.set("access-control-allow-origin", consoleOrigin);
         headers.set("access-control-allow-credentials", "true");
       }
+      let callbackPhase: CallbackFailurePhase | undefined =
+        initial.pathname === "/auth/oidc/callback" && request.method === "GET"
+          ? "attempt"
+          : undefined;
       try {
         const url = requestUrl(request);
         const store = createStore();
@@ -1395,14 +1594,17 @@ export function createSharedAuthSession(options: {
             sessionDigest = await hash(secret);
           let value: SharedAuthGrant | undefined;
           try {
+            callbackPhase = "exchange";
             value = await client.exchange(code, attempt.verifier, attempt.nonce);
+            callbackPhase = "issuer";
             if (
               !(await client.active(value)) ||
               (await client.canonicalAccount(value)).accountId !== value.subject
             )
               throw new SharedAuthSessionError("session_invalid");
             // Explicit canonical bootstrap precedes ACTIVE local session creation.
-            const bootstrap = await directory(value, "/bootstrap", true);
+            callbackPhase = "bootstrap";
+            const bootstrap = await directory(value, "/bootstrap", true, true);
             const workspace = bootstrap.workspace;
             if (
               !record(workspace) ||
@@ -1411,6 +1613,7 @@ export function createSharedAuthSession(options: {
               workspace.ownerUserId !== value.subject
             )
               throw new SharedAuthSessionError("session_invalid");
+            callbackPhase = "workspace";
             const selected = await currentWorkspace(value, workspace.id);
             if (selected.type !== "personal" || !selected.owner)
               throw new SharedAuthSessionError("workspace_forbidden");
@@ -1427,20 +1630,31 @@ export function createSharedAuthSession(options: {
             // stores even when they cannot furnish a qualified original.
             // A source that was qualified before this await must not drift.
             const qualifiedBefore = freshOriginalSource();
+            callbackPhase = "organization";
             const workspaceOrganization = workspaceOrganizationFromDirectory(
-              await directory(value, `/${encodeURIComponent(selected.id)}/billing-organization`),
+              await directory(
+                value,
+                `/${encodeURIComponent(selected.id)}/billing-organization`,
+                false,
+                true,
+              ),
               selected.id,
             );
-            if (qualifiedBefore && !freshOriginalSource())
+            if (qualifiedBefore && !freshOriginalSource()) {
+              reportOrganizationFailure("source_drift", null);
               throw new SharedAuthSessionError("session_unavailable");
+            }
+            callbackPhase = "principal";
             const resolved = await principal(value, selected, store, {
               phase: "fresh-callback",
               workspaceOrganization,
               originalSource: () => qualifiedBefore && freshOriginalSource(),
             });
             const principalId = resolved.principalId;
+            callbackPhase = "prior_session";
             const oldSecret = cookie(request, sessionCookie);
             if (oldSecret) await store.revokeSession(await hash(oldSecret), now());
+            callbackPhase = "session_write";
             const stamp = now();
             const createSession = store.createSession;
             const session: OidcSessionRecord = {
@@ -1463,10 +1677,15 @@ export function createSharedAuthSession(options: {
             } finally {
               closeWrite();
             }
+            callbackPhase = "response";
             headers.append("set-cookie", setCookie(sessionCookie, secret, absoluteTtl / 1000));
+            // Only an acknowledged shared login replaces the legacy browser login.
+            headers.append("set-cookie", setCookie(legacySessionCookie, "", 0));
             headers.set("location", `${consoleOrigin}/`);
             return new Response(null, { status: 303, headers });
           } catch (error) {
+            const failedPhase = callbackPhase;
+            callbackPhase = "cleanup";
             if (value) {
               await store.queueRevocation({
                 id: `callback:${crypto.randomUUID()}`,
@@ -1477,14 +1696,23 @@ export function createSharedAuthSession(options: {
               // A lost create acknowledgement must not leave a usable local row.
               await store.revokeSession(sessionDigest, now());
             }
+            callbackPhase = failedPhase;
             throw error;
           }
         }
         if (url.pathname === "/auth/oidc/logout" && request.method === "POST") {
           if (url.search !== "" || request.headers.get("origin") !== consoleOrigin)
             throw new SharedAuthSessionError("session_invalid");
-          headers.set("set-cookie", setCookie(sessionCookie, "", 0));
           const secret = cookie(request, sessionCookie);
+          if (
+            !secret &&
+            (request.headers.get("cookie") ?? "")
+              .split(";")
+              .some((part) => part.trim().split("=", 1)[0] === legacySessionCookie)
+          )
+            throw new SharedAuthSessionError("session_invalid");
+          headers.set("set-cookie", setCookie(sessionCookie, "", 0));
+          headers.append("set-cookie", setCookie(legacySessionCookie, "", 0));
           if (secret) await store.revokeSession(await hash(secret), now());
           // Upstream outages cannot delay the browser's local logout. The
           // owning maintenance entry drains this already durable outbox.
@@ -1503,6 +1731,7 @@ export function createSharedAuthSession(options: {
         }
         return Response.json({ error: { code: "method_not_allowed" } }, { status: 405, headers });
       } catch (error) {
+        if (callbackPhase) reportCallbackFailure(callbackPhase, error);
         const forbidden =
           error instanceof SharedAuthSessionError && error.code === "workspace_forbidden";
         const bad = invalid(error);

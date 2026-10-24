@@ -8,7 +8,6 @@ import {
   readWorkerRequestFinancialAuthConsumerPort,
 } from "./financial-auth-consumer.ts";
 import { canonicalJson } from "./json.ts";
-import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import type { Row, Sql, SqlParam, SqlStatement, SqlWrite } from "./ports.ts";
 import { readSharedAuthFinancialConsentCurrentOriginalData } from "./shared-auth-financial-consent.ts";
 import { parseSharedAuthFinancialActionConsentOriginal } from "./shared-auth-financial-consent-contract.ts";
@@ -34,6 +33,7 @@ import {
 } from "./shared-financial-retained-r1.ts";
 import { createStripeCustomerOriginalDefinition } from "./stripe-customer-custody.ts";
 import {
+  assertWorkerRequestFinancialSqlOrigin,
   batchWorkerRequestFinancialCurrentConsentOriginal,
   queryWorkerRequestFinancialCurrentConsentOriginal,
   readWorkerRequestConsumers,
@@ -59,7 +59,7 @@ export type FinancialCurrentConsentCustomerOperationOriginal =
       kind: "completed-receipt-read" | "original-read";
       requestInputs: WorkerRequestFinancialInputs;
       phase: "L1" | "D";
-      writerEpoch: string;
+      writerEpoch: WorkerRequestFinancialInputs["writerEpoch"];
       original: CustomerPhaseInput;
       statement: SqlStatement;
     }>
@@ -67,7 +67,7 @@ export type FinancialCurrentConsentCustomerOperationOriginal =
       kind: "phase-batch";
       requestInputs: WorkerRequestFinancialInputs;
       phase: "L1" | "D";
-      writerEpoch: string;
+      writerEpoch: WorkerRequestFinancialInputs["writerEpoch"];
       original: CustomerPhaseInput;
       plan: CustomerPhasePlan;
     }>;
@@ -78,7 +78,7 @@ export type FinancialCurrentConsentNativeOriginal =
       connection: WorkerRequestSql;
       inputs: WorkerRequestFinancialInputs;
       phase: "L1" | "D";
-      writerEpoch: string;
+      writerEpoch: WorkerRequestFinancialInputs["writerEpoch"];
       original: CustomerPhaseInput;
       statement: SqlStatement;
     }>
@@ -87,7 +87,7 @@ export type FinancialCurrentConsentNativeOriginal =
       connection: WorkerRequestSql;
       inputs: WorkerRequestFinancialInputs;
       phase: "L1" | "D";
-      writerEpoch: string;
+      writerEpoch: WorkerRequestFinancialInputs["writerEpoch"];
       original: CustomerPhaseInput;
       plan: CustomerPhasePlan;
     }>;
@@ -405,10 +405,10 @@ export function createFinancialCurrentConsentCustomerExecutor(
     assertOrigin();
     const plan = compileCustomerPhase(phase);
     if (!sameStatements(plan.statements, statements)) unavailable();
-    // The request Sql must be Root's Money writer for this phase's own epoch, and
-    // a write requires the exact fenced 0104 Customer shape; recovery reads do not.
+    // Root verifies this request's original Sql for its selected database mode.
+    // A write still requires the exact fenced 0104 Customer shape; recovery reads do not.
     try {
-      assertMoneyCutoverSqlOrigin(inputs.sql, { writerEpoch: phase.writerEpoch });
+      assertWorkerRequestFinancialSqlOrigin(connection, inputs.sql);
       await assertFinancial0104CustomerWriteShape(inputs.sql);
     } catch {
       unavailable();

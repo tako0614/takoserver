@@ -15,7 +15,7 @@ import {
   type Theme,
   theme,
 } from "../state.ts";
-import { card, copyable, ICON, icon, toast, when } from "../ui.ts";
+import { card, copyable, explain, ICON, icon, toast, when } from "../ui.ts";
 
 /**
  * The account, the organization, and where this console is pointed.
@@ -92,7 +92,13 @@ export function settingsPage(organization: Organization): Child {
             { style: { marginTop: "16px" } },
             h(
               "button",
-              { class: "btn btn--danger", type: "button", onClick: signOut },
+              {
+                class: "btn btn--danger",
+                type: "button",
+                onClick: () => {
+                  void signOut().catch((error: unknown) => toast(explain(error as Error), "bad"));
+                },
+              },
               icon(ICON.signOut, 14),
               text(tr("サインアウト", "Sign out")),
             ),

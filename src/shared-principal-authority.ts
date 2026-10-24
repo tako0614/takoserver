@@ -532,6 +532,21 @@ export function createSharedPrincipalAuthorityStore(options: { readonly sql: Sql
       if (rows.length > 1) throw new AuthAuthorityStoreError("unavailable");
       return rows[0] ? bindingFrom(rows[0]) : null;
     },
+    /**
+     * Every binding recorded for one exact (issuer, subject), in any state.
+     * A bounded retained read: it selects nothing and grants nothing.
+     */
+    async readSubjectBindings(identity: {
+      readonly issuer: string;
+      readonly subject: string;
+    }): Promise<readonly SharedPrincipalBinding[]> {
+      const rows = await sql.query(
+        "SELECT * FROM shared_principal_bindings WHERE issuer=? AND subject=? ORDER BY binding_ref LIMIT 17",
+        [authAuthorityText(identity.issuer, 2048), authAuthorityText(identity.subject)],
+      );
+      if (rows.length > 16) throw new AuthAuthorityStoreError("unavailable");
+      return Object.freeze(rows.map(bindingFrom));
+    },
     async createFresh(input: FreshSharedPrincipal): Promise<SharedPrincipalBinding> {
       const plan = freshSharedPlan(input);
       await batch(sql, plan.statements);
@@ -724,6 +739,13 @@ export function createSharedPrincipalAuthorityStore(options: { readonly sql: Sql
       ]);
       return await requireBinding(selected.ref);
     },
+    // TODO(TASK-0110): on D1, `changes` is the statement's total_changes()
+    // delta, so the AFTER UPDATE trigger auth_binding_retired (which retires
+    // the binding's active credential classes) makes this UPDATE report more
+    // than 1 whenever such a class exists, and this method then throws
+    // `conflict` after the retirement has committed. Prove the retired row by
+    // RETURNING (as revokeSession does) before any production caller uses it;
+    // it has none today.
     async retireBinding(
       ref: string,
       expectedEvidence: AuthAuthorityEvidence,

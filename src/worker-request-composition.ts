@@ -39,8 +39,10 @@ import {
 } from "./identity-setup.ts";
 import { canonicalDigest } from "./json.ts";
 import {
+  assertFreshNativeSqlBackingOrigin,
   assertMoneyCutoverSqlBackingOrigin,
   assertMoneyCutoverSqlOrigin,
+  createFreshNativeSql,
   createMoneyCutoverSql,
   inspectMoneyCutoverGuard,
   type MoneyCutoverGuardState,
@@ -92,14 +94,14 @@ export interface WorkerSharedAuthStaging {
 /** A request-local connection, constructed here rather than supplied as generic Sql. */
 export interface WorkerRequestSql {
   readonly sql: Sql;
-  readonly moneyGuard: MoneyCutoverGuardState;
+  readonly moneyGuard: MoneyCutoverGuardState | "fresh-native";
 }
 
-type WorkerRequestOriginPurpose = "native-primary" | "shared-auth-staging";
+type WorkerRequestOriginPurpose = "native-primary" | "shared-auth-staging" | "auth103-fresh-native";
 const requestOrigins = new WeakMap<
   WorkerRequestSql,
   {
-    readonly writerEpoch: string;
+    readonly writerEpoch: string | undefined;
     readonly purpose: WorkerRequestOriginPurpose;
     readonly database: WorkerRequestDatabase;
     readonly withSession: NonNullable<WorkerRequestDatabase["withSession"]>;
@@ -182,6 +184,41 @@ export async function createWorkerRequestSql(options: {
   return await constructWorkerPrimaryRequestSql(options, "shared-auth-staging");
 }
 
+/** Provisional fresh primary: only native Auth103 qualification may expose consumers. */
+export function createWorkerFreshNativeRequestSql(
+  database: WorkerRequestDatabase,
+): WorkerRequestSql {
+  const withSession = database?.withSession;
+  if (typeof withSession !== "function")
+    throw new TypeError("fresh Auth103 Worker requires a native primary D1 session");
+  let session: D1DatabaseLike;
+  try {
+    session = Reflect.apply(withSession, database, ["first-primary"]);
+  } catch {
+    throw new TypeError("fresh Auth103 Worker primary session is unavailable");
+  }
+  const rawSql = createD1Sql(session, { acknowledgement: "explicit-d1-result" });
+  const prepare = dataMethod(session, "prepare");
+  const batch = dataMethod(session, "batch");
+  const sql = createFreshNativeSql(rawSql);
+  assertFreshNativeSqlBackingOrigin(sql, rawSql);
+  const connection: WorkerRequestSql = Object.freeze({ sql, moneyGuard: "fresh-native" });
+  requestOrigins.set(
+    connection,
+    Object.freeze({
+      writerEpoch: undefined,
+      purpose: "auth103-fresh-native",
+      database,
+      withSession,
+      session,
+      prepare,
+      batch,
+      rawSql,
+    }),
+  );
+  return connection;
+}
+
 /** Capture only code inputs; request/environment data cannot replace the owning ports. */
 export function captureWorkerSharedAuthStaging(
   options: WorkerSharedAuthStaging,
@@ -250,7 +287,7 @@ export interface WorkerRequestFinancialInputs {
   readonly client: StripeBillingClient;
   readonly realm: HostedBillingFinancialRealm;
   readonly clock: Clock;
-  readonly writerEpoch: string;
+  readonly writerEpoch: string | undefined;
 }
 
 const requestFinancialInputs = new WeakMap<WorkerRequestSql, WorkerRequestFinancialInputs>();
@@ -303,22 +340,20 @@ export async function queryWorkerRequestFinancialCurrentConsentOriginal(
 }
 
 /** Send one complete Financial-owned Customer receipt transaction on its original
- * primary inside Root's Money permit frame: the request's own verified Money
- * writer (same raw primary and writer epoch) inserts and deletes the permit
- * around the plan and checks both acknowledgements. Financial plans carry no
- * permit statements (L1=7, D=6); a byte-matched permit plan is never sent raw. */
+ * primary. Money retains its permit frame; fresh Auth103 requires its separate
+ * qualified native origin. Both use the same send-once and strict ACK fence. */
 export async function batchWorkerRequestFinancialCurrentConsentOriginal(
   connection: WorkerRequestSql,
   operation: FinancialCurrentConsentCustomerOperation,
 ): Promise<readonly SqlWrite[]> {
-  const { original, origin, inputs } = readWorkerFinancialCurrentConsentNativeOriginal(
+  const { original, inputs } = readWorkerFinancialCurrentConsentNativeOriginal(
     connection,
     operation,
     "batch",
   );
   if (
     original.kind !== "batch" ||
-    connection.moneyGuard !== "ready" ||
+    (connection.moneyGuard !== "ready" && connection.moneyGuard !== "fresh-native") ||
     original.plan.phase !== original.phase ||
     original.plan.statements.length !== (original.phase === "L1" ? 7 : 6)
   )
@@ -329,10 +364,7 @@ export async function batchWorkerRequestFinancialCurrentConsentOriginal(
   sent.add(original.phase);
   financialCurrentConsentBatches.set(connection, sent);
   const writer = connection.sql;
-  assertMoneyCutoverSqlBackingOrigin(writer, {
-    rawSql: origin.rawSql,
-    writerEpoch: origin.writerEpoch,
-  });
+  assertWorkerRequestFinancialSqlOrigin(connection, writer);
   const result = await writer.batch(original.plan.statements);
   assertWorkerRequestBacking(connection);
   const current = readFinancialCurrentConsentNativeOriginal(operation, "batch");
@@ -879,11 +911,13 @@ export function readWorkerRequestRetainedCredentialInputs(
 export function readWorkerRequestConsumers(connection: WorkerRequestSql): WorkerRequestConsumers {
   const consumers = requestConsumers.get(connection);
   const origin = requestOrigins.get(connection);
-  if (!consumers || origin?.purpose !== "shared-auth-staging" || consumers.sql !== connection.sql)
+  if (
+    !consumers ||
+    (origin?.purpose !== "shared-auth-staging" && origin?.purpose !== "auth103-fresh-native") ||
+    consumers.sql !== connection.sql
+  )
     throw new TypeError("Worker request consumers have not been constructed");
-  assertMoneyCutoverSqlOrigin(consumers.sql, {
-    writerEpoch: origin.writerEpoch,
-  });
+  assertWorkerRequestFinancialSqlOrigin(connection, consumers.sql);
   assertAuthTokenCaptureReader(consumers.accounts, { sql: consumers.sql });
   assertHostedBillingFinancialRealm(consumers.realm, {
     sql: consumers.sql,
@@ -1010,6 +1044,27 @@ export function assertWorkerRequestBackingOrigin(connection: WorkerRequestSql): 
   assertWorkerRequestBacking(connection);
 }
 
+/** Exact SQL origin for Financial's same-primary 0104 guarded operation. */
+export function assertWorkerRequestFinancialSqlOrigin(
+  connection: WorkerRequestSql,
+  sql: Sql,
+): void {
+  const origin = assertWorkerRequestBacking(connection);
+  if (sql !== connection.sql) throw new SqlError("invalid", "Worker request Financial Sql differs");
+  if (origin.purpose === "auth103-fresh-native") {
+    if (connection.moneyGuard !== "fresh-native" || !requestConsumers.has(connection))
+      throw new SqlError("invalid", "fresh Auth103 Financial origin is not qualified");
+    assertFreshNativeSqlBackingOrigin(sql, origin.rawSql);
+  } else {
+    if (connection.moneyGuard !== "ready" || origin.writerEpoch === undefined)
+      throw new SqlError("invalid", "Money Financial origin is not ready");
+    assertMoneyCutoverSqlBackingOrigin(sql, {
+      rawSql: origin.rawSql,
+      writerEpoch: origin.writerEpoch,
+    });
+  }
+}
+
 /** Match the actual platform binding without exposing the private native origin. */
 export function assertWorkerRequestNativeBinding(
   connection: WorkerRequestSql,
@@ -1031,10 +1086,18 @@ function assertWorkerRequestBacking(connection: WorkerRequestSql) {
     dataMethod(origin.session, "batch") !== origin.batch
   )
     throw new TypeError("Worker request primary session methods differ");
-  assertMoneyCutoverSqlBackingOrigin(connection.sql, {
-    rawSql: origin.rawSql,
-    writerEpoch: origin.writerEpoch,
-  });
+  if (origin.purpose === "auth103-fresh-native") {
+    if (connection.moneyGuard !== "fresh-native" || origin.writerEpoch !== undefined)
+      throw new TypeError("fresh Auth103 request backing differs");
+    assertFreshNativeSqlBackingOrigin(connection.sql, origin.rawSql);
+  } else {
+    if (origin.writerEpoch === undefined || connection.moneyGuard === "fresh-native")
+      throw new TypeError("Money request backing differs");
+    assertMoneyCutoverSqlBackingOrigin(connection.sql, {
+      rawSql: origin.rawSql,
+      writerEpoch: origin.writerEpoch,
+    });
+  }
   return origin;
 }
 
@@ -1140,9 +1203,10 @@ export function initializeWorkerRequestNativeInputs(options: WorkerRequestConsum
   ) as unknown as WorkerRequestConsumerOptions;
   const origin = assertWorkerRequestBacking(selected.connection);
   if (
-    origin.purpose !== "shared-auth-staging" ||
+    (origin.purpose !== "shared-auth-staging" && origin.purpose !== "auth103-fresh-native") ||
     selected.sql !== selected.connection.sql ||
-    selected.connection.moneyGuard !== "ready" ||
+    (selected.connection.moneyGuard !== "ready" &&
+      selected.connection.moneyGuard !== "fresh-native") ||
     selected.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
     selected.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin ||
     nativeInitializations.has(selected.connection) ||
@@ -1293,14 +1357,23 @@ function constructWorkerRequestConsumers(
   const origin = requestOrigins.get(options.connection);
   const { sql, client, realm, clock, randomId } = options;
   if (
-    origin?.purpose !== "shared-auth-staging" ||
+    (origin?.purpose !== "shared-auth-staging" && origin?.purpose !== "auth103-fresh-native") ||
     options.connection.sql !== sql ||
-    options.connection.moneyGuard !== "ready" ||
+    (options.connection.moneyGuard !== "ready" &&
+      options.connection.moneyGuard !== "fresh-native") ||
     options.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
     options.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin
   )
     throw new TypeError("shared-login Worker request composition differs");
-  assertMoneyCutoverSqlOrigin(sql, { writerEpoch: origin.writerEpoch });
+  if (origin.purpose === "auth103-fresh-native") {
+    if (qualified === null)
+      throw new TypeError("fresh Auth103 consumers require the qualified native original");
+    assertFreshNativeSqlBackingOrigin(sql, origin.rawSql);
+  } else {
+    if (origin.writerEpoch === undefined)
+      throw new TypeError("Money request Writer epoch is absent");
+    assertMoneyCutoverSqlOrigin(sql, { writerEpoch: origin.writerEpoch });
+  }
   assertHostedBillingFinancialRealm(realm, {
     sql,
     client,

@@ -552,11 +552,12 @@ export function ledgerPredicate(names: readonly string[]): string {
       WHERE tbl_name='d1_migrations' AND type<>'table' AND name NOT GLOB 'sqlite_*')`;
 }
 
-export function originalShapePredicate(expectedShape: string): string {
+function shapePredicate(expectedShape: string, lower?: string, upper?: string): string {
+  const range = `${lower === undefined ? "" : ` AND name>=${sqlLiteral(lower)}`}${upper === undefined ? "" : ` AND name<${sqlLiteral(upper)}`}`;
   return `NOT EXISTS (
     WITH expected AS MATERIALIZED (SELECT value FROM json_each(${sqlLiteral(expectedShape)})),
     actual AS MATERIALIZED (SELECT type,name,tbl_name,COALESCE(sql,'') AS sql FROM main.sqlite_schema
-      WHERE name NOT GLOB 'sqlite_*' AND tbl_name NOT IN ('d1_migrations','_cf_KV','_cf_METADATA'))
+      WHERE name NOT GLOB 'sqlite_*' AND tbl_name NOT IN ('d1_migrations','_cf_KV','_cf_METADATA')${range})
     SELECT 1 FROM expected LEFT JOIN actual ON actual.type=json_extract(expected.value,'$.type')
       AND actual.name=json_extract(expected.value,'$.name')
       AND actual.tbl_name=json_extract(expected.value,'$.table')
@@ -566,6 +567,138 @@ export function originalShapePredicate(expectedShape: string): string {
       WHERE actual.type=json_extract(expected.value,'$.type') AND actual.name=json_extract(expected.value,'$.name')
         AND actual.tbl_name=json_extract(expected.value,'$.table'))
   )`;
+}
+
+export function originalShapePredicate(expectedShape: string): string {
+  return shapePredicate(expectedShape);
+}
+
+const D1_SQL_BYTES = 100_000;
+const SHAPE_CHUNK_BYTES = 60_000;
+
+/** Name ranges partition the entire native catalog, including foreign extras.
+ * The conjunction is the original two-way exact tuple comparison. */
+export function boundedOriginalShapePredicates(expectedShape: string): readonly string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(expectedShape);
+  } catch {
+    throw preflightError("Auth103 original shape is malformed");
+  }
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length === 0 ||
+    `${JSON.stringify(parsed)}\n` !== expectedShape
+  )
+    throw preflightError("Auth103 original shape is not its canonical source");
+  const rows = parsed as Record<string, unknown>[];
+  if (
+    rows.some(
+      (row) =>
+        row === null ||
+        typeof row !== "object" ||
+        Array.isArray(row) ||
+        JSON.stringify(Object.keys(row)) !== '["type","name","table","sql"]' ||
+        Object.values(row).some((value) => typeof value !== "string") ||
+        !/^[\x20-\x7e]+$/u.test(row.name as string),
+    )
+  )
+    throw preflightError("Auth103 original shape contains an invalid tuple");
+  const ordered = rows
+    .slice()
+    .sort((a, b) =>
+      (a.name as string) < (b.name as string)
+        ? -1
+        : (a.name as string) > (b.name as string)
+          ? 1
+          : 0,
+    );
+  if (new Set(ordered.map((row) => row.name)).size !== ordered.length)
+    throw preflightError("Auth103 original shape repeats an object name");
+  const chunks: Record<string, unknown>[][] = [];
+  let chunk: Record<string, unknown>[] = [];
+  for (const row of ordered) {
+    if (
+      chunk.length > 0 &&
+      Buffer.byteLength(JSON.stringify([...chunk, row])) > SHAPE_CHUNK_BYTES
+    ) {
+      chunks.push(chunk);
+      chunk = [];
+    }
+    chunk.push(row);
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  const predicates = chunks.map((part, index) => {
+    const lower = index === 0 ? undefined : (part[0]?.name as string);
+    const upper = chunks[index + 1]?.[0]?.name as string | undefined;
+    const predicate = shapePredicate(JSON.stringify(part), lower, upper);
+    if (Buffer.byteLength(predicate) >= D1_SQL_BYTES - 512)
+      throw preflightError("Auth103 original shape chunk exceeds D1 SQL limit");
+    return predicate;
+  });
+  if (predicates.length === 0) throw preflightError("Auth103 original shape has no predicates");
+  return predicates;
+}
+
+/** A lossless literal encoding only: the five-bind owner predicate is unchanged.
+ * Private-use tokens are forbidden in the source and reverse in SQLite REPLACE. */
+function compactCatalogLiteral(value: string): string {
+  return memoByContent("auth103-compact-catalog-literal-v1", [value], () =>
+    compileCompactCatalogLiteral(value),
+  );
+}
+
+function compileCompactCatalogLiteral(value: string): string {
+  const tokens = Array.from({ length: 32 }, (_, index) => String.fromCharCode(0xe000 + index));
+  if (tokens.some((token) => value.includes(token)))
+    throw preflightError("Auth103 source catalog collides with literal encoding");
+  let encoded = value;
+  const dictionary: { token: string; phrase: string }[] = [];
+  for (const token of tokens) {
+    if (Buffer.byteLength(sqlLiteral(encoded)) < 76_000) break;
+    let best: { phrase: string; next: string; saving: number } | undefined;
+    for (const length of [12, 16, 24, 32, 48, 64, 96]) {
+      const counts = new Map<string, number>();
+      for (let index = 0; index <= encoded.length - length; index++) {
+        const phrase = encoded.slice(index, index + length);
+        counts.set(phrase, (counts.get(phrase) ?? 0) + 1);
+      }
+      const candidates = [...counts].sort((a, b) => b[1] - a[1]).slice(0, 4);
+      for (const [phrase] of candidates) {
+        const next = encoded.replaceAll(phrase, token);
+        const saving =
+          Buffer.byteLength(sqlLiteral(encoded)) -
+          Buffer.byteLength(sqlLiteral(next)) -
+          Buffer.byteLength(sqlLiteral(phrase)) -
+          32;
+        if (saving > (best?.saving ?? 0)) best = { phrase, next, saving };
+      }
+    }
+    if (best === undefined) break;
+    encoded = best.next;
+    dictionary.push({ token, phrase: best.phrase });
+  }
+  let expression = sqlLiteral(encoded);
+  for (const { token, phrase } of dictionary.slice().reverse())
+    expression = `replace(${expression},${sqlLiteral(token)},${sqlLiteral(phrase)})`;
+  let decoded = encoded;
+  for (const { token, phrase } of dictionary.slice().reverse())
+    decoded = decoded.replaceAll(token, phrase);
+  if (decoded !== value) throw preflightError("Auth103 catalog literal encoding is not lossless");
+  return expression;
+}
+
+export function boundCurrentPredicate(
+  registration: readonly string[],
+  catalogJson: string,
+): string {
+  if (registration.length !== 4 || AUTH103_NATIVE_CURRENT_PREDICATE.split("?").length !== 6)
+    throw preflightError("Auth103 fixed current predicate bind mismatch");
+  const literal = sqlLiteral(catalogJson);
+  const bound = boundPredicate(AUTH103_NATIVE_CURRENT_PREDICATE, [...registration, catalogJson]);
+  if (bound.split(literal).length !== 2)
+    throw preflightError("Auth103 fixed catalog bind is ambiguous");
+  return bound.replace(literal, compactCatalogLiteral(catalogJson));
 }
 
 export function boundPredicate(sql: string, values: readonly string[]): string {

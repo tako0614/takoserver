@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  assertFreshNativeSqlBackingOrigin,
   assertMoneyCutoverSqlBackingOrigin,
   assertMoneyCutoverSqlOrigin,
+  createFreshNativeSql,
   createMoneyCutoverSql,
   MONEY_CUTOVER_EPOCH,
   MONEY_CUTOVER_PERMIT_TABLE,
@@ -50,6 +52,24 @@ function expectInvalid(assertion: () => void): void {
 }
 
 describe("money cutover backing origin", () => {
+  test("fresh native SQL keeps the exact backing and public statement fence without a Money epoch", async () => {
+    const { raw, batches } = backing();
+    const fresh = createFreshNativeSql(raw);
+    expect(assertFreshNativeSqlBackingOrigin(fresh, raw)).toBe(undefined);
+    expectInvalid(() => assertFreshNativeSqlBackingOrigin({ ...fresh }, raw));
+    expectInvalid(() => assertFreshNativeSqlBackingOrigin(fresh, { ...raw }));
+    await fresh.batch([{ sql: "INSERT INTO principals (id) VALUES (?)", params: ["p"] }]);
+    expect(batches).toHaveLength(1);
+    expect(batches[0]).toHaveLength(1);
+    await expect(
+      fresh.run("INSERT INTO money_cutover_writer_permit VALUES (1)"),
+    ).rejects.toMatchObject({ code: "invalid" });
+    expect(batches).toHaveLength(1);
+    const originalBatch = raw.batch;
+    Object.defineProperty(raw, "batch", { value: () => [], configurable: true });
+    expectInvalid(() => assertFreshNativeSqlBackingOrigin(fresh, raw));
+    Object.defineProperty(raw, "batch", { value: originalBatch, configurable: true });
+  });
   test("accepts the real D1 adapter constructor shape without native method calls", () => {
     const calls = { prepare: 0, bind: 0, all: 0, batch: 0 };
     const database: D1DatabaseLike = {

@@ -47,6 +47,7 @@ import {
   type HostedBrowserSelectorSelection,
   selectHostedBrowserContinuation,
 } from "./financial-hosted-browser-selector.ts";
+import { createFinancialHostedOwnerRead } from "./financial-hosted-owner-read.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError, type Wallet } from "./ledger.ts";
 import { MoneyError, minorToMicros, parseUnsignedMicros } from "./money.ts";
@@ -475,84 +476,42 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   };
 
   const hostedBrowserActor = async (request: Request) => {
+    if (!sharedAuth || !consoleOrigin) throw new AuthError("unauthenticated");
+    // Preserve the original composition-time RP callables. The source-bound
+    // owner reader must not adopt a substituted method at the request boundary.
     if (
-      !sharedAuth ||
       !sharedAuthenticate ||
       !sharedObserveFinal ||
       !sharedFinalSelection ||
-      !consoleOrigin ||
-      request.headers.get("origin") !== consoleOrigin ||
-      request.headers.has("authorization") ||
-      hasNamedCookie(request, "takoserver_session") ||
-      !hasNamedCookie(request, "__Host-takoserver_shared_session")
+      Object.getOwnPropertyDescriptor(sharedAuth, "authenticate")?.value !== sharedAuthenticate ||
+      Object.getOwnPropertyDescriptor(sharedAuth, "observeFinalWorkspaceOrganization")?.value !==
+        sharedObserveFinal ||
+      Object.getOwnPropertyDescriptor(sharedAuth, "finalSessionSelection")?.value !==
+        sharedFinalSelection
     )
-      throw new AuthError("unauthenticated");
+      controlError("backend_unavailable", 503);
     try {
-      const context: Awaited<ReturnType<SharedAuthSession["authenticate"]>> = await Reflect.apply(
-        sharedAuthenticate,
+      return await createFinancialHostedOwnerRead({
+        request,
         sharedAuth,
-        [request],
-      );
-      if (context?.actor.kind !== "session") throw new AuthError("unauthenticated");
-      return context;
+        accounts,
+        qualifiedConsoleOrigin: consoleOrigin,
+      });
     } catch (error) {
       if (error instanceof AuthError) throw error;
-      if (error instanceof SharedAuthSessionError) {
-        if (error.code === "session_invalid") throw new AuthError("unauthenticated");
-        if (error.code === "workspace_forbidden") throw new AuthError("permission_denied");
-      }
       controlError("backend_unavailable", 503);
     }
   };
 
   const hostedBrowserOwner = async (
     request: Request,
-    initial: NonNullable<Awaited<ReturnType<SharedAuthSession["authenticate"]>>>,
+    initial: Awaited<ReturnType<typeof hostedBrowserActor>>,
     scope: HostedBrowserBillingScope,
   ): Promise<void> => {
-    if (!sharedAuth || !sharedObserveFinal || !sharedFinalSelection)
-      controlError("backend_unavailable", 503);
     try {
-      const observed: Awaited<ReturnType<SharedAuthSession["observeFinalWorkspaceOrganization"]>> =
-        await Reflect.apply(sharedObserveFinal, sharedAuth, [request, scope.workspaceId]);
-      const selected: ReturnType<SharedAuthSession["finalSessionSelection"]> = Reflect.apply(
-        sharedFinalSelection,
-        sharedAuth,
-        [observed],
-      );
-      if (
-        !observed ||
-        !selected ||
-        initial.actor.kind !== "session" ||
-        observed.actor.kind !== "session" ||
-        initial.accountId !== scope.canonicalAccountId ||
-        observed.accountId !== initial.accountId ||
-        selected.accountId !== initial.accountId ||
-        selected.principalId !== initial.actor.principalId ||
-        observed.actor.principalId !== initial.actor.principalId ||
-        selected.identity.issuer !== initial.provenance.issuer ||
-        selected.identity.clientId !== initial.provenance.clientId ||
-        selected.identity.subject !== initial.provenance.subject ||
-        selected.identity.sessionId !== initial.provenance.sessionId ||
-        selected.identity.authTime !== initial.provenance.authTime ||
-        selected.sessionWorkspaceId !== initial.workspace.id ||
-        selected.selectedWorkspaceId !== scope.workspaceId ||
-        observed.workspace.id !== scope.workspaceId ||
-        observed.workspaceRef !== scope.workspaceRef ||
-        observed.organizationId !== scope.organizationId
-      )
-        controlError("backend_unavailable", 503);
-      const principal = await accounts.principal(selected.principalId);
-      if (!principal || principal.id !== selected.principalId)
-        controlError("backend_unavailable", 503);
-      const org = await accounts.requireOwner(observed.actor, scope.organizationId);
-      if (org.ownerPrincipalId !== selected.principalId) throw new AuthError("permission_denied");
+      await initial.assertCurrent(request, scope);
     } catch (error) {
       if (error instanceof AuthError || error instanceof ControlError) throw error;
-      if (error instanceof SharedAuthSessionError) {
-        if (error.code === "session_invalid") throw new AuthError("unauthenticated");
-        if (error.code === "workspace_forbidden") throw new AuthError("permission_denied");
-      }
       controlError("backend_unavailable", 503);
     }
   };

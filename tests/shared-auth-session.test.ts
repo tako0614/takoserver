@@ -29,6 +29,7 @@ const INITIAL_TIME = 1_800_000_000_000;
 const LOCAL_PRINCIPAL = "retained-local-takoserver-principal-123";
 const ATTEMPT_COOKIE = "__Host-takoserver_oidc_attempt";
 const SESSION_COOKIE = "__Host-takoserver_shared_session";
+const LEGACY_SESSION_COOKIE = "takoserver_session";
 
 const pinnedOrigins = {
   issuer: SESSION_TEST_CONFIG.issuer,
@@ -240,7 +241,10 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       expect(JSON.stringify(attempts)).not.toContain(started.location.searchParams.get("state"));
       expect(JSON.stringify(attempts)).not.toContain(started.location.searchParams.get("nonce"));
 
-      const response = await f.callback(started);
+      const response = await f.callback({
+        ...started,
+        browserCookie: `${started.browserCookie}; ${LEGACY_SESSION_COOKIE}=legacy_B`,
+      });
       expect(response.status).toBe(303);
       expect(response.headers.get("location")).toBe(`${SESSION_TEST_CONSOLE}/`);
       expect(response.headers.get("location")).not.toContain("token");
@@ -248,6 +252,9 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       const setCookies = response.headers.getSetCookie();
       expect(setCookies).toContain(
         `${ATTEMPT_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+      );
+      expect(setCookies).toContain(
+        `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
       );
       expect(setCookies.find((item) => item.startsWith(SESSION_COOKIE))).toContain(
         "Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=604800",
@@ -319,6 +326,697 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       await f.dispose();
     }
   }, 30_000);
+
+  test("callback bootstrap transport failure emits closed records and keeps grant cleanup", async () => {
+    const f = await fixture();
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      f.issuer.control.onBootstrap = async () => {
+        throw new Error("private callback code, bearer token and SQL text must not be logged");
+      };
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE))).toBe(
+        false,
+      );
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+            reason: "transport",
+            status: null,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "bootstrap",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+        1,
+      );
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("fresh callback bootstrap HTTP 503 emits one bounded Directory result", async () => {
+    let bootstrapCalls = 0;
+    const f = await fixture({
+      send: async (request, send) => {
+        if (new URL(request.url).pathname.endsWith("/shared-workspaces/bootstrap")) {
+          bootstrapCalls += 1;
+          return new Response("private upstream body", { status: 503 });
+        }
+        return await send(request);
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE))).toBe(
+        false,
+      );
+      expect(bootstrapCalls).toBe(1);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+            reason: "http_non_ok",
+            status: 503,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "bootstrap",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+        1,
+      );
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test.each([400, 429, 530])(
+    "fresh callback bootstrap HTTP %i retains the actual bounded status",
+    async (status) => {
+      const f = await fixture({
+        send: async (request, send) =>
+          new URL(request.url).pathname.endsWith("/shared-workspaces/bootstrap")
+            ? new Response("private response body", { status })
+            : await send(request),
+      });
+      const originalConsoleError = console.error;
+      const emitted: unknown[][] = [];
+      try {
+        const started = await f.login();
+        console.error = (...args: unknown[]) => {
+          emitted.push(args);
+        };
+        const response = await f.callback(started);
+        expect(response.status).toBe(503);
+        expect(emitted).toEqual([
+          [
+            JSON.stringify({
+              marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+              reason: "http_non_ok",
+              status,
+            }),
+          ],
+          [
+            JSON.stringify({
+              marker: "takoserver.shared_auth.callback.failure.v1",
+              phase: "bootstrap",
+              class: "session",
+              code: "session_unavailable",
+            }),
+          ],
+        ]);
+      } finally {
+        console.error = originalConsoleError;
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
+  test("fresh callback bootstrap transport failure emits no exception text or HTTP status", async () => {
+    const f = await fixture({
+      send: async (request, send) => {
+        if (new URL(request.url).pathname.endsWith("/shared-workspaces/bootstrap"))
+          throw new Error("private bearer, callback code and SQL text");
+        return await send(request);
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+            reason: "transport",
+            status: null,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "bootstrap",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+        1,
+      );
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("a later Directory Workspace GET failure has no bootstrap request marker", async () => {
+    const f = await fixture({
+      send: async (request, send) => {
+        const url = new URL(request.url);
+        return url.pathname === "/api/v1/account/shared-workspaces" &&
+          url.searchParams.has("selectedWorkspaceId")
+          ? new Response(null, { status: 503 })
+          : await send(request);
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "workspace",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test.each([400, 429, 503, 530])(
+    "fresh callback Organization GET HTTP %i reports its bounded failure without a session",
+    async (status) => {
+      const f = await fixture({
+        send: async (request, send) =>
+          new URL(request.url).pathname.endsWith(
+            `/${SESSION_TEST_PERSONAL.id}/billing-organization`,
+          )
+            ? new Response("private Organization body", { status })
+            : await send(request),
+      });
+      const originalConsoleError = console.error;
+      const emitted: unknown[][] = [];
+      try {
+        const started = await f.login();
+        console.error = (...args: unknown[]) => {
+          emitted.push(args);
+        };
+        const response = await f.callback(started);
+        expect(response.status).toBe(503);
+        expect(emitted).toEqual([
+          [
+            JSON.stringify({
+              marker: "takoserver.shared_auth.organization.failure.v1",
+              reason: "http_non_ok",
+              status,
+            }),
+          ],
+          [
+            JSON.stringify({
+              marker: "takoserver.shared_auth.callback.failure.v1",
+              phase: "organization",
+              class: "session",
+              code: "session_unavailable",
+            }),
+          ],
+        ]);
+        expect(await f.d1.sql.query("SELECT digest FROM shared_auth_sessions")).toEqual([]);
+        expect(await f.d1.store.listPendingRevocations(f.now(), 2)).toHaveLength(1);
+      } finally {
+        console.error = originalConsoleError;
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
+  test("fresh callback Organization transport failure reports no private exception text", async () => {
+    const f = await fixture({
+      send: async (request, send) => {
+        if (
+          new URL(request.url).pathname.endsWith(
+            `/${SESSION_TEST_PERSONAL.id}/billing-organization`,
+          )
+        )
+          throw new Error("private bearer token and Organization response must not appear");
+        return await send(request);
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.organization.failure.v1",
+            reason: "transport",
+            status: null,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "organization",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect(JSON.stringify(emitted)).not.toContain("private bearer token");
+      expect(await f.d1.sql.query("SELECT digest FROM shared_auth_sessions")).toEqual([]);
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("fresh callback Organization body deadline reports only after the GET rejects", async () => {
+    let cancelled = false;
+    const f = await fixture({
+      send: async (request, send) => {
+        if (
+          !new URL(request.url).pathname.endsWith(
+            `/${SESSION_TEST_PERSONAL.id}/billing-organization`,
+          )
+        )
+          return await send(request);
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(cancelled).toBe(true);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.organization.failure.v1",
+            reason: "deadline",
+            status: null,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "organization",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect(await f.d1.sql.query("SELECT digest FROM shared_auth_sessions")).toEqual([]);
+      expect(await f.d1.store.listPendingRevocations(f.now(), 2)).toHaveLength(1);
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("fresh callback Organization post-GET source drift reports only its closed reason", async () => {
+    const f = await fixture();
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      f.issuer.control.onPersonalBillingOrganization = async () => {
+        f.composition.principals.resolve = async () => {
+          throw new Error("mutable principal method must never replace the original");
+        };
+      };
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.organization.failure.v1",
+            reason: "source_drift",
+            status: null,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "organization",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect(await f.d1.sql.query("SELECT digest FROM shared_auth_sessions")).toEqual([]);
+      expect(await f.d1.store.listPendingRevocations(f.now(), 2)).toHaveLength(1);
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test.each([
+    [401, 400, "session_invalid"],
+    [403, 403, "workspace_forbidden"],
+    [404, 403, "workspace_forbidden"],
+  ] as const)(
+    "fresh callback Organization GET HTTP %i preserves its non-unavailable classification",
+    async (upstreamStatus, callbackStatus, code) => {
+      const f = await fixture({
+        send: async (request, send) =>
+          new URL(request.url).pathname.endsWith(
+            `/${SESSION_TEST_PERSONAL.id}/billing-organization`,
+          )
+            ? new Response(null, { status: upstreamStatus })
+            : await send(request),
+      });
+      const originalConsoleError = console.error;
+      const emitted: unknown[][] = [];
+      try {
+        const started = await f.login();
+        console.error = (...args: unknown[]) => {
+          emitted.push(args);
+        };
+        const response = await f.callback(started);
+        expect(response.status).toBe(callbackStatus);
+        expect(emitted).toEqual([
+          [
+            JSON.stringify({
+              marker: "takoserver.shared_auth.callback.failure.v1",
+              phase: "organization",
+              class: "session",
+              code,
+            }),
+          ],
+        ]);
+        expect(await f.d1.sql.query("SELECT digest FROM shared_auth_sessions")).toEqual([]);
+      } finally {
+        console.error = originalConsoleError;
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
+  test("Organization diagnostic sink failure preserves the callback error and grant custody", async () => {
+    const f = await fixture({
+      send: async (request, send) =>
+        new URL(request.url).pathname.endsWith(`/${SESSION_TEST_PERSONAL.id}/billing-organization`)
+          ? new Response(null, { status: 503 })
+          : await send(request),
+    });
+    const originalConsoleError = console.error;
+    try {
+      const started = await f.login();
+      console.error = () => {
+        throw new Error("private diagnostic sink failure");
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE))).toBe(
+        false,
+      );
+      expect(await f.d1.sql.query("SELECT digest FROM shared_auth_sessions")).toEqual([]);
+      expect(await f.d1.store.listPendingRevocations(f.now(), 2)).toHaveLength(1);
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("a diagnostic-only status accessor failure cannot replace the mapped bootstrap error", async () => {
+    let statusReads = 0;
+    const f = await fixture({
+      send: async (request, send) => {
+        if (!new URL(request.url).pathname.endsWith("/shared-workspaces/bootstrap"))
+          return await send(request);
+        const response = new Response(null, { status: 530 });
+        Object.defineProperty(response, "status", {
+          get() {
+            statusReads += 1;
+            if (statusReads > 3) throw new Error("private status accessor failed");
+            return 530;
+          },
+        });
+        return response;
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(statusReads).toBe(4);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+            reason: "http_non_ok",
+            status: null,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "bootstrap",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+        1,
+      );
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("a failing bootstrap diagnostic sink cannot change callback or grant cleanup", async () => {
+    const f = await fixture({
+      send: async (request, send) =>
+        new URL(request.url).pathname.endsWith("/shared-workspaces/bootstrap")
+          ? new Response(null, { status: 503 })
+          : await send(request),
+    });
+    const originalConsoleError = console.error;
+    try {
+      const started = await f.login();
+      console.error = () => {
+        throw new Error("diagnostic sink unavailable");
+      };
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE))).toBe(
+        false,
+      );
+      expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+        1,
+      );
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("bootstrap body deadline emits once after the request actually rejects", async () => {
+    let cancelled = false;
+    const f = await fixture({
+      send: async (request, send) => {
+        if (!new URL(request.url).pathname.endsWith("/shared-workspaces/bootstrap"))
+          return await send(request);
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            cancel() {
+              cancelled = true;
+            },
+          }),
+          { headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const beforeCallback = Date.now();
+      const response = await f.callback(started);
+      expect(response.status).toBe(503);
+      expect(Date.now() - beforeCallback).toBeLessThan(6500);
+      expect(cancelled).toBe(true);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.directory.bootstrap.failure.v1",
+            reason: "deadline",
+            status: null,
+          }),
+        ],
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "bootstrap",
+            class: "session",
+            code: "session_unavailable",
+          }),
+        ],
+      ]);
+      expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+        1,
+      );
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("successful bootstrap never emits a late Directory failure after its timer window", async () => {
+    const f = await fixture();
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      const signedIn = await f.signedIn();
+      expect(signedIn.response.status).toBe(303);
+      await Bun.sleep(5100);
+      expect(emitted).toEqual([]);
+    } finally {
+      console.error = originalConsoleError;
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test.each(["captured", "emitter-throws"])(
+    "callback creation ACK loss keeps cleanup when diagnostic %s",
+    async (diagnostic) => {
+      const privateFailure = {
+        get name(): never {
+          throw new Error("private name accessor");
+        },
+        get code(): never {
+          throw new Error("private code accessor");
+        },
+        get message(): never {
+          throw new Error("private message accessor");
+        },
+        get stack(): never {
+          throw new Error("private stack accessor");
+        },
+      };
+      const f = await fixture({
+        wrapStore: (store) => ({
+          ...store,
+          async createSession(record) {
+            await store.createSession(record);
+            throw privateFailure;
+          },
+        }),
+      });
+      const originalConsoleError = console.error;
+      const emitted: unknown[][] = [];
+      try {
+        const started = await f.login();
+        console.error = (...args: unknown[]) => {
+          if (diagnostic === "emitter-throws") throw new Error("diagnostic sink failed");
+          emitted.push(args);
+        };
+        const response = await f.callback(started);
+        expect(response.status).toBe(503);
+        expect(
+          response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE)),
+        ).toBe(false);
+        expect(await f.d1.sql.query("SELECT status FROM shared_auth_sessions")).toEqual([
+          { status: "revocation_pending" },
+        ]);
+        expect((await f.d1.store.listPendingRevocations(f.now(), 2)).length).toBeGreaterThanOrEqual(
+          1,
+        );
+        expect(emitted).toEqual(
+          diagnostic === "emitter-throws"
+            ? []
+            : [
+                [
+                  JSON.stringify({
+                    marker: "takoserver.shared_auth.callback.failure.v1",
+                    phase: "session_write",
+                    class: "unknown",
+                    code: "unknown",
+                  }),
+                ],
+              ],
+        );
+      } finally {
+        console.error = originalConsoleError;
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
 
   test("Console session confirmation uses exact credentialed CORS and logout requires its Origin", async () => {
     const f = await fixture();
@@ -398,11 +1096,26 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
 
   test("a failed canonical bootstrap retains the acquired grant for revocation and creates no session", async () => {
     const f = await fixture();
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
     try {
       f.issuer.control.bootstrapEnabled = false;
       const started = await f.login();
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
       const response = await f.callback(started);
       expect(response.status).toBe(403);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.callback.failure.v1",
+            phase: "bootstrap",
+            class: "session",
+            code: "workspace_forbidden",
+          }),
+        ],
+      ]);
       expect(response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE))).toBe(
         false,
       );
@@ -415,6 +1128,7 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
         [acquired.accessToken, acquired.refreshToken].sort(),
       );
     } finally {
+      console.error = originalConsoleError;
       await f.dispose();
     }
   }, 30_000);
@@ -640,6 +1354,86 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
     }
   }, 30_000);
 
+  test.each([
+    "takoserver_session=legacy_B",
+    "takoserver_session=",
+    "takoserver_session=%not-a-credential",
+    "takoserver_session",
+  ])(
+    "shared logout refuses a legacy-only named cookie %j without effects",
+    async (legacy) => {
+      let revocations = 0;
+      const f = await fixture({
+        wrapStore: (store) => ({
+          ...store,
+          async revokeSession(digest, stamp) {
+            revocations += 1;
+            return store.revokeSession(digest, stamp);
+          },
+        }),
+      });
+      try {
+        const signedIn = await f.signedIn();
+        const requestsBefore = f.issuer.requests.length;
+        const response = await f.request("/auth/oidc/logout", {
+          method: "POST",
+          headers: { cookie: `unrelated=value; ${legacy}`, origin: SESSION_TEST_CONSOLE },
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: { code: "session_invalid" } });
+        expect(response.headers.has("set-cookie")).toBe(false);
+        expect(revocations).toBe(0);
+        expect((await f.d1.store.readSession(signedIn.digest))?.status).toBe("active");
+        expect(f.issuer.requests.length).toBe(requestsBefore);
+      } finally {
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
+  test("shared logout remains idempotent without either named cookie", async () => {
+    const f = await fixture();
+    try {
+      for (const otherCookie of [
+        undefined,
+        "takoserver_session_suffix=x; prefix_takoserver_session=x",
+      ]) {
+        const headers = new Headers({ origin: SESSION_TEST_CONSOLE });
+        if (otherCookie !== undefined) headers.set("cookie", otherCookie);
+        const response = await f.request("/auth/oidc/logout", { method: "POST", headers });
+        expect(response.status).toBe(204);
+        expect(response.headers.getSetCookie()).toEqual([
+          `${SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+          `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+        ]);
+      }
+      expect(f.issuer.requests).toEqual([]);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("shared-only logout still revokes its own session", async () => {
+    const f = await fixture();
+    try {
+      const signedIn = await f.signedIn();
+      const response = await f.request("/auth/oidc/logout", {
+        method: "POST",
+        headers: { cookie: signedIn.sessionCookie, origin: SESSION_TEST_CONSOLE },
+      });
+      expect(response.status).toBe(204);
+      expect(response.headers.getSetCookie()).toEqual([
+        `${SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+        `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+      ]);
+      expect((await f.d1.store.readSession(signedIn.digest))?.status).toBe("revocation_pending");
+      expect(await f.runtime.authenticate(f.sessionRequest(signedIn.sessionCookie))).toBeNull();
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
   test("logout denies locally before unavailable issuer revocation and maintenance survives a restart", async () => {
     const f = await fixture();
     try {
@@ -647,12 +1441,16 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       f.issuer.control.revocationAvailable = false;
       const response = await f.request("/auth/oidc/logout", {
         method: "POST",
-        headers: { cookie: signedIn.sessionCookie, origin: SESSION_TEST_CONSOLE },
+        headers: {
+          cookie: `${signedIn.sessionCookie}; ${LEGACY_SESSION_COOKIE}=legacy_B`,
+          origin: SESSION_TEST_CONSOLE,
+        },
       });
       expect(response.status).toBe(204);
-      expect(response.headers.get("set-cookie")).toBe(
+      expect(response.headers.getSetCookie()).toEqual([
         `${SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
-      );
+        `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+      ]);
       expect(f.issuer.requests.filter((r) => r.url.pathname === "/oauth/revoke")).toEqual([]);
       expect(await f.runtime.authenticate(f.sessionRequest(signedIn.sessionCookie))).toBeNull();
       expect(await f.runtime.retryRevocations()).toEqual({ completed: 0, pending: 1 });
@@ -691,10 +1489,18 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       });
       try {
         const started = await f.login();
-        const response = await f.callback(started);
+        const response = await f.callback({
+          ...started,
+          browserCookie: `${started.browserCookie}; ${LEGACY_SESSION_COOKIE}=legacy_B`,
+        });
         expect(response.status).toBe(503);
         expect(
           response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE)),
+        ).toBe(false);
+        expect(
+          response.headers
+            .getSetCookie()
+            .some((item) => item.startsWith(`${LEGACY_SESSION_COOKIE}=`)),
         ).toBe(false);
         expect(creations).toBe(1);
         expect((await f.callback(started)).status).toBe(400);

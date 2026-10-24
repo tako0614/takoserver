@@ -18,6 +18,10 @@ import {
   assertFinancialHostedBrowserSelection,
   type FinancialHostedBrowserSelection,
 } from "./financial-hosted-browser-selection.ts";
+import {
+  assertFinancialHostedOwnerReadSource,
+  type FinancialHostedOwnerRead,
+} from "./financial-hosted-owner-read.ts";
 
 /** The fixed, named Hosted native entrypoint. Its binding is service capability only. */
 export interface HostedBrowserBillingRpcSupplier {
@@ -25,7 +29,10 @@ export interface HostedBrowserBillingRpcSupplier {
     input: HostedBrowserBillingLookup,
     selection: HostedBrowserLiveSelectionTarget,
   ): Promise<unknown>;
-  readBrowserBillingContinuation(input: HostedBrowserBillingLookup): Promise<unknown>;
+  readBrowserBillingContinuation(
+    input: HostedBrowserBillingLookup,
+    liveRead?: HostedBrowserLiveReadTarget,
+  ): Promise<unknown>;
   claimBrowserBillingContinuation(
     input: HostedBrowserBillingLookup,
     authorization: HostedBrowserLiveAuthorizationTarget,
@@ -40,6 +47,10 @@ export interface HostedBrowserBillingRpcSupplier {
 export interface HostedBrowserBillingLookup {
   readonly continuationRef: string;
   readonly canonicalAccountId: string;
+}
+
+export interface HostedBrowserLiveReadTarget {
+  assertReadCurrent(scope: HostedBrowserBillingScope): Promise<void>;
 }
 
 export type HostedBrowserBillingRefusal = {
@@ -171,6 +182,39 @@ function sameScope(actual: HostedBrowserBillingScope, expected: HostedBrowserBil
   if (
     actual.continuationRef !== expected.continuationRef ||
     actual.canonicalAccountId !== expected.canonicalAccountId
+  )
+    unavailable();
+}
+
+function snapshotLookup(input: HostedBrowserBillingLookup): HostedBrowserBillingLookup {
+  if (!input || typeof input !== "object" || Array.isArray(input)) unavailable();
+  const selector = Object.getOwnPropertyDescriptor(input, "continuationRef");
+  const account = Object.getOwnPropertyDescriptor(input, "canonicalAccountId");
+  if (
+    !selector ||
+    !("value" in selector) ||
+    typeof selector.value !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(selector.value) ||
+    !account ||
+    !("value" in account) ||
+    typeof account.value !== "string" ||
+    account.value.length === 0
+  )
+    unavailable();
+  return Object.freeze({
+    continuationRef: selector.value,
+    canonicalAccountId: account.value,
+  });
+}
+
+function assertLookupUnchanged(
+  original: HostedBrowserBillingLookup,
+  snapshot: HostedBrowserBillingLookup,
+): void {
+  const current = snapshotLookup(original);
+  if (
+    current.continuationRef !== snapshot.continuationRef ||
+    current.canonicalAccountId !== snapshot.canonicalAccountId
   )
     unavailable();
 }
@@ -514,6 +558,11 @@ export interface HostedBrowserBillingRpcClient {
     },
   ): Promise<HostedBrowserBillingPrepare>;
   read(input: HostedBrowserBillingLookup): Promise<HostedBrowserBillingRead>;
+  readWithCurrentOwner(
+    input: HostedBrowserBillingLookup,
+    ownerRead: FinancialHostedOwnerRead,
+    originalRequest: Request,
+  ): Promise<HostedBrowserBillingRead>;
   claim(
     input: HostedBrowserBillingLookup,
     authorization: HostedBrowserLiveAuthorizationTarget,
@@ -567,6 +616,35 @@ export function createHostedBrowserBillingRpcClient(
         releaseRpcData(result);
       }
     },
+    async readWithCurrentOwner(
+      input: HostedBrowserBillingLookup,
+      ownerRead: FinancialHostedOwnerRead,
+      originalRequest: Request,
+    ) {
+      let result: unknown;
+      let remote: Awaited<ReturnType<typeof createHostedBrowserLiveReadTarget>> | undefined;
+      try {
+        const lookup = snapshotLookup(input);
+        assertFinancialHostedOwnerReadSource(ownerRead, originalRequest, lookup.canonicalAccountId);
+        remote = await createHostedBrowserLiveReadTarget(ownerRead, originalRequest, input, lookup);
+        assertLookupUnchanged(input, lookup);
+        assertFinancialHostedOwnerReadSource(ownerRead, originalRequest, lookup.canonicalAccountId);
+        result = await Reflect.apply(read, supplier, [lookup, remote.target]);
+        assertLookupUnchanged(input, lookup);
+        assertFinancialHostedOwnerReadSource(ownerRead, originalRequest, lookup.canonicalAccountId);
+        const parsed = parseHostedBrowserBillingRead(result, lookup);
+        if (parsed.kind === "view" || parsed.kind === "payment") {
+          const scope = parsed.kind === "view" ? parsed.scope : parsed.original.scope;
+          if (!remote.completedFor(scope)) unavailable();
+        }
+        return parsed;
+      } catch {
+        return unavailable();
+      } finally {
+        remote?.disposeRemote();
+        releaseRpcData(result);
+      }
+    },
     async claim(
       input: HostedBrowserBillingLookup,
       authorization: HostedBrowserLiveAuthorizationTarget,
@@ -599,6 +677,94 @@ export function createHostedBrowserBillingRpcClient(
       }
     },
   });
+}
+
+/** A request-local native prototype callback; no permission DATA is returned. */
+export async function createHostedBrowserLiveReadTarget(
+  ownerRead: FinancialHostedOwnerRead,
+  originalRequest: Request,
+  originalLookup: HostedBrowserBillingLookup,
+  lookup: HostedBrowserBillingLookup,
+): Promise<{
+  readonly target: HostedBrowserLiveReadTarget;
+  completedFor(scope: HostedBrowserBillingScope): boolean;
+  disposeRemote(): void;
+}> {
+  assertFinancialHostedOwnerReadSource(ownerRead, originalRequest, lookup.canonicalAccountId);
+  assertLookupUnchanged(originalLookup, lookup);
+  try {
+    const { RpcTarget } = await import("cloudflare:workers");
+    assertFinancialHostedOwnerReadSource(ownerRead, originalRequest, lookup.canonicalAccountId);
+    assertLookupUnchanged(originalLookup, lookup);
+    let live = true;
+    let parentDisposed = false;
+    let pinned: HostedBrowserBillingScope | undefined;
+    let completed = false;
+    let failed = false;
+    let pending = 0;
+    class Target extends RpcTarget implements HostedBrowserLiveReadTarget {
+      async assertReadCurrent(scope: HostedBrowserBillingScope): Promise<void> {
+        let started = false;
+        try {
+          if (!live || failed || pending !== 0) unavailable();
+          pending++;
+          started = true;
+          completed = false;
+          assertFinancialHostedOwnerReadSource(
+            ownerRead,
+            originalRequest,
+            lookup.canonicalAccountId,
+          );
+          assertLookupUnchanged(originalLookup, lookup);
+          const selected = parseHostedBrowserBillingScope(scope);
+          sameScope(selected, lookup);
+          if (pinned && !sameHostedBrowserBillingScope(pinned, selected)) unavailable();
+          pinned ??= selected;
+          await ownerRead.assertCurrent(originalRequest, selected);
+          if (!live || !sameHostedBrowserBillingScope(selected, scope)) unavailable();
+          assertLookupUnchanged(originalLookup, lookup);
+          assertFinancialHostedOwnerReadSource(
+            ownerRead,
+            originalRequest,
+            lookup.canonicalAccountId,
+          );
+          completed = true;
+        } catch {
+          failed = true;
+          unavailable();
+        } finally {
+          if (started) pending--;
+        }
+      }
+
+      [Symbol.dispose](): void {
+        live = false;
+      }
+    }
+    const target = new Target();
+    return Object.freeze({
+      target,
+      completedFor(scope: HostedBrowserBillingScope): boolean {
+        // Workerd disposes a transferred target after Hosted returns. A read
+        // completed before that native release remains valid; disposal during
+        // its await is caught above, and parent disposal always invalidates it.
+        return !!(
+          !parentDisposed &&
+          !failed &&
+          pending === 0 &&
+          completed &&
+          pinned &&
+          sameHostedBrowserBillingScope(pinned, scope)
+        );
+      },
+      disposeRemote(): void {
+        parentDisposed = true;
+        live = false;
+      },
+    });
+  } catch {
+    unavailable();
+  }
 }
 
 export interface HostedBrowserLiveSelectionTarget {

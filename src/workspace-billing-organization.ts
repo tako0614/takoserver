@@ -15,10 +15,15 @@ import type { SqlStatement } from "./ports.ts";
  *
  * The id locates product records. It grants no payment consent.
  *
- * Known limitation: there is no owner transfer. If a subject's active binding
- * is revoked and the subject later receives a fresh principal, the Org stays
- * owned by the old principal and the new issuance is refused (fail-closed).
- * Accepted for staging; revisit before production.
+ * A returning subject keeps its owner: while its binding is active and
+ * current, a later login reuses the SAME principal and binding and sends only
+ * the owner guard, which writes nothing and aborts unless the same Workspace
+ * is bound to the same Org that principal owns.
+ *
+ * There is no owner transfer and no re-enrollment. A subject whose bindings
+ * are all retired is refused before issuance and never receives a fresh
+ * principal, so its Org stays owned by the retired principal and no second Org
+ * is created (fail-closed). A successor binding is a separate authority action.
  */
 export const WORKSPACE_BILLING_ORGANIZATION_CONTRACT =
   "takoserver.workspace-billing-organization@v1";
@@ -95,10 +100,15 @@ export interface WorkspaceBillingOrganizationMaterialization {
  * aborts the whole batch, through the binding's org_id length CHECK, unless the
  * Org is owned by this principal, holds its owner membership and is the
  * Workspace's binding.
+ *
+ * The Org INSERT returns its own inserted row. Root 0105's AFTER INSERT capture
+ * appends Financial birth observations in the same statement, and D1 counts
+ * those trigger rows in the statement's changes, so the returned row (not the
+ * change count) is the exact evidence of the Org row this statement wrote.
  */
-export function workspaceBillingOrganizationStatements(
+function materialization(
   input: WorkspaceBillingOrganizationMaterialization,
-): readonly SqlStatement[] {
+): WorkspaceBillingOrganizationMaterialization {
   if (
     !input ||
     typeof input !== "object" ||
@@ -117,11 +127,48 @@ export function workspaceBillingOrganizationStatements(
     !TIME.test(input.createdAt)
   )
     fail();
-  const { organizationId: org, workspaceRef: ref, principalId: owner, name, createdAt } = input;
+  return input;
+}
+
+/** The consistency guard: aborts the batch unless the owner tuple is complete. */
+function ownerGuard(input: WorkspaceBillingOrganizationMaterialization): SqlStatement {
+  const { organizationId: org, workspaceRef: ref, principalId: owner, createdAt } = input;
+  return Object.freeze({
+    sql: `INSERT INTO org_wallet_workspace_bindings (workspace_ref, org_id, created_at)
+            SELECT ?, '', ? WHERE NOT EXISTS (
+              SELECT 1 FROM orgs o
+              JOIN org_memberships m ON m.org_id = o.id AND m.principal_id = o.owner_principal_id
+                AND m.role = 'owner'
+              JOIN org_wallet_workspace_bindings b ON b.workspace_ref = ? AND b.org_id = o.id
+              WHERE o.id = ? AND o.owner_principal_id = ?)`,
+    params: Object.freeze([ref, createdAt, ref, org, owner]),
+  });
+}
+
+/**
+ * The single statement for a returning owner's later login. It writes no
+ * Organization row: it changes nothing and aborts the whole batch, through
+ * the binding's org_id length CHECK, unless this exact Org already exists,
+ * is owned by this principal, holds its owner membership and is this
+ * Workspace's binding. A missing, foreign or differently bound Org is
+ * therefore refused, never created or transferred.
+ */
+export function workspaceBillingOrganizationOwnerGuard(
+  input: WorkspaceBillingOrganizationMaterialization,
+): SqlStatement {
+  return ownerGuard(materialization(input));
+}
+
+export function workspaceBillingOrganizationStatements(
+  input: WorkspaceBillingOrganizationMaterialization,
+): readonly SqlStatement[] {
+  const selected = materialization(input);
+  const { organizationId: org, workspaceRef: ref, principalId: owner, name, createdAt } = selected;
   return Object.freeze([
     Object.freeze({
       sql: `INSERT INTO orgs (id, name, owner_principal_id, created_at)
-            SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM orgs WHERE id = ?)`,
+            SELECT ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM orgs WHERE id = ?)
+            RETURNING id, name, owner_principal_id, created_at`,
       params: Object.freeze([org, name, owner, createdAt, org]),
     }),
     Object.freeze({
@@ -139,15 +186,6 @@ export function workspaceBillingOrganizationStatements(
               AND NOT EXISTS (SELECT 1 FROM org_wallet_workspace_bindings WHERE workspace_ref = ?)`,
       params: Object.freeze([ref, createdAt, org, owner, ref]),
     }),
-    Object.freeze({
-      sql: `INSERT INTO org_wallet_workspace_bindings (workspace_ref, org_id, created_at)
-            SELECT ?, '', ? WHERE NOT EXISTS (
-              SELECT 1 FROM orgs o
-              JOIN org_memberships m ON m.org_id = o.id AND m.principal_id = o.owner_principal_id
-                AND m.role = 'owner'
-              JOIN org_wallet_workspace_bindings b ON b.workspace_ref = ? AND b.org_id = o.id
-              WHERE o.id = ? AND o.owner_principal_id = ?)`,
-      params: Object.freeze([ref, createdAt, ref, org, owner]),
-    }),
+    ownerGuard(selected),
   ]);
 }

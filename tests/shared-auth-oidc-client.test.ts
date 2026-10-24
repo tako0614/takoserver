@@ -576,8 +576,178 @@ describe("first-party staging OIDC protocol", () => {
     }
   });
 
+  test("fresh exchange token transport failure emits one closed request discriminator", async () => {
+    const { client, requests } = await fixture({
+      send: async () => {
+        throw new Error(`private token response ${config.clientSecret} test-code`);
+      },
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      await expect(client.exchange("test-code", verifier, nonce)).rejects.toMatchObject({
+        code: "oidc_unavailable",
+      });
+      expect(requests).toHaveLength(1);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.oidc.exchange_request.failure.v1",
+            endpoint: "token",
+            reason: "transport",
+          }),
+        ],
+      ]);
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+
+  test("fresh exchange JWKS 5xx emits only the JWKS failure discriminator", async () => {
+    const { client, requests } = await fixture({
+      send: async (request, response) =>
+        new URL(request.url).pathname === "/oauth/jwks"
+          ? new Response("private issuer text", { status: 503 })
+          : await response(),
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      await expect(client.exchange("test-code", verifier, nonce)).rejects.toMatchObject({
+        code: "oidc_unavailable",
+      });
+      expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+        "/oauth/token",
+        "/oauth/jwks",
+      ]);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.oidc.exchange_request.failure.v1",
+            endpoint: "jwks",
+            reason: "http_5xx",
+          }),
+        ],
+      ]);
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+
+  test("settled successful exchange clears its timer without a late diagnostic", async () => {
+    const { client, requests } = await fixture();
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      await client.exchange("test-code", verifier, nonce);
+      expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+        "/oauth/token",
+        "/oauth/jwks",
+      ]);
+      await Bun.sleep(5100);
+      expect(emitted).toEqual([]);
+    } finally {
+      console.error = originalConsoleError;
+    }
+  }, 7000);
+
+  test("other issuer requests and invalid exchange responses emit no failure discriminator", async () => {
+    const { client } = await fixture({
+      send: async () => new Response(null, { status: 503 }),
+    });
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
+    try {
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      await expect(client.refresh(previous)).rejects.toMatchObject({ code: "oidc_unavailable" });
+      await expect(client.active(previous)).rejects.toMatchObject({ code: "oidc_unavailable" });
+      await expect(client.canonicalAccount(previous)).rejects.toMatchObject({
+        code: "oidc_unavailable",
+      });
+      expect(emitted).toEqual([]);
+      const refreshWithId = await fixture({
+        send: async (request, response) =>
+          new URL(request.url).pathname === "/oauth/jwks"
+            ? new Response(null, { status: 503 })
+            : await response(),
+      });
+      await expect(refreshWithId.client.refresh(previous)).rejects.toMatchObject({
+        code: "oidc_unavailable",
+      });
+      expect(refreshWithId.requests.map((request) => new URL(request.url).pathname)).toEqual([
+        "/oauth/token",
+        "/oauth/jwks",
+      ]);
+      expect(emitted).toEqual([]);
+      const invalid = await fixture({ send: async () => new Response(null, { status: 401 }) });
+      await expect(invalid.client.exchange("test-code", verifier, nonce)).rejects.toMatchObject({
+        code: "oidc_invalid",
+      });
+      expect(emitted).toEqual([]);
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+
+  test("a failing diagnostic sink cannot replace the original token transport rejection", async () => {
+    const { client, requests } = await fixture({
+      send: async () => {
+        throw new Error("private network failure");
+      },
+    });
+    const originalConsoleError = console.error;
+    try {
+      console.error = () => {
+        throw new Error("diagnostic sink failed");
+      };
+      await expect(client.exchange("test-code", verifier, nonce)).rejects.toMatchObject({
+        code: "oidc_unavailable",
+      });
+      expect(requests).toHaveLength(1);
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+
+  test("a throwing diagnostic console accessor cannot replace the original rejection", async () => {
+    const { client, requests } = await fixture({
+      send: async () => {
+        throw new Error("private network failure");
+      },
+    });
+    const descriptor = Object.getOwnPropertyDescriptor(console, "error");
+    if (!descriptor) throw new Error("missing test console descriptor");
+    try {
+      Object.defineProperty(console, "error", {
+        configurable: true,
+        get() {
+          throw new Error("diagnostic console accessor failed");
+        },
+      });
+      await expect(client.exchange("test-code", verifier, nonce)).rejects.toMatchObject({
+        code: "oidc_unavailable",
+      });
+    } finally {
+      Object.defineProperty(console, "error", descriptor);
+    }
+    expect(requests).toHaveLength(1);
+  });
+
   test("bounds a response body that stalls after headers to five seconds", async () => {
     let cancelled = false;
+    const originalConsoleError = console.error;
+    const emitted: unknown[][] = [];
     const { client } = await fixture({
       send: async () =>
         new Response(
@@ -590,10 +760,26 @@ describe("first-party staging OIDC protocol", () => {
         ),
     });
     const started = Date.now();
-    await expect(client.exchange("test-code", verifier, nonce)).rejects.toMatchObject({
-      code: "oidc_unavailable",
-    });
-    expect(cancelled).toBe(true);
-    expect(Date.now() - started).toBeLessThan(6000);
+    try {
+      console.error = (...args: unknown[]) => {
+        emitted.push(args);
+      };
+      await expect(client.exchange("test-code", verifier, nonce)).rejects.toMatchObject({
+        code: "oidc_unavailable",
+      });
+      expect(cancelled).toBe(true);
+      expect(Date.now() - started).toBeLessThan(6000);
+      expect(emitted).toEqual([
+        [
+          JSON.stringify({
+            marker: "takoserver.shared_auth.oidc.exchange_request.failure.v1",
+            endpoint: "token",
+            reason: "deadline",
+          }),
+        ],
+      ]);
+    } finally {
+      console.error = originalConsoleError;
+    }
   }, 7000);
 });

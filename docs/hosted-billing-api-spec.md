@@ -109,6 +109,12 @@ Hosted commercial defaults merely by running Takoserver OSS.
 
 Authenticate and check the exact Organization/scope before looking up billing
 objects or parsing the command body. Scopes do not imply other scopes.
+
+An operator can consume an already issued `wallet:read` key through the
+[issued-key read supplier](issued-org-billing-read.md). It retains the original
+private credential file and uses these existing GET routes; it does not mint
+authority from a Hosted account/Workspace or mount a Hosted Worker supplier.
+
 Legacy top-up is owner-session-only; the canonical reference-based extension
 also accepts `payments:write`. Personal creation does not accept an arbitrary principal ID, API
 key impersonation, Hosted session or caller-selected owner. A future delegated
