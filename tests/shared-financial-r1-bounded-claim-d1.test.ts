@@ -39,7 +39,8 @@ async function copyExactSyntheticFixture(source: Awaited<ReturnType<typeof fixtu
       "SELECT type, name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 WHEN 'trigger' THEN 3 ELSE 4 END, name",
     )
     .all() as { type: string; name: string; sql: string }[];
-  for (const object of schema) await target.run(object.sql);
+  const statements: { sql: string; params?: readonly SqlParam[] }[] = [];
+  for (const object of schema) statements.push({ sql: object.sql });
 
   const tables = schema.filter((object) => object.type === "table");
   for (const { name } of tables) {
@@ -59,12 +60,15 @@ async function copyExactSyntheticFixture(source: Awaited<ReturnType<typeof fixtu
           throw new Error(`missing fixture value for ${name}.${column}`);
         return row[column];
       });
-      await target.run(
-        `INSERT INTO ${quoted} (${writable.map((column) => `"${column}"`).join(",")}) VALUES (${writable.map(() => "?").join(",")})`,
-        values,
-      );
+      statements.push({
+        sql: `INSERT INTO ${quoted} (${writable.map((column) => `"${column}"`).join(",")}) VALUES (${writable.map(() => "?").join(",")})`,
+        params: values,
+      });
     }
   }
+  const acknowledgements = await target.batch(statements);
+  if (acknowledgements.length !== statements.length)
+    throw new Error("fixture bootstrap returned an incomplete batch acknowledgement");
 }
 
 async function harness() {
@@ -143,6 +147,10 @@ async function harness() {
       { acknowledgement: "explicit-d1-result" },
     );
     await copyExactSyntheticFixture(source, bootstrap);
+    if (counters.batch !== 1 || counters.all !== 0)
+      throw new Error(
+        "fixture bootstrap must use one acknowledged batch and no per-statement runs",
+      );
     const sql = createMoneyCutoverSql(raw, EPOCH);
     const realm = await verifyHostedBillingFinancialRealm({
       sql,
