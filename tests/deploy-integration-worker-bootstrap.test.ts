@@ -4,6 +4,7 @@ import { createHash, generateKeyPairSync } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import {
   buildFreshMoneyPreservedPreEpochImport,
@@ -38,6 +39,7 @@ import type {
   WranglerVersionPublicationLease,
 } from "../scripts/deploy/wrangler-state.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import {
   applyQualifiedMigrationNames,
@@ -48,6 +50,7 @@ const COMMIT = "a".repeat(40);
 const ACCOUNT_ID = "b".repeat(32);
 const WORKER_NAME = "takoserver-api-integration";
 const ACCOUNT_SUBDOMAIN = "takoserver-integration";
+const FRESH_AUTH103_ACCOUNT_SUBDOMAIN = "shoutatomiyama0614";
 const VERSION_ID = "00000000-0000-4000-8000-000000000001";
 const DEPLOYMENT_ID = "00000000-0000-4000-8000-000000000002";
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
@@ -120,6 +123,11 @@ const COMPLETE_V2_0088_SCHEMA = schemaState(
   V2_0088_APPLIED,
   applicationShape(join(sourceRoot, "migrations"), V2_0088_APPLIED),
 );
+const V2_0100_APPLIED = MIGRATIONS.slice(0, 100).map(({ name }) => name);
+const COMPLETE_V2_0100_SCHEMA = schemaState(
+  V2_0100_APPLIED,
+  applicationShape(join(sourceRoot, "migrations"), V2_0100_APPLIED),
+);
 
 const keyMaterial = makeKeyMaterial();
 const signingRow: SigningPublicKeyRow = {
@@ -171,6 +179,19 @@ const v2Target0088 = {
   d1: { ...v2Target.d1, databaseId: "00000000-0000-4000-8000-000000000088" },
   takoformV2: { config: V2_ARTIFACT_CONFIG, storageLineage: "v2-0088" },
 } satisfies DeployTarget;
+const AUTH103_WORKER_NAME = new URL(SHARED_AUTH_STAGING_PROFILE.publicOrigin).hostname.split(
+  ".",
+)[0];
+if (AUTH103_WORKER_NAME === undefined)
+  throw new Error("Auth103 fixture Worker name is unavailable");
+const freshAuth103QuiescedTarget = {
+  ...v2Target0088,
+  workerName: AUTH103_WORKER_NAME,
+  publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+  takoformV2: { ...v2Target0088.takoformV2, storageLineage: "v2-0100" },
+  auth103NativeProfile: "root-shared-auth-staging-v1",
+  schemaMaintenanceMode: "pre-auth103-quiesced",
+} satisfies DeployTarget;
 
 const runtimeInputSealKeyring = JSON.stringify({
   current: {
@@ -182,6 +203,163 @@ const runtimeInputSealKeyring = JSON.stringify({
 afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }));
 
 describe("Takoserver integration Worker bootstrap", () => {
+  test("old and foreign Auth103 origins refuse status and apply before credentials or native reads", async () => {
+    for (const origin of [
+      "https://integration-money-8732b77a789fd563406269261bf09e71.shoutatomiyama0614.workers.dev",
+      "https://integration-foreign.shoutatomiyama0614.workers.dev",
+    ]) {
+      const workerName = new URL(origin).hostname.split(".")[0];
+      if (workerName === undefined) throw new Error("origin lacks a Worker name");
+      const selected = { ...freshAuth103QuiescedTarget, workerName, publicOrigin: origin };
+      for (const action of ["status", "apply"] as const) {
+        const fixture = bootstrapFixture({ target: selected });
+        let credentialCalls = 0;
+        const run: WorkerProcess = async () => {
+          credentialCalls++;
+          throw new Error("unexpected credential or build access");
+        };
+        for (const state of [undefined, fixture.state]) {
+          const error = await rejectedError(
+            runIntegrationWorkerBootstrap(
+              { action, environment: "integration", commit: COMMIT },
+              selected,
+              { run, ...(state === undefined ? {} : { state }) },
+            ),
+          );
+          expect(error).toBeInstanceOf(DeployError);
+          expect(error.message).toContain("exact fresh v2-0100 quiesced profile");
+        }
+        expect(credentialCalls).toBe(0);
+        expect(fixture.stateCalls).toEqual([]);
+      }
+    }
+  });
+
+  test("fresh Auth103 origin still uses the independent account workers.dev subdomain", async () => {
+    const fixture = bootstrapFixture({
+      target: freshAuth103QuiescedTarget,
+      accountSubdomain: "crossed-account",
+    });
+    const error = await rejectedError(apply(fixture));
+    expect(error).toBeInstanceOf(DeployError);
+    expect(error.message).toContain("selected workers.dev origin does not match");
+    expect(fixture.lifecycleCalls).toHaveLength(0);
+  });
+
+  test("Auth103 first publication rejects a mixed profile before credentials or native reads", async () => {
+    const { schemaMaintenanceMode: omittedMode, ...noMode } = freshAuth103QuiescedTarget;
+    const { auth103NativeProfile: omittedProfile, ...noProfile } = freshAuth103QuiescedTarget;
+    void omittedMode;
+    void omittedProfile;
+    const cases = [
+      noMode,
+      noProfile,
+      {
+        ...freshAuth103QuiescedTarget,
+        takoformV2: {
+          ...freshAuth103QuiescedTarget.takoformV2,
+          storageLineage: "v2-0088" as const,
+        },
+      },
+    ];
+    for (const selected of cases) {
+      let effects = 0;
+      const error = await rejectedError(
+        runIntegrationWorkerBootstrap(
+          { action: "apply", environment: "integration", commit: COMMIT },
+          selected,
+          {
+            run: async () => {
+              effects++;
+              throw new Error("unexpected credential or build access");
+            },
+          },
+        ),
+      );
+      expect(error).toBeInstanceOf(DeployError);
+      expect(error.message).toContain("exact fresh v2-0100 quiesced profile");
+      expect(effects).toBe(0);
+    }
+  });
+
+  test("fresh Auth103 quiesced first publication requires its original source build before upload", async () => {
+    const selected = freshAuth103QuiescedTarget;
+    const fixture = bootstrapFixture({
+      target: selected,
+      accountSubdomain: FRESH_AUTH103_ACCOUNT_SUBDOMAIN,
+    });
+    const secretDirectory = writeSecretDirectory(selected);
+    const shape = deriveExpectedApplicationShape(
+      projectFreshIntegrationV2MigrationArtifact0100(
+        readMigrationArtifact(join(sourceRoot, "migrations")),
+      ).files,
+    );
+    const tables = (JSON.parse(shape) as { type: string; name: string }[])
+      .filter((row) => row.type === "table")
+      .map((row) => row.name);
+    const seeded = new Set([
+      "tf_cloudflare_provider_invocation_epoch",
+      "tf_v2_operation_acceptance_counter",
+      "money_unit_policy",
+      "stripe_mode_realm",
+    ]);
+    try {
+      const error = await rejectedError(
+        apply(fixture, {
+          secretDirectory,
+          freshV2DataReader: {
+            read: async () => ({
+              tableCounts: Object.fromEntries(
+                tables.map((name) => [name, seeded.has(name) ? 1 : 0]),
+              ),
+              ledgerRows: 100,
+              foreignKeyViolations: 0,
+              invocationEpoch: [
+                {
+                  singleton: 1,
+                  epoch_id: null,
+                  state: "closed",
+                  opened_at_ms: null,
+                  closed_at_ms: null,
+                },
+              ],
+              acceptanceCounter: [{ id: 1, last_order: 0, last_operation_id: null }],
+              moneyUnitPolicy: [
+                {
+                  singleton: 1,
+                  ledger_unit: "usd-micros-v2",
+                  historical_usage_unit: "microcent-v1",
+                  cash_unit: "usd-cents-v1",
+                },
+              ],
+              stripeRealm: [{ singleton: 1, mode: "test", pinned_at: "2026-10-20T09:37:06.426Z" }],
+            }),
+          },
+        }),
+      );
+      expect(error).toBeInstanceOf(DeployError);
+      expect(error.message).toContain("Auth103");
+      expect(fixture.lifecycleCalls).toHaveLength(0);
+    } finally {
+      rmSync(secretDirectory, { recursive: true, force: true });
+    }
+  });
+
+  test("a quiesced Auth103 Worker cannot be reported as normal Host ready", async () => {
+    const fixture = bootstrapFixture({
+      target: freshAuth103QuiescedTarget,
+      accountSubdomain: FRESH_AUTH103_ACCOUNT_SUBDOMAIN,
+      initiallyPublished: true,
+    });
+    const status = await readPublishedStatus(fixture);
+    expect(status).toMatchObject({
+      state: "drift",
+      ready: false,
+      deployedCommit: COMMIT,
+      storageQualified: true,
+      versionId: VERSION_ID,
+    });
+  });
   test("rejects production and rehearsal before provider, credentials, or state effects", async () => {
     const calls: string[] = [];
     const run: WorkerProcess = async () => {
@@ -527,6 +705,7 @@ describe("fresh v2-0100-money-preserved first Host", () => {
 
 interface FixtureOptions {
   readonly target: DeployTarget;
+  readonly accountSubdomain?: string;
   readonly initiallyPublished?: boolean;
   readonly initialScripts?: readonly string[];
   readonly initialHistory?: readonly unknown[];
@@ -682,7 +861,7 @@ function bootstrapFixture(options: FixtureOptions): BootstrapFixture {
     },
     async workerAccountSubdomain() {
       stateCalls.push("workerAccountSubdomain");
-      return ACCOUNT_SUBDOMAIN;
+      return options.accountSubdomain ?? ACCOUNT_SUBDOMAIN;
     },
     async workerSchedules() {
       stateCalls.push("workerSchedules");
@@ -886,6 +1065,7 @@ async function readPublishedStatus(fixture: BootstrapFixture): Promise<Record<st
 }
 
 function completeV2Schema(selectedTarget: DeployTarget): D1SchemaState {
+  if (selectedTarget.takoformV2?.storageLineage === "v2-0100") return COMPLETE_V2_0100_SCHEMA;
   return selectedTarget.takoformV2?.storageLineage === "v2-0088"
     ? COMPLETE_V2_0088_SCHEMA
     : COMPLETE_V2_SCHEMA;
@@ -947,6 +1127,12 @@ function writeSecretDirectory(
 ): string {
   const directory = mkdtempSync(join(fixtureRoot, "secrets-"));
   const values: Record<string, string> = { TAKOSERVER_SIGNING_KEY: keyMaterial.privateRaw };
+  if (selectedTarget.auth103NativeProfile !== undefined) {
+    values.TAKOSERVER_SHARED_AUTH_CLIENT_SECRET = "fixture-shared-auth-client-secret";
+    values.TAKOSERVER_SHARED_AUTH_SESSION_ENCRYPTION_KEY = Buffer.alloc(32, 3).toString(
+      "base64url",
+    );
+  }
   if (selectedTarget.edgeSupplies !== undefined)
     values.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING = keyring;
   if (selectedTarget.takoformV2 !== undefined) {

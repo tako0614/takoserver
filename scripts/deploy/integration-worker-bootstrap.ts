@@ -19,6 +19,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parseRuntimeInputSealKeyRing } from "../../src/runtime-input-seal-keyring.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
@@ -1676,6 +1677,15 @@ export async function runIntegrationWorkerBootstrap(
     invocation = maintenanceData(invocation) as unknown as IntegrationWorkerBootstrapInvocation;
   }
   validateInvocation(invocation, target);
+  if (
+    (target.auth103NativeProfile !== undefined ||
+      target.schemaMaintenanceMode === "pre-auth103-quiesced") &&
+    !freshAuth103QuiescedBootstrap(target)
+  ) {
+    throw preflightError(
+      "Auth103 first Worker bootstrap requires the exact fresh v2-0100 quiesced profile",
+    );
+  }
   // Pure, before any credential or provider call: a fresh Money-preserved
   // first Host must carry the writer, its minted epoch and the retained mint.
   const freshMoneyWriter =
@@ -2289,6 +2299,7 @@ async function statusExisting(
     const originalCustody = originalMaintenance?.readCustody();
     const ready =
       originalMaintenance === undefined &&
+      !freshAuth103QuiescedBootstrap(target) &&
       identity.commit === invocation.commit &&
       moneyUnitSchemaReady(schema.applied) &&
       orgBillingSchemaReady(target, schema.applied) &&
@@ -2467,24 +2478,30 @@ async function verifyBootstrap(input: {
   await input.originalMaintenance?.assertCurrent();
   const probe =
     input.originalMaintenance === undefined
-      ? await probeProduct(
-          input.target.publicOrigin,
-          input.options.fetcher ?? ((url, init) => fetch(url, init)),
-        )
+      ? freshAuth103QuiescedBootstrap(input.target)
+        ? await probeSchemaMaintenance(
+            input.target.publicOrigin,
+            input.options.fetcher ?? ((url, init) => fetch(url, init)),
+            "pre-auth103-quiesced",
+          )
+        : await probeProduct(
+            input.target.publicOrigin,
+            input.options.fetcher ?? ((url, init) => fetch(url, init)),
+          )
       : await probeSchemaMaintenance(
           input.target.publicOrigin,
           (url, init) => fetch(url, init),
           ORIGINAL_MONEY_MAINTENANCE_MODE,
         );
-  if (input.originalMaintenance !== undefined) {
+  if (input.originalMaintenance !== undefined || freshAuth103QuiescedBootstrap(input.target)) {
     const final = await readNativePresence("verification", input.target, input.state);
     if (
       final.history?.versionId !== after.history.versionId ||
       final.history.deploymentId !== after.history.deploymentId ||
       final.chain.length !== 1
     )
-      throw verificationError("original money maintenance Version changed after503 readback");
-    await input.originalMaintenance.assertCurrent();
+      throw verificationError("quiesced Worker Version changed after503 readback");
+    await input.originalMaintenance?.assertCurrent();
   }
   return {
     kind:
@@ -2492,7 +2509,9 @@ async function verifyBootstrap(input: {
         ? "takoserver.integration-worker-bootstrap-apply@v1"
         : ORIGINAL_MONEY_MAINTENANCE_RESULT,
     ...(input.originalMaintenance === undefined
-      ? {}
+      ? freshAuth103QuiescedBootstrap(input.target)
+        ? { maintenanceOnly: true, normalHostReady: false }
+        : {}
       : {
           maintenanceOnly: true,
           normalHostReady: false,
@@ -2621,6 +2640,20 @@ async function prepareBootstrapArtifact(
   maintenanceOnly = false,
   versionOnly = false,
 ): Promise<PreparedWorkerArtifact> {
+  if (freshAuth103QuiescedBootstrap(target) && !maintenanceOnly && !versionOnly) {
+    // The owning default writer alone can bind the registered Auth103 source,
+    // exact checkout and build define to the artifact and its module digest.
+    // A caller's build process/config override is deliberately not transferable.
+    return await prepareWorkerArtifact({
+      root,
+      target,
+      commit,
+      sourceRepositoryRoot,
+      ...(wranglerPath === undefined ? {} : { wranglerPath }),
+      run: runCommand,
+      environment: {},
+    });
+  }
   const buildRun: WorkerProcess = async (command, input = {}) => {
     const childEnvironment = input.env ?? {};
     if (
@@ -2671,6 +2704,17 @@ async function prepareBootstrapArtifact(
               }),
       }),
   });
+}
+
+function freshAuth103QuiescedBootstrap(target: DeployTarget): boolean {
+  return (
+    target.environment === "integration" &&
+    target.takoformV2?.storageLineage === "v2-0100" &&
+    target.auth103NativeProfile === "root-shared-auth-staging-v1" &&
+    target.schemaMaintenanceMode === "pre-auth103-quiesced" &&
+    target.publicOrigin === SHARED_AUTH_STAGING_PROFILE.publicOrigin &&
+    target.publicOrigin.startsWith(`https://${target.workerName}.`)
+  );
 }
 
 function writeInspectionConfig(
