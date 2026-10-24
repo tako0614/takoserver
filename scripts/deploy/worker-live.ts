@@ -55,6 +55,8 @@ export interface WorkerState {
   workerAccountSubdomain?(): Promise<string>;
   workerDeployments(workerName: string): Promise<readonly unknown[]>;
   workerVersion(workerName: string, versionId: string): Promise<unknown>;
+  /** Exact code-module readback for a selected Auth103 source forward. */
+  workerVersionWithModules?(workerName: string, versionId: string): Promise<unknown>;
   workerSecrets(workerName: string): Promise<readonly unknown[]>;
 }
 

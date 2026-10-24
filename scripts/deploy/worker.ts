@@ -12,6 +12,7 @@ import {
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
 import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
+import { verifySelectedAuth103WorkerModules } from "./auth103-original-worker-modules.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -98,6 +99,7 @@ import {
   LEGACY_UNATTRIBUTED_PREDECESSOR,
   type WorkerState,
   type WorkerVersionAuthoritySelection,
+  workerVersionIdentity,
 } from "./worker-live.ts";
 
 export interface WorkerMigrationReader {
@@ -882,6 +884,20 @@ export async function runWorker(
     }
 
     if (invocation.action === "status") {
+      if (freshAuth103Source) {
+        await inspectSelectedAuth103WorkerModules("preflight", target, state, before);
+        const current = await inspectWorker("preflight", target, state, migrations, {
+          sourceRepositoryRoot,
+          ...(beforeAuthorityProfile === undefined
+            ? {}
+            : { authorityProfile: beforeAuthorityProfile }),
+        });
+        assertWorkerInspectionUnchanged(
+          before,
+          current,
+          "selected Auth103 Worker changed during historical module verification",
+        );
+      }
       const moneyServingProbe =
         target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
         target.schemaMaintenanceMode === undefined &&
@@ -1024,6 +1040,11 @@ export async function runWorker(
     if (refreshStateAfterGate !== undefined) state = await refreshStateAfterGate();
 
     const nativeAuth103Forward = freshAuth103Source;
+    if (nativeAuth103Forward) {
+      // Original replay can take minutes. Keep it before the existing sealed
+      // artifact and current-predecessor fence immediately ahead of upload.
+      await inspectSelectedAuth103WorkerModules("preflight", target, state, before);
+    }
     const prepared = await prepareWorkerArtifact({
       root,
       target,
@@ -1258,6 +1279,9 @@ export async function runWorker(
     if (after.commit !== source.commit || after.bundleDigestHex !== bundleDigestHex) {
       throw verificationError("served Worker annotation does not identify the sealed upload");
     }
+    if (freshAuth103Source) {
+      await inspectSelectedAuth103WorkerModules("verification", target, state, after);
+    }
     if (!workerSchemaAllowsPending(target, after.migrations, sourceRepositoryRoot)) {
       throw verificationError("Worker publication left pending D1 migrations");
     }
@@ -1309,6 +1333,13 @@ export async function runWorker(
                 target.publicOrigin,
                 options.fetcher ?? ((input, init) => fetch(input, init)),
               );
+    if (freshAuth103Source) {
+      const final = await inspectWorker("verification", target, state, migrations, {
+        sourceRepositoryRoot,
+        ...(afterAuthorityProfile === undefined ? {} : { authorityProfile: afterAuthorityProfile }),
+      });
+      assertAuth103PostUploadCurrent(after, final);
+    }
     return {
       kind: "takoserver.worker-apply@v2",
       surface: invocation.surface,
@@ -1510,6 +1541,21 @@ function assertWorkerInspectionUnchanged(
   }
 }
 
+export function assertAuth103PostUploadCurrent(
+  expected: Pick<WorkerInspection, "history" | "commit" | "bundleDigestHex">,
+  actual: Pick<WorkerInspection, "history" | "commit" | "bundleDigestHex">,
+): void {
+  if (
+    actual.history.deploymentId !== expected.history.deploymentId ||
+    actual.history.versionId !== expected.history.versionId ||
+    actual.history.previousVersionId !== expected.history.previousVersionId ||
+    actual.commit !== expected.commit ||
+    actual.bundleDigestHex !== expected.bundleDigestHex
+  ) {
+    throw verificationError("Auth103 Worker changed after module proof and serving probe");
+  }
+}
+
 async function requireDistinctIntegrationE2eSigningIdentity(
   target: DeployTarget,
   database: Pick<SigningDatabase, "readKey">,
@@ -1566,6 +1612,43 @@ async function inspectWorker(
     }
     throw verificationError("Worker post-mutation authoritative inspection failed");
   }
+}
+
+async function inspectSelectedAuth103WorkerModules(
+  phase: "preflight" | "verification",
+  target: DeployTarget,
+  state: WorkerState,
+  inspection: WorkerInspection,
+): Promise<void> {
+  if (
+    inspection.commit === null ||
+    inspection.bundleDigestHex === null ||
+    state.workerVersionWithModules === undefined
+  ) {
+    throw phase === "preflight"
+      ? preflightError("selected Auth103 Worker has no exact module readback")
+      : verificationError("selected Auth103 Worker has no exact module readback");
+  }
+  const version = await state.workerVersionWithModules(
+    target.workerName,
+    inspection.history.versionId,
+  );
+  const identity = workerVersionIdentity(phase, version);
+  if (
+    identity.commit !== inspection.commit ||
+    identity.bundleDigestHex !== inspection.bundleDigestHex
+  ) {
+    throw phase === "preflight"
+      ? preflightError("selected Auth103 module readback differs from its inspected Version")
+      : verificationError("selected Auth103 module readback differs from its inspected Version");
+  }
+  verifySelectedAuth103WorkerModules(
+    phase,
+    target,
+    identity.commit,
+    identity.bundleDigestHex,
+    version,
+  );
 }
 
 async function inspectWorkerState(

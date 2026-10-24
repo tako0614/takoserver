@@ -18,6 +18,7 @@ import { compileAuth103NativeImportShapes } from "../scripts/deploy/schema-auth1
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
+  assertAuth103PostUploadCurrent,
   authoritySensitiveWorkerPaths,
   probeMoneyCutoverProductOrFrozen,
   probeProduct,
@@ -53,6 +54,28 @@ const V2_DEPLOYMENT_AFTER = "00000000-0000-4000-8000-000000000012";
 const VERSION_UNRELATED = "00000000-0000-4000-8000-000000000003";
 const VERSION_UNRELATED_PREVIOUS = "00000000-0000-4000-8000-000000000004";
 const OTHER_COMMIT = "d".repeat(40);
+
+test("Auth103 post-upload currentness refuses a superseded Version", () => {
+  const expected = {
+    history: {
+      deploymentId: V2_DEPLOYMENT_AFTER,
+      versionId: VERSION_AFTER,
+      previousVersionId: VERSION_BEFORE,
+    },
+    commit: COMMIT,
+    bundleDigestHex: createHash("sha256").update(BUNDLE).digest("hex"),
+  };
+  expect(() => assertAuth103PostUploadCurrent(expected, expected)).not.toThrow();
+  for (const current of [
+    { ...expected, history: { ...expected.history, deploymentId: "new-deployment" } },
+    { ...expected, history: { ...expected.history, versionId: VERSION_UNRELATED } },
+    { ...expected, history: { ...expected.history, previousVersionId: VERSION_UNRELATED } },
+    { ...expected, commit: OTHER_COMMIT },
+    { ...expected, bundleDigestHex: "0".repeat(64) },
+  ]) {
+    expect(() => assertAuth103PostUploadCurrent(expected, current)).toThrow(DeployError);
+  }
+});
 const ARTIFACT_BLOB_IO_COMPATIBILITY_PENDING = [
   "0037_worker_runtime_input_preparation_v2.sql",
   "0038_selfhost_edge_kv.sql",
@@ -1048,7 +1071,7 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
-  test("reviewed fresh Auth103 forward requires the registered exact source before upload", async () => {
+  test("reviewed fresh Auth103 forward requires module-capable predecessor readback before upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-auth103-forward-"));
     try {
       const current = fixture({
@@ -1082,7 +1105,9 @@ describe("split Takoserver Worker surfaces", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect((failure as Error).message).toContain("Auth103 source qualification");
+      expect((failure as Error).message).toContain(
+        "selected Auth103 Worker has no exact module readback",
+      );
       expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });

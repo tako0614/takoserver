@@ -91,6 +91,33 @@ describe("realized Worker configuration", () => {
     }
   });
 
+  test("Auth103 releases keep their source-install SQL out of Wrangler's additional modules", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-auth103-module-root-"));
+    try {
+      const realized = (selected: DeployTarget, name: string) =>
+        JSON.parse(
+          readFileSync(
+            writeWorkerConfig(selected, {
+              path: join(root, name),
+              main: "worker.js",
+              commit: "a".repeat(40),
+            }),
+            "utf8",
+          ),
+        ) as Record<string, unknown>;
+      const integration = { ...target, environment: "integration" } satisfies DeployTarget;
+      expect(realized(integration, "plain.json").find_additional_modules).toBeUndefined();
+      expect(
+        realized(
+          { ...integration, auth103NativeProfile: "root-shared-auth-staging-v1" },
+          "auth103.json",
+        ).find_additional_modules,
+      ).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("adds the fixed Hosted billing supplier only for its explicit target selection", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-hosted-billing-rpc-"));
     try {

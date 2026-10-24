@@ -21,6 +21,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parseRuntimeInputSealKeyRing } from "../../src/runtime-input-seal-keyring.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
+import { verifySelectedAuth103WorkerModules } from "./auth103-original-worker-modules.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -994,6 +995,35 @@ interface NativePresence {
   readonly routeOwner: boolean;
   readonly domainOwner: boolean;
   readonly absent: boolean;
+}
+
+export function assertAuth103StatusCurrent(
+  initial: {
+    readonly history: unknown;
+    readonly chain: readonly unknown[];
+    readonly scriptPresent: boolean;
+    readonly routeOwner: boolean;
+    readonly domainOwner: boolean;
+  },
+  current: {
+    readonly absent: boolean;
+    readonly history: unknown;
+    readonly chain: readonly unknown[];
+    readonly scriptPresent: boolean;
+    readonly routeOwner: boolean;
+    readonly domainOwner: boolean;
+  },
+): void {
+  if (
+    current.absent ||
+    canonicalJson(current.history) !== canonicalJson(initial.history) ||
+    canonicalJson(current.chain) !== canonicalJson(initial.chain) ||
+    current.scriptPresent !== initial.scriptPresent ||
+    current.routeOwner !== initial.routeOwner ||
+    current.domainOwner !== initial.domainOwner
+  ) {
+    throw preflightError("Auth103 Worker deployment history changed during module verification");
+  }
 }
 
 interface SigningEvidence {
@@ -2300,6 +2330,10 @@ async function statusExisting(
             ORIGINAL_MONEY_MAINTENANCE_MODE,
           );
     const originalCustody = originalMaintenance?.readCustody();
+    if (freshAuth103QuiescedBootstrap(target)) {
+      const current = await readNativePresence("preflight", target, state);
+      assertAuth103StatusCurrent(initial, current);
+    }
     const ready =
       originalMaintenance === undefined &&
       !freshAuth103QuiescedBootstrap(target) &&
@@ -2626,7 +2660,19 @@ async function inspectVersion(
   assertNoTargetOwners(phase, target, native);
   assertWorkerSettings(phase, await state.workerSettings(target.workerName));
   assertImmutableVersion(phase, version);
-  const moduleDigest = exactModuleDigest(phase, version);
+  let moduleDigest: string;
+  if (freshAuth103QuiescedBootstrap(target)) {
+    verifySelectedAuth103WorkerModules(
+      phase,
+      target,
+      identity.commit,
+      identity.bundleDigestHex,
+      version,
+    );
+    moduleDigest = identity.bundleDigestHex;
+  } else {
+    moduleDigest = exactModuleDigest(phase, version);
+  }
   if (moduleDigest !== identity.bundleDigestHex) {
     throw phaseError(phase, "Worker Version module bytes differ from its bundle annotation");
   }

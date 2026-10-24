@@ -12,6 +12,7 @@ import {
 } from "../scripts/deploy/fresh-money-preserved.ts";
 import type { IntegrationStorageGenerationTargetVerificationOptions } from "../scripts/deploy/integration-storage-generation.ts";
 import {
+  assertAuth103StatusCurrent,
   FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER,
   type IntegrationWorkerBootstrapOptions,
   type IntegrationWorkerBootstrapSchemaReader,
@@ -55,6 +56,34 @@ const VERSION_ID = "00000000-0000-4000-8000-000000000001";
 const DEPLOYMENT_ID = "00000000-0000-4000-8000-000000000002";
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
+
+test("Auth103 status refuses deployment or predecessor drift after module verification", () => {
+  const history = {
+    deploymentId: DEPLOYMENT_ID,
+    versionId: VERSION_ID,
+    previousVersionId: null,
+  };
+  const initial = {
+    history,
+    chain: [history],
+    scriptPresent: true,
+    routeOwner: false,
+    domainOwner: false,
+  };
+  expect(() => assertAuth103StatusCurrent(initial, { ...initial, absent: false })).not.toThrow();
+  for (const current of [
+    { ...initial, absent: true },
+    { ...initial, absent: false, history: { ...history, versionId: "new-version" } },
+    { ...initial, absent: false, history: { ...history, deploymentId: "new-deployment" } },
+    { ...initial, absent: false, history: { ...history, previousVersionId: "new-predecessor" } },
+    { ...initial, absent: false, chain: [{ ...history, versionId: "new-version" }] },
+    { ...initial, absent: false, scriptPresent: false },
+    { ...initial, absent: false, routeOwner: true },
+    { ...initial, absent: false, domainOwner: true },
+  ]) {
+    expect(() => assertAuth103StatusCurrent(initial, current)).toThrow(DeployError);
+  }
+});
 const PUBLIC_ORIGIN = `https://${WORKER_NAME}.${ACCOUNT_SUBDOMAIN}.workers.dev`;
 const SCHEDULES = ["*/5 * * * *"] as const;
 const EXPECTED_BOOTSTRAP_TEST_COMMAND = [
@@ -345,7 +374,7 @@ describe("Takoserver integration Worker bootstrap", () => {
     }
   });
 
-  test("a quiesced Auth103 Worker cannot be reported as normal Host ready", async () => {
+  test("a quiesced Auth103 fixture without original module proof cannot be reported ready", async () => {
     const fixture = bootstrapFixture({
       target: freshAuth103QuiescedTarget,
       accountSubdomain: FRESH_AUTH103_ACCOUNT_SUBDOMAIN,
@@ -355,8 +384,8 @@ describe("Takoserver integration Worker bootstrap", () => {
     expect(status).toMatchObject({
       state: "drift",
       ready: false,
-      deployedCommit: COMMIT,
-      storageQualified: true,
+      deployedCommit: null,
+      storageQualified: false,
       versionId: VERSION_ID,
     });
   });

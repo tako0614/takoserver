@@ -180,6 +180,12 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
   }
   const realized = {
     ...neutralConfig,
+    // The registered source-install SQL is sealed beside worker.js for the
+    // owning D1 importer. Wrangler otherwise discovers that .sql sibling as
+    // a Text module during --no-bundle upload.
+    ...(target.auth103NativeProfile === "root-shared-auth-staging-v1"
+      ? { find_additional_modules: false }
+      : {}),
     name: target.workerName,
     main: options.main,
     account_id: target.accountId,
