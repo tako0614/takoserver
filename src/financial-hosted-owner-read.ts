@@ -69,6 +69,26 @@ type HeldSource = Omit<Held, "initial" | "scope">;
 
 const heldByRead = new WeakMap<object, Held>();
 
+/** Internal source assertion for the native read wrapper; it conveys no Actor. */
+export function assertFinancialHostedOwnerReadSource(
+  read: FinancialHostedOwnerRead,
+  originalRequest: Request,
+  canonicalAccountId: string,
+): void {
+  try {
+    const held = heldByRead.get(read) ?? unavailable();
+    if (
+      held.request !== originalRequest ||
+      held.initial.accountId !== canonicalAccountId ||
+      held.method !== "GET"
+    )
+      unavailable();
+    assertSource(held);
+  } catch {
+    unavailable();
+  }
+}
+
 function assertSource(held: HeldSource): void {
   const request = held.request;
   const headers = [...request.headers];

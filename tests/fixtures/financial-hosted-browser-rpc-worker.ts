@@ -1,4 +1,8 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
+import {
+  createFinancialHostedOwnerRead,
+  createHostedBrowserBillingRpcClient,
+} from "@takoserver/core/financial-request-origin";
 import { createAccounts } from "../../src/auth.ts";
 import {
   parseHostedBrowserBillingOriginal,
@@ -6,10 +10,11 @@ import {
 } from "../../src/financial-hosted-browser-continuation.ts";
 import { createFinancialHostedBrowserRequestAuthorization } from "../../src/financial-hosted-browser-request.ts";
 import {
-  createHostedBrowserBillingRpcClient,
   createHostedBrowserLiveAuthorizationTarget,
+  createHostedBrowserLiveReadTarget,
   type HostedBrowserBillingLookup,
   type HostedBrowserLiveAuthorizationTarget,
+  type HostedBrowserLiveReadTarget,
 } from "../../src/financial-hosted-browser-rpc.ts";
 import { createSharedAuthSession } from "../../src/shared-auth-session.ts";
 import {
@@ -30,11 +35,11 @@ const ORGANIZATION = "native-browser-organization";
 const WORKSPACE_REF = "native-browser-workspace-ref";
 const HEX = "a".repeat(64);
 
-function originalFor(kind: string) {
+function originalFor(kind: string, selector = kind.repeat(64)) {
   return parseHostedBrowserBillingOriginal({
     contractVersion: "hosted-browser-v1",
     scope: {
-      continuationRef: kind.repeat(64),
+      continuationRef: selector,
       canonicalAccountId: SESSION_TEST_ACCOUNT,
       workspaceId: SESSION_TEST_PERSONAL.id,
       workspaceRef: WORKSPACE_REF,
@@ -71,7 +76,10 @@ interface Env {
   REVOKER: { fetch(request: Request): Promise<Response> };
   GATE: { fetch(request: Request): Promise<Response> };
   HOSTED: {
-    readBrowserBillingContinuation(input: HostedBrowserBillingLookup): Promise<unknown>;
+    readBrowserBillingContinuation(
+      input: HostedBrowserBillingLookup,
+      liveRead?: HostedBrowserLiveReadTarget,
+    ): Promise<unknown>;
     claimBrowserBillingContinuation(
       input: HostedBrowserBillingLookup,
       authorization: HostedBrowserLiveAuthorizationTarget,
@@ -90,8 +98,85 @@ function errorCode(error: unknown): string {
 
 /** Local Hosted fixture: it calls the real transferred prototype callback. */
 export class Hosted extends WorkerEntrypoint<Env> {
-  async readBrowserBillingContinuation() {
-    return { kind: "unavailable" };
+  async readBrowserBillingContinuation(
+    input: HostedBrowserBillingLookup,
+    liveRead?: HostedBrowserLiveReadTarget,
+  ) {
+    const mode = input.continuationRef.slice(-2);
+    const scope = {
+      continuationRef: input.continuationRef,
+      canonicalAccountId: input.canonicalAccountId,
+      workspaceId: SESSION_TEST_PERSONAL.id,
+      workspaceRef: WORKSPACE_REF,
+      organizationId: ORGANIZATION,
+      billingSourceRef: "native-browser-source",
+      sourceEpoch: "native-browser-epoch",
+    };
+    const view = { kind: "view", contractVersion: "hosted-browser-v1", scope };
+    if (mode === "a9") return { kind: "denied" };
+    if (mode === "a5") return view;
+    if (!liveRead || typeof liveRead.assertReadCurrent !== "function")
+      throw new Error("native read callback prototype method is invisible");
+    if (mode === "b2") {
+      try {
+        await liveRead.assertReadCurrent({ ...scope, continuationRef: "b".repeat(64) });
+      } catch {
+        // A mismatched selector cannot be laundered into this lookup's view.
+      }
+      return view;
+    }
+    if (mode === "a7" || mode === "b3" || mode === "b4") {
+      const entered = await this.env.GATE.fetch(new Request("https://fixture.invalid/entered"));
+      if (entered.status !== 204) throw new Error("local read callback barrier failed");
+    }
+    if (mode === "a2") {
+      const revoked = await this.env.REVOKER.fetch(new Request("https://fixture.invalid/revoke"));
+      if (revoked.status !== 204) throw new Error("local read Owner revocation failed");
+    }
+    if (mode === "a3") {
+      await liveRead.assertReadCurrent(scope);
+      try {
+        await liveRead.assertReadCurrent({ ...scope, workspaceRef: "different-ref" });
+      } catch {
+        // A real Hosted caller may catch a failed callback. It cannot reuse the first success.
+      }
+      return view;
+    }
+    if (mode === "a6") {
+      await liveRead.assertReadCurrent(scope);
+      const revoked = await this.env.REVOKER.fetch(new Request("https://fixture.invalid/revoke"));
+      if (revoked.status !== 204) throw new Error("local read Owner revocation failed");
+      try {
+        await liveRead.assertReadCurrent(scope);
+      } catch {
+        // Do not let a prior success authorize this apparent positive response.
+      }
+      return view;
+    }
+    await liveRead.assertReadCurrent(scope);
+    if (mode === "b7") {
+      const dispose = (liveRead as HostedBrowserLiveReadTarget & { [Symbol.dispose](): void })[
+        Symbol.dispose
+      ];
+      if (typeof dispose !== "function") throw new Error("native read disposer is unavailable");
+      Reflect.apply(dispose, liveRead, []);
+      let rejected = false;
+      try {
+        await liveRead.assertReadCurrent(scope);
+      } catch {
+        rejected = true;
+      }
+      if (!rejected) throw new Error("native callback survived completed release");
+      return view;
+    }
+    if (mode === "a1")
+      return {
+        kind: "payment",
+        original: originalFor("f", input.continuationRef),
+        custody: { phase: "prepared" },
+      };
+    if (mode === "a4") return { ...view, scope: { ...scope, sourceEpoch: "different-epoch" } };
+    return view;
   }
 
   async recordBrowserBillingContinuationOutcome() {
@@ -180,6 +265,114 @@ export default {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/auth/"))
       return (await sharedAuth.fetch(request)) ?? new Response(null, { status: 404 });
+    if (url.pathname.startsWith("/test/read/")) {
+      const mode = url.pathname.slice("/test/read/".length);
+      if (!/^(?:a[0-9]|b[0-7])$/u.test(mode)) return new Response(null, { status: 404 });
+      const accounts = createAccounts({
+        sql,
+        clock: () => new Date(NOW),
+        identity: {
+          async verify() {
+            throw new Error("not used by native Accounts reader");
+          },
+        },
+      });
+      const ownerRead = await createFinancialHostedOwnerRead({
+        request,
+        sharedAuth,
+        accounts,
+        qualifiedConsoleOrigin: SESSION_TEST_CONSOLE,
+      });
+      const lookup = {
+        continuationRef: `${"a".repeat(62)}${mode}`,
+        canonicalAccountId: SESSION_TEST_ACCOUNT,
+      };
+      const client = createHostedBrowserBillingRpcClient(env.HOSTED);
+      if (mode === "a7" || mode === "a8" || mode === "b5" || mode === "b6") {
+        const remote = await createHostedBrowserLiveReadTarget(ownerRead, request, lookup, lookup);
+        const prototypeVisible =
+          !Object.hasOwn(remote.target, "assertReadCurrent") &&
+          typeof remote.target.assertReadCurrent === "function";
+        const scope = {
+          ...lookup,
+          workspaceId: SESSION_TEST_PERSONAL.id,
+          workspaceRef: WORKSPACE_REF,
+          organizationId: ORGANIZATION,
+          billingSourceRef: "native-browser-source",
+          sourceEpoch: "native-browser-epoch",
+        };
+        let result: string;
+        try {
+          if (mode === "a7" || mode === "b5" || mode === "b6") {
+            if (mode !== "a7") {
+              const entered = await env.GATE.fetch(new Request("https://fixture.invalid/entered"));
+              if (entered.status !== 204) throw new Error("local callback barrier failed");
+            }
+            const pending =
+              mode === "a7"
+                ? env.HOSTED.readBrowserBillingContinuation(lookup, remote.target)
+                : remote.target.assertReadCurrent(scope);
+            const entered = await env.GATE.fetch(new Request("https://fixture.invalid/wait"));
+            if (entered.status !== 204) throw new Error("local callback wait failed");
+            let second: string | undefined;
+            if (mode === "a7") remote.disposeRemote();
+            if (mode === "b5") scope.sourceEpoch = "mutated-epoch";
+            if (mode === "b6") {
+              try {
+                await remote.target.assertReadCurrent(scope);
+                second = "allowed";
+              } catch (error) {
+                second = errorCode(error);
+              }
+            }
+            const released = await env.GATE.fetch(new Request("https://fixture.invalid/release"));
+            if (released.status !== 204) throw new Error("local callback release failed");
+            try {
+              await pending;
+              result = "allowed";
+            } catch (error) {
+              result = errorCode(error);
+            }
+            if (second) result = `${result}/${second}`;
+          } else {
+            remote.disposeRemote();
+            try {
+              await remote.target.assertReadCurrent(scope);
+              result = "allowed";
+            } catch (error) {
+              result = errorCode(error);
+            }
+          }
+        } finally {
+          remote.disposeRemote();
+        }
+        return Response.json({ result, prototypeVisible, completed: remote.completedFor(scope) });
+      }
+      let result: string;
+      try {
+        let pending: ReturnType<typeof client.readWithCurrentOwner>;
+        if (mode === "b3" || mode === "b4") {
+          pending = client.readWithCurrentOwner(lookup, ownerRead, request);
+          const entered = await env.GATE.fetch(new Request("https://fixture.invalid/wait"));
+          if (entered.status !== 204) throw new Error("local callback wait failed");
+          if (mode === "b3") lookup.continuationRef = "b".repeat(64);
+          else request.headers.set("x-drift", "changed");
+          const released = await env.GATE.fetch(new Request("https://fixture.invalid/release"));
+          if (released.status !== 204) throw new Error("local callback release failed");
+        } else {
+          pending = client.readWithCurrentOwner(
+            mode === "b1" ? { ...lookup, canonicalAccountId: "foreign-account" } : lookup,
+            ownerRead,
+            mode === "b0" ? request.clone() : request,
+          );
+        }
+        const selected = await pending;
+        result = selected.kind;
+      } catch (error) {
+        result = errorCode(error);
+      }
+      return Response.json({ result });
+    }
     if (!url.pathname.startsWith("/test/claim/")) return new Response(null, { status: 404 });
     const kind = url.pathname.slice("/test/claim/".length);
     if (!/^[abcde]$/u.test(kind)) return new Response(null, { status: 404 });
