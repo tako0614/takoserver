@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalJson } from "../../src/json.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import {
   applicationSchemaMatches,
   deriveExpectedApplicationShape,
@@ -676,6 +677,29 @@ export async function runWorker(
   if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
     throw preflightError("Worker maintenance selectors conflict");
   }
+  const freshAuth103Source =
+    target.auth103NativeProfile === "root-shared-auth-staging-v1" &&
+    target.schemaMaintenanceMode === "pre-auth103-quiesced" &&
+    target.moneyCutoverWriterPolicy === undefined;
+  if (freshAuth103Source) {
+    const selectedHost = new URL(SHARED_AUTH_STAGING_PROFILE.publicOrigin).hostname;
+    if (
+      target.environment !== "integration" ||
+      target.takoformV2?.storageLineage !== "v2-0100" ||
+      target.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
+      target.workerName !== selectedHost.split(".")[0]
+    ) {
+      throw preflightError(
+        "fresh Auth103 Worker requires its exact selected Root origin and v2-0100 source",
+      );
+    }
+    if (
+      invocation.action === "apply" &&
+      invocation.surface !== "takoserver-worker-authority-cutover"
+    ) {
+      throw preflightError("fresh Auth103 Worker forward requires reviewed authority cutover");
+    }
+  }
   if (invocation.legacyPredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
       throw preflightError(
@@ -999,6 +1023,7 @@ export async function runWorker(
     // write after the gate reuses a bearer resolved before it.
     if (refreshStateAfterGate !== undefined) state = await refreshStateAfterGate();
 
+    const nativeAuth103Forward = freshAuth103Source;
     const prepared = await prepareWorkerArtifact({
       root,
       target,
@@ -1008,31 +1033,35 @@ export async function runWorker(
       run,
       environment,
       ...(versionPublication ? { dryRunCommand: "versions-upload" as const } : {}),
-      writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
-        writeWorkerConfig(target, {
-          path,
-          main,
-          commit: source.commit,
-          sourceRepositoryRoot,
-          ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
-          ...(bundleDigestHex === undefined
-            ? {}
-            : { workerArtifactDigest: `sha256:${bundleDigestHex}` as const }),
-          ...(versionPublication ? { topology: "version-only" as const } : {}),
-          ...(target.integrationE2eCredentialAuthority === undefined
-            ? {}
-            : bundleDigestHex === undefined
-              ? { authorityProfile: { kind: "historical-pre-jit" as const } }
-              : {
-                  authorityProfile: {
-                    kind: "provenance-bound-jit" as const,
-                    provenance: {
-                      sourceCommit: source.commit,
-                      artifactDigest: `sha256:${bundleDigestHex}` as const,
-                    },
-                  },
-                }),
-        }),
+      ...(nativeAuth103Forward
+        ? {}
+        : {
+            writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
+              writeWorkerConfig(target, {
+                path,
+                main,
+                commit: source.commit,
+                sourceRepositoryRoot,
+                ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
+                ...(bundleDigestHex === undefined
+                  ? {}
+                  : { workerArtifactDigest: `sha256:${bundleDigestHex}` as const }),
+                ...(versionPublication ? { topology: "version-only" as const } : {}),
+                ...(target.integrationE2eCredentialAuthority === undefined
+                  ? {}
+                  : bundleDigestHex === undefined
+                    ? { authorityProfile: { kind: "historical-pre-jit" as const } }
+                    : {
+                        authorityProfile: {
+                          kind: "provenance-bound-jit" as const,
+                          provenance: {
+                            sourceCommit: source.commit,
+                            artifactDigest: `sha256:${bundleDigestHex}` as const,
+                          },
+                        },
+                      }),
+              }),
+          }),
     });
     const { bundlePath, configPath, bundleDigestHex } = prepared;
     const artifact = prepared.seal();

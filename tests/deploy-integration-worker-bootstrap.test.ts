@@ -1149,6 +1149,7 @@ function writeSecretDirectory(
 function versionForTarget(selectedTarget: DeployTarget, message: string): Record<string, unknown> {
   const expected = expectedExactBindingClosure(selectedTarget, {
     workerArtifactDigest: `sha256:${BUNDLE_DIGEST}`,
+    ...(selectedTarget.auth103NativeProfile === undefined ? {} : { nativeSourceCommit: COMMIT }),
   });
   const bindings = Object.entries(expected).flatMap(([name, requirement]) =>
     requirement === null ? [] : [{ name, type: requirement.type, ...requirement.fields }],

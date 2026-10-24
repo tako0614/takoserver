@@ -154,7 +154,12 @@ export async function inspectLiveWorkerVersionForRetirement(
       ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
       ...(identity.kind === "canonical"
-        ? { workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const }
+        ? {
+            workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+            ...(target.auth103NativeProfile === undefined
+              ? {}
+              : { nativeSourceCommit: identity.commit }),
+          }
         : {}),
     }),
   );
@@ -255,6 +260,7 @@ export async function inspectCanonicalWorkerVersionWithScriptIdentity(
       ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
       workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
+      ...(target.auth103NativeProfile === undefined ? {} : { nativeSourceCommit: identity.commit }),
     }),
   );
   if (input.selectedCommit !== undefined && identity.commit !== input.selectedCommit) {
@@ -454,6 +460,9 @@ async function inspectSecretCreatedTransition(
       expectedSecrets: predecessorSecrets,
       ...profileInput,
       workerArtifactDigest: `sha256:${predecessorIdentity.bundleDigestHex}`,
+      ...(target.auth103NativeProfile === undefined
+        ? {}
+        : { nativeSourceCommit: predecessorIdentity.commit }),
     }),
   );
   assertExactVersionBindingClosure(
@@ -465,6 +474,9 @@ async function inspectSecretCreatedTransition(
       expectedSecrets: desiredSecrets,
       ...profileInput,
       workerArtifactDigest: `sha256:${predecessorIdentity.bundleDigestHex}`,
+      ...(target.auth103NativeProfile === undefined
+        ? {}
+        : { nativeSourceCommit: predecessorIdentity.commit }),
     }),
   );
   if (input.selectedCommit !== undefined && predecessorIdentity.commit !== input.selectedCommit) {
@@ -633,7 +645,12 @@ async function inspectLiveWorkerVersionCore(
     ...(input.expectedSecrets === undefined ? {} : { expectedSecrets: input.expectedSecrets }),
     ...(authorityProfile === undefined ? {} : { authorityProfile }),
     ...(identity.kind === "canonical"
-      ? { workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const }
+      ? {
+          workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+          ...(target.auth103NativeProfile === undefined
+            ? {}
+            : { nativeSourceCommit: identity.commit }),
+        }
       : {}),
   } as const;
   assertExactVersionBindingClosure(

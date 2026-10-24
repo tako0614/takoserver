@@ -1172,6 +1172,7 @@ export async function runD1SchemaAuth103(
         historicalVersion,
         expectedExactBindingClosure(target, {
           workerArtifactDigest: `sha256:${artifact.bundleDigestHex}`,
+          nativeSourceCommit: source.commit,
         }),
       );
       const moduleDigest = exactV2MaintenanceModuleDigest(

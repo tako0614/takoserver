@@ -1417,6 +1417,9 @@ async function runOriginalMoneyMaintenanceSuccessor(
       signingKeyId: target.signing.currentKeyId,
       expectedSecrets: [],
       workerArtifactDigest: `sha256:${prepared.bundleDigestHex}`,
+      ...(target.auth103NativeProfile === undefined
+        ? {}
+        : { nativeSourceCommit: invocation.commit }),
     });
     if (expectedSuccessor.TAKOSERVER_ENVIRONMENT?.fields.text !== "integration")
       throw preflightError(
@@ -2600,6 +2603,7 @@ async function inspectVersion(
       ...(maintenanceOnly ? { expectedSecrets: [] } : {}),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
       workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+      ...(target.auth103NativeProfile === undefined ? {} : { nativeSourceCommit: identity.commit }),
     }),
   };
   // This exact historical exception is reachable only after the repair owner

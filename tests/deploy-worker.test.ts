@@ -37,6 +37,7 @@ import {
 } from "../scripts/deploy/worker-authority-paths.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../src/integration-e2e-credential-authority.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import { objectBucketSuppliesFixture } from "./helpers/hosted-supply-fixtures.ts";
 import {
   completeIntegrationStorageState,
@@ -94,7 +95,27 @@ const schemaMaintenanceTarget = {
   schemaMaintenanceMode: "pre-0058-quiesced",
 } satisfies DeployTarget;
 
+const auth103WorkerName = new URL(SHARED_AUTH_STAGING_PROFILE.publicOrigin).hostname.split(".")[0];
+if (auth103WorkerName === undefined) throw new Error("Auth103 Worker fixture name is unavailable");
+const freshAuth103QuiescedTarget = {
+  ...v2Target,
+  workerName: auth103WorkerName,
+  publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+  takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0100" },
+  auth103NativeProfile: "root-shared-auth-staging-v1",
+  schemaMaintenanceMode: "pre-auth103-quiesced",
+} satisfies DeployTarget;
+
 const canonicalMigrations = readMigrationArtifact().names;
+const freshAuth100State = (() => {
+  const source = readMigrationArtifact();
+  const shape = deriveExpectedApplicationShape(source.files.slice(0, 100));
+  return {
+    applied: source.names.slice(0, 100),
+    shape,
+    shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+  };
+})();
 const canonicalMoneyShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
 const canonicalMoneyShapeDigest = `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`;
 const currentAuth103State = (() => {
@@ -143,6 +164,8 @@ function fixture(
     readonly diff?: string;
     readonly dirty?: string;
     readonly applied?: readonly string[];
+    readonly schemaState?: { readonly shape: string; readonly shapeDigest: string };
+    readonly accountSubdomain?: string;
     readonly beforeMessage?: string | null;
     readonly beforeMessageAfterBuild?: string | null;
     readonly afterMessage?: string | null;
@@ -172,9 +195,10 @@ function fixture(
       ? currentAuth103State.applied
       : canonicalMigrations);
   const selectedShape =
-    selectedApplied.length === 103
+    input.schemaState ??
+    (selectedApplied.length === 103
       ? currentAuth103State
-      : { shape: canonicalMoneyShape, shapeDigest: canonicalMoneyShapeDigest };
+      : { shape: canonicalMoneyShape, shapeDigest: canonicalMoneyShapeDigest });
   let current = input.current ?? "before";
   let built = false;
   let replacementObserved = false;
@@ -247,7 +271,19 @@ function fixture(
   };
   const state: WorkerState = {
     async workerDomains() {
-      return [{ hostname: "api.integration.example.test", service: selectedTarget.workerName }];
+      if (new URL(selectedTarget.publicOrigin).hostname.endsWith(".workers.dev")) return [];
+      return [
+        {
+          hostname: new URL(selectedTarget.publicOrigin).hostname,
+          service: selectedTarget.workerName,
+        },
+      ];
+    },
+    async workerSubdomain() {
+      return { enabled: true, previewsEnabled: false };
+    },
+    async workerAccountSubdomain() {
+      return input.accountSubdomain ?? "fixture-account";
     },
     async workerDeployments() {
       if (current === "before") {
@@ -1007,6 +1043,116 @@ describe("split Takoserver Worker surfaces", () => {
       expect(failure).toBeInstanceOf(DeployError);
       expect(failure.message).toContain("takoserver-worker-authority-cutover");
       expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reviewed fresh Auth103 forward requires the registered exact source before upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-auth103-forward-"));
+    try {
+      const current = fixture({
+        selectedTarget: freshAuth103QuiescedTarget,
+        local: canonicalMigrations,
+        applied: freshAuth100State.applied,
+        schemaState: freshAuth100State,
+        accountSubdomain: "shoutatomiyama0614",
+        diff: "scripts/deploy/worker-state.ts\n",
+      });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        freshAuth103QuiescedTarget,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "reviewer@example.test",
+          integrationStorageVerification: integrationStorageVerificationOptions(
+            freshAuth103QuiescedTarget,
+            { readState: async () => freshAuth100State },
+          ),
+          fetcher: async () => {
+            throw new Error("unexpected HTTP probe");
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as Error).message).toContain("Auth103 source qualification");
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("fresh Auth103 Worker forward refuses foreign origin and routine route before credentials", async () => {
+    const foreign = {
+      ...freshAuth103QuiescedTarget,
+      workerName: "integration-money-8732b77a789fd563406269261bf09e71",
+      publicOrigin:
+        "https://integration-money-8732b77a789fd563406269261bf09e71.shoutatomiyama0614.workers.dev",
+    } satisfies DeployTarget;
+    for (const [surface, selected, message] of [
+      ["takoserver-worker-authority-cutover", foreign, "exact selected Root origin"],
+      ["takoserver-worker", freshAuth103QuiescedTarget, "reviewed authority cutover"],
+    ] as const) {
+      let calls = 0;
+      const failure = await runWorker(
+        { surface, action: "apply", environment: "integration", commit: COMMIT },
+        selected,
+        {
+          run: async () => {
+            calls++;
+            throw new Error("unexpected credential or source read");
+          },
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as Error).message).toContain(message);
+      expect(calls).toBe(0);
+    }
+  });
+
+  test("fresh Auth103 forward refuses a crossed account subdomain before its gate or upload", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-worker-auth103-crossed-subdomain-"));
+    try {
+      const current = fixture({
+        selectedTarget: freshAuth103QuiescedTarget,
+        local: canonicalMigrations,
+        applied: freshAuth100State.applied,
+        schemaState: freshAuth100State,
+        accountSubdomain: "foreign-account",
+        diff: "scripts/deploy/worker-state.ts\n",
+      });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        freshAuth103QuiescedTarget,
+        {
+          ...current,
+          outputDirectory: root,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          review: "reviewer@example.test",
+          integrationStorageVerification: integrationStorageVerificationOptions(
+            freshAuth103QuiescedTarget,
+            { readState: async () => freshAuth100State },
+          ),
+        },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as Error).message).toContain(
+        "selected workers.dev origin does not match the authoritative account Worker hostname",
+      );
+      expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
+      expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -2997,6 +3143,12 @@ function versionForTarget(id: string, message: string, selectedTarget: DeployTar
   const match = /^takoserver-worker:([0-9a-f]{40}):([0-9a-f]{64})$/u.exec(message);
   if (!match) throw new Error("invalid test Worker annotation");
   const expected = expectedExactBindingClosure(selectedTarget, {
+    ...(selectedTarget.auth103NativeProfile === undefined
+      ? {}
+      : {
+          nativeSourceCommit: match[1] as string,
+          workerArtifactDigest: `sha256:${match[2]}` as const,
+        }),
     ...(selectedTarget.integrationE2eCredentialAuthority === undefined
       ? {}
       : {
