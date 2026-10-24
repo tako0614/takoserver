@@ -4,6 +4,8 @@ declare module "cloudflare:workers" {
   export abstract class WorkerEntrypoint<Env = unknown> {
     protected readonly env: Env;
   }
+  /** Portable declaration only; the actual native runtime supplies the class. */
+  export class RpcTarget {}
   /**
    * Enough of the base class for the programs that type-check a Durable Object
    * without `@cloudflare/workers-types`. `ctx` is `never` here so a caller must

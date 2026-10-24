@@ -13,6 +13,7 @@ import {
   refreshSharedAuthAvailability,
   setApiOrigin,
   sharedAuthAvailable,
+  storeSharedSessionReturnPath,
   theme,
 } from "../state.ts";
 import { beginTakosIdSignIn } from "../takos-id.ts";
@@ -106,9 +107,7 @@ function sharedSessionRow(): Child {
         onClick: () => {
           try {
             const loginUrl = sharedSessionLoginUrl(apiOrigin());
-            const returnKey = "takoserver.shared-session-return";
-            if (route().path === "/billing") sessionStorage.setItem(returnKey, "billing");
-            else sessionStorage.removeItem(returnKey);
+            storeSharedSessionReturnPath(route().path);
             busy.set(true);
             window.location.assign(loginUrl);
           } catch (error) {

@@ -21,6 +21,9 @@ const SESSION_KIND_KEY = "takoserver.session-kind";
 const ORG_KEY = "takoserver.organization";
 const THEME_KEY = "takoserver.theme";
 const ORIGIN_KEY = "takoserver.origin";
+const SHARED_SESSION_RETURN_KEY = "takoserver.shared-session-return";
+const HOSTED_CONTINUATION_PATH = /^\/billing\/hosted-continuations\/([0-9a-f]{64})$/u;
+const HOSTED_CONTINUATION_VALUE = /^hosted-continuation:([0-9a-f]{64})$/u;
 
 export type Theme = "system" | "light" | "dark";
 export type SessionKind = "shared-auth" | "legacy";
@@ -138,12 +141,57 @@ export async function bootstrapSharedSession(): Promise<boolean> {
   return true;
 }
 
-/** A same-origin enum, never a URL, used only for the one safe billing return. */
-export function takeSharedSessionReturnPath(): "/billing" | "/" {
-  const key = "takoserver.shared-session-return";
-  const path = sessionStorage.getItem(key);
-  sessionStorage.removeItem(key);
-  return path === "billing" ? "/billing" : "/";
+/** Retain only closed, same-tab destinations across the fixed-root SSO callback. */
+export function storeSharedSessionReturnPath(path: string): void {
+  const hosted = HOSTED_CONTINUATION_PATH.exec(path);
+  const value =
+    path === "/billing"
+      ? "billing"
+      : hosted && hosted[0] === path
+        ? `hosted-continuation:${hosted[1]}`
+        : null;
+  try {
+    if (value === null) sessionStorage.removeItem(SHARED_SESSION_RETURN_KEY);
+    else sessionStorage.setItem(SHARED_SESSION_RETURN_KEY, value);
+  } catch {
+    try {
+      sessionStorage.removeItem(SHARED_SESSION_RETURN_KEY);
+    } catch {
+      // Storage denial safely drops the optional return destination.
+    }
+  }
+}
+
+/** Consume a closed same-tab selector, deriving paths only from fixed prefixes. */
+export function takeSharedSessionReturnPath(): string {
+  let value: string | null = null;
+  try {
+    value = sessionStorage.getItem(SHARED_SESSION_RETURN_KEY);
+    sessionStorage.removeItem(SHARED_SESSION_RETURN_KEY);
+  } catch {
+    return "/";
+  }
+  if (value === "billing") return "/billing";
+  const hosted = value === null ? null : HOSTED_CONTINUATION_VALUE.exec(value);
+  return hosted && hosted[0] === value ? `/billing/hosted-continuations/${hosted[1]}` : "/";
+}
+
+/** Preserve a direct selector; only the fixed-root SSO callback may consume a saved return. */
+export function resolveSharedSessionReturnPath(currentPath: string): string {
+  const direct = HOSTED_CONTINUATION_PATH.exec(currentPath);
+  const directPath = direct && direct[0] === currentPath ? currentPath : null;
+  let value: string | null;
+  try {
+    value = sessionStorage.getItem(SHARED_SESSION_RETURN_KEY);
+    sessionStorage.removeItem(SHARED_SESSION_RETURN_KEY);
+  } catch {
+    return directPath ?? "/";
+  }
+  if (directPath !== null) return directPath;
+  if (currentPath !== "/") return "/";
+  if (value === "billing") return "/billing";
+  const hosted = value === null ? null : HOSTED_CONTINUATION_VALUE.exec(value);
+  return hosted && hosted[0] === value ? `/billing/hosted-continuations/${hosted[1]}` : "/";
 }
 
 export function selectOrganization(id: string): void {
