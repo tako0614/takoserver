@@ -1405,8 +1405,8 @@ test("a sealed fifth runtime permits only the exact sixth-runtime append", () =>
   }
 });
 
-// Fixed source pins preserve historical served R27/R30 bytes. R31 is the current
-// candidate tool tree and keeps its Auth source/profile identity exact.
+// Fixed source pins preserve historical served R27/R30 bytes and the R31
+// candidate. The ordinary candidate changes exactly two Auth source paths.
 type AuthSourceSnapshot = Readonly<Record<string, Readonly<{ blob: string; digest: string }>>>;
 const R27_AUTH_SOURCES: AuthSourceSnapshot = {
   "src/auth103-native-origin-source.ts": {
@@ -1459,6 +1459,17 @@ const R31_AUTH_SOURCES: AuthSourceSnapshot = {
     digest: "sha256:24f2aacca326b0bec5c41fac8e0a23148032c462cc815f75111fc49eca7b696a",
   },
 };
+const ORDINARY_AUTH_SOURCES: AuthSourceSnapshot = {
+  ...R31_AUTH_SOURCES,
+  "src/auth103-native-origin-source.ts": {
+    blob: "32004c9118f9a0d9f44f3058f4cb14f766c5edae",
+    digest: "sha256:62802cf4702e2b83984245183cdeb2e3c7259e46fa8573c5b9211a1c3b5ab282",
+  },
+  "src/auth103-native-source-contract.ts": {
+    blob: "c027681fd9c01092b6bf944c512c57819b7505c9",
+    digest: "sha256:971b5dbc73237efc51cf7700615f1acc7cbf62d56970e3a4b03e440c27b2fa64",
+  },
+};
 const R27_TARGET_REF = "sha256:5a401af9c8b60ea27b81019fe8add7b75ca70a9646ffc3481880c47b2f0140ae";
 
 function authSourcePin(sources: AuthSourceSnapshot, path: string) {
@@ -1488,7 +1499,7 @@ function authSourcePathsDiff(from: AuthSourceSnapshot, to: AuthSourceSnapshot): 
   );
 }
 
-test("the current tool tree carries the candidate Auth paths byte-identically", () => {
+test("the current tool tree carries the ordinary candidate Auth paths byte-identically", () => {
   expect([...AUTH103_CURRENT_RUNTIME_DEPLOYED_SOURCE_PATHS]).toEqual([
     "src/auth103-native-origin-source.ts",
     "src/auth103-native-source-contract.ts",
@@ -1498,7 +1509,11 @@ test("the current tool tree carries the candidate Auth paths byte-identically", 
   ]);
   // Read actual working-tree bytes; neither HEAD nor an old Git object can stand in.
   const current = currentAuthSources();
-  expect(current).toEqual(R31_AUTH_SOURCES);
+  expect(current).toEqual(ORDINARY_AUTH_SOURCES);
+  expect(authSourcePathsDiff(R31_AUTH_SOURCES, current)).toEqual([
+    "src/auth103-native-origin-source.ts",
+    "src/auth103-native-source-contract.ts",
+  ]);
   expect(authSourcePathsDiff(R27_AUTH_SOURCES, R30_AUTH_SOURCES)).toEqual([
     "src/shared-auth-session.ts",
   ]);
