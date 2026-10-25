@@ -18,6 +18,7 @@ import {
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
+import { createOrdinaryFinancialPublicSql } from "../src/ordinary-financial-public-sql.ts";
 import { type Sql, SqlError, type SqlWrite } from "../src/ports.ts";
 import { ROOT_0105_DDL } from "../src/root-0105-org-capture-triggers.ts";
 import { createSharedAuthSessionStore } from "../src/shared-auth-session-store.ts";
@@ -289,6 +290,39 @@ for (const mode of modes) {
     expect(await d1.count("shared_auth_sessions")).toBe(1);
   }, 60000);
 }
+
+test("ordinary SQL fence permits full served-schema fresh-native issuance on its first-primary D1", async () => {
+  const d1 = await servedD1("fresh-native");
+  const data = await input();
+  const ordinary = createOrdinaryFinancialPublicSql(d1.raw);
+  const acknowledgements: (readonly SqlWrite[])[] = [];
+  const sql: Sql = {
+    query: ordinary.query,
+    run: ordinary.run,
+    async batch(statements) {
+      const writes = await ordinary.batch(statements);
+      acknowledgements.push(writes);
+      return writes;
+    },
+  };
+  Object.freeze(sql);
+
+  const result = await issue(sql, data);
+  expect(result.session.digest).toBe(data.session.digest);
+  expect(result.principal.binding.ref).toBe(data.principal.binding.ref);
+  expect(acknowledgements).toHaveLength(1);
+  expect(acknowledgements[0]?.map((write) => write.changes)).toEqual([1, 1, 1, 1, 1, 2, 1, 1, 0]);
+  expect(await d1.counts()).toMatchObject({
+    principals: 1,
+    shared_principal_bindings: 1,
+    shared_auth_sessions: 1,
+    credential_authority_classes: 1,
+    orgs: 1,
+    org_memberships: 1,
+    org_wallet_workspace_bindings: 1,
+    financial_customer_history_birth_observations: 1,
+  });
+}, 60000);
 
 test("on the served schema only orgs carries a row-writing INSERT trigger among the issuance tables", async () => {
   // The exact ACK bounds rely on this: fixed-five, membership and Workspace
