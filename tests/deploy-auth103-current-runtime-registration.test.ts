@@ -1462,8 +1462,8 @@ const R31_AUTH_SOURCES: AuthSourceSnapshot = {
 const ORDINARY_AUTH_SOURCES: AuthSourceSnapshot = {
   ...R31_AUTH_SOURCES,
   "src/auth103-native-origin-source.ts": {
-    blob: "32004c9118f9a0d9f44f3058f4cb14f766c5edae",
-    digest: "sha256:62802cf4702e2b83984245183cdeb2e3c7259e46fa8573c5b9211a1c3b5ab282",
+    blob: "437a86ba4c1f7e7546ede33bf387cee164ed9f5d",
+    digest: "sha256:46f773d41607834bd96be7987096ae5e5120f486b61ebd69b22242c2f6647f69",
   },
   "src/auth103-native-source-contract.ts": {
     blob: "c027681fd9c01092b6bf944c512c57819b7505c9",
