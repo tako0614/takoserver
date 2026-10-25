@@ -702,6 +702,7 @@ test("an ordinary registered installation qualifies its exact first-primary and 
         targetRef,
         sourceRef,
         clockPolicyRef: canonical.clockPolicyRef,
+        sourceProfile: "ordinary",
       });
       const capturedCurrentness = native.auth103NativeRequestCurrentness(capture, connection);
       expect(capturedCurrentness.params).toHaveLength(10);

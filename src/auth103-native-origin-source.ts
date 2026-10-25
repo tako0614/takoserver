@@ -65,10 +65,12 @@ export interface Auth103NativeRequestOriginData {
   readonly targetRef: string;
   readonly sourceRef: string;
   readonly clockPolicyRef: string;
+  readonly sourceProfile: Auth103NativeStorageSourceProfile;
 }
 interface Original {
   readonly connection: WorkerRequestSql;
   readonly inputs: WorkerRequestFinancialInputs;
+  readonly sourceProfile: Auth103NativeStorageSourceProfile;
   readonly query: Sql["query"];
   readonly run: Sql["run"];
   readonly batch: Sql["batch"];
@@ -176,6 +178,7 @@ function assertOriginal(original: Original): void {
   const current = original.readInputs(original.connection);
   const prior = original.inputs;
   if (
+    original.sourceProfile !== (originalBuildProfile?.sourceProfile ?? unavailable()) ||
     current.sql !== prior.sql ||
     current.client !== prior.client ||
     current.realm !== prior.realm ||
@@ -243,7 +246,7 @@ function currentness(original: Original, catalogJson: string) {
   const { registrationRef, recipeDigest, clockSourceDigest, clockPolicyRef, rpRegistration } =
     original.manifest;
   return Object.freeze({
-    sql: auth103NativeCurrentnessSql(originalBuildProfile?.sourceProfile ?? unavailable()),
+    sql: auth103NativeCurrentnessSql(original.sourceProfile),
     params: Object.freeze([
       registrationRef,
       recipeDigest,
@@ -270,6 +273,7 @@ export async function qualifyAuth103NativeRequestOrigin(
   try {
     if (!auth103NativeSourceCodeSelected()) return unavailable();
     const selectedManifest = manifest();
+    const sourceProfile = originalBuildProfile?.sourceProfile ?? unavailable();
     const composition = await import("./worker-request-composition.ts");
     const inputs = composition.readWorkerRequestNativeInitializationInputs(connection);
     const queryMethod = method<Sql["query"]>(inputs.sql, "query");
@@ -293,6 +297,7 @@ export async function qualifyAuth103NativeRequestOrigin(
         connection,
         selectedManifest.sourceCommit,
       ),
+      sourceProfile,
       deploymentRef: "",
       deploymentRecordJson: "",
       rpRecordJson: "",
@@ -303,7 +308,7 @@ export async function qualifyAuth103NativeRequestOrigin(
       selectedManifest.targetRef,
       selectedManifest.sourceRef,
       initial.artifactDigest,
-      originalBuildProfile?.sourceProfile ?? unavailable(),
+      initial.sourceProfile,
     ]);
     assertOriginal(initial);
     const deploymentReceiptRef = await canonicalDigest([
@@ -316,7 +321,7 @@ export async function qualifyAuth103NativeRequestOrigin(
       receiptRef: deploymentReceiptRef,
       manifest: selectedManifest,
       artifactDigest: initial.artifactDigest,
-      sourceProfile: originalBuildProfile?.sourceProfile ?? unavailable(),
+      sourceProfile: initial.sourceProfile,
       rpRecordJson,
     });
     const original: Original = Object.freeze({
@@ -400,7 +405,13 @@ export function readAuth103NativeRequestOrigin(
   if (original === undefined || original.connection !== connection) return null;
   assertOriginal(original);
   const { authSchemaRef, targetRef, sourceRef, clockPolicyRef } = original.manifest;
-  return Object.freeze({ authSchemaRef, targetRef, sourceRef, clockPolicyRef });
+  return Object.freeze({
+    authSchemaRef,
+    targetRef,
+    sourceRef,
+    clockPolicyRef,
+    sourceProfile: original.sourceProfile,
+  });
 }
 
 /** Original code-selected platform binding only; absence is an unavailable proof path. */

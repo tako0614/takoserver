@@ -5,6 +5,7 @@ import {
   readAuth103NativeRequestOrigin,
   readAuth103NativeRpRegistrationOriginal,
 } from "./auth103-native-origin-source.ts";
+import type { Auth103NativeStorageSourceProfile } from "./auth103-native-source-contract.ts";
 import { createAuth103SourceClock, readAuth103SourceClock } from "./auth103-source-clock.ts";
 import type { HostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
 import type { Clock, Sql } from "./ports.ts";
@@ -51,6 +52,7 @@ export interface FinancialAuthConsumerPort {
 export interface FinancialAuthConsumerContext {
   readonly sql: Sql;
   readonly realm: HostedBillingFinancialRealm;
+  readonly sourceProfile: Auth103NativeStorageSourceProfile;
   readonly writerEpoch: string | undefined;
   readonly authSchemaRef: string;
   readonly targetRef: string;
@@ -87,10 +89,20 @@ export function assertFinancialAuthConsumerPort(
     if (!port || typeof port !== "object") return unavailable();
     const held = portOrigins.get(port as FinancialAuthConsumerPort);
     if (!held || !context || typeof context !== "object") return unavailable();
-    const keys = ["sql", "realm", "writerEpoch", "authSchemaRef", "targetRef"] as const;
+    const keys = [
+      "sql",
+      "realm",
+      "sourceProfile",
+      "writerEpoch",
+      "authSchemaRef",
+      "targetRef",
+    ] as const;
     const selected = keys.map((key) => ownData(context, key));
     if (
       keys.some((key, i) => selected[i] !== held.context[key]) ||
+      (held.context.sourceProfile === "ordinary" && held.context.writerEpoch !== undefined) ||
+      (held.context.sourceProfile === "money-preserved" &&
+        typeof held.context.writerEpoch !== "string") ||
       ownData(port, "readValidatedCredential") !== held.credential ||
       ownData(port, "readValidatedPrincipalBinding") !== held.principal
     )
@@ -205,7 +217,13 @@ function createFinancialAuthConsumerPortFromOriginal(
     const qualified = readAuth103NativeRequestOrigin(native, connection);
     const rpRegistration = readAuth103NativeRpRegistrationOriginal(native, connection);
     if (!qualified || !rpRegistration) return unavailable();
-    const nativeKeys = ["authSchemaRef", "targetRef", "sourceRef", "clockPolicyRef"] as const;
+    const nativeKeys = [
+      "authSchemaRef",
+      "targetRef",
+      "sourceRef",
+      "clockPolicyRef",
+      "sourceProfile",
+    ] as const;
     if (nativeKeys.some((key) => rpRegistration.native[key] !== qualified[key]))
       return unavailable();
     const originals = createWorkerRequestFinancialAuthOriginalReaders(connection);
@@ -225,6 +243,7 @@ function createFinancialAuthConsumerPortFromOriginal(
         current.targetRef !== qualified.targetRef ||
         current.sourceRef !== qualified.sourceRef ||
         current.clockPolicyRef !== qualified.clockPolicyRef ||
+        current.sourceProfile !== qualified.sourceProfile ||
         !currentRp ||
         currentRp.registrationRef !== rpRegistration.registrationRef ||
         currentRp.registrationDigest !== rpRegistration.registrationDigest ||
@@ -239,6 +258,7 @@ function createFinancialAuthConsumerPortFromOriginal(
     const context: FinancialAuthConsumerContext = Object.freeze({
       sql: inputs.sql,
       realm: inputs.realm,
+      sourceProfile: qualified.sourceProfile,
       writerEpoch: inputs.writerEpoch,
       authSchemaRef: qualified.authSchemaRef,
       targetRef: qualified.targetRef,
