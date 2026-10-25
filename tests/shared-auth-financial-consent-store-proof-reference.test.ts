@@ -332,7 +332,7 @@ describe("historical consentProofRef lookup of immutable receipt-backed original
     unchangedReadOnly(f, before);
   });
 
-  test("same-shaped connection clones and original-method replacement across SQL await cannot supply request origin", async () => {
+  test("same-shaped connection clones and frozen methods cannot replace the original proof read", async () => {
     const f = await committed();
     const before = checkpoint(f);
     const foreign: WorkerRequestSql[] = [
@@ -344,20 +344,23 @@ describe("historical consentProofRef lookup of immutable receipt-backed original
     for (const method of ["run", "query"] as const) {
       const g = await committed();
       const prior = checkpoint(g);
+      let replaced: boolean | undefined;
       g.native.beforeRead = async (sql) => {
         if (isLookup(sql))
-          Object.defineProperty(g.graph.sql, method, {
+          replaced = Reflect.defineProperty(g.graph.sql, method, {
             value: async () => {
               throw new Error("replacement must not be invoked");
             },
             configurable: true,
           });
       };
-      await unavailable(
-        createSharedAuthFinancialConsentProofReferenceReader(g.connection).readProofOriginalData(
-          g.input.command.key.consentRef,
-        ),
-      );
+      const actual = await createSharedAuthFinancialConsentProofReferenceReader(
+        g.connection,
+      ).readProofOriginalData(g.input.command.key.consentRef);
+      expect(Object.isFrozen(g.graph.sql)).toBe(true);
+      expect(replaced).toBe(false);
+      expect(actual.consentProofRef).toBe(g.input.command.key.consentRef);
+      expect(actual.original.command).toEqual(g.input.command);
       unchangedReadOnly(g, prior);
     }
     unchangedReadOnly(f, before);

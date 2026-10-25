@@ -480,11 +480,12 @@ describe("unmounted one-batch pending29 command16 mandatory-original14 DATA", ()
     expect(f.native.batchCalls).toBe(1);
   });
 
-  test("batch method replacement during dispatch is unavailable and does not dispatch through a replacement receiver", async () => {
+  test("frozen batch method rejects replacement during dispatch and retains one original result", async () => {
     const f = await graphFixture({ seedPending: false });
     let replacementCalls = 0;
+    let replaced: boolean | undefined;
     f.native.afterBatch = (results) => {
-      Object.defineProperty(f.graph.sql, "batch", {
+      replaced = Reflect.defineProperty(f.graph.sql, "batch", {
         value: async () => {
           replacementCalls++;
           return [];
@@ -495,9 +496,13 @@ describe("unmounted one-batch pending29 command16 mandatory-original14 DATA", ()
       });
       return results;
     };
-    await unavailable(
-      persistCaptureAndConsumeSharedAuthFinancialConsentRequestData(f.connection, f.input),
+    const actual = await persistCaptureAndConsumeSharedAuthFinancialConsentRequestData(
+      f.connection,
+      f.input,
     );
+    expect(Object.isFrozen(f.graph.sql)).toBe(true);
+    expect(replaced).toBe(false);
+    expect(actual.state).toBe("receipted-original-data");
     expect(replacementCalls).toBe(0);
     expect(f.native.batchCalls).toBe(1);
     allOriginalRows(f);
