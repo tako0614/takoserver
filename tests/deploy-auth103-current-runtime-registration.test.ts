@@ -1470,6 +1470,13 @@ const ORDINARY_AUTH_SOURCES: AuthSourceSnapshot = {
     digest: "sha256:971b5dbc73237efc51cf7700615f1acc7cbf62d56970e3a4b03e440c27b2fa64",
   },
 };
+const REPAIRED_ORDINARY_AUTH_SOURCES: AuthSourceSnapshot = {
+  ...ORDINARY_AUTH_SOURCES,
+  "src/auth103-native-origin-source.ts": {
+    blob: "6aa757e2b2fb49b3fa7ea2e4853fdca96a1545b4",
+    digest: "sha256:9234a5660825ce5033e1ee454aa948598ba08f6f3ccfef4fdcb46cf7d5094616",
+  },
+};
 const R27_TARGET_REF = "sha256:5a401af9c8b60ea27b81019fe8add7b75ca70a9646ffc3481880c47b2f0140ae";
 
 function authSourcePin(sources: AuthSourceSnapshot, path: string) {
@@ -1509,7 +1516,10 @@ test("the current tool tree carries the ordinary candidate Auth paths byte-ident
   ]);
   // Read actual working-tree bytes; neither HEAD nor an old Git object can stand in.
   const current = currentAuthSources();
-  expect(current).toEqual(ORDINARY_AUTH_SOURCES);
+  expect(current).toEqual(REPAIRED_ORDINARY_AUTH_SOURCES);
+  expect(authSourcePathsDiff(ORDINARY_AUTH_SOURCES, current)).toEqual([
+    "src/auth103-native-origin-source.ts",
+  ]);
   expect(authSourcePathsDiff(R31_AUTH_SOURCES, current)).toEqual([
     "src/auth103-native-origin-source.ts",
     "src/auth103-native-source-contract.ts",
