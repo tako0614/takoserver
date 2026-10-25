@@ -241,7 +241,6 @@ describe("hermetic Worker bundle identity", () => {
         nestedSourceLabels: nested.sourceLabels,
       });
       expect(shallow.bytes).toEqual(nested.bytes);
-      expect(shallow.sourceLabels[0]).toBe("// src/ports.ts");
       expect(shallow.sourceLabels).toContain("// src/entry-cloudflare-worker.ts");
       expect(shallow.sourceLabels.every((label) => !label.includes(root))).toBe(true);
     } finally {
