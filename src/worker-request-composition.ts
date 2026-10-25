@@ -19,6 +19,10 @@ import {
   type Auth103NativeRequestOrigin,
   captureAuth103NativeFinancialProofReceiver,
 } from "./auth103-native-origin-source.ts";
+import {
+  AUTH103_NATIVE_REGISTRATION_QUERY,
+  auth103NativeCurrentnessSql,
+} from "./auth103-native-source-contract.ts";
 import { readAuth103SourceClock } from "./auth103-source-clock.ts";
 import {
   createCredentialAuthorityClassStore,
@@ -48,7 +52,7 @@ import {
   type MoneyCutoverGuardState,
 } from "./money-cutover-sql.ts";
 import { createOrdinaryFinancialPublicSql } from "./ordinary-financial-public-sql.ts";
-import { type Clock, type Row, type Sql, SqlError, type SqlWrite } from "./ports.ts";
+import { type Clock, type Row, type Sql, SqlError, type SqlParam, type SqlWrite } from "./ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
   createSharedAuthSession,
@@ -1134,6 +1138,48 @@ export function assertWorkerRequestNativeBinding(
   const original = assertWorkerRequestBacking(connection);
   if (original.database !== expectedPlatformDatabase)
     throw new TypeError("Worker request platform database binding differs");
+}
+
+/** Fixed native ordinary source-currentness read; no SQL or raw adapter escapes. */
+export async function queryWorkerRequestOrdinaryAuth103CurrentRegistration(
+  connection: WorkerRequestSql,
+  params: readonly SqlParam[],
+): Promise<readonly Row[]> {
+  const origin = assertWorkerRequestBacking(connection);
+  const snapshot: string[] = [];
+  if (
+    origin.purpose !== "ordinary-native-primary" ||
+    origin.ordinarySql !== connection.sql ||
+    origin.ordinaryRawSqlMethods === undefined ||
+    !Array.isArray(params) ||
+    params.length !== 10 ||
+    Object.keys(params).length !== 10 ||
+    Object.getOwnPropertySymbols(params).length !== 0 ||
+    Object.getOwnPropertyNames(params).length !== 11
+  )
+    throw new SqlError("invalid", "Worker request ordinary currentness input differs");
+  for (let index = 0; index < 10; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(params, String(index));
+    if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "string")
+      throw new SqlError("invalid", "Worker request ordinary currentness input differs");
+    snapshot.push(descriptor.value);
+  }
+  Object.freeze(snapshot);
+  const sql = `${AUTH103_NATIVE_REGISTRATION_QUERY.replace(" ORDER BY registration_ref COLLATE BINARY", "")} WHERE ${auth103NativeCurrentnessSql("ordinary")}`;
+  const check = () => {
+    if (
+      assertWorkerRequestBacking(connection) !== origin ||
+      readWorkerRequestNativeInitializationInputs(connection).sql !== connection.sql ||
+      origin.purpose !== "ordinary-native-primary" ||
+      dataMethod(origin.rawSql, "query") !== origin.ordinaryRawSqlMethods?.[0]
+    )
+      throw new SqlError("invalid", "Worker request ordinary currentness origin differs");
+  };
+  check();
+  const query = dataMethod(origin.rawSql, "query") as Sql["query"];
+  const result = await Reflect.apply(query, origin.rawSql, [sql, snapshot]);
+  check();
+  return result;
 }
 
 /** Private source assertion input; undefined is an exact ordinary-origin value. */

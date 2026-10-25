@@ -52,6 +52,7 @@ import {
   captureWorkerSharedAuthStaging,
   createWorkerOrdinaryPrimaryRequestSql,
   initializeWorkerRequestNativeInputs,
+  queryWorkerRequestOrdinaryAuth103CurrentRegistration,
   readWorkerRequestNativeInitializationInputs,
 } from "../src/worker-request-composition.ts";
 import {
@@ -588,6 +589,7 @@ test("an ordinary registered installation qualifies its exact first-primary and 
       object,
       { readonly sql: string; readonly params: readonly SqlParam[] }
     >();
+    let replaceBatchOnCurrentnessRead: (() => void) | undefined;
     const binding = {
       prepare(sql: string) {
         const statement = {
@@ -598,11 +600,21 @@ test("an ordinary registered installation qualifies its exact first-primary and 
           async all() {
             const original = originals.get(statement);
             if (!original) throw new Error("ordinary native fixture statement differs");
+            const resultRows = database.db
+              .query<Row, never[]>(original.sql)
+              .all(...(original.params as never[]));
+            if (
+              replaceBatchOnCurrentnessRead &&
+              original.sql.toLowerCase().includes("auth103_native_source_registration") &&
+              original.sql.toLowerCase().includes("money_cutover_freeze")
+            ) {
+              const replace = replaceBatchOnCurrentnessRead;
+              replaceBatchOnCurrentnessRead = undefined;
+              replace();
+            }
             return {
               success: true,
-              results: database.db
-                .query<Row, never[]>(original.sql)
-                .all(...(original.params as never[])),
+              results: resultRows,
               meta: { changes: 0 },
             };
           },
@@ -619,6 +631,21 @@ test("an ordinary registered installation qualifies its exact first-primary and 
       },
     };
     const connection = await createWorkerOrdinaryPrimaryRequestSql({ database: binding });
+    await expect(
+      queryWorkerRequestOrdinaryAuth103CurrentRegistration(connection, new Array(10)),
+    ).rejects.toMatchObject({ code: "invalid" });
+    const accessorParams = Array.from({ length: 10 }, () => "fixed");
+    let accessorCalls = 0;
+    Object.defineProperty(accessorParams, "0", {
+      get() {
+        accessorCalls++;
+        return "fixed";
+      },
+    });
+    await expect(
+      queryWorkerRequestOrdinaryAuth103CurrentRegistration(connection, accessorParams),
+    ).rejects.toMatchObject({ code: "invalid" });
+    expect(accessorCalls).toBe(0);
     const client = createStripeBillingClient({
       secretKey: "sk_test_auth103_native_component",
       mode: "test",
@@ -706,6 +733,9 @@ test("an ordinary registered installation qualifies its exact first-primary and 
       });
       const capturedCurrentness = native.auth103NativeRequestCurrentness(capture, connection);
       expect(capturedCurrentness.params).toHaveLength(10);
+      await expect(
+        connection.sql.query(capturedCurrentness.sql, capturedCurrentness.params),
+      ).rejects.toMatchObject({ code: "invalid" });
       const evaluateCurrentness = () =>
         database.db
           .query(`SELECT CASE WHEN (${capturedCurrentness.sql}) THEN 1 ELSE 0 END AS current`)
@@ -718,6 +748,21 @@ test("an ordinary registered installation qualifies its exact first-primary and 
         clock: options.clock,
         writerEpoch: undefined,
       });
+      const originalBatch = binding.batch;
+      try {
+        replaceBatchOnCurrentnessRead = () => {
+          binding.batch = async () => {
+            throw new Error("ordinary native fixture method was replaced");
+          };
+        };
+        await expect(native.qualifyAuth103NativeRequestOrigin(connection)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        expect(binding.batch).not.toBe(originalBatch);
+      } finally {
+        binding.batch = originalBatch;
+        replaceBatchOnCurrentnessRead = undefined;
+      }
       for (const ddl of [
         MONEY_CUTOVER_FREEZE_DDL,
         MONEY_CUTOVER_PERMIT_DDL,

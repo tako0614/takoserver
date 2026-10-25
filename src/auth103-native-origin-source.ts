@@ -230,6 +230,24 @@ async function query(
   assertOriginal(original);
   return rows(result, keys);
 }
+async function ordinaryCurrentRegistration(original: Original, params: readonly SqlParam[]) {
+  assertOriginal(original);
+  await original.assertProfileSchema(original.connection, original.manifest.sourceCommit);
+  assertOriginal(original);
+  const composition = await import("./worker-request-composition.ts");
+  const result = await composition.queryWorkerRequestOrdinaryAuth103CurrentRegistration(
+    original.connection,
+    params,
+  );
+  await original.assertProfileSchema(original.connection, original.manifest.sourceCommit);
+  assertOriginal(original);
+  return rows(result, [
+    "registration_ref",
+    "recipe_digest",
+    "clock_source_digest",
+    "clock_policy_ref",
+  ]);
+}
 function registration(original: Original, result: readonly Row[]): void {
   const row = result[0];
   if (
@@ -378,15 +396,12 @@ export async function qualifyAuth103NativeRequestOrigin(
     if (digest !== selectedManifest.catalogDigest) return unavailable();
     const catalogSnapshotJson = JSON.stringify(catalog);
     const final = currentness(original, catalogSnapshotJson);
-    registration(
-      original,
-      await query(
-        original,
-        `${AUTH103_NATIVE_REGISTRATION_QUERY.replace(" ORDER BY registration_ref COLLATE BINARY", "")} WHERE ${final.sql}`,
-        keys,
-        final.params,
-      ),
-    );
+    const finalRegistrationSql = `${AUTH103_NATIVE_REGISTRATION_QUERY.replace(" ORDER BY registration_ref COLLATE BINARY", "")} WHERE ${final.sql}`;
+    const finalRegistrationRows =
+      original.sourceProfile === "ordinary"
+        ? await ordinaryCurrentRegistration(original, final.params)
+        : await query(original, finalRegistrationSql, keys, final.params);
+    registration(original, finalRegistrationRows);
     assertOriginal(original);
     const capture = Object.freeze({}) as Auth103NativeRequestOrigin;
     originals.set(capture, Object.freeze({ ...original, catalogSnapshotJson }));
