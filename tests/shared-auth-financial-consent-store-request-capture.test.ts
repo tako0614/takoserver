@@ -774,7 +774,7 @@ describe("private actual request-Sql command capture and fixed-original recovery
     }
   });
 
-  test("run or query mutation across builder await fails closing origin before any write", async () => {
+  test("frozen request graph rejects run or query replacement while original capture completes", async () => {
     for (const method of ["run", "query"] as const) {
       const f = await graphFixture();
       const prior = f.effects();
@@ -782,15 +782,19 @@ describe("private actual request-Sql command capture and fixed-original recovery
         f.connection,
         captureInput(f.input),
       );
-      Object.defineProperty(f.connection.sql, method, {
+      const replaced = Reflect.defineProperty(f.connection.sql, method, {
         value: async () => {
           throw new Error("replacement must not be called");
         },
       });
-      await unavailable(attempt);
-      expect(f.native.calls).toEqual([]);
-      expect(f.native.batchCalls).toBe(0);
-      expect(rows(f.db, C)).toEqual([]);
+      const result = await attempt;
+      expect(Object.isFrozen(f.connection.sql)).toBe(true);
+      expect(replaced).toBe(false);
+      expect(result.command).toEqual(f.input.command);
+      expect(f.native.batchCalls).toBe(1);
+      expect(f.native.calls).toHaveLength(3);
+      expect(rows(f.db, C)).toHaveLength(1);
+      expect(rows(f.db, O)).toEqual([]);
       expectNoOtherEffects(f, prior);
     }
   });
@@ -863,7 +867,7 @@ describe("private actual request-Sql command capture and fixed-original recovery
     expect(f.native.batchCalls).toBe(0);
   });
 
-  test("method drift during actual batch await rejects even when the original transaction later commits once", async () => {
+  test("frozen method replacement during actual batch await preserves one original capture", async () => {
     const f = await graphFixture();
     const pause = gate();
     const prior = f.effects();
@@ -872,14 +876,29 @@ describe("private actual request-Sql command capture and fixed-original recovery
       f.connection,
       captureInput(f.input),
     );
-    await pause.entered;
-    Object.defineProperty(f.connection.sql, "run", {
-      value: async () => {
-        throw new Error("foreign method");
-      },
-    });
-    pause.release();
-    await unavailable(attempt);
+    let reached = false;
+    let replaced: boolean | undefined;
+    try {
+      reached = await Promise.race([
+        pause.entered.then(() => true),
+        attempt.then(
+          () => false,
+          () => false,
+        ),
+      ]);
+      if (reached)
+        replaced = Reflect.defineProperty(f.connection.sql, "run", {
+          value: async () => {
+            throw new Error("foreign method");
+          },
+        });
+    } finally {
+      pause.release();
+    }
+    const result = await attempt;
+    expect(reached).toBe(true);
+    expect(replaced).toBe(false);
+    expect(result.command).toEqual(f.input.command);
     expect(f.native.batchCalls).toBe(1);
     expect(f.native.calls).toHaveLength(3);
     expect(rows(f.db, C)).toHaveLength(1);
@@ -1046,7 +1065,7 @@ describe("private actual request-Sql command capture and fixed-original recovery
     }
   });
 
-  test("query method drift across recovery await is unavailable and never falls back to a write", async () => {
+  test("frozen query replacement across recovery await preserves original GET without a write", async () => {
     const f = await graphFixture({}, true);
     const pause = gate();
     const prior = f.effects();
@@ -1058,15 +1077,31 @@ describe("private actual request-Sql command capture and fixed-original recovery
       await pause.wait();
     };
     const attempt = recovery.readOriginalData();
-    await pause.entered;
-    Object.defineProperty(f.connection.sql, "query", {
-      value: async () => {
-        throw new Error("foreign read");
-      },
-    });
-    pause.release();
-    await unavailable(attempt);
+    let reached = false;
+    let replaced: boolean | undefined;
+    try {
+      reached = await Promise.race([
+        pause.entered.then(() => true),
+        attempt.then(
+          () => false,
+          () => false,
+        ),
+      ]);
+      if (reached)
+        replaced = Reflect.defineProperty(f.connection.sql, "query", {
+          value: async () => {
+            throw new Error("foreign read");
+          },
+        });
+    } finally {
+      pause.release();
+    }
+    const result = await attempt;
+    expect(reached).toBe(true);
+    expect(replaced).toBe(false);
+    expect(result.receiptRef).toBe(f.input.command.key.receiptRef);
     expect(f.native.batchCalls).toBe(0);
+    expectRecoveryQueriesOnly(f);
     expect(rows(f.db, O)).toHaveLength(1);
     expectNoOtherEffects(f, prior);
   });
