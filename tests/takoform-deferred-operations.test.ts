@@ -10,6 +10,7 @@ import { ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { TAKOFORM_APPLY_SELECTION_VERSION } from "../src/takoform/apply-selection.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import type { DeferredOperationsConfiguration } from "../src/takoform/operations.ts";
 import type {
   InstalledTakoformForm,
   TakoformDriverReceipt,
@@ -1302,7 +1303,7 @@ describe("durable deferred Takoform operations", () => {
       },
     };
     const opened = persistentHarness(undefined, driver, [form], {
-      shouldDefer: () => true,
+      shouldDefer: ({ operation }) => operation === "delete",
       pollsBeforeCommit: 1,
       executeOnAccept: true,
     }).open();
@@ -3191,7 +3192,7 @@ function persistentHarness(
   forms: readonly InstalledTakoformForm[] = [form],
   /** The production shape defers every provider-backed mutation inline. */
   deferred: {
-    readonly shouldDefer?: () => boolean;
+    readonly shouldDefer?: DeferredOperationsConfiguration["shouldDefer"];
     readonly pollsBeforeCommit?: number;
     readonly executeOnAccept?: boolean;
     readonly inlineExecuteMilliseconds?: number;
