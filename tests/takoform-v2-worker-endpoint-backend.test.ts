@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
-import type { JsonObject } from "../src/ports.ts";
+import { type JsonObject, SqlError } from "../src/ports.ts";
 import { createSelfhostV2WorkerEndpointFrontend } from "../src/selfhost-v2-worker-endpoint-frontend.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -32,7 +32,7 @@ import {
   WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
-import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import type { V2Backend, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 import {
   createForwardWorkerEndpointForm,
   createWorkerEndpointForm,
@@ -51,13 +51,146 @@ function digest(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
+function observeAssetExecuteFailure(backend: V2Backend, report: (line: string) => void): void {
+  const originalExecute = backend.execute;
+  let emitted = false;
+  backend.execute = function (this: V2Backend, input) {
+    const result = originalExecute.call(this, input);
+    void result.catch((error: unknown) => {
+      try {
+        if (emitted) return;
+        emitted = true;
+        const errorClass =
+          error instanceof SqlError
+            ? "SqlError"
+            : error instanceof TypeError
+              ? "TypeError"
+              : error instanceof Error
+                ? "Error"
+                : "non_error";
+        const reason =
+          error instanceof SqlError && error.code === "constraint"
+            ? error.message.includes("tf_v2_artifact_lease_expired") ||
+              error.message.includes("tf_v2_artifact_progress_writer_fenced")
+              ? "lease-guard"
+              : error.message.includes("tf_v2_artifact_progress_not_monotonic")
+                ? "progress-order"
+                : "other-constraint"
+            : "not-constraint";
+        report(
+          JSON.stringify({
+            marker: "takoform.v2.endpoint_asset_execute.failure.v1",
+            stage: "asset-backend-execute",
+            class: errorClass,
+            code: error instanceof SqlError ? error.code : "unclassified",
+            reason,
+          }),
+        );
+      } catch {
+        // A hostile rejection or diagnostic sink cannot replace the original ACK.
+      }
+    });
+    return result;
+  };
+}
+
+test("asset diagnostic retains the exact rejected Promise through a throwing sink or rejection", async () => {
+  const execution: V2Execution = {
+    operationId: "diagnostic-operation",
+    leaseToken: "diagnostic-lease",
+    backendKey: "diagnostic-backend",
+    backendId: "diagnostic-backend",
+    targetKey: TARGET_KEY,
+    resourceUid: "diagnostic-resource",
+    principal: "org-endpoint",
+    action: "create",
+    generation: 1,
+    form: STATIC_ASSET_BUNDLE_FORM_URL,
+    space: "prod",
+    name: "diagnostic-asset",
+    spec: {},
+    previousObserved: {},
+    previousOutput: {},
+  };
+  const hostile = new Proxy(
+    {},
+    {
+      getPrototypeOf() {
+        throw new TypeError("hostile rejection prototype");
+      },
+    },
+  );
+  for (const [error, expectedReports, expectedReason] of [
+    [new SqlError("unavailable", "not emitted"), 1, "not-constraint"],
+    [new SqlError("constraint", "tf_v2_artifact_lease_expired"), 1, "lease-guard"],
+    [new SqlError("constraint", "tf_v2_artifact_progress_not_monotonic"), 1, "progress-order"],
+    [new SqlError("constraint", "other constraint"), 1, "other-constraint"],
+    [hostile, 0, null],
+  ] as const) {
+    const originalPromise = Promise.reject(error);
+    let receiver: unknown;
+    let argument: unknown;
+    let calls = 0;
+    let reports = 0;
+    let reportedLine: string | null = null;
+    const backend: V2Backend = {
+      id: "diagnostic-backend",
+      targetKey: TARGET_KEY,
+      execute(input) {
+        receiver = this;
+        argument = input;
+        calls += 1;
+        return originalPromise;
+      },
+      reconcile() {
+        return originalPromise;
+      },
+    };
+    observeAssetExecuteFailure(backend, (line) => {
+      reports += 1;
+      reportedLine = line;
+      throw new Error("diagnostic sink failed");
+    });
+    const result = backend.execute(execution);
+    expect(result).toBe(originalPromise);
+    expect(
+      await result.then(
+        () => null,
+        (caught) => caught,
+      ),
+    ).toBe(error);
+    expect(receiver).toBe(backend);
+    expect(argument).toBe(execution);
+    expect(calls).toBe(1);
+    expect(reports).toBe(expectedReports);
+    expect(
+      reportedLine ===
+        (expectedReports === 1
+          ? JSON.stringify({
+              marker: "takoform.v2.endpoint_asset_execute.failure.v1",
+              stage: "asset-backend-execute",
+              class: "SqlError",
+              code: error instanceof SqlError ? error.code : "unclassified",
+              reason: expectedReason,
+            })
+          : null),
+    ).toBe(true);
+  }
+});
+
+async function exerciseEndpoint(
+  deleteDeploymentFirst: boolean,
+  preCreateDelayMs = 0,
+): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "v2-endpoint-backend-"));
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
   const sql = createSqliteSql(db);
   let clockMs = Date.now();
-  const now = () => new Date(clockMs);
+  const now = () => {
+    clockMs = Math.max(clockMs, Date.now());
+    return new Date(clockMs);
+  };
   const fileUrl = "https://artifacts.example.test/endpoint/index.html";
   const manifestUrl = "https://artifacts.example.test/endpoint/manifest.json";
   const fileBytes = new TextEncoder().encode("<h1>fixture</h1>");
@@ -79,6 +212,9 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
       },
     },
   });
+  // Keep the same accepted backend object and Promise while classifying only
+  // an otherwise-hidden execution throw. No dispatch or retry is added.
+  observeAssetExecuteFailure(assets.form.backend, (line) => console.error(line));
   const publicationState = createV2WorkerPublicationState({
     sql,
     now,
@@ -274,6 +410,7 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
     return accepted;
   };
   try {
+    if (preCreateDelayMs > 0) await Bun.sleep(preCreateDelayMs);
     const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
     workerUid = worker.resourceUid;
     const asset = await create(STATIC_ASSET_BUNDLE_FORM_URL, "assets", {
@@ -438,6 +575,8 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
 test("accepted Endpoint deletes its route with an active Deployment", () =>
   exerciseEndpoint(false));
 test("accepted Endpoint deletes its route after Deployment deletion", () => exerciseEndpoint(true));
+test("accepted Endpoint retains its route outcome when setup precedes a delayed first create", () =>
+  exerciseEndpoint(false, 1_100));
 
 for (const action of ["create", "update", "delete"] as const) {
   test(`an Endpoint ${action} whose candidate the owner retired before activation settles with no effect`, async () => {
