@@ -425,23 +425,39 @@ describe("unmounted actual request capture-to-consume ordered DATA effect", () =
     expect(f.native.calls).toEqual([]);
   });
 
-  test("method replacement across preflight or the consume await fails closing origin without a third write", async () => {
+  test("frozen request methods reject replacement across preflight or consume without a third write", async () => {
     for (const phase of ["preflight", "consume"] as const) {
       const f = await graphFixture();
+      let replaced: boolean | undefined;
       if (phase === "consume")
         f.native.afterBatch = (result) => {
           if (f.native.batchCalls === 2)
-            f.connection.sql.query = f.connection.sql.query.bind(f.connection.sql);
+            replaced = Reflect.set(
+              f.connection.sql,
+              "query",
+              f.connection.sql.query.bind(f.connection.sql),
+            );
           return result;
         };
       const promise = captureAndConsumeSharedAuthFinancialConsentRequestOriginalData(
         f.connection,
         f.input,
       );
-      if (phase === "preflight") f.connection.sql.run = f.connection.sql.run.bind(f.connection.sql);
-      await unavailable(promise);
-      expect(f.native.batchCalls).toBe(phase === "preflight" ? 0 : 2);
-      expect(rows(f.db, O)).toHaveLength(phase === "preflight" ? 0 : 1);
+      if (phase === "preflight")
+        replaced = Reflect.set(
+          f.connection.sql,
+          "run",
+          f.connection.sql.run.bind(f.connection.sql),
+        );
+      const result = await promise;
+      expect(Object.isFrozen(f.connection.sql)).toBe(true);
+      expect(replaced).toBe(false);
+      expect(result.state).toBe("receipted-original-data");
+      expect(f.native.batchCalls).toBe(2);
+      expect(writes(f, C)).toHaveLength(1);
+      expect(writes(f, O)).toHaveLength(1);
+      expect(rows(f.db, O)).toHaveLength(1);
+      fullOriginalRow(f, f.input.command, f.input.recordedAt);
     }
   });
 
