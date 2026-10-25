@@ -39,6 +39,63 @@ const SCHEDULE = [
   "2026-10-22T20:10:37.000Z",
 ] as const;
 const FAILING = at("2026-10-22T20:24:37.000Z");
+const FAILURE_DIAGNOSTIC = "shared-auth-grant-health.case-failure.v1";
+
+type FailurePhase =
+  | "fixture"
+  | "pre_failure_schedule"
+  | "captured_request"
+  | "request_result"
+  | "session_fingerprint"
+  | "pending_revocations"
+  | "post_failure_get"
+  | "marker_assertions"
+  | "deadline_oracles";
+
+function closedExceptionClass(error: unknown): "TypeError" | "RangeError" | "Error" | "non_error" {
+  try {
+    if (error instanceof TypeError) return "TypeError";
+    if (error instanceof RangeError) return "RangeError";
+    if (error instanceof Error) return "Error";
+    return "non_error";
+  } catch {
+    return "non_error";
+  }
+}
+
+function reportFailureDiagnostic(phase: FailurePhase, error: unknown, requestErrorClass: string) {
+  try {
+    console.error(
+      JSON.stringify({
+        marker: FAILURE_DIAGNOSTIC,
+        phase,
+        exceptionClass: closedExceptionClass(error),
+        requestErrorClass,
+      }),
+    );
+  } catch {
+    // Diagnostic failures must not replace the original test failure.
+  }
+}
+
+test("failure diagnostic classification preserves a hostile proxy value", () => {
+  const proxy = new Proxy(
+    {},
+    {
+      getPrototypeOf: () => {
+        throw 0;
+      },
+    },
+  );
+  let caught: unknown;
+  try {
+    throw proxy;
+  } catch (error) {
+    caught = error;
+    expect(closedExceptionClass(error)).toBe("non_error");
+  }
+  expect(caught).toBe(proxy);
+});
 
 const disposers: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -292,70 +349,87 @@ describe("R20 grant health on the served schema against the Accounts refresh con
 
   for (const c of cases)
     test(`fresh-native: ${c.name} leaves the live fence fingerprint and a localizing marker`, async () => {
-      let failing = false;
-      const f = await fixture("fresh-native", {
-        send: async (request, send) =>
-          failing && c.send ? await c.send(request, send) : await send(request),
-        wrapStore: (store) =>
-          c.wrapStore ? withFailing(store, () => failing, c.wrapStore) : store,
-      });
-      const session = await beforeFailure(f);
-      f.setTime(FAILING);
-      failing = true;
-      const started = Date.now();
-      const { result, logged } = await captureErrors(async () => {
-        try {
-          return { returned: await f.get(session.sessionCookie) };
-        } catch (error) {
-          return { thrown: error };
-        }
-      });
-      const elapsed = Date.now() - started;
-      failing = false;
-      // authenticateWith converts session_invalid and oidc_invalid into null
-      // (control.ts /v1/me: 401). requestActor maps any other rejection, apart
-      // from a thrown session_invalid (401) or workspace_forbidden (403), to 503.
-      const http =
-        "returned" in result
-          ? result.returned === null
-            ? 401
-            : 200
-          : result.thrown instanceof SharedAuthSessionError &&
-              result.thrown.code === "session_invalid"
-            ? 401
+      let phase: FailurePhase = "fixture";
+      let requestErrorClass = "none";
+      try {
+        let failing = false;
+        const f = await fixture("fresh-native", {
+          send: async (request, send) =>
+            failing && c.send ? await c.send(request, send) : await send(request),
+          wrapStore: (store) =>
+            c.wrapStore ? withFailing(store, () => failing, c.wrapStore) : store,
+        });
+        phase = "pre_failure_schedule";
+        const session = await beforeFailure(f);
+        f.setTime(FAILING);
+        failing = true;
+        const started = Date.now();
+        phase = "captured_request";
+        const { result, logged } = await captureErrors(async () => {
+          try {
+            return { returned: await f.get(session.sessionCookie) };
+          } catch (error) {
+            requestErrorClass = closedExceptionClass(error);
+            return { thrown: error };
+          }
+        });
+        phase = "request_result";
+        const elapsed = Date.now() - started;
+        failing = false;
+        // authenticateWith converts session_invalid and oidc_invalid into null
+        // (control.ts /v1/me: 401). requestActor maps any other rejection, apart
+        // from a thrown session_invalid (401) or workspace_forbidden (403), to 503.
+        const http =
+          "returned" in result
+            ? result.returned === null
+              ? 401
+              : 200
             : result.thrown instanceof SharedAuthSessionError &&
-                result.thrown.code === "workspace_forbidden"
-              ? 403
-              : 503;
-      expect(http).toBe(c.http);
-      // The fence's own 401s are the outer null conversion, not a thrown error.
-      if (c.http === 401) expect("returned" in result && result.returned === null).toBe(true);
-      if (c.http === 503 && c.failureClass === "oidc")
-        expect("thrown" in result && result.thrown).toBeInstanceOf(SharedAuthOidcError);
-      const row = await f.store.readSession(session.digest);
-      expect(row?.status).toBe("revocation_pending");
-      expect(row?.version).toBe(session.version + 2);
-      expect(await f.pending()).toEqual([
-        { id: `${session.digest}:uncertain:${session.version + 1}`, status: "pending" },
-        { id: `uncertain:${session.digest}:${session.version + 1}`, status: "pending" },
-      ]);
-      expect(await f.get(session.sessionCookie)).toBeNull();
-      const markers = logged
-        .filter((line) => line.includes(MARKER))
-        .map((line) => JSON.parse(line));
-      expect(markers).toHaveLength(1);
-      const { stepMs, ...marker } = markers[0];
-      expect(marker).toEqual({
-        marker: MARKER,
-        step: c.step,
-        refreshed: c.refreshed,
-        class: c.failureClass,
-        code: c.code,
-      });
-      expect(Number.isSafeInteger(stepMs) && stepMs >= 0 && stepMs <= elapsed).toBe(true);
-      if (c.deadline) expect(stepMs).toBeGreaterThanOrEqual(4900);
-      else expect(stepMs).toBeLessThan(4900);
-      expect(JSON.stringify(markers)).not.toContain("synthetic-");
+                result.thrown.code === "session_invalid"
+              ? 401
+              : result.thrown instanceof SharedAuthSessionError &&
+                  result.thrown.code === "workspace_forbidden"
+                ? 403
+                : 503;
+        expect(http).toBe(c.http);
+        // The fence's own 401s are the outer null conversion, not a thrown error.
+        if (c.http === 401) expect("returned" in result && result.returned === null).toBe(true);
+        if (c.http === 503 && c.failureClass === "oidc")
+          expect("thrown" in result && result.thrown).toBeInstanceOf(SharedAuthOidcError);
+        phase = "session_fingerprint";
+        const row = await f.store.readSession(session.digest);
+        expect(row?.status).toBe("revocation_pending");
+        expect(row?.version).toBe(session.version + 2);
+        phase = "pending_revocations";
+        expect(await f.pending()).toEqual([
+          { id: `${session.digest}:uncertain:${session.version + 1}`, status: "pending" },
+          { id: `uncertain:${session.digest}:${session.version + 1}`, status: "pending" },
+        ]);
+        phase = "post_failure_get";
+        expect(await f.get(session.sessionCookie)).toBeNull();
+        phase = "marker_assertions";
+        const markers = logged
+          .filter((line) => line.includes(MARKER))
+          .map((line) => JSON.parse(line));
+        expect(markers).toHaveLength(1);
+        const { stepMs, ...marker } = markers[0];
+        expect(marker).toEqual({
+          marker: MARKER,
+          step: c.step,
+          refreshed: c.refreshed,
+          class: c.failureClass,
+          code: c.code,
+        });
+        phase = "deadline_oracles";
+        expect(Number.isSafeInteger(stepMs) && stepMs >= 0 && stepMs <= elapsed).toBe(true);
+        if (c.deadline) expect(stepMs).toBeGreaterThanOrEqual(4900);
+        else expect(stepMs).toBeLessThan(4900);
+        expect(JSON.stringify(markers)).not.toContain("synthetic-");
+      } catch (error) {
+        if (c.name === "completion with an unknown acknowledgement")
+          reportFailureDiagnostic(phase, error, requestErrorClass);
+        throw error;
+      }
     }, 60_000);
 });
 
