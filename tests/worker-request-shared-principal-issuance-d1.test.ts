@@ -209,6 +209,53 @@ const issue = (sql: Sql, data: FreshSharedRpIssuanceData, authority: string | nu
     workspaceBillingAuthority: authority,
   }).issueFreshOnce(data);
 
+type ExistingOrgFailurePhase = "setup" | "seed" | "pre-count" | "issuance" | "post-count";
+function reportExistingOrgFailure(phase: ExistingOrgFailurePhase, error: unknown): void {
+  try {
+    const exceptionClass =
+      error instanceof SqlError
+        ? "SqlError"
+        : error instanceof AuthAuthorityStoreError
+          ? "AuthAuthorityStoreError"
+          : error instanceof TypeError
+            ? "TypeError"
+            : error instanceof Error
+              ? "Error"
+              : "non-Error";
+    console.error(
+      JSON.stringify({
+        marker: "takoserver.test.shared_principal_issuance.existing_org_failure.v1",
+        phase,
+        exceptionClass,
+      }),
+    );
+  } catch {
+    // A test diagnostic sink or classifier failure cannot replace the original failure.
+  }
+}
+
+test("existing Organization failure diagnostic is closed and sink failure is swallowed", () => {
+  const original = console.error;
+  const entries: unknown[] = [];
+  try {
+    console.error = (...values: unknown[]) => entries.push(...values);
+    reportExistingOrgFailure("seed", new TypeError("private message"));
+    expect(entries).toEqual([
+      JSON.stringify({
+        marker: "takoserver.test.shared_principal_issuance.existing_org_failure.v1",
+        phase: "seed",
+        exceptionClass: "TypeError",
+      }),
+    ]);
+    console.error = () => {
+      throw new Error("diagnostic sink failed");
+    };
+    expect(() => reportExistingOrgFailure("issuance", new Error("private message"))).not.toThrow();
+  } finally {
+    console.error = original;
+  }
+});
+
 for (const mode of modes) {
   test(`${mode}: D1 counts the Root 0105 birth row in the orgs ACK and issuance still acknowledges`, async () => {
     const d1 = await servedD1(mode);
@@ -289,38 +336,48 @@ test("an Org re-created after its raw birth was recorded acknowledges with no ne
 }, 60000);
 
 test("an Organization already materialized for the principal acknowledges with no Org changes", async () => {
-  const d1 = await servedD1("money");
-  const data = await input();
-  const at = new Date().toISOString();
-  // The owner tuple exists before the batch: every Organization INSERT selects
-  // nothing, so no trigger runs and each statement changes exactly 0 rows.
-  await d1.database.batch([
-    d1.database
-      .prepare("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)")
-      .bind(data.organizationId, "Personal workspace", data.principal.principalId, at),
-    d1.database
-      .prepare(
-        "INSERT INTO org_memberships (org_id, principal_id, role, created_at) VALUES (?, ?, 'owner', ?)",
-      )
-      .bind(data.organizationId, data.principal.principalId, at),
-    d1.database
-      .prepare(
-        "INSERT INTO org_wallet_workspace_bindings (workspace_ref, org_id, created_at) VALUES (?, ?, ?)",
-      )
-      .bind(WORKSPACE_REF, data.organizationId, at),
-  ]);
-  const before = await d1.counts();
-  await issue(d1.sql, data);
-  expect(d1.acks[0]?.map((write) => write.changes)).toEqual([1, 1, 1, 1, 1, 0, 0, 0, 0]);
-  expect(d1.acks[0]?.slice(5).map((write) => write.rows)).toEqual([[], [], [], []]);
-  expect(await d1.counts()).toMatchObject({
-    orgs: 1,
-    org_memberships: 1,
-    org_wallet_workspace_bindings: 1,
-    financial_customer_history_birth_observations:
-      before.financial_customer_history_birth_observations,
-    shared_auth_sessions: 1,
-  });
+  let phase: ExistingOrgFailurePhase = "setup";
+  try {
+    const d1 = await servedD1("money");
+    const data = await input();
+    const at = new Date().toISOString();
+    // The owner tuple exists before the batch: every Organization INSERT selects
+    // nothing, so no trigger runs and each statement changes exactly 0 rows.
+    phase = "seed";
+    await d1.database.batch([
+      d1.database
+        .prepare("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)")
+        .bind(data.organizationId, "Personal workspace", data.principal.principalId, at),
+      d1.database
+        .prepare(
+          "INSERT INTO org_memberships (org_id, principal_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+        )
+        .bind(data.organizationId, data.principal.principalId, at),
+      d1.database
+        .prepare(
+          "INSERT INTO org_wallet_workspace_bindings (workspace_ref, org_id, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(WORKSPACE_REF, data.organizationId, at),
+    ]);
+    phase = "pre-count";
+    const before = await d1.counts();
+    phase = "issuance";
+    await issue(d1.sql, data);
+    expect(d1.acks[0]?.map((write) => write.changes)).toEqual([1, 1, 1, 1, 1, 0, 0, 0, 0]);
+    expect(d1.acks[0]?.slice(5).map((write) => write.rows)).toEqual([[], [], [], []]);
+    phase = "post-count";
+    expect(await d1.counts()).toMatchObject({
+      orgs: 1,
+      org_memberships: 1,
+      org_wallet_workspace_bindings: 1,
+      financial_customer_history_birth_observations:
+        before.financial_customer_history_birth_observations,
+      shared_auth_sessions: 1,
+    });
+  } catch (error) {
+    reportExistingOrgFailure(phase, error);
+    throw error;
+  }
 }, 60000);
 
 test("a second fresh principal for an already bound subject is refused atomically", async () => {
