@@ -552,6 +552,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "adapter", "native-contract"],
   },
   {
+    // Private ordinary-only SQL fence; native/source/Financial authority is separate.
+    name: "adapter",
+    match: /^src\/ordinary-financial-public-sql\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
     name: "domain",
     match:
       /^src\/(?:token|auth|auth-authority-schema-plan|auth-principal-schema-plan|auth-rp-storage-schema-plan|credential-authority-class|shared-principal-authority|ledger|money|meter-pricing|org-billing|org-usage-summary|org-workspace-usage|workspace-billing-organization|org-limit-policy|org-on-demand-terms|org-top-up|shared-financial-action|hosted-billing-realm|hosted-subscription-adapter|stripe-top-up-client|stripe-customer-custody|stripe-card-setup|stripe-on-demand|stripe-on-demand-verification|billing-config|hosted-pricing|hosted-run-pricing|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|actor-class-candidate-inspection|actor-resource-graph|worker-endpoint-origin-reservations|selfhost-actor-contract-closure|workflow-instances|workflow-resource-graph|workflow-resource-lifecycle|workflow-data|workflow-driver|workflow-execution|workflow-due-scheduler|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|tenant-run-principal|form-authority-operator-proof|google-identity|takos-id-identity|shared-auth-oidc-client|shared-auth-session|shared-auth-session-store|identity-setup|stripe-settlement|stripe-events|stripe-billing|stripe-billing-client|stripe-billing-store|subscription-custody|subscription-command-receipts|stripe-subscription-plan-change|payment-events|payment-settings|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$|integration-actor-(?:host|form-authority)\.ts$)/u,

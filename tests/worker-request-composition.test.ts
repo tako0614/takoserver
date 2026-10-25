@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as financialRequestOrigin from "@takoserver/core/financial-request-origin";
+import { Miniflare } from "miniflare";
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import { type AppPorts, buildApp } from "../src/app.ts";
@@ -34,7 +35,12 @@ import {
   readFinancialActionConsentR1RequestCaptures,
 } from "../src/shared-financial-retained-r1.ts";
 import { createSharedPrincipalAuthorityStore } from "../src/shared-principal-authority.ts";
-import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../src/sql-d1.ts";
+import {
+  createD1Sql,
+  type D1DatabaseLike,
+  type D1ResultLike,
+  type D1StatementLike,
+} from "../src/sql-d1.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
   assertWorkerRequestBackingOrigin,
@@ -974,6 +980,99 @@ describe("Worker primary Auth schema observations", () => {
     expect(readWorkerRequestWriterEpochOrigin(connection)).toBeUndefined();
     expect(f.sessions).toEqual([{ constraint: "first-primary", queries: [] }]);
     expect(() => readWorkerRequestFinancialInputs(connection)).toThrow();
+  });
+
+  test("ordinary first-primary D1 facade guards writes without scanning catalogs for SELECT", async () => {
+    const runtime = new Miniflare({
+      cf: false,
+      workers: [
+        {
+          config: {
+            name: "ordinary-first-primary-public-sql-test",
+            type: "worker",
+            compatibilityDate: "2026-08-18",
+            manifest: {
+              mainModule: "worker.js",
+              modules: {
+                "worker.js": {
+                  type: "esm",
+                  contents: "export default {fetch(){return new Response('ok')}}",
+                },
+              },
+            },
+            env: { STATE_DB: { type: "d1", id: "ordinary-first-primary-public-sql-test" } },
+            triggers: [],
+          },
+        },
+      ],
+    });
+    try {
+      const binding = await runtime.getD1Database("STATE_DB");
+      const setup = createD1Sql(binding, { acknowledgement: "explicit-d1-result" });
+      await setup.batch([
+        { sql: "CREATE TABLE orgs(id TEXT PRIMARY KEY, name TEXT NOT NULL)" },
+        { sql: "CREATE TABLE org_wallet_holds(id TEXT PRIMARY KEY)" },
+        { sql: "CREATE TABLE financial_source_events(id TEXT PRIMARY KEY)" },
+      ]);
+
+      const observedSql: string[] = [];
+      let selectedSession: D1DatabaseLike | undefined;
+      const database: WorkerRequestDatabase = {
+        prepare: (sql) => Reflect.apply(binding.prepare, binding, [sql]),
+        batch: (statements) => Reflect.apply(binding.batch, binding, [statements]),
+        withSession(constraint) {
+          const native = Reflect.apply(binding.withSession, binding, [constraint]);
+          const session: D1DatabaseLike = {
+            prepare(sql) {
+              observedSql.push(sql);
+              return Reflect.apply(native.prepare, native, [sql]);
+            },
+            batch(statements) {
+              return Reflect.apply(native.batch, native, [statements]);
+            },
+          };
+          selectedSession = session;
+          return session;
+        },
+      };
+      const connection = await createWorkerOrdinaryPrimaryRequestSql({ database });
+      expect(Object.isFrozen(connection.sql)).toBe(true);
+      expect(() => assertWorkerRequestBackingOrigin(connection)).not.toThrow();
+
+      observedSql.length = 0;
+      expect(await connection.sql.query("SELECT id FROM orgs WHERE id='auth'")).toEqual([]);
+      expect(observedSql).toEqual([
+        "SELECT count(*) AS n FROM sqlite_temp_schema",
+        "SELECT id FROM orgs WHERE id='auth'",
+      ]);
+      expect(observedSql.some((sql) => sql.includes("main.sqlite_schema"))).toBe(false);
+      expect(observedSql.some((sql) => sql.includes("pragma_foreign_key_list"))).toBe(false);
+
+      const auth = await connection.sql.run(
+        "INSERT INTO orgs(id,name) VALUES('auth','first') ON CONFLICT(id) DO UPDATE SET name=excluded.name RETURNING id",
+      );
+      expect(auth.rows).toEqual([{ id: "auth" }]);
+      expect(
+        await connection.sql.run("INSERT INTO org_wallet_holds(id) VALUES('wallet')"),
+      ).toMatchObject({ changes: 1 });
+      await expect(
+        connection.sql.run("INSERT INTO financial_source_events(id) VALUES('blocked')"),
+      ).rejects.toThrow();
+
+      const session = selectedSession;
+      if (!session) throw new Error("first-primary session was not selected");
+      const prepare = session.prepare;
+      session.prepare = () => {
+        throw new Error("test replacement must not be called");
+      };
+      expect(() => assertWorkerRequestBackingOrigin(connection)).toThrow(
+        "Worker request primary session methods differ",
+      );
+      session.prepare = prepare;
+      expect(() => assertWorkerRequestBackingOrigin(connection)).not.toThrow();
+    } finally {
+      await runtime.dispose();
+    }
   });
 
   test("ordinary native primary retains the real realm without epoch or unqualified RP fallback", async () => {

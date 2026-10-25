@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { FINANCIAL_0104_FENCED_TABLES } from "../src/financial-0104-money-fence.ts";
 import { createOrdinaryFinancialPublicSql } from "../src/ordinary-financial-public-sql.ts";
-import type { Sql } from "../src/ports.ts";
+import type { Sql, SqlStatement } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 const databases: Database[] = [];
@@ -130,13 +130,116 @@ test("the final catalog guard rolls back a body write on same-connection schema 
     query: base.query,
     run: base.run,
     batch: async (statements) => {
-      database.exec("CREATE TABLE surprise(id TEXT)");
+      if (statements.some((statement) => statement.sql.includes("INSERT INTO orgs")))
+        database.exec("CREATE TABLE surprise(id TEXT)");
       return base.batch(statements);
     },
   };
   const sql = createOrdinaryFinancialPublicSql(raw);
   await expect(sql.run("INSERT INTO orgs(id) VALUES('o')")).rejects.toThrow();
   expect(database.query("SELECT count(*) AS n FROM orgs").get()).toEqual({ n: 0 });
+});
+
+test("metadata FK rows require an exact catalog match from the same atomic batch", async () => {
+  const { database } = fixture();
+  const base = createSqliteSql(database);
+  let bodyBatchSubmitted = false;
+  let metadataBatch: readonly SqlStatement[] | undefined;
+  const standaloneForeignKeyQueries: string[] = [];
+  const raw: Sql = {
+    query: async (sql, params) => {
+      if (sql.includes("pragma_foreign_key_list")) standaloneForeignKeyQueries.push(sql);
+      return base.query(sql, params);
+    },
+    run: base.run,
+    batch: async (statements) => {
+      if (statements.some((statement) => statement.sql.includes("INSERT INTO orgs"))) {
+        bodyBatchSubmitted = true;
+        return base.batch(statements);
+      }
+      metadataBatch = [...statements];
+      const results = await base.batch(statements);
+      if (!statements[0]?.sql.includes("main.sqlite_schema"))
+        throw new Error("metadata snapshot did not batch catalog first");
+      return results.map((result, index) =>
+        index === 0
+          ? {
+              ...result,
+              rows: result.rows.map((row) =>
+                row.name === "orgs" ? { ...row, sql: "CREATE TABLE orgs(id TEXT)" } : row,
+              ),
+            }
+          : result,
+      );
+    },
+  };
+  await expect(
+    createOrdinaryFinancialPublicSql(raw).run("INSERT INTO orgs(id,name) VALUES('o','one')"),
+  ).rejects.toThrow("catalog changed during metadata snapshot");
+  expect(bodyBatchSubmitted).toBe(false);
+  expect(metadataBatch?.[1]?.sql).toBe("SELECT count(*) AS n FROM sqlite_temp_schema");
+  expect(
+    metadataBatch?.filter((statement) => statement.sql.includes("pragma_foreign_key_list")),
+  ).toHaveLength(2);
+  expect(standaloneForeignKeyQueries).toEqual([]);
+  expect(database.query("SELECT count(*) AS n FROM orgs").get()).toEqual({ n: 0 });
+});
+
+test("metadata batch refuses missing or malformed positional acknowledgements", async () => {
+  for (const mode of ["missing", "malformed"] as const) {
+    const { database } = fixture();
+    const base = createSqliteSql(database);
+    let bodyBatchSubmitted = false;
+    const raw: Sql = {
+      query: base.query,
+      run: base.run,
+      batch: async (statements) => {
+        if (statements.some((statement) => statement.sql.includes("INSERT INTO orgs"))) {
+          bodyBatchSubmitted = true;
+          return base.batch(statements);
+        }
+        const results = await base.batch(statements);
+        if (mode === "missing") return results.slice(0, -1);
+        return results.map((result, index) =>
+          index === 0 ? ({ rows: null, changes: 0 } as unknown as typeof result) : result,
+        );
+      },
+    };
+    await expect(
+      createOrdinaryFinancialPublicSql(raw).run("INSERT INTO orgs(id,name) VALUES('o','one')"),
+    ).rejects.toThrow();
+    expect(bodyBatchSubmitted).toBe(false);
+    expect(database.query("SELECT count(*) AS n FROM orgs").get()).toEqual({ n: 0 });
+  }
+});
+
+test("plain SELECT uses only TEMP and selected query while CTE stays fully guarded", async () => {
+  const { database } = fixture();
+  const base = createSqliteSql(database);
+  const queries: string[] = [];
+  const batches: SqlStatement[][] = [];
+  const raw: Sql = {
+    query: async (sql, params) => {
+      queries.push(sql);
+      return base.query(sql, params);
+    },
+    run: base.run,
+    batch: async (statements) => {
+      batches.push([...statements]);
+      return base.batch(statements);
+    },
+  };
+  const sql = createOrdinaryFinancialPublicSql(raw);
+  expect(await sql.query("SELECT id FROM orgs")).toEqual([]);
+  expect(queries).toEqual(["SELECT count(*) AS n FROM sqlite_temp_schema", "SELECT id FROM orgs"]);
+  expect(batches).toHaveLength(0);
+
+  expect(await sql.query("WITH selected AS (SELECT 1 AS id) SELECT id FROM selected")).toEqual([
+    { id: 1 },
+  ]);
+  expect(batches).toHaveLength(2);
+  expect(batches[0]?.[0]?.sql).toContain("main.sqlite_schema");
+  expect(batches[1]?.[0]?.sql).toContain("WITH selected");
 });
 
 test("TEMP objects, unsupported FK metadata, and an oversized catalog refuse before body batch", async () => {
@@ -148,13 +251,12 @@ test("TEMP objects, unsupported FK metadata, and an oversized catalog refuse bef
   const base = createSqliteSql(temp.database);
   let batches = 0;
   const unsupported: Sql = {
-    query: (statement, params) =>
-      statement.includes("pragma_foreign_key_list")
-        ? Promise.reject(new Error("unsupported"))
-        : base.query(statement, params),
+    query: base.query,
     run: base.run,
     batch: async (statements) => {
-      batches++;
+      if (statements.some((statement) => statement.sql.includes("pragma_foreign_key_list")))
+        throw new Error("unsupported");
+      if (statements.some((statement) => statement.sql.includes("INSERT INTO orgs"))) batches++;
       return base.batch(statements);
     },
   };
@@ -174,10 +276,7 @@ test("TEMP objects, unsupported FK metadata, and an oversized catalog refuse bef
           ])
         : base.query(statement, params),
     run: base.run,
-    batch: async (statements) => {
-      batches++;
-      return base.batch(statements);
-    },
+    batch: base.batch,
   };
   await expect(
     createOrdinaryFinancialPublicSql(oversized).run("INSERT INTO orgs(id,name) VALUES('o','one')"),
@@ -259,16 +358,18 @@ test("only exact D1 internal tables with FK-free CREATE TABLE SQL skip metadata 
   const base = createSqliteSql(database);
   const inspected: string[] = [];
   const raw: Sql = {
-    query: (sql, params) => {
-      if (sql.includes("pragma_foreign_key_list")) {
-        const table = params?.[0];
-        if (typeof table === "string") inspected.push(table);
-        if (table === "_cf_METADATA") return Promise.reject(new Error("internal table denied"));
-      }
-      return base.query(sql, params);
-    },
+    query: base.query,
     run: base.run,
-    batch: base.batch,
+    batch: async (statements) => {
+      for (const statement of statements) {
+        if (statement.sql.includes("pragma_foreign_key_list")) {
+          const table = statement.params?.[0];
+          if (typeof table === "string") inspected.push(table);
+          if (table === "_cf_METADATA") throw new Error("internal table denied");
+        }
+      }
+      return base.batch(statements);
+    },
   };
   const result = await createOrdinaryFinancialPublicSql(raw).run(
     "INSERT INTO orgs(id,name) VALUES('o','one')",
@@ -303,20 +404,37 @@ test("unknown, malformed, or FK-bearing tables never use the D1 internal metadat
     let internalMetadataRequested = false;
     const raw: Sql = {
       query: async (sql, params) => {
-        if (sql.includes("main.sqlite_schema")) {
-          const rows = await base.query(sql, params);
-          return scenario.overrideCatalog
-            ? rows.map((row) => (row.name === scenario.table ? { ...row, sql: null } : row))
-            : rows;
-        }
-        if (sql.includes("pragma_foreign_key_list") && params?.[0] === scenario.table) {
+        const rows = await base.query(sql, params);
+        return sql.includes("main.sqlite_schema") && scenario.overrideCatalog
+          ? rows.map((row) => (row.name === scenario.table ? { ...row, sql: null } : row))
+          : rows;
+      },
+      run: base.run,
+      batch: async (statements) => {
+        if (
+          statements.some(
+            (statement) =>
+              statement.sql.includes("pragma_foreign_key_list") &&
+              statement.params?.[0] === scenario.table,
+          )
+        ) {
           internalMetadataRequested = true;
           throw new Error("FK metadata unavailable");
         }
-        return base.query(sql, params);
+        const results = await base.batch(statements);
+        if (!scenario.overrideCatalog || !statements[0]?.sql.includes("main.sqlite_schema"))
+          return results;
+        return results.map((result, index) =>
+          index === 0
+            ? {
+                ...result,
+                rows: result.rows.map((row) =>
+                  row.name === scenario.table ? { ...row, sql: null } : row,
+                ),
+              }
+            : result,
+        );
       },
-      run: base.run,
-      batch: base.batch,
     };
     await expect(
       createOrdinaryFinancialPublicSql(raw).run("INSERT INTO orgs(id,name) VALUES('o','one')"),
@@ -374,7 +492,8 @@ test("a temporary object introduced after preflight aborts and rolls back the bo
     query: base.query,
     run: base.run,
     batch: async (statements) => {
-      database.exec("CREATE TEMP TABLE late_temp(id TEXT)");
+      if (statements.some((statement) => statement.sql.includes("INSERT INTO orgs")))
+        database.exec("CREATE TEMP TABLE late_temp(id TEXT)");
       return base.batch(statements);
     },
   };
@@ -405,6 +524,29 @@ test("the facade is frozen and refuses a changed captured raw method before batc
   expect(database.query("SELECT count(*) AS n FROM orgs").get()).toEqual({ n: 0 });
 });
 
+test("a raw method changed during the body batch rejects after the single possibly committed write", async () => {
+  const { database } = fixture();
+  const base = createSqliteSql(database);
+  let bodyBatches = 0;
+  const raw: Sql = {
+    query: base.query,
+    run: base.run,
+    batch: async (statements) => {
+      const results = await base.batch(statements);
+      if (statements.some((statement) => statement.sql.includes("INSERT INTO orgs"))) {
+        bodyBatches++;
+        raw.query = async () => [];
+      }
+      return results;
+    },
+  };
+  await expect(
+    createOrdinaryFinancialPublicSql(raw).run("INSERT INTO orgs(id,name) VALUES('o','one')"),
+  ).rejects.toThrow();
+  expect(bodyBatches).toBe(1);
+  expect(database.query("SELECT count(*) AS n FROM orgs").get()).toEqual({ n: 1 });
+});
+
 test("batch rejects missing body or final guard acknowledgements", async () => {
   const { database } = fixture();
   const base = createSqliteSql(database);
@@ -413,6 +555,8 @@ test("batch rejects missing body or final guard acknowledgements", async () => {
     run: base.run,
     batch: async (statements) => {
       const results = await base.batch(statements);
+      if (!statements.some((statement) => statement.sql.includes("INSERT INTO orgs")))
+        return results;
       return results.map((result, index) =>
         index === 0 ? ({ rows: null, changes: 1 } as unknown as typeof result) : result,
       );
@@ -430,7 +574,12 @@ test("batch rejects missing body or final guard acknowledgements", async () => {
   const missingGuard: Sql = {
     query: missingBase.query,
     run: missingBase.run,
-    batch: async (statements) => (await missingBase.batch(statements)).slice(0, -1),
+    batch: async (statements) => {
+      const results = await missingBase.batch(statements);
+      return statements.some((statement) => statement.sql.includes("INSERT INTO orgs"))
+        ? results.slice(0, -1)
+        : results;
+    },
   };
   await expect(
     createOrdinaryFinancialPublicSql(missingGuard).run(

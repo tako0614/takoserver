@@ -9,8 +9,8 @@ import {
 } from "./ports.ts";
 
 /**
- * An unadopted, internal ordinary-source prototype. This is a statement and
- * catalog write fence, not a native-source, actor, billing, or serving grant.
+ * Private ordinary-only SQL fence; native/source/Financial authority is separate.
+ * This is a statement and catalog write fence, not an actor or billing grant.
  * The new ordinary R1/H0 names are fixed DATA from the pending Financial
  * manifests; their source component is not yet adopted in this tree.
  */
@@ -424,16 +424,35 @@ export function createOrdinaryFinancialPublicSql(raw: Sql): Sql {
         refuse("Money cutover control reference");
       effects.push(...statementEffects(singleStatement(statement.sql)));
     }
-    const rows = (await original.query.call(raw, CATALOG_SQL)).map(catalogRow);
-    const temp = await original.query.call(raw, TEMP_SQL);
-    if (temp.length !== 1 || temp[0]?.n !== 0) refuse("temporary catalog");
-    const json = JSON.stringify(rows);
+    const initialRows = (await original.query.call(raw, CATALOG_SQL)).map(catalogRow);
+    original.current();
+    const json = JSON.stringify(initialRows);
     if (new TextEncoder().encode(json).length > MAX_CATALOG_BYTES) refuse("catalog size");
+    const metadataStatements: SqlStatement[] = [{ sql: CATALOG_SQL }, { sql: TEMP_SQL }];
+    const metadataTables = initialRows.filter(
+      (row) => row.type === "table" && !isD1InternalTableWithoutForeignKeys(row),
+    );
+    for (const row of metadataTables)
+      metadataStatements.push({ sql: FOREIGN_KEYS_SQL, params: [row.name] });
+    const metadata = await original.batch.call(raw, metadataStatements);
+    original.current();
+    if (
+      !Array.isArray(metadata) ||
+      metadata.length !== metadataStatements.length ||
+      metadata.some((result) => !validWrite(result))
+    )
+      throw new SqlError("unavailable", "ordinary catalog snapshot acknowledgement missing");
+    const snapshotRows = metadata[0]?.rows.map(catalogRow);
+    if (!snapshotRows || JSON.stringify(snapshotRows) !== json)
+      refuse("catalog changed during metadata snapshot");
+    const temp = metadata[1]?.rows;
+    if (temp?.length !== 1 || temp[0]?.n !== 0) refuse("temporary catalog");
     const foreignKeys: ForeignKey[] = [];
-    for (const row of rows) {
-      if (row.type !== "table") continue;
-      if (isD1InternalTableWithoutForeignKeys(row)) continue;
-      const keys = await original.query.call(raw, FOREIGN_KEYS_SQL, [row.name]);
+    for (let index = 0; index < metadataTables.length; index++) {
+      const row = metadataTables[index];
+      const result = metadata[index + 2];
+      if (!row || !result) refuse("foreign-key snapshot acknowledgement");
+      const keys = result.rows;
       for (const key of keys) {
         if (
           typeof key.parent !== "string" ||
@@ -449,12 +468,13 @@ export function createOrdinaryFinancialPublicSql(raw: Sql): Sql {
         });
       }
     }
-    guardedWrite(effects, rows, foreignKeys);
+    guardedWrite(effects, snapshotRows, foreignKeys);
     original.current();
     const results = await original.batch.call(raw, [
       ...batch,
       { sql: GUARD_SQL, params: [json, "ordinary-catalog-drift"] },
     ]);
+    original.current();
     if (!Array.isArray(results) || results.length !== batch.length + 1)
       throw new SqlError("unavailable", "ordinary catalog guard acknowledgement missing");
     for (const result of results) {
@@ -468,6 +488,31 @@ export function createOrdinaryFinancialPublicSql(raw: Sql): Sql {
   };
   return Object.freeze({
     async query(sql: string, params?: readonly SqlParam[]): Promise<readonly Row[]> {
+      const [statement] = snapshotStatements([{ sql, ...(params ? { params } : {}) }]);
+      if (!statement) throw new SqlError("invalid", "ordinary query statement missing");
+      original.current();
+      if (MONEY_CUTOVER_CONTROL_REFERENCE.test(statement.sql.trim()))
+        refuse("Money cutover control reference");
+      const tokens = singleStatement(statement.sql);
+      if (tokens[0]?.kind === "word" && tokens[0].text === "SELECT") {
+        const temp = await original.query.call(raw, TEMP_SQL);
+        original.current();
+        if (temp.length !== 1 || temp[0]?.n !== 0) refuse("temporary catalog");
+        const rows = await original.query.call(raw, statement.sql, statement.params);
+        original.current();
+        if (
+          !Array.isArray(rows) ||
+          rows.some(
+            (row, index) =>
+              !Object.hasOwn(rows, index) ||
+              row === null ||
+              typeof row !== "object" ||
+              Array.isArray(row),
+          )
+        )
+          throw new SqlError("unavailable", "ordinary query acknowledgement malformed");
+        return rows;
+      }
       const first = (await execute([{ sql, ...(params ? { params } : {}) }]))[0];
       if (!first) throw new SqlError("unavailable", "ordinary query acknowledgement missing");
       return first.rows;

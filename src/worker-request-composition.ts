@@ -47,6 +47,7 @@ import {
   inspectMoneyCutoverGuard,
   type MoneyCutoverGuardState,
 } from "./money-cutover-sql.ts";
+import { createOrdinaryFinancialPublicSql } from "./ordinary-financial-public-sql.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlWrite } from "./ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
@@ -113,6 +114,8 @@ const requestOrigins = new WeakMap<
     readonly prepare: unknown;
     readonly batch: unknown;
     readonly rawSql: Sql;
+    readonly ordinarySql: Sql | undefined;
+    readonly ordinaryRawSqlMethods: readonly unknown[] | undefined;
     readonly sqlMethods: readonly unknown[];
   }
 >();
@@ -166,9 +169,15 @@ async function constructWorkerPrimaryRequestSql(
   const writerEpoch = options.writerEpoch;
   let moneyGuard: MoneyCutoverGuardState | "not-selected";
   let sql: Sql;
+  let ordinarySql: Sql | undefined;
+  let ordinaryRawSqlMethods: readonly unknown[] | undefined;
   if (ordinary) {
     moneyGuard = "not-selected";
-    sql = rawSql;
+    ordinaryRawSqlMethods = Object.freeze(
+      (["query", "run", "batch"] as const).map((name) => dataMethod(rawSql, name)),
+    );
+    ordinarySql = createOrdinaryFinancialPublicSql(rawSql);
+    sql = ordinarySql;
   } else {
     if (writerEpoch === undefined)
       throw new TypeError("Worker request Money writer selection differs");
@@ -189,6 +198,8 @@ async function constructWorkerPrimaryRequestSql(
       prepare,
       batch,
       rawSql,
+      ordinarySql,
+      ordinaryRawSqlMethods,
       sqlMethods,
     }),
   );
@@ -241,6 +252,8 @@ export function createWorkerFreshNativeRequestSql(
       prepare,
       batch,
       rawSql,
+      ordinarySql: undefined,
+      ordinaryRawSqlMethods: undefined,
       sqlMethods,
     }),
   );
@@ -1149,7 +1162,13 @@ function assertWorkerRequestBacking(connection: WorkerRequestSql) {
     if (
       connection.moneyGuard !== "not-selected" ||
       origin.writerEpoch !== undefined ||
-      connection.sql !== origin.rawSql ||
+      connection.sql !== origin.ordinarySql ||
+      origin.ordinarySql === undefined ||
+      origin.ordinaryRawSqlMethods === undefined ||
+      origin.ordinaryRawSqlMethods.some((method, index) => {
+        const name = (["query", "run", "batch"] as const)[index];
+        return name === undefined || dataMethod(origin.rawSql, name) !== method;
+      }) ||
       origin.sqlMethods.some((method, index) => {
         const name = (["query", "run", "batch"] as const)[index];
         return name === undefined || dataMethod(connection.sql, name) !== method;
