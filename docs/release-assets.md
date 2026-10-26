@@ -448,14 +448,14 @@ that two builds of the same source produce the same bytes:
 
 ```sh
 cd services/workflow-execution-guard
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=go1.26.9 \
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=go1.26.10 \
   go build -trimpath -buildvcs=false -ldflags=-buildid= \
   -o /usr/local/libexec/takoserver/workflow-execution-guard ./cmd/workflow-execution-guard
-go version -m /usr/local/libexec/takoserver/workflow-execution-guard   # go1.26.9, -trimpath=true, CGO_ENABLED=0
+go version -m /usr/local/libexec/takoserver/workflow-execution-guard   # go1.26.10, -trimpath=true, CGO_ENABLED=0
 ```
 
-On 2026-10-11, from source commit `5f4f2eef` (the guard source and `go.mod`
-are unchanged on the release branch), this produced SHA-256
+On 2026-10-11, from source commit `5f4f2eef` with Go 1.26.9, the same flags
+produced SHA-256
 `67709482e9d49b1df1af483f210a5038f1e0a2689f805adb33d5cfc76b2b0b20`,
 4,456,737 bytes, statically linked, from two different source paths. An
 operator who builds the same tag with the same command can compare against

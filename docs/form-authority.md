@@ -533,8 +533,8 @@ exactly that for the embedded exact publisher set:
 
 ```sh
 # 1. start the released Core verifier with the digest this checkout computes
-#    (needs Go 1.26.9 or newer, or GOTOOLCHAIN=auto so the module's
-#    `toolchain go1.26.9` directive selects it; go1.26.0 builds but ships the
+#    (needs Go 1.26.10 or newer, or GOTOOLCHAIN=auto so the module's
+#    `toolchain go1.26.10` directive selects it; go1.26.0 builds but ships the
 #    unpatched standard library)
 cd services/takoform-core-verifier && go build -o /tmp/takoform-core-verifier ./cmd/server
 TAKOFORM_CORE_VERIFIER_ARTIFACT_DIGEST=<sha256:…> /tmp/takoform-core-verifier &
