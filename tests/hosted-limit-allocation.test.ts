@@ -745,7 +745,9 @@ test("native D1 rolls back a purchase allocation when its admission policy chang
   try {
     const database = await runtime.getD1Database("STATE_DB");
     for (const schema of schemas()) {
-      for (const statement of splitMigration(schema)) await database.prepare(statement).run();
+      const statements = splitMigration(schema);
+      if (statements.length > 0)
+        await database.batch(statements.map((statement) => database.prepare(statement)));
     }
     await exercisePolicyFence(createD1Sql(database));
   } finally {
