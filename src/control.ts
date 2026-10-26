@@ -2583,8 +2583,8 @@ async function jsonObject(
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     controlError("invalid_argument", 400);
   }
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength === 0 || bytes.byteLength > limit) {
+  const bytes = await boundedBody(request, limit);
+  if (bytes === null || bytes.byteLength === 0) {
     controlError("invalid_argument", 400);
   }
   try {
