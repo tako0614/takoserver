@@ -187,6 +187,9 @@ async function exerciseEndpoint(
   const databasePath = join(root, "state.sqlite");
   writeMigrateSqliteFile(databasePath);
   const db = new Database(databasePath);
+  // Keep per-commit durability without rollback-journal metadata churn in this
+  // short-lease file fixture. The one-second SQL lease guards remain active.
+  db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
   const sql = createSqliteSql(db);
   let clockMs = Date.now();
   const now = () => {
