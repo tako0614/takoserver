@@ -14,24 +14,28 @@ const OriginalWorker = threads.Worker;
 const miniflareEntry = require.resolve("miniflare");
 const preload = fileURLToPath(new URL("./preload-miniflare-undici.cjs", import.meta.url));
 type Options = WorkerOptions & { preload?: string | string[] };
+// Test evidence for the SDK's own CJS construction, across real binding access.
+export const miniflareHttpThreadStarts: string[] = [];
 mock.module("undici", () => installedUndici);
-mock.module("node:worker_threads", () => ({
-  ...threads,
-  Worker: class extends OriginalWorker {
-    constructor(filename: string | URL, options?: Options) {
-      // Only Miniflare's eval thread uses this owning filename. Keep every
-      // other Worker and its options unchanged; never rewrite the SDK script.
-      const selected = options?.eval === true && options.workerData?.filename === miniflareEntry;
-      const existing = options?.preload;
-      super(
-        filename,
-        selected
-          ? {
-              ...options,
-              preload: [...(typeof existing === "string" ? [existing] : (existing ?? [])), preload],
-            }
-          : options,
-      );
-    }
-  },
-}));
+class MiniflareHttpWorker extends OriginalWorker {
+  constructor(filename: string | URL, options?: Options) {
+    // Only Miniflare's eval thread uses this owning filename. Keep every
+    // other Worker and its options unchanged; never rewrite the SDK script.
+    const selected = options?.eval === true && options.workerData?.filename === miniflareEntry;
+    const existing = options?.preload;
+    super(
+      filename,
+      selected
+        ? {
+            ...options,
+            preload: [...(typeof existing === "string" ? [existing] : (existing ?? [])), preload],
+          }
+        : options,
+    );
+    if (selected) miniflareHttpThreadStarts.push(miniflareEntry);
+  }
+}
+// Bun's ESM mock does not replace the builtin object returned by CJS require.
+// Miniflare uses that object, so install the same constructor in both paths.
+Object.defineProperty(threads, "Worker", { value: MiniflareHttpWorker });
+mock.module("node:worker_threads", () => threads);

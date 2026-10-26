@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { Worker } from "node:worker_threads";
 import { Miniflare } from "miniflare";
 import { fetch } from "undici";
+import { miniflareHttpThreadStarts } from "./preload-miniflare-http.ts";
 
 test("Miniflare HTTP preserves the original URL, CF override and redirects", async () => {
   const mf = new Miniflare({
@@ -146,3 +147,42 @@ test("Miniflare synchronous HTTP threads load the installed Undici dispatcher", 
     );
   }
 });
+
+test("the actual Miniflare D1 binding selects its synchronous HTTP thread preload", async () => {
+  const before = miniflareHttpThreadStarts.length;
+  const mf = new Miniflare({
+    cf: false,
+    workers: [
+      {
+        config: {
+          name: "http-thread-binding-contract",
+          type: "worker",
+          compatibilityDate: "2026-08-17",
+          manifest: {
+            mainModule: "worker.js",
+            modules: {
+              "worker.js": {
+                type: "esm",
+                contents: "export default {fetch(){return new Response('actual worker')}}",
+              },
+            },
+          },
+          env: { DB: { type: "d1", id: "http-thread-binding-contract" } },
+        },
+      },
+    ],
+  });
+  try {
+    const db = await mf.getD1Database("DB");
+    await db.prepare("CREATE TABLE proof (value TEXT NOT NULL)").run();
+    await db.prepare("INSERT INTO proof VALUES (?)").bind("actual D1 value").run();
+    expect(await db.prepare("SELECT value FROM proof").first<{ value: string }>()).toEqual({
+      value: "actual D1 value",
+    });
+    expect(miniflareHttpThreadStarts.slice(before)).toEqual([
+      createRequire(import.meta.url).resolve("miniflare"),
+    ]);
+  } finally {
+    await mf.dispose();
+  }
+}, 60_000);
