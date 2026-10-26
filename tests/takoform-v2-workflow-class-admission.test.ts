@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
 import { Miniflare } from "miniflare";
+import type { Sql, SqlStatement, SqlWrite } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
 import {
@@ -252,3 +253,115 @@ test("Miniflare D1 atomically accepts 1 and 8 weighted Workflow class graphs and
     await runtime.dispose();
   }
 }, 120_000);
+
+function measuredReadFixture() {
+  const db = migrateSqliteDatabase();
+  const original = createSqliteSql(db);
+  let roundtrips = 0;
+  let fault: "truncated" | "malformed-rows" | null = null;
+  const sql: Sql = {
+    async query(statement, params) {
+      roundtrips++;
+      return await original.query(statement, params);
+    },
+    run: original.run.bind(original),
+    async batch(statements: readonly SqlStatement[]) {
+      roundtrips++;
+      const results = await original.batch(statements);
+      if (fault && statements.every(({ sql }) => /^\s*SELECT\b/iu.test(sql))) {
+        if (fault === "truncated") return results.slice(1);
+        return results.map((result, index) =>
+          index === 0 ? { ...result, rows: null } : result,
+        ) as unknown as readonly SqlWrite[];
+      }
+      return results;
+    },
+  };
+  return {
+    db,
+    original,
+    ...createWorkflowAdmissionFixture(sql),
+    resetRoundtrips() {
+      roundtrips = 0;
+    },
+    get roundtrips() {
+      return roundtrips;
+    },
+    setFault(value: typeof fault) {
+      fault = value;
+    },
+  };
+}
+
+async function createMeasuredGraph(f: ReturnType<typeof measuredReadFixture>, count: number) {
+  const worker = await f.create(MODULE_WORKER_FORM_URL, `read-plan-worker-${count}`, {});
+  const versions = [];
+  for (let index = 0; index < count; index++)
+    versions.push(await f.version(worker.resourceUid, `read-plan-version-${count}-${index}`));
+  await f.create(WORKER_DEPLOYMENT_FORM_URL, `read-plan-deployment-${count}`, {
+    worker: { resourceUid: worker.resourceUid },
+    versions: versions.map((version) => ({
+      workerVersion: { resourceUid: version.resourceUid },
+      weight: 10_000 / count,
+    })),
+  });
+  return { worker, versions };
+}
+
+test("Workflow currentness keeps database roundtrips linear for one and eight Versions", async () => {
+  const f = measuredReadFixture();
+  const roundtrips: number[] = [];
+  try {
+    for (const count of [1, 8]) {
+      const { worker } = await createMeasuredGraph(f, count);
+      f.resetRoundtrips();
+      expect((await f.admission.prepare(f.request(worker.resourceUid))).kind).toBe("qualified");
+      roundtrips.push(f.roundtrips);
+    }
+    // Every boundary still checks the full graph; it must not pay one D1
+    // request per row again for every inspected Version.
+    expect(roundtrips[1]).toBeLessThan((roundtrips[0] ?? 0) * 12);
+  } finally {
+    f.db.close();
+  }
+});
+
+for (const fault of ["truncated", "malformed-rows"] as const) {
+  test(`Workflow currentness refuses a ${fault} fresh read acknowledgement`, async () => {
+    const f = measuredReadFixture();
+    try {
+      const { worker } = await createMeasuredGraph(f, 1);
+      f.setFault(fault);
+      expect((await f.admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    } finally {
+      f.db.close();
+    }
+  });
+}
+
+test("Workflow currentness re-reads the graph after awaited class inspection", async () => {
+  const f = measuredReadFixture();
+  try {
+    const { worker, versions } = await createMeasuredGraph(f, 1);
+    let inspections = 0;
+    const admission = createV2WorkflowClassAdmission({
+      sql: f.sql,
+      targetKey: TARGET,
+      bundleCustody: f.bundleCustody,
+      inspector: {
+        async inspectWorkflowClass() {
+          inspections++;
+          await f.original.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+            '{"ready":false}',
+            versions[0]?.resourceUid ?? "",
+          ]);
+          return { outcome: "valid" };
+        },
+      },
+    });
+    expect((await admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    expect(inspections).toBe(1);
+  } finally {
+    f.db.close();
+  }
+});
