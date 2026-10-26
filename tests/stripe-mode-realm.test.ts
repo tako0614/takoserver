@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { inspectStripeModeRealm } from "../scripts/deploy/stripe-mode-realm.ts";
@@ -18,14 +18,21 @@ import {
 } from "../src/stripe-mode-realm.ts";
 
 async function openFileSql(path: string) {
-  const db = new Database(path);
-  for (const migration of MIGRATIONS) {
-    if (migration.name === "0098_stripe_mode_realm.sql") continue;
-    db.exec(migration.sql);
-  }
-  db.exec(
+  // Seed exactly the same ordered SQL image without an SSD commit for every
+  // fixture DDL statement. Claims and restart still use the actual file and
+  // separately opened SQLite connections, with ordinary connection settings.
+  const image = databaseAfter([
+    ...MIGRATIONS.filter((migration) => migration.name !== "0098_stripe_mode_realm.sql").map(
+      (migration) => migration.sql,
+    ),
     await Bun.file(new URL("../migrations/0098_stripe_mode_realm.sql", import.meta.url)).text(),
-  );
+  ]);
+  try {
+    writeFileSync(path, image.serialize(), { flag: "wx", mode: 0o600 });
+  } finally {
+    image.close();
+  }
+  const db = new Database(path);
   return { db, sql: createSqliteSql(db) };
 }
 
@@ -1638,7 +1645,7 @@ import {
   assertMoneyD1StripeRealmPinContributionCurrent,
   readMoneyD1StripeRealmPinContribution,
 } from "../scripts/deploy/stripe-mode-realm.ts";
-import { migratedDatabase } from "./helpers/migrated-database.ts";
+import { databaseAfter, migratedDatabase } from "./helpers/migrated-database.ts";
 
 test("realm contribution producer refuses forged original members before their facts getters", async () => {
   let reads = 0;
