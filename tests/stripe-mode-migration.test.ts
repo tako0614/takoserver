@@ -1,11 +1,12 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { type MigratableDatabase, migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { StripeMode } from "../src/stripe-mode-realm.ts";
+import { databaseBuiltOnce } from "./helpers/migrated-database.ts";
 
 function oldThrough(db: Database, count: number): void {
   db.exec(
@@ -22,6 +23,15 @@ function oldThrough(db: Database, count: number): void {
 
 const old97 = (db: Database) => oldThrough(db, 97);
 
+function writeOld97File(path: string): void {
+  const image = databaseBuiltOnce("stripe-mode-migration:old97:2026-10-14T00:00:00.000Z", old97);
+  try {
+    writeFileSync(path, image.serialize(), { flag: "wx", mode: 0o600 });
+  } finally {
+    image.close();
+  }
+}
+
 function snapshot(db: Database) {
   return {
     schema: db
@@ -35,8 +45,8 @@ test("old 97 Stripe history refuses either realm before 98 changes schema or led
   const root = mkdtempSync(join(tmpdir(), "stripe-mode-old97-"));
   const path = join(root, "control.sqlite");
   try {
+    writeOld97File(path);
     const db = new Database(path);
-    old97(db);
     db.exec(`INSERT INTO stripe_events
       (event_id, type, livemode, object_id, event_created_at, received_at, outcome, settled_at)
       VALUES ('evt_old', 'invoice.paid', 0, 'in_old', '2026-10-14T00:00:00.000Z',
@@ -64,8 +74,8 @@ test("a never-billed 97 predecessor upgrades and pins LIVE atomically, then rest
   const root = mkdtempSync(join(tmpdir(), "stripe-mode-upgrade-"));
   const path = join(root, "control.sqlite");
   try {
+    writeOld97File(path);
     const db = new Database(path);
-    old97(db);
     db.exec(`INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
       VALUES ('principal_1', 'google', 'subject_1', 'a@example.test', 'A', '2026-10-14T00:00:00.000Z')`);
     expect(migrateSqlite(db, { stripeMode: "live" })).toEqual({
