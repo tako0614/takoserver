@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
 import { createSelfhostV2WorkerEndpointFrontend } from "../src/selfhost-v2-worker-endpoint-frontend.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -44,6 +43,8 @@ import {
 } from "../src/takoform-v2/worker-publication-state.ts";
 import type { V2WorkerRuntimeOwnerExecutionResult } from "../src/workerd-worker-runtime-owner.ts";
 
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
+
 const TARGET_KEY = "fixture-v2-worker-endpoint";
 const HOSTNAME = "assigned.example.test";
 
@@ -51,13 +52,20 @@ function digest(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
+async function exerciseEndpoint(
+  deleteDeploymentFirst: boolean,
+  preCreateDelayMs = 0,
+): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "v2-endpoint-backend-"));
-  const db = new Database(join(root, "state.sqlite"));
-  migrateSqlite(db);
+  const databasePath = join(root, "state.sqlite");
+  writeMigrateSqliteFile(databasePath);
+  const db = new Database(databasePath);
   const sql = createSqliteSql(db);
   let clockMs = Date.now();
-  const now = () => new Date(clockMs);
+  const now = () => {
+    clockMs = Math.max(clockMs, Date.now());
+    return new Date(clockMs);
+  };
   const fileUrl = "https://artifacts.example.test/endpoint/index.html";
   const manifestUrl = "https://artifacts.example.test/endpoint/manifest.json";
   const fileBytes = new TextEncoder().encode("<h1>fixture</h1>");
@@ -274,6 +282,7 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
     return accepted;
   };
   try {
+    if (preCreateDelayMs > 0) await Bun.sleep(preCreateDelayMs);
     const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
     workerUid = worker.resourceUid;
     const asset = await create(STATIC_ASSET_BUNDLE_FORM_URL, "assets", {
@@ -438,6 +447,8 @@ async function exerciseEndpoint(deleteDeploymentFirst: boolean): Promise<void> {
 test("accepted Endpoint deletes its route with an active Deployment", () =>
   exerciseEndpoint(false));
 test("accepted Endpoint deletes its route after Deployment deletion", () => exerciseEndpoint(true));
+test("accepted Endpoint retains its route outcome when setup precedes a delayed first create", () =>
+  exerciseEndpoint(false, 1_100));
 
 for (const action of ["create", "update", "delete"] as const) {
   test(`an Endpoint ${action} whose candidate the owner retired before activation settles with no effect`, async () => {
@@ -714,8 +725,9 @@ test("forward Endpoint preserves retained predicate bytes and exact parameters",
 
 test("forward Endpoint real Core capture and SQL guard close04/05 and06/05/07 without Container serving", async () => {
   const root = mkdtempSync(join(tmpdir(), "forward-endpoint-admission-"));
-  const db = new Database(join(root, "state.sqlite"));
-  migrateSqlite(db);
+  const databasePath = join(root, "state.sqlite");
+  writeMigrateSqliteFile(databasePath);
+  const db = new Database(databasePath);
   const sql = createSqliteSql(db);
   const principal = "org-forward-endpoint";
   const now = () => new Date();
