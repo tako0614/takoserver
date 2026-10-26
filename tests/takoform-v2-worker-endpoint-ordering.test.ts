@@ -267,6 +267,9 @@ async function settleAll(h: Harness, engine: Engine, ids: readonly string[]) {
 test("self-host admits only one live or pending WorkerDeployment per Worker", async () => {
   const h = harness();
   try {
+    // Artifact custody's SQLite lease trigger uses the DB clock. A busy test
+    // runner must not leave this fixture's Engine clock frozen behind it.
+    await Bun.sleep(1_100);
     const { deploymentSpec } = await h.foundations();
     const first = await accept(h.engine, WORKER_DEPLOYMENT_FORM_URL, "deployment", deploymentSpec);
     const secondRequest = () =>
