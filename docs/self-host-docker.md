@@ -30,7 +30,7 @@ Build the image:
 docker build -t takoserver-selfhost:local .
 ```
 
-The base image pins Bun 1.4.0, matching `.bun-version`, by its registry digest,
+The base image pins Bun 1.4.3, matching `.bun-version`, by its registry digest,
 and dependencies come from the frozen lockfile. Only the source, its committed
 pricing configuration, the vendored Takoform v2.1.1 reference files, the
 lockfile and package manifest, the license and the operator and artifact CLIs

@@ -63,7 +63,7 @@ function databaseReader(db: Database) {
 async function main(): Promise<void> {
   const mode = process.argv[2];
   const configPath = process.argv[3];
-  if (Bun.version !== "1.4.0") throw new Error("process proof requires pinned Bun 1.4.0");
+  if (Bun.version !== "1.4.3") throw new Error("process proof requires pinned Bun 1.4.3");
   if (
     !configPath ||
     (mode !== "dispatch-after-import" && mode !== "dispatch-before-import" && mode !== "reconcile")
