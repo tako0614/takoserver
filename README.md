@@ -17,7 +17,7 @@ manage them.
 To serve Workers:
 
 - a Linux x86-64 machine with glibc 2.38 or newer, such as Ubuntu 24.04;
-- git, curl, jq, Bun 1.4.0, and the Go toolchain to build the Workflow
+- git, curl, jq, Bun 1.4.3, and the Go toolchain to build the Workflow
   execution guard;
 - the pinned `workerd`, attached to the
   [2.0.0-rc.1 pre-release](https://github.com/tako0614/takoserver/releases/tag/v2.0.0-rc.1);

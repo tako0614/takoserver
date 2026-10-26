@@ -238,7 +238,7 @@ function expectedConfiguration(
 }
 
 test("a killed post-import process reopens read-only without a second import", async () => {
-  expect(Bun.version).toBe("1.4.0");
+  expect(Bun.version).toBe("1.4.3");
   const fixture = prepareFixture();
   try {
     const snapshot = await fixture.snapshotPromise;
@@ -326,7 +326,7 @@ test("a killed post-import process reopens read-only without a second import", a
 });
 
 test("a killed pre-import process reopens held at 0057 without import", async () => {
-  expect(Bun.version).toBe("1.4.0");
+  expect(Bun.version).toBe("1.4.3");
   const fixture = prepareFixture();
   try {
     const snapshot = await fixture.snapshotPromise;

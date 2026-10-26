@@ -2586,8 +2586,8 @@ async function jsonObject(
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     controlError("invalid_argument", 400);
   }
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength === 0 || bytes.byteLength > limit) {
+  const bytes = await boundedBody(request, limit);
+  if (bytes === null || bytes.byteLength === 0) {
     controlError("invalid_argument", 400);
   }
   try {
@@ -2644,7 +2644,9 @@ async function boundedBody(request: Request, limit: number): Promise<Uint8Array 
       const part = await reader.read();
       if (part.done) break;
       if (!(part.value instanceof Uint8Array) || part.value.byteLength > limit - total) {
-        await reader.cancel().catch(() => undefined);
+        // A cloned Request tees its body: cancellation may wait for the unread
+        // sibling. Refusal must not await that sibling or drain it.
+        void reader.cancel().catch(() => undefined);
         return null;
       }
       chunks.push(part.value);

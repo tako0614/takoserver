@@ -83,14 +83,14 @@ as `KEY` and `ORG`; keep it open between steps.
   Keep a note of `$COMMIT`: an update later moves from it to a newer reviewed
   commit.
 
-- Bun at the version in `.bun-version` (currently 1.4.0), installed where the
+- Bun at the version in `.bun-version` (currently 1.4.3), installed where the
   `takoserver` user can run it. The installer's default location is the
   installing user's home, which `takoserver` cannot read when root runs it. As
   root, this installs `/usr/local/bin/bun`, the path the wrapper script of
   step 3 runs:
 
   ```sh
-  curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s bun-v1.4.0
+  curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s bun-v1.4.3
   ```
 
 - For the complete local Worker profile, two native binaries. Install both
