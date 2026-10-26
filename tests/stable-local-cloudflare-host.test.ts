@@ -111,6 +111,17 @@ describe("the stable local Cloudflare-backed Host", () => {
             bytes: `class RoadApp {
   fetch = async (request, env) => {
     const url = new URL(request.url);
+    if (url.pathname === "/bridge-echo") {
+      const headers = new Headers({
+        "content-type": "application/octet-stream",
+        "x-echo-method": request.method,
+        "x-echo-header": request.headers.get("x-bridge-probe"),
+        "x-echo-url": request.url,
+      });
+      headers.append("set-cookie", "bridge_a=1; Path=/");
+      headers.append("set-cookie", "bridge_b=2; Path=/");
+      return new Response(await request.arrayBuffer(), { status: 207, statusText: "Multi-Status", headers });
+    }
     if (url.pathname === "/api/health") {
       const table = await env.DB.prepare(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'road_probe'",
@@ -193,6 +204,27 @@ export { index_default as default };`,
       expect(fallback.status).toBe(200);
       expect(fallback.headers.get("content-type")).toStartWith("text/html");
       expect(await fallback.text()).toBe(indexHtml);
+      const bytes = new Uint8Array([0, 1, 2, 255, 65, 0, 66]);
+      const echo = await fetch(`${host.endpoint}/bridge-echo?keep=1`, {
+        method: "POST",
+        headers: { "x-bridge-probe": "retained" },
+        body: new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(bytes.subarray(0, 3));
+            controller.enqueue(bytes.subarray(3));
+            controller.close();
+          },
+        }),
+      });
+      expect(echo.status).toBe(207);
+      expect(echo.statusText).toBe("Multi-Status");
+      expect(echo.headers.get("x-echo-method")).toBe("POST");
+      expect(echo.headers.get("x-echo-header")).toBe("retained");
+      const echoedUrl = new URL(echo.headers.get("x-echo-url") ?? "missing");
+      expect(echoedUrl.pathname).toBe("/bridge-echo");
+      expect(echoedUrl.search).toBe("?keep=1");
+      expect(echo.headers.getSetCookie()).toEqual(["bridge_a=1; Path=/", "bridge_b=2; Path=/"]);
+      expect(new Uint8Array(await echo.arrayBuffer())).toEqual(bytes);
     } finally {
       await host.close();
     }
