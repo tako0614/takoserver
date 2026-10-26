@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import { Miniflare } from "miniflare";
 import { fetch } from "undici";
 
@@ -69,6 +71,76 @@ test("Miniflare HTTP preload closes connections without replacing the Undici dis
     expect(requests[1]?.port).toBeNumber();
     expect(requests[0]?.port).not.toBe(requests[1]?.port);
   } finally {
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+});
+
+test("Miniflare synchronous HTTP threads load the installed Undici dispatcher", async () => {
+  const requests: { connection: string | undefined; port: number | undefined; body: string }[] = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+    request.on("end", () => {
+      requests.push({
+        connection: request.headers.connection,
+        port: request.socket.remotePort,
+        body,
+      });
+      response.end("actual threaded HTTP response");
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("missing loopback listener");
+  // Match the actual SDK's eval Worker and owning filename resolution. The
+  // main test realm's module mock alone cannot reach this separate registry.
+  const worker = new Worker(
+    `const { parentPort, workerData } = require("node:worker_threads");
+     const actualRequire = require("node:module").createRequire(workerData.filename);
+     const { Pool, fetch } = actualRequire("undici");
+     (async () => {
+       const pool = new Pool(new URL(workerData.url).origin, { headersTimeout: 0, bodyTimeout: 0 });
+       const dispatch = pool.dispatch?.bind(pool);
+       let dispatches = 0;
+       if (dispatch) pool.dispatch = (options, handler) => { dispatches++; return dispatch(options, handler); };
+       try {
+         const bodies = [];
+         for (let i = 0; i < 2; i++) bodies.push(await (await fetch(workerData.url, { method: "POST", body: "retained threaded request", dispatcher: pool })).text());
+         parentPort.postMessage({ dispatch: typeof Pool.prototype.dispatch, dispatches, bodies });
+       } catch (error) { parentPort.postMessage({ error: String(error) }); }
+       finally { await pool.close?.(); }
+     })();`,
+    {
+      eval: true,
+      workerData: {
+        filename: createRequire(import.meta.url).resolve("miniflare"),
+        url: `http://127.0.0.1:${address.port}/`,
+      },
+    },
+  );
+  try {
+    const result = await new Promise((resolve, reject) => {
+      worker.once("message", resolve);
+      worker.once("error", reject);
+    });
+    expect(result).toEqual({
+      dispatch: "function",
+      dispatches: 2,
+      bodies: ["actual threaded HTTP response", "actual threaded HTTP response"],
+    });
+    expect(requests.map(({ connection, body }) => ({ connection, body }))).toEqual([
+      { connection: "close", body: "retained threaded request" },
+      { connection: "close", body: "retained threaded request" },
+    ]);
+    expect(requests[0]?.port).toBeNumber();
+    expect(requests[1]?.port).toBeNumber();
+    expect(requests[0]?.port).not.toBe(requests[1]?.port);
+  } finally {
+    await worker.terminate();
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     );
