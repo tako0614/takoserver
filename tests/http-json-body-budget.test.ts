@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createControlRoutes } from "../src/control.ts";
 import {
   buildApp,
   createEphemeralSql,
@@ -94,20 +95,98 @@ async function expectInvalidArgument(response: Response): Promise<void> {
   expect(body.error?.code).toBe("invalid_argument");
 }
 
+/** A valid sessions body padded to an exact wire byte length. */
+function sessionsJsonOf(totalBytes: number): string {
+  const prefix = JSON.stringify({ provider: "google", assertion: "inert-test-assertion" });
+  const body = prefix + " ".repeat(totalBytes - prefix.length);
+  expect(new TextEncoder().encode(body).byteLength).toBe(totalBytes);
+  return body;
+}
+
 describe("unauthenticated JSON route body budget", () => {
   test("an over-budget stream is refused and cancelled without being drained", async () => {
     const { fetch, verifyCalls } = app();
     const { stream, counters } = instrumentedStream(TOTAL_CHUNKS);
+    const request = sessionsRequest(stream);
+    const before = await settled(counters);
 
-    const response = await fetch(sessionsRequest(stream));
+    const response = await fetch(request);
 
     await expectInvalidArgument(response);
     // The decisive pair: the route stopped reading, and said so to the source.
     expect(counters.cancelled).toBe(true);
-    // Do not pin the incidental prefetch count; require it strictly bounded
-    // against what was offered (a full drain would equal TOTAL_CHUNKS).
-    expect(counters.pulls).toBeLessThan(TOTAL_CHUNKS / 4);
+    // Do not pin the incidental prefetch count; require the app's own demand
+    // strictly bounded above the Request-construction baseline (a full drain
+    // would pull all TOTAL_CHUNKS beyond it).
+    expect(counters.pulls - before).toBeLessThan(TOTAL_CHUNKS / 4);
     expect(verifyCalls()).toBe(0);
+  });
+
+  test("a cloned Hosted prepare body refuses before its unread sibling is cancelled", async () => {
+    let rpcCalls = 0;
+    // Only the actual pre-auth body parser is exercised. No native supplier,
+    // actor or payment is qualified by this deliberately unavailable transport.
+    const control = createControlRoutes({
+      publicOrigin: "https://api.takoserver.com",
+      accounts: {} as never,
+      inventory: {} as never,
+      deployments: {} as never,
+      attachments: {} as never,
+      migrations: {} as never,
+      forms: [],
+      identityProviders: [],
+      ledger: {} as never,
+      catalog: {} as never,
+      reseller: {} as never,
+      tokens: {} as never,
+      settlement,
+      clock: () => new Date(0),
+      hostedBrowserBillingRpc: {
+        async readBrowserBillingContinuation() {
+          rpcCalls++;
+          throw new Error("unreachable Hosted transport");
+        },
+        async claimBrowserBillingContinuation() {
+          rpcCalls++;
+          throw new Error("unreachable Hosted transport");
+        },
+        async recordBrowserBillingContinuationOutcome() {
+          rpcCalls++;
+          throw new Error("unreachable Hosted transport");
+        },
+      },
+    });
+    const { stream, counters } = instrumentedStream(TOTAL_CHUNKS);
+    const request = new Request(
+      `https://api.takoserver.com/v1/billing/hosted-continuations/${"a".repeat(64)}`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: stream,
+        duplex: "half",
+      } as RequestInit,
+    );
+    const before = await settled(counters);
+    const response = control(request, new URL(request.url));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const refusalDeadline = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), 1_000);
+    });
+    try {
+      const settledResponse = await Promise.race([response, refusalDeadline]);
+      expect(settledResponse).not.toBeNull();
+      if (settledResponse === null) throw new Error("body refusal waited for the unread sibling");
+      await expectInvalidArgument(settledResponse);
+      expect(counters.pulls - before).toBeLessThan(TOTAL_CHUNKS / 4);
+      expect(rpcCalls).toBe(0);
+      expect(request.bodyUsed).toBe(false);
+    } finally {
+      clearTimeout(timer);
+      // The original branch belongs to this fixture. Cancel it only after the
+      // response assertion, so cleanup cannot satisfy the behavior under test.
+      await request.body?.cancel();
+      await response.catch(() => undefined);
+    }
   });
 
   test("an empty stream and an absent body keep the same refusal", async () => {
@@ -145,6 +224,19 @@ describe("unauthenticated JSON route body budget", () => {
     expect(response.status).toBe(200);
     const body = (await response.json()) as { sessionToken?: unknown };
     expect(typeof body.sessionToken).toBe("string");
+  });
+
+  test("the exact 64KiB edge is accepted and one byte over is refused", async () => {
+    const { fetch, verifyCalls } = app();
+
+    const ok = await fetch(sessionsRequest(sessionsJsonOf(64 * 1_024)));
+    expect(verifyCalls()).toBe(1);
+    expect(ok.status).toBe(200);
+
+    const over = await fetch(sessionsRequest(sessionsJsonOf(64 * 1_024 + 1)));
+    await expectInvalidArgument(over);
+    // The accepted request already consumed the verifier call.
+    expect(verifyCalls()).toBe(1);
   });
 
   test("a body that is not an object keeps its refusal", async () => {

@@ -2641,7 +2641,9 @@ async function boundedBody(request: Request, limit: number): Promise<Uint8Array 
       const part = await reader.read();
       if (part.done) break;
       if (!(part.value instanceof Uint8Array) || part.value.byteLength > limit - total) {
-        await reader.cancel().catch(() => undefined);
+        // A cloned Request tees its body: cancellation may wait for the unread
+        // sibling. Refusal must not await that sibling or drain it.
+        void reader.cancel().catch(() => undefined);
         return null;
       }
       chunks.push(part.value);
