@@ -5,7 +5,6 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -31,6 +30,8 @@ import {
   openWorkerdWorkerRuntimeOwner,
   type WorkerdWorkerRuntimeOwner,
 } from "../src/workerd-worker-runtime-owner.ts";
+
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const TARGET_KEY = "fixture-v2-worker-runtime-owner";
 const CHILD_SOURCE = `
@@ -75,8 +76,9 @@ test("accepted Deployment create, update, replay and delete settle only through 
   const binary = join(root, "bun-workerd-stand-in.js");
   await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
   await chmod(binary, 0o700);
-  const db = new Database(join(root, "state.sqlite"));
-  migrateSqlite(db);
+  const databasePath = join(root, "state.sqlite");
+  writeMigrateSqliteFile(databasePath);
+  const db = new Database(databasePath);
   const sql = createSqliteSql(db);
   const fileBytes = new TextEncoder().encode("<h1>owned static worker</h1>");
   const fileUrl = "https://artifacts.example.test/static/index.html";
@@ -105,13 +107,17 @@ test("accepted Deployment create, update, replay and delete settle only through 
   let owner: WorkerdWorkerRuntimeOwner | undefined;
   let loseNextOwnerAcknowledgement = false;
   let clockMs = Date.now();
+  const now = () => {
+    clockMs = Math.max(clockMs, Date.now());
+    return new Date(clockMs);
+  };
   const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
   const deploymentForm = createWorkerDeploymentForm({
     targetKey: TARGET_KEY,
     publicationState,
     scheduledAttachments: createWorkerCronTriggerAdmissionReader({
       sql,
-      now: () => new Date(clockMs),
+      now,
     }),
     ownerForWorker(workerUid) {
       const selectedOwner = owner;
@@ -167,7 +173,7 @@ test("accepted Deployment create, update, replay and delete settle only through 
   };
   const engine = createTakoformV2Engine({
     sql,
-    now: () => new Date(clockMs),
+    now,
     replayWindowSeconds: 3600,
     leaseMilliseconds: 1_000,
     authorize: async () => true,
@@ -189,6 +195,9 @@ test("accepted Deployment create, update, replay and delete settle only through 
   };
   try {
     const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
+    // Keep this wait before the asset claim: a frozen Engine clock must not
+    // hand SQLite an already-expired lease after a slow prerequisite.
+    await Bun.sleep(1_100);
     const asset = await create(STATIC_ASSET_BUNDLE_FORM_URL, "assets", {
       artifact: { url: manifestUrl, sha256: sha256(manifestBytes) },
     });

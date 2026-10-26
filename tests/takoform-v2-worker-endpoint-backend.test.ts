@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { type JsonObject, SqlError } from "../src/ports.ts";
 import { createSelfhostV2WorkerEndpointFrontend } from "../src/selfhost-v2-worker-endpoint-frontend.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -43,6 +42,8 @@ import {
   createV2WorkerPublicationState,
 } from "../src/takoform-v2/worker-publication-state.ts";
 import type { V2WorkerRuntimeOwnerExecutionResult } from "../src/workerd-worker-runtime-owner.ts";
+
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const TARGET_KEY = "fixture-v2-worker-endpoint";
 const HOSTNAME = "assigned.example.test";
@@ -183,8 +184,9 @@ async function exerciseEndpoint(
   preCreateDelayMs = 0,
 ): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), "v2-endpoint-backend-"));
-  const db = new Database(join(root, "state.sqlite"));
-  migrateSqlite(db);
+  const databasePath = join(root, "state.sqlite");
+  writeMigrateSqliteFile(databasePath);
+  const db = new Database(databasePath);
   const sql = createSqliteSql(db);
   let clockMs = Date.now();
   const now = () => {
@@ -853,8 +855,9 @@ test("forward Endpoint preserves retained predicate bytes and exact parameters",
 
 test("forward Endpoint real Core capture and SQL guard close04/05 and06/05/07 without Container serving", async () => {
   const root = mkdtempSync(join(tmpdir(), "forward-endpoint-admission-"));
-  const db = new Database(join(root, "state.sqlite"));
-  migrateSqlite(db);
+  const databasePath = join(root, "state.sqlite");
+  writeMigrateSqliteFile(databasePath);
+  const db = new Database(databasePath);
   const sql = createSqliteSql(db);
   const principal = "org-forward-endpoint";
   const now = () => new Date();
