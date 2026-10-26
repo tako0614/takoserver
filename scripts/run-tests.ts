@@ -86,7 +86,6 @@ const child = Bun.spawn(
     "--bail=1",
     `--parallel=${workers}`,
     "--preload=./tests/preload-isolated-tmpdir.ts",
-    "--preload=./tests/preload-miniflare-native-http.ts",
     `--timings=${report}`,
     "--update-timings",
     ...args,
