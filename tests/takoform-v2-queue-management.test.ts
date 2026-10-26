@@ -66,6 +66,12 @@ function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise
       }
     : sql;
   let nowMs = Date.now();
+  // Queue custody SQL fences claims against the DB wall clock; explicit
+  // backoff advances must remain monotonic without freezing later claims.
+  const now = () => {
+    nowMs = Math.max(nowMs, Date.now());
+    return new Date(nowMs);
+  };
   let capabilityAvailable = true;
   let servingSourceOperationId = "fixture-source";
   let servingVersionUid = "fixture-version";
@@ -192,7 +198,7 @@ function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise
   const consumer = createQueueConsumerForm({ sql, targetKey, capability });
   const engine = createTakoformV2Engine({
     sql,
-    now: () => new Date(nowMs),
+    now,
     replayWindowSeconds: 60,
     leaseMilliseconds: 1_000,
     authorize: async (who, where) => who === principal && where === space,
@@ -748,6 +754,8 @@ test("registered batch selection is UID-scoped and DELETE closes admission befor
       worker: { resourceUid: worker.resourceUid },
     });
     f.setServingSource(deployment.id);
+    // The DB clock advances before this new claim, even on a slow Host.
+    await Bun.sleep(1_100);
     const consumer = await f.create(
       QUEUE_CONSUMER_FORM_URL,
       "consumer",
@@ -1102,6 +1110,8 @@ test("a pre-send cancellation after SQLite handle reopen refunds the exact unsen
     expect(next.claims[0]?.attempts).toBe(1);
     // Accepted DELETE closes SQL send authorization, so a registered but
     // unsent batch need not wait for its reservation deadline to drain.
+    // A new DELETE must acquire a fresh lease after a delayed pre-send phase.
+    await Bun.sleep(1_100);
     const deleted = await f.engine.acceptDelete({
       principal,
       key: "unsent-consumer-delete-key-01",
