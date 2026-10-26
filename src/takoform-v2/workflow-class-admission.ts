@@ -22,6 +22,8 @@ import {
 } from "./types.ts";
 import type { V2WorkflowClassAdmission } from "./workflow-backend.ts";
 
+const CAPTURE_READ_BATCH_SIZE = 64;
+
 type Evidence = { readonly table: string; readonly key: readonly string[]; readonly rows: Row[] };
 type Version = {
   readonly uid: string;
@@ -391,8 +393,8 @@ async function recapture(
   readPlan: readonly SqlStatement[],
 ): Promise<Capture> {
   const rows: (readonly Row[])[] = [];
-  for (let offset = 0; offset < readPlan.length; offset += 64) {
-    const statements = readPlan.slice(offset, offset + 64);
+  for (let offset = 0; offset < readPlan.length; offset += CAPTURE_READ_BATCH_SIZE) {
+    const statements = readPlan.slice(offset, offset + CAPTURE_READ_BATCH_SIZE);
     const results = await input.sql.batch(statements);
     if (!Array.isArray(results) || results.length !== statements.length) throw busy();
     for (const result of results) {
