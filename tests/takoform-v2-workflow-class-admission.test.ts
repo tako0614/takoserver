@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
 import { Miniflare } from "miniflare";
-import type { Sql, SqlStatement, SqlWrite } from "../src/ports.ts";
+import type { Sql, SqlParam, SqlStatement, SqlWrite } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
 import {
@@ -258,7 +258,7 @@ function measuredReadFixture() {
   const db = migrateSqliteDatabase();
   const original = createSqliteSql(db);
   let roundtrips = 0;
-  let fault: "truncated" | "malformed-rows" | null = null;
+  let fault: "truncated" | "extra-result" | "malformed-rows" | null = null;
   const sql: Sql = {
     async query(statement, params) {
       roundtrips++;
@@ -270,8 +270,9 @@ function measuredReadFixture() {
       const results = await original.batch(statements);
       if (fault && statements.every(({ sql }) => /^\s*SELECT\b/iu.test(sql))) {
         if (fault === "truncated") return results.slice(1);
+        if (fault === "extra-result") return [...results, ...results.slice(0, 1)];
         return results.map((result, index) =>
-          index === 0 ? { ...result, rows: null } : result,
+          index === 0 ? { ...result, rows: { 0: result.rows[0], length: 1 } } : result,
         ) as unknown as readonly SqlWrite[];
       }
       return results;
@@ -298,17 +299,17 @@ async function createMeasuredGraph(f: ReturnType<typeof measuredReadFixture>, co
   const versions = [];
   for (let index = 0; index < count; index++)
     versions.push(await f.version(worker.resourceUid, `read-plan-version-${count}-${index}`));
-  await f.create(WORKER_DEPLOYMENT_FORM_URL, `read-plan-deployment-${count}`, {
+  const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, `read-plan-deployment-${count}`, {
     worker: { resourceUid: worker.resourceUid },
     versions: versions.map((version) => ({
       workerVersion: { resourceUid: version.resourceUid },
       weight: 10_000 / count,
     })),
   });
-  return { worker, versions };
+  return { worker, versions, deployment };
 }
 
-test("Workflow currentness keeps database roundtrips linear for one and eight Versions", async () => {
+test("Workflow currentness bounds roundtrips for one and eight Versions", async () => {
   const f = measuredReadFixture();
   const roundtrips: number[] = [];
   try {
@@ -326,8 +327,8 @@ test("Workflow currentness keeps database roundtrips linear for one and eight Ve
   }
 });
 
-for (const fault of ["truncated", "malformed-rows"] as const) {
-  test(`Workflow currentness refuses a ${fault} fresh read acknowledgement`, async () => {
+for (const fault of ["truncated", "extra-result", "malformed-rows"] as const) {
+  test(`Workflow currentness refuses fresh read acknowledgement: ${fault}`, async () => {
     const f = measuredReadFixture();
     try {
       const { worker } = await createMeasuredGraph(f, 1);
@@ -355,6 +356,53 @@ test("Workflow currentness re-reads the graph after awaited class inspection", a
             '{"ready":false}',
             versions[0]?.resourceUid ?? "",
           ]);
+          return { outcome: "valid" };
+        },
+      },
+    });
+    expect((await admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    expect(inspections).toBe(1);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("Workflow currentness retains the ambiguous completed-history refusal", async () => {
+  const f = measuredReadFixture();
+  try {
+    const { worker, deployment } = await createMeasuredGraph(f, 1);
+    let inspections = 0;
+    const admission = createV2WorkflowClassAdmission({
+      sql: f.sql,
+      targetKey: TARGET,
+      bundleCustody: f.bundleCustody,
+      inspector: {
+        async inspectWorkflowClass() {
+          inspections++;
+          const [operation] = await f.original.query(
+            "SELECT * FROM tf_v2_operations WHERE id = ?",
+            [deployment.id],
+          );
+          if (!operation) throw new Error("missing completed Deployment");
+          // The schema permits direct terminal inserts even though the ordinary
+          // writer only mints queued Operations. Keep the recapture's refusal.
+          const extra = {
+            ...operation,
+            id: "read-plan-ambiguous-completed-operation",
+            replay_key: "read-plan-ambiguous-completed-key",
+            backend_key: "read-plan-ambiguous-completed-backend",
+            acceptance_order: null,
+          };
+          const columns = Object.keys(extra);
+          await f.original.run(
+            `INSERT INTO tf_v2_operations (${columns.map((column) => `"${column}"`).join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+            Object.values(extra) as SqlParam[],
+          );
+          const [count] = await f.original.query(
+            "SELECT count(*) AS n FROM tf_v2_operations WHERE resource_uid = ? AND generation = 1 AND action IN ('create','update') AND status = 'succeeded' AND effect = 'complete'",
+            [deployment.resourceUid],
+          );
+          expect(count?.n).toBe(2);
           return { outcome: "valid" };
         },
       },
