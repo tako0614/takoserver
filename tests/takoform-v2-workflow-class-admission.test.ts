@@ -345,6 +345,7 @@ test("Workflow currentness re-reads the graph after awaited class inspection", a
   try {
     const { worker, versions } = await createMeasuredGraph(f, 1);
     let inspections = 0;
+    let drifted = false;
     const admission = createV2WorkflowClassAdmission({
       sql: f.sql,
       targetKey: TARGET,
@@ -356,11 +357,17 @@ test("Workflow currentness re-reads the graph after awaited class inspection", a
             '{"ready":false}',
             versions[0]?.resourceUid ?? "",
           ]);
+          const [row] = await f.original.query(
+            "SELECT observed_json FROM tf_v2_resources WHERE uid = ?",
+            [versions[0]?.resourceUid ?? ""],
+          );
+          drifted = row?.observed_json === '{"ready":false}';
           return { outcome: "valid" };
         },
       },
     });
     expect((await admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    expect(drifted).toBe(true);
     expect(inspections).toBe(1);
   } finally {
     f.db.close();
@@ -372,6 +379,7 @@ test("Workflow currentness retains the ambiguous completed-history refusal", asy
   try {
     const { worker, deployment } = await createMeasuredGraph(f, 1);
     let inspections = 0;
+    let completedRows: unknown;
     const admission = createV2WorkflowClassAdmission({
       sql: f.sql,
       targetKey: TARGET,
@@ -402,12 +410,15 @@ test("Workflow currentness retains the ambiguous completed-history refusal", asy
             "SELECT count(*) AS n FROM tf_v2_operations WHERE resource_uid = ? AND generation = 1 AND action IN ('create','update') AND status = 'succeeded' AND effect = 'complete'",
             [deployment.resourceUid],
           );
-          expect(count?.n).toBe(2);
+          completedRows = count?.n;
           return { outcome: "valid" };
         },
       },
     });
     expect((await admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    // Inspector exceptions are translated to unavailable: prove the mutation
+    // completed outside that catchable callback before accepting the refusal.
+    expect(completedRows).toBe(2);
     expect(inspections).toBe(1);
   } finally {
     f.db.close();
