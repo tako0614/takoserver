@@ -1,5 +1,5 @@
 import { canonicalJson } from "../json.ts";
-import type { JsonObject, Row, Sql, SqlParam } from "../ports.ts";
+import type { JsonObject, Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import type { WorkerModuleSemanticInspector } from "../worker-module-inspection-contract.ts";
 import type { DurableWorkflowSpec } from "./forms/durable-workflow.ts";
 import { WORKER_BUNDLE_FORM_URL } from "./forms/worker-bundle.ts";
@@ -30,6 +30,7 @@ type Version = {
   readonly bundleObserved: JsonObject | null;
 };
 type Capture = {
+  readonly readPlan: readonly SqlStatement[];
   readonly evidence: readonly Evidence[];
   readonly versions: readonly Version[];
   readonly activeVersionUids: ReadonlySet<string>;
@@ -100,7 +101,26 @@ async function capture(input: {
   readonly targetKey: string;
   readonly workerUid: string;
 }): Promise<Capture> {
-  const { sql } = input;
+  const readPlan: SqlStatement[] = [];
+  const sql: Sql = {
+    async query(statement, params) {
+      readPlan.push(
+        Object.freeze({
+          sql: statement,
+          params: Object.freeze(
+            (params ?? []).map((value) => (value instanceof ArrayBuffer ? value.slice(0) : value)),
+          ),
+        }),
+      );
+      return await input.sql.query(statement, params);
+    },
+    async run() {
+      throw busy();
+    },
+    async batch() {
+      throw busy();
+    },
+  };
   const evidence = new Map<string, Evidence>();
   const add = (table: string, key: readonly string[], row: Row) => {
     const current = evidence.get(table) ?? { table, key, rows: [] };
@@ -355,11 +375,67 @@ async function capture(input: {
     ),
   }));
   return {
+    readPlan: Object.freeze(readPlan),
     evidence: ordered,
     versions,
     activeVersionUids,
     vector: canonicalJson(ordered as unknown as JsonObject),
   };
+}
+
+// Every await boundary still runs the entire capture validator against fresh
+// SQL results. Batching only removes per-read D1 transport/commit boundaries;
+// no result or authorization is reused from the original capture.
+async function recapture(
+  input: Parameters<typeof capture>[0],
+  readPlan: readonly SqlStatement[],
+): Promise<Capture> {
+  const rows: (readonly Row[])[] = [];
+  for (let offset = 0; offset < readPlan.length; offset += 64) {
+    const statements = readPlan.slice(offset, offset + 64);
+    const results = await input.sql.batch(statements);
+    if (!Array.isArray(results) || results.length !== statements.length) throw busy();
+    for (const result of results) {
+      if (!Array.isArray(result?.rows)) throw busy();
+      rows.push(result.rows);
+    }
+  }
+  let next = 0;
+  const sql: Sql = {
+    async query(statement, params) {
+      const expected = readPlan[next];
+      const actualParams = params ?? [];
+      const expectedParams = expected?.params ?? [];
+      if (
+        !expected ||
+        statement !== expected.sql ||
+        actualParams.length !== expectedParams.length ||
+        actualParams.some((value, index) => !sameReadParam(value, expectedParams[index]))
+      )
+        throw busy();
+      const result = rows[next++];
+      if (!result) throw busy();
+      return result;
+    },
+    async run() {
+      throw busy();
+    },
+    async batch() {
+      throw busy();
+    },
+  };
+  const current = await capture({ ...input, sql });
+  if (next !== readPlan.length) throw busy();
+  return current;
+}
+
+function sameReadParam(actual: SqlParam, expected: SqlParam | undefined): boolean {
+  if (actual instanceof ArrayBuffer && expected instanceof ArrayBuffer) {
+    const a = new Uint8Array(actual);
+    const b = new Uint8Array(expected);
+    return a.length === b.length && a.every((value, index) => value === b[index]);
+  }
+  return Object.is(actual, expected);
 }
 
 function predicateFor(input: {
@@ -431,7 +507,7 @@ export function createV2WorkflowClassAdmission(options: {
     if (!captured) return { captured: null, invalid: false, unavailable: true };
     const stillCurrent = async (): Promise<boolean> => {
       try {
-        return (await capture(captureInput)).vector === captured.vector;
+        return (await recapture(captureInput, captured.readPlan)).vector === captured.vector;
       } catch {
         return false;
       }
