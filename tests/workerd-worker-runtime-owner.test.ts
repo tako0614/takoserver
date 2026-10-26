@@ -2043,6 +2043,8 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     continueActorTurn?.();
     return activeActorTurnRead ?? owner.selectWorkflowExecution(request);
   };
+  let releaseLease: (() => Promise<void>) | undefined;
+  let deletion: ReturnType<typeof owner.execute> | undefined;
   try {
     expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
     expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
@@ -2063,6 +2065,7 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     expect(selection.selected.hostModules.size).toBeGreaterThan(0);
     expect(await selection.stillCurrent()).toBe(true);
     const lease = await selection.acquirePrivateServiceBindings(new AbortController().signal);
+    releaseLease = () => lease.release();
     expect(lease.services).toEqual([]);
     const mutable = { ...request };
     const pending = owner.selectWorkflowExecution(mutable);
@@ -2086,14 +2089,24 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
       continueActorTurn = resolve;
     }).then(() => owner.selectWorkflowExecution(request));
     let deleteFinished = false;
-    const deletion = owner.execute(execution(workerUid, deleteId, "delete")).then((result) => {
+    deletion = owner.execute(execution(workerUid, deleteId, "delete")).then((result) => {
       deleteFinished = true;
       return result;
     });
-    await Bun.sleep(30);
+    const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+    const statePath = join(owned.root, "owners", workerKey, "runtime-owner.json");
+    await until(() => {
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+        incarnations: readonly { operationId: string; status: string }[];
+      };
+      return state.incarnations.some(
+        (record) => record.operationId === createId && record.status === "retiring",
+      );
+    });
     expect(deleteFinished).toBe(false);
     expect(await selection.stillCurrent()).toBe(false);
     await lease.release();
+    releaseLease = undefined;
     expect(await deletion).toMatchObject({
       kind: "confirmed",
       identity: null,
@@ -2101,6 +2114,12 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     expect(actorDrainCalls).toBe(2);
     expect(await selection.stillCurrent()).toBe(false);
   } finally {
+    // An assertion failure must also finish the private lease and its DELETE;
+    // otherwise close correctly refuses and the abandoned lock reaches GC.
+    await releaseLease?.();
+    allowActorDrain = true;
+    if (deletion) await deletion;
+    else await owner.execute(execution(workerUid, deleteId, "delete"));
     await owner.close().catch(() => undefined);
     await owned.cleanup();
   }
