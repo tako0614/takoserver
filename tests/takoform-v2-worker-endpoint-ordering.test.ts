@@ -51,8 +51,10 @@ function harness() {
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
   const sql = createSqliteSql(db);
-  let clockMs = Date.now();
-  const now = () => new Date(clockMs);
+  // SQL custody guards read SQLite's wall clock. Keep new claims on that
+  // clock while allowing explicit retry-backoff advances in these journeys.
+  let clockOffsetMs = 0;
+  const now = () => new Date(Date.now() + clockOffsetMs);
   const fileUrl = "https://artifacts.example.test/ordering/index.html";
   const manifestUrl = "https://artifacts.example.test/ordering/manifest.json";
   const fileBytes = new TextEncoder().encode("<h1>ordering</h1>");
@@ -192,7 +194,7 @@ function harness() {
     engineWith,
     ownerCalls,
     advance(ms: number) {
-      clockMs += ms;
+      clockOffsetMs += ms;
     },
     async foundations(target = engine) {
       const created = async (form: string, name: string, spec: JsonObject) => {
