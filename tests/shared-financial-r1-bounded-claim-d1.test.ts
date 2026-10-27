@@ -3,7 +3,7 @@ import { Miniflare } from "miniflare";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { canonicalJson } from "../src/json.ts";
 import { createMoneyCutoverSql } from "../src/money-cutover-sql.ts";
-import type { Sql, SqlParam } from "../src/ports.ts";
+import type { Sql, SqlParam, SqlStatement } from "../src/ports.ts";
 import {
   buildFinancialR1BoundedAttemptCustodyStatement,
   createFinancialR1AttemptDataReader,
@@ -39,7 +39,7 @@ async function copyExactSyntheticFixture(source: Awaited<ReturnType<typeof fixtu
       "SELECT type, name, sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 WHEN 'trigger' THEN 3 ELSE 4 END, name",
     )
     .all() as { type: string; name: string; sql: string }[];
-  for (const object of schema) await target.run(object.sql);
+  const statements: SqlStatement[] = schema.map(({ sql }) => ({ sql }));
 
   const tables = schema.filter((object) => object.type === "table");
   for (const { name } of tables) {
@@ -59,11 +59,14 @@ async function copyExactSyntheticFixture(source: Awaited<ReturnType<typeof fixtu
           throw new Error(`missing fixture value for ${name}.${column}`);
         return row[column];
       });
-      await target.run(
-        `INSERT INTO ${quoted} (${writable.map((column) => `"${column}"`).join(",")}) VALUES (${writable.map(() => "?").join(",")})`,
-        values,
-      );
+      statements.push({
+        sql: `INSERT INTO ${quoted} (${writable.map((column) => `"${column}"`).join(",")}) VALUES (${writable.map(() => "?").join(",")})`,
+        params: values,
+      });
     }
+  }
+  for (let offset = 0; offset < statements.length; offset += 64) {
+    await target.batch(statements.slice(offset, offset + 64));
   }
 }
 
