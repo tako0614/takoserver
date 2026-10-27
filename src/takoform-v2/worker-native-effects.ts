@@ -1,5 +1,9 @@
 import { canonicalJson } from "../json.ts";
 import type { Clock, Sql, SqlParam } from "../ports.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  isForwardFamilyWorkerVersionForm,
+} from "./forms/container-consumer-specs.ts";
 import { FORWARD_WORKER_VERSION_FORM_URL, WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
 import { forwardWorkerNativeSchemaReady } from "./forward-worker-native-schema.ts";
 import type { V2Execution } from "./types.ts";
@@ -161,6 +165,25 @@ export function createForwardV2NativeEffectCustody(options: {
   );
 }
 
+/**
+ * Source-selected WV0.8 custody: the 0.7 native identity/receipt ABI under its own Form.
+ *
+ * FAILS CLOSED against the installed 106 forward native schema: its insert guard admits only
+ * WorkerVersion 0.5.0 / 0.7.0, so a grant for a 0.8.0 Version throws at the insert guard until a
+ * successor schema widens those domains together with the readiness predicate every forward
+ * custody repeats. Deliberately not exported from the package barrel; a test pins the refusal.
+ */
+export function createContainerConsumerV2NativeEffectCustody(options: {
+  readonly sql: Sql;
+  readonly now?: Clock;
+}): V2NativeEffectCustody {
+  return createNativeEffectCustody(
+    options,
+    CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+    ` AND ${forwardWorkerNativeSchemaReady()}`,
+  );
+}
+
 function createNativeEffectCustody(
   options: { readonly sql: Sql; readonly now?: Clock },
   form: string,
@@ -168,7 +191,7 @@ function createNativeEffectCustody(
 ): V2NativeEffectCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
-  const receiptReadySuffix = form === FORWARD_WORKER_VERSION_FORM_URL ? requiredDomainSuffix : "";
+  const receiptReadySuffix = isForwardFamilyWorkerVersionForm(form) ? requiredDomainSuffix : "";
 
   function currentTime(): number | null {
     const value = now().getTime();

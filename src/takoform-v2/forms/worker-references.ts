@@ -240,11 +240,11 @@ export function referencesForWorkerForm(
   }
 }
 
-function observed(resourceUid: string, formUrl: string): V2ReferenceRequirement {
+export function observed(resourceUid: string, formUrl: string): V2ReferenceRequirement {
   return { resourceUid, formUrl, readiness: "observed" };
 }
 
-function normalizeRequirements(
+export function normalizeRequirements(
   requirements: readonly V2ReferenceRequirement[],
 ): readonly V2ReferenceRequirement[] {
   const byUid = new Map<string, V2ReferenceRequirement>();

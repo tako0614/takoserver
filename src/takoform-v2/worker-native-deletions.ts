@@ -1,5 +1,9 @@
 import { canonicalJson } from "../json.ts";
 import type { Clock, JsonObject, Sql, SqlParam } from "../ports.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  isForwardFamilyWorkerVersionForm,
+} from "./forms/container-consumer-specs.ts";
 import { FORWARD_WORKER_VERSION_FORM_URL, WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
 import { forwardWorkerNativeSchemaReady } from "./forward-worker-native-schema.ts";
 import type { V2Execution } from "./types.ts";
@@ -182,14 +186,30 @@ export function createForwardV2NativeDeletionCustody(options: {
   return createNativeDeletionCustody(options, FORWARD_WORKER_VERSION_FORM_URL);
 }
 
+/**
+ * Source-selected WV0.8 cleanup.
+ *
+ * FAILS CLOSED against the installed 106 forward native schema: its stage/send/absence guards
+ * admit only WorkerVersion 0.5.0 / 0.7.0, so a 0.8.0 deletion cannot be staged until a
+ * successor schema widens those domains. This follows from the schema guards, not a deletion
+ * execution test. Not exported from the package barrel.
+ */
+export function createContainerConsumerV2NativeDeletionCustody(options: {
+  readonly sql: Sql;
+  readonly now?: Clock;
+}): V2NativeDeletionCustody {
+  return createNativeDeletionCustody(options, CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL);
+}
+
 function createNativeDeletionCustody(
   options: { readonly sql: Sql; readonly now?: Clock },
   form: string,
 ): V2NativeDeletionCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
-  const forwardReady =
-    form === FORWARD_WORKER_VERSION_FORM_URL ? forwardWorkerNativeSchemaReady() : null;
+  const forwardReady = isForwardFamilyWorkerVersionForm(form)
+    ? forwardWorkerNativeSchemaReady()
+    : null;
   const readySuffix = forwardReady === null ? "" : ` AND (${forwardReady})`;
   const claim = `${CLAIM}${readySuffix}`;
 

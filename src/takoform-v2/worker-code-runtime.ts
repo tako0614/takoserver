@@ -66,7 +66,7 @@ export type V2WorkerCodeDeploymentVariant = WorkerdDeploymentVariant<WorkerdSite
 export async function projectV2WorkerCodeVersion(input: {
   readonly identity: V2WorkerCodeVersionIdentity;
   readonly spec: unknown;
-  readonly sourceForm?: typeof import("./forms/worker-specs.ts").FORWARD_WORKER_VERSION_FORM_URL;
+  readonly sourceForm?: import("./forms/container-consumer-specs.ts").ForwardFamilyWorkerVersionFormUrl;
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: WorkerdRuntime["inspectModule"];

@@ -5,6 +5,20 @@ import type {
   SqlArtifactCustodyRead,
   SqlArtifactCustodyUnverified,
 } from "./forms/artifact-custody.ts";
+import {
+  referencesForContainerConsumerWorkerDeployment,
+  referencesForForwardFamilyWorkerVersion,
+} from "./forms/container-consumer-references.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_FAMILY_WORKER_DEPLOYMENT_FORM_URLS,
+  type ForwardFamilyWorkerDeploymentFormUrl,
+  type ForwardFamilyWorkerVersionFormUrl,
+  isForwardFamilyWorkerDeploymentForm,
+  isForwardFamilyWorkerVersionForm,
+  selectableWorkerVersionForms,
+  WORKER_DEPLOYMENT_SLOT_FORM_URLS,
+} from "./forms/container-consumer-specs.ts";
 import { OBJECT_BUCKET_LIMITS, parseObjectBucketSpec } from "./forms/object-bucket.ts";
 import {
   type ObjectBucketBindingForm,
@@ -24,14 +38,11 @@ import {
 import type { WorkerBundleCustody } from "./forms/worker-bundle-backend.ts";
 import {
   referencesForForwardWorkerDeployment,
-  referencesForForwardWorkerVersion,
   referencesForWorkerDeployment,
   referencesForWorkerVersion,
 } from "./forms/worker-references.ts";
 import {
-  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
   FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_VERSION_FORM_URL,
   type ForwardWorkerVersionSpec,
   MODULE_WORKER_FORM_URL,
   parseForwardWorkerDeploymentSpec,
@@ -61,7 +72,7 @@ export interface V2ForwardWorkerFamilyProfile {
   readonly sourceOperationId: string;
   readonly resourceUid: string;
   readonly generation: number;
-  readonly form: typeof FORWARD_WORKER_VERSION_FORM_URL | typeof FORWARD_WORKER_DEPLOYMENT_FORM_URL;
+  readonly form: ForwardFamilyWorkerVersionFormUrl | ForwardFamilyWorkerDeploymentFormUrl;
   readonly principal: string;
   readonly space: string;
   readonly targetKey: string;
@@ -93,8 +104,8 @@ export interface V2WorkerPublicationSnapshot {
       readonly generation: number;
       readonly weight: number;
       readonly spec: WorkerVersionSpec;
-      /** Present only for a new, exact07 snapshot. */
-      readonly form?: typeof FORWARD_WORKER_VERSION_FORM_URL;
+      /** Present only for a new snapshot of an exact forward-family Version Form. */
+      readonly form?: ForwardFamilyWorkerVersionFormUrl;
       readonly bucketBindings?: readonly ObjectBucketBindingForm[];
     }[];
   } | null;
@@ -172,7 +183,7 @@ export interface V2WorkerVersionSnapshot {
     readonly uid: string;
     readonly generation: number;
     readonly spec: WorkerVersionSpec;
-    readonly form?: typeof FORWARD_WORKER_VERSION_FORM_URL;
+    readonly form?: ForwardFamilyWorkerVersionFormUrl;
     readonly bucketBindings?: readonly ObjectBucketBindingForm[];
   };
 }
@@ -526,7 +537,7 @@ function confirmedServingSource(
   return (
     (row.form_url === WORKER_DEPLOYMENT_FORM_URL ||
       row.form_url === WORKER_ENDPOINT_FORM_URL ||
-      (forward && row.form_url === FORWARD_WORKER_DEPLOYMENT_FORM_URL)) &&
+      (forward && isForwardFamilyWorkerDeploymentForm(row.form_url))) &&
     op.resource_uid === row.uid &&
     op.principal === row.principal &&
     op.backend_id === row.backend_id &&
@@ -832,16 +843,18 @@ function createPublicationState(
   const now = options.now ?? (() => new Date());
   const publicationForms = (forward: boolean): readonly string[] =>
     forward
-      ? [
-          WORKER_DEPLOYMENT_FORM_URL,
-          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-          WORKER_ENDPOINT_FORM_URL,
-        ]
+      ? [...WORKER_DEPLOYMENT_SLOT_FORM_URLS, WORKER_ENDPOINT_FORM_URL]
       : [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL];
+  // Every Deployment Form a retained (0.4.0) publication must not share a Worker with.
+  const foreignFamilyForms = WORKER_DEPLOYMENT_SLOT_FORM_URLS.filter(
+    (form) => form !== WORKER_DEPLOYMENT_FORM_URL,
+  );
+  const forwardFormPlaceholders = `IN (${publicationForms(true)
+    .map(() => "?")
+    .join(", ")})`;
   // Extend only the source-selected closed scope; retained SQL stays byte-identical.
   const scopedSql = (query: string, forward: boolean) =>
-    forward ? query.replaceAll("IN (?, ?)", "IN (?, ?, ?, ?)") : query;
+    forward ? query.replaceAll("IN (?, ?)", forwardFormPlaceholders) : query;
 
   async function resource(uid: string): Promise<ResourceRow | null> {
     return ((await sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [uid]))[0] ??
@@ -862,16 +875,15 @@ function createPublicationState(
       if (
         !source ||
         !op ||
-        (source.form_url !== FORWARD_WORKER_VERSION_FORM_URL &&
-          source.form_url !== FORWARD_WORKER_DEPLOYMENT_FORM_URL) ||
+        (!isForwardFamilyWorkerVersionForm(source.form_url) &&
+          !isForwardFamilyWorkerDeploymentForm(source.form_url)) ||
         (op.action !== "create" && op.action !== "update") ||
         !isCurrentClaim(op, source, execution, now().getTime())
       )
         return null;
-      const version =
-        source.form_url === FORWARD_WORKER_VERSION_FORM_URL
-          ? parseForwardWorkerVersionSpec(JSON.parse(op.accepted_spec_json))
-          : null;
+      const version = isForwardFamilyWorkerVersionForm(source.form_url)
+        ? parseForwardWorkerVersionSpec(JSON.parse(op.accepted_spec_json))
+        : null;
       const deployment = version
         ? null
         : parseForwardWorkerDeploymentSpec(JSON.parse(op.accepted_spec_json));
@@ -881,9 +893,11 @@ function createPublicationState(
       if (!refs) return null;
       const targets = refs.map((row) => ({ resourceUid: row.target_uid, formUrl: row.form_url }));
       const expected = version
-        ? referencesForForwardWorkerVersion(version, targets)
+        ? referencesForForwardFamilyWorkerVersion(source.form_url, version, targets)
         : deployment
-          ? referencesForForwardWorkerDeployment(deployment, targets)
+          ? source.form_url === CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL
+            ? referencesForContainerConsumerWorkerDeployment(deployment, targets)
+            : referencesForForwardWorkerDeployment(deployment, targets)
           : [];
       const edges = await sql.query(
         "SELECT target_uid FROM tf_v2_resource_references WHERE referrer_uid = ? ORDER BY target_uid",
@@ -1263,17 +1277,25 @@ function createPublicationState(
   async function exactVersionReferences(
     operationId: string,
     spec: WorkerVersionSpec,
-    forward = false,
+    versionForm: string,
   ): Promise<ReferenceRow[] | null> {
     const rows = await references(operationId);
     let expected: ReturnType<typeof referencesForWorkerVersion>;
     try {
-      expected = forward
-        ? referencesForForwardWorkerVersion(
-            parseForwardWorkerVersionSpec(spec),
-            (rows ?? []).map((row) => ({ resourceUid: row.target_uid, formUrl: row.form_url })),
-          )
-        : referencesForWorkerVersion(spec);
+      // The Version's own Form selects the reconstruction, so a 0.7.0 Version can never
+      // be re-read against 0.8.0's wider Container target set.
+      if (isForwardFamilyWorkerVersionForm(versionForm)) {
+        expected = referencesForForwardFamilyWorkerVersion(
+          versionForm,
+          parseForwardWorkerVersionSpec(spec),
+          (rows ?? []).map((row) => ({ resourceUid: row.target_uid, formUrl: row.form_url })),
+        );
+      } else if (versionForm === WORKER_VERSION_FORM_URL) {
+        expected = referencesForWorkerVersion(spec);
+      } else {
+        // Any other Form (for example the accepted-vocabulary-only 0.6.0) is never re-read here.
+        return null;
+      }
     } catch {
       return null;
     }
@@ -1354,16 +1376,10 @@ function createPublicationState(
     if (forward)
       return (await sql.query(
         `SELECT op.* FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid=op.resource_uid
-       WHERE r.form_url IN (?, ?, ?, ?) AND r.deleted_at IS NULL
+       WHERE r.form_url ${forwardFormPlaceholders} AND r.deleted_at IS NULL
        AND op.status IN ('queued','running','waiting_input','reconciling')
        AND json_extract(op.accepted_spec_json, '$.worker.resourceUid')=? ORDER BY op.created_at,op.id`,
-        [
-          WORKER_DEPLOYMENT_FORM_URL,
-          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-          WORKER_ENDPOINT_FORM_URL,
-          workerUid,
-        ],
+        [...publicationForms(true), workerUid],
       )) as unknown as OperationRow[];
     return (await sql.query(
       `SELECT op.* FROM tf_v2_operations op
@@ -1560,7 +1576,9 @@ function createPublicationState(
 
   async function captureVersion(execution: V2Execution, forward = false): Promise<VersionCapture> {
     if (
-      execution.form !== (forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL) ||
+      !(forward
+        ? isForwardFamilyWorkerVersionForm(execution.form)
+        : execution.form === WORKER_VERSION_FORM_URL) ||
       (execution.action !== "create" && execution.action !== "update")
     ) {
       return versionUnresolved(
@@ -1602,7 +1620,7 @@ function createPublicationState(
     } catch {
       return versionUnresolved("graph_unresolved", "Worker identity spec is invalid");
     }
-    const refRows = await exactVersionReferences(op.id, spec, forward);
+    const refRows = await exactVersionReferences(op.id, spec, execution.form);
     if (!refRows) {
       return versionUnresolved(
         "graph_unresolved",
@@ -1698,9 +1716,9 @@ function createPublicationState(
         uid: own.uid,
         generation: op.generation,
         spec,
-        ...(forward
+        ...(forward && isForwardFamilyWorkerVersionForm(execution.form)
           ? {
-              form: FORWARD_WORKER_VERSION_FORM_URL,
+              form: execution.form,
               bucketBindings: snapshotObjectBucketBindingForms(bucketBindings),
             }
           : {}),
@@ -1754,12 +1772,13 @@ function createPublicationState(
     input: LivePublicationCaptureInput | CurrentServingCaptureInput,
   ): Promise<Capture | CurrentCapture> {
     let forward = "forward" in input && input.forward === true;
-    let deploymentForm = forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL;
     const current = "currentServing" in input ? input.currentServing : null;
     const execution = "execution" in input ? input.execution : null;
     if (
       execution !== null &&
-      execution.form !== deploymentForm &&
+      !(forward
+        ? isForwardFamilyWorkerDeploymentForm(execution.form)
+        : execution.form === WORKER_DEPLOYMENT_FORM_URL) &&
       execution.form !== WORKER_ENDPOINT_FORM_URL
     )
       return unresolved("graph_unresolved", "This operation is not a Worker publication");
@@ -1771,22 +1790,31 @@ function createPublicationState(
     if (!op || !own) {
       return unresolved("graph_unresolved", "The accepted publication source is unavailable");
     }
+    // The Deployment Form that owns this Worker is the accepted Resource's own Form, never a
+    // request value; a forward scope without a Deployment owner keeps the 0.6.0 default.
+    let deploymentForm: string = forward
+      ? isForwardFamilyWorkerDeploymentForm(own.form_url)
+        ? own.form_url
+        : FORWARD_WORKER_DEPLOYMENT_FORM_URL
+      : WORKER_DEPLOYMENT_FORM_URL;
     if (forwardFamily && own.form_url === WORKER_ENDPOINT_FORM_URL) {
       // Endpoint keeps its owning03 identity. Select the accepted Deployment
       // family from this same SQL owner/Space, never from request metadata.
       const endpointWorker = workerUidFromOperation(op);
-      forward =
-        endpointWorker !== null &&
-        (
-          await matchingResources(
-            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-            endpointWorker,
-            op.principal,
-            own.space,
-            true,
-          )
-        ).length > 0;
-      deploymentForm = forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL;
+      let familyForm: ForwardFamilyWorkerDeploymentFormUrl | null = null;
+      if (endpointWorker !== null)
+        for (const candidate of FORWARD_FAMILY_WORKER_DEPLOYMENT_FORM_URLS)
+          if (
+            (await matchingResources(candidate, endpointWorker, op.principal, own.space, true))
+              .length > 0
+          ) {
+            familyForm = candidate;
+            break;
+          }
+      // Two forward Deployment Forms on one Worker pick the first here and then fail the
+      // exact-Form check below as a publication conflict.
+      forward = familyForm !== null;
+      deploymentForm = familyForm ?? WORKER_DEPLOYMENT_FORM_URL;
     }
     if (current && pendingStatuses.has(op.status)) {
       return unresolved("source_unsettled", "The serving source Operation is not terminal");
@@ -1893,7 +1921,7 @@ function createPublicationState(
         incumbentResource.space !== own.space ||
         (incumbentResource.form_url !== WORKER_DEPLOYMENT_FORM_URL &&
           incumbentResource.form_url !== WORKER_ENDPOINT_FORM_URL &&
-          (!forward || incumbentResource.form_url !== FORWARD_WORKER_DEPLOYMENT_FORM_URL)) ||
+          (!forward || !isForwardFamilyWorkerDeploymentForm(incumbentResource.form_url))) ||
         workerUidFromOperation(incumbent) !== workerUid ||
         (incumbentResource.deleted_at !== null &&
           !(incumbent.status === "succeeded" && incumbent.action === "delete")) ||
@@ -1970,11 +1998,7 @@ function createPublicationState(
         ? (async () =>
             (
               await Promise.all(
-                [
-                  WORKER_DEPLOYMENT_FORM_URL,
-                  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-                  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-                ].map((form) =>
+                WORKER_DEPLOYMENT_SLOT_FORM_URLS.map((form) =>
                   matchingResources(form, workerUid, op.principal, own.space, !!current),
                 ),
               )
@@ -2111,23 +2135,23 @@ function createPublicationState(
         }
       }
       const refRows = await references(chosenDeployment.op.id);
+      // Each Deployment Form selects from its own closed Version set (0.6.0 never gains 0.8.0).
+      const selectable = selectableWorkerVersionForms(chosenDeployment.row.form_url);
       if (
+        !selectable ||
         !refRows ||
         refRows.length !== spec.versions.length + 1 ||
         !hasReference(refRows, workerUid, MODULE_WORKER_FORM_URL, "observed") ||
-        spec.versions.some(
-          (item) =>
-            !hasReference(
-              refRows,
-              item.workerVersion.resourceUid,
-              forward
-                ? (refRows.find((ref) => ref.target_uid === item.workerVersion.resourceUid)
-                    ?.form_url ?? "")
-                : WORKER_VERSION_FORM_URL,
-              "ready",
-              workerUid,
-            ),
-        )
+        spec.versions.some((item) => {
+          const sealed = refRows.find(
+            (ref) => ref.target_uid === item.workerVersion.resourceUid,
+          )?.form_url;
+          return (
+            sealed === undefined ||
+            !selectable.includes(sealed) ||
+            !hasReference(refRows, item.workerVersion.resourceUid, sealed, "ready", workerUid)
+          );
+        })
       ) {
         return unresolved(
           "graph_unresolved",
@@ -2157,8 +2181,7 @@ function createPublicationState(
         const observed = row ? parseObject(row.observed_json) : null;
         if (
           !row ||
-          (row.form_url !== WORKER_VERSION_FORM_URL &&
-            (!forward || row.form_url !== FORWARD_WORKER_VERSION_FORM_URL)) ||
+          !selectable.includes(row.form_url) ||
           !hasReference(refRows, uid, row.form_url, "ready", workerUid) ||
           row.principal !== op.principal ||
           row.space !== own.space ||
@@ -2171,12 +2194,11 @@ function createPublicationState(
         }
         let versionSpec: WorkerVersionSpec;
         try {
-          versionSpec =
-            row.form_url === FORWARD_WORKER_VERSION_FORM_URL
-              ? parseForwardWorkerVersionSpec(parseObject(row.spec_json))
-              : parseWorkerVersionSpec(parseObject(row.spec_json));
+          versionSpec = isForwardFamilyWorkerVersionForm(row.form_url)
+            ? parseForwardWorkerVersionSpec(parseObject(row.spec_json))
+            : parseWorkerVersionSpec(parseObject(row.spec_json));
           if (
-            row.form_url === FORWARD_WORKER_VERSION_FORM_URL &&
+            isForwardFamilyWorkerVersionForm(row.form_url) &&
             !forwardContainerBindings &&
             parseForwardWorkerVersionSpec(versionSpec).containerBindings.length
           )
@@ -2194,11 +2216,7 @@ function createPublicationState(
           );
         }
         const versionReferences = last
-          ? await exactVersionReferences(
-              last.id,
-              versionSpec,
-              row.form_url === FORWARD_WORKER_VERSION_FORM_URL,
-            )
+          ? await exactVersionReferences(last.id, versionSpec, row.form_url)
           : null;
         if (!versionReferences) {
           return unresolved(
@@ -2214,7 +2232,7 @@ function createPublicationState(
           new Set(versionSpec.serviceBindings.map((item) => item.resource.resourceUid)),
           op.target_key,
           new Set(
-            forwardContainerBindings && row.form_url === FORWARD_WORKER_VERSION_FORM_URL
+            forwardContainerBindings && isForwardFamilyWorkerVersionForm(row.form_url)
               ? parseForwardWorkerVersionSpec(versionSpec).containerBindings.map(
                   (item) => item.resource.resourceUid,
                 )
@@ -2260,9 +2278,9 @@ function createPublicationState(
           generation: row.generation,
           weight: weighted.weight,
           spec: versionSpec,
-          ...(row.form_url === FORWARD_WORKER_VERSION_FORM_URL
+          ...(isForwardFamilyWorkerVersionForm(row.form_url)
             ? {
-                form: FORWARD_WORKER_VERSION_FORM_URL,
+                form: row.form_url,
                 bucketBindings: snapshotObjectBucketBindingForms(
                   versionSpec.bucketBindings.map((binding) => {
                     const ref = versionReferences.find(
@@ -2484,17 +2502,11 @@ function createPublicationState(
         sqlGuard = {
           sql: `(${sqlGuard.sql}) AND NOT EXISTS (
             SELECT 1 FROM tf_v2_resources foreign_family
-            WHERE foreign_family.form_url IN (?, ?) AND foreign_family.deleted_at IS NULL
+            WHERE foreign_family.form_url IN (${foreignFamilyForms.map(() => "?").join(", ")})
+              AND foreign_family.deleted_at IS NULL
               AND foreign_family.principal = ? AND foreign_family.space = ?
               AND json_extract(foreign_family.spec_json, '$.worker.resourceUid') = ?)`,
-          params: [
-            ...sqlGuard.params,
-            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-            op.principal,
-            own.space,
-            workerUid,
-          ],
+          params: [...sqlGuard.params, ...foreignFamilyForms, op.principal, own.space, workerUid],
         };
       }
     } catch {
@@ -2626,7 +2638,7 @@ function createPublicationState(
     if (forwardFamily) {
       const source = await operation(captured.currentServing.sourceOperationId);
       const owner = source ? await resource(source.resource_uid) : null;
-      if (owner?.form_url === FORWARD_WORKER_DEPLOYMENT_FORM_URL)
+      if (isForwardFamilyWorkerDeploymentForm(owner?.form_url))
         captured = { ...captured, forward: true };
     }
     let initial: CurrentCapture;
@@ -2872,11 +2884,11 @@ function createPublicationState(
         if (await hasPendingPublication(workerUid)) return { kind: "unknown" };
 
         if (forwardFamily) {
-          for (const form of [
-            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-          ])
-            if ((await matchingResources(form, workerUid, principal, space, true)).length > 0)
+          for (const form of WORKER_DEPLOYMENT_SLOT_FORM_URLS)
+            if (
+              form !== WORKER_DEPLOYMENT_FORM_URL &&
+              (await matchingResources(form, workerUid, principal, space, true)).length > 0
+            )
               return { kind: "unknown" };
         }
         const deployments = await matchingResources(
@@ -2989,11 +3001,11 @@ function createPublicationState(
           ],
         );
         if (forwardFamily) {
-          for (const form of [
-            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-          ])
-            if ((await matchingResources(form, workerUid, principal, space, true)).length > 0)
+          for (const form of WORKER_DEPLOYMENT_SLOT_FORM_URLS)
+            if (
+              form !== WORKER_DEPLOYMENT_FORM_URL &&
+              (await matchingResources(form, workerUid, principal, space, true)).length > 0
+            )
               return { kind: "unknown" };
         }
         if (
@@ -3083,7 +3095,7 @@ function createPublicationState(
     resolve: (input: { execution: V2Execution; incumbentSourceOperationId?: string }) =>
       resolvePublication({
         execution: input.execution,
-        ...(forwardFamily && input.execution.form === FORWARD_WORKER_DEPLOYMENT_FORM_URL
+        ...(forwardFamily && isForwardFamilyWorkerDeploymentForm(input.execution.form)
           ? { forward: true as const }
           : {}),
         ...(input.incumbentSourceOperationId === undefined

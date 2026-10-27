@@ -10,6 +10,13 @@ import type {
   V2WorkerSQLiteExternalUseInput,
 } from "../worker-invocation-port.ts";
 import {
+  type ForwardFamilyWorkerDeploymentFormUrl,
+  type ForwardFamilyWorkerVersionFormUrl,
+  isForwardFamilyWorkerDeploymentForm,
+  isForwardFamilyWorkerVersionForm,
+  selectableWorkerVersionForms,
+} from "./forms/container-consumer-specs.ts";
+import {
   FORWARD_WORKER_DEPLOYMENT_FORM_URL,
   FORWARD_WORKER_VERSION_FORM_URL,
 } from "./forms/worker-specs.ts";
@@ -599,36 +606,50 @@ export function createV2WorkerInvocationLifecycle(options: {
 export function createForwardV2WorkerInvocationLifecycle(options: {
   readonly sql: Sql;
   readonly now?: Clock;
-  readonly selectedVersionForm?: typeof VERSION_FORM | typeof FORWARD_WORKER_VERSION_FORM_URL;
+  readonly selectedVersionForm?: typeof VERSION_FORM | ForwardFamilyWorkerVersionFormUrl;
+  /**
+   * The exact Deployment Form whose active graph this lifecycle admits; 0.6.0 by default.
+   * `0.7.0` constructs, but Cron admission for it fails closed against the installed 106
+   * forward native schema (its guards admit only WorkerDeployment 0.4.0 / 0.6.0). This is
+   * established by the schema guards; the new-Form test covers construction, not Cron execution.
+   */
+  readonly deploymentForm?: ForwardFamilyWorkerDeploymentFormUrl;
 }): V2WorkerInvocationCustody {
   const selectedVersionForm = options.selectedVersionForm ?? FORWARD_WORKER_VERSION_FORM_URL;
+  const deploymentForm = options.deploymentForm ?? FORWARD_WORKER_DEPLOYMENT_FORM_URL;
+  if (!isForwardFamilyWorkerDeploymentForm(deploymentForm))
+    throw new TypeError("unsupported WorkerDeployment Form");
   if (
     selectedVersionForm !== VERSION_FORM &&
-    selectedVersionForm !== FORWARD_WORKER_VERSION_FORM_URL
+    !isForwardFamilyWorkerVersionForm(selectedVersionForm)
   )
     throw new TypeError("unsupported selected WorkerVersion Form");
-  return createWorkerInvocationLifecycle(options, true, selectedVersionForm);
+  // A Deployment never admits a Version Form outside its own closed set (0.6.0 never 0.8.0).
+  if (!selectableWorkerVersionForms(deploymentForm)?.includes(selectedVersionForm))
+    throw new TypeError("selected WorkerVersion Form is not selectable by this Deployment Form");
+  return createWorkerInvocationLifecycle(options, true, selectedVersionForm, deploymentForm);
 }
 
 function createWorkerInvocationLifecycle(
   options: { readonly sql: Sql; readonly now?: Clock },
   forward: boolean,
-  selectedVersionForm: typeof VERSION_FORM | typeof FORWARD_WORKER_VERSION_FORM_URL,
+  selectedVersionForm: typeof VERSION_FORM | ForwardFamilyWorkerVersionFormUrl,
+  forwardDeploymentForm: ForwardFamilyWorkerDeploymentFormUrl = FORWARD_WORKER_DEPLOYMENT_FORM_URL,
 ): V2WorkerInvocationCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
   const successorReady = forward ? forwardWorkerNativeSchemaReady() : null;
   const ready = (predicate: string) =>
     successorReady === null ? predicate : `(${predicate}) AND (${successorReady})`;
-  const deploymentForm = forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : DEPLOYMENT_FORM;
+  const deploymentForm = forward ? forwardDeploymentForm : DEPLOYMENT_FORM;
+  const releaseForms = (selectableWorkerVersionForms(deploymentForm) ?? [])
+    .map((form) => `'${form}'`)
+    .join(", ");
   const versionForm = selectedVersionForm;
   const cronAdmissionSql = forward
     ? ADMIT_CRON_SQL.replaceAll(DEPLOYMENT_FORM, deploymentForm)
         .replaceAll(VERSION_FORM, versionForm)
-        .replace(
-          `rv.form_url IS NOT '${versionForm}'`,
-          `rv.form_url NOT IN ('${VERSION_FORM}', '${FORWARD_WORKER_VERSION_FORM_URL}')`,
-        )
+        .replace(`rv.form_url IS NOT '${versionForm}'`, `rv.form_url NOT IN (${releaseForms})`)
         .replace(
           `(${v2WorkerInvocationSchemaReady("cron")})`,
           `(${ready(v2WorkerInvocationSchemaReady("cron"))})`,

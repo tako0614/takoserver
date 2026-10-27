@@ -60,6 +60,37 @@ export {
   type V2HeldArtifactSourceOptions,
 } from "./forms/artifact-source.ts";
 export { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./forms/at-least-once-queue.ts";
+export {
+  fixedReferencesForContainerConsumerWorkerDeployment,
+  fixedReferencesForContainerConsumerWorkerVersion,
+  fixedReferencesForForwardFamilyWorkerVersion,
+  prepareContainerConsumerWorkerDeploymentReferences,
+  prepareContainerConsumerWorkerVersionReferences,
+  referencesForContainerConsumerWorkerDeployment,
+  referencesForContainerConsumerWorkerVersion,
+  referencesForForwardFamilyWorkerVersion,
+} from "./forms/container-consumer-references.ts";
+export {
+  CONTAINER_0_1_FORM_URL,
+  CONTAINER_0_2_FORM_URL,
+  CONTAINER_CONSUMER_TARGET_FORM_URLS,
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  type ContainerConsumerTargetFormUrl,
+  FORWARD_FAMILY_WORKER_DEPLOYMENT_FORM_URLS,
+  FORWARD_FAMILY_WORKER_VERSION_FORM_URLS,
+  type ForwardFamilyWorkerDeploymentFormUrl,
+  type ForwardFamilyWorkerVersionFormUrl,
+  isContainerConsumerTargetFormUrl,
+  isForwardFamilyWorkerDeploymentForm,
+  isForwardFamilyWorkerVersionForm,
+  parseContainerConsumerWorkerDeploymentSpec,
+  parseContainerConsumerWorkerVersionSpec,
+  selectableWorkerVersionForms,
+  validateContainerConsumerWorkerDeploymentUpdate,
+  validateContainerConsumerWorkerVersionUpdate,
+  WORKER_DEPLOYMENT_SLOT_FORM_URLS,
+} from "./forms/container-consumer-specs.ts";
 export { DURABLE_WORKFLOW_FORM_URL } from "./forms/durable-workflow.ts";
 export {
   EDGE_KV_NAMESPACE_FORM_URL,
