@@ -2313,9 +2313,14 @@ class FormRoutePublication {
       "SELECT * FROM tf_v2_resource_references WHERE referrer_uid = ? ORDER BY target_uid",
       [String(source.resource.uid)],
     );
+    // The actual ModuleWorker Form declares no references. Core therefore
+    // retains no set row for it; bind that exact empty absence just as strictly
+    // as an explicitly sealed empty set. Nonempty or malformed sets still refuse.
+    const unsealedEmpty =
+      !sealed && exact && required.length === 0 && refs.length === 0 && edges.length === 0;
     if (
-      !sealed ||
-      sealed.sealed !== 1 ||
+      (!sealed && !unsealedEmpty) ||
+      (sealed !== null && sealed.sealed !== 1) ||
       (exact && refs.length !== required.length) ||
       required.some(
         (expected) =>
@@ -2331,7 +2336,14 @@ class FormRoutePublication {
       refs.some((ref) => !edges.some((edge) => edge.target_uid === ref.target_uid))
     )
       throw new TypeError("sealed/active source reference set changed");
-    evidence.add("tf_v2_operation_reference_sets", sealed);
+    if (sealed) evidence.add("tf_v2_operation_reference_sets", sealed);
+    else
+      evidence.require(
+        statement(
+          "NOT EXISTS (SELECT 1 FROM tf_v2_operation_reference_sets WHERE operation_id = ?)",
+          [operationId],
+        ),
+      );
     for (const ref of refs) evidence.add("tf_v2_operation_references", ref);
     for (const edge of edges) evidence.add("tf_v2_resource_references", edge);
     evidence.require(
