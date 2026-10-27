@@ -121,10 +121,16 @@ async function fixture(mode: Mode) {
       },
     };
     const raw = createD1Sql(observed, { acknowledgement: "explicit-d1-result" });
-    for (const statement of frameHostMigrationSql(base)) await raw.run(statement);
+    // The same statements in the same order. The first keeps its own native round trip, as before:
+    // the native D1 binding creates its internal metadata table on the first non-batch statement,
+    // which keeps the complete sqlite_schema (rootpage and rowid order included) identical to the
+    // one-statement-at-a-time setup. The other statements go as ONE native primary batch (D1's
+    // implicit transaction) instead of one round trip each.
+    const setup: SqlStatement[] = [];
+    for (const statement of frameHostMigrationSql(base)) setup.push({ sql: statement });
     // Replace only the owning synthetic fixture's minimal RP table with the
     // actual full RP candidate. The fixture source and registry stay untouched.
-    await raw.run("DROP TABLE shared_auth_sessions");
+    setup.push({ sql: "DROP TABLE shared_auth_sessions" });
     for (const source of [
       additiveAuthFullRpDDL,
       MONEY_CUTOVER_FREEZE_DDL,
@@ -134,8 +140,15 @@ async function fixture(mode: Mode) {
       "CREATE TABLE test_pair_marks (id INTEGER PRIMARY KEY NOT NULL, label TEXT NOT NULL)",
       "CREATE TABLE test_pair_audit (id INTEGER PRIMARY KEY, digest TEXT NOT NULL)",
     ])
-      for (const statement of frameHostMigrationSql(source)) await raw.run(statement);
-    await raw.run("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)", [WRITER]);
+      for (const statement of frameHostMigrationSql(source)) setup.push({ sql: statement });
+    setup.push({
+      sql: "INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)",
+      params: [WRITER],
+    });
+    const [first, ...rest] = setup;
+    if (!first) throw new Error("fixture setup is empty");
+    await raw.run(first.sql, first.params);
+    await raw.batch(rest);
     const sql = mode === "money" ? createMoneyCutoverSql(raw, WRITER) : raw;
     const now = Date.now() - 1000;
     const at = new Date(now).toISOString();
