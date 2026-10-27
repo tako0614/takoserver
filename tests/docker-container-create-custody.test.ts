@@ -90,6 +90,14 @@ function fixture(requiredSecretNames: readonly string[] = ["TOKEN"]) {
       durable = { ...durable, nativeId, state: "bound" };
       if (bindAckLost) throw new Error("synthetic private binding diagnostic");
     },
+    async confirmStopped(record, observation) {
+      if (
+        !durable ||
+        durable.claimId !== record.claimId ||
+        durable.nativeId !== observation.native.nativeId
+      )
+        throw new Error("synthetic private stop diagnostic");
+    },
     async confirmRemoved(record, nativeId) {
       if (!durable || durable.claimId !== record.claimId || durable.nativeId !== nativeId)
         throw new Error("synthetic private removal diagnostic");
@@ -112,6 +120,10 @@ function fixture(requiredSecretNames: readonly string[] = ["TOKEN"]) {
       };
       if (createAckLost) throw new Error("synthetic private daemon diagnostic");
       return native.nativeId;
+    },
+    async stop() {
+      if (inspected) inspected = { ...inspected, state: "stopped" };
+      return "stopped";
     },
     async remove() {
       deletes++;

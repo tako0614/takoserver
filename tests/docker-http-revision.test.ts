@@ -573,6 +573,14 @@ function creationFixture(
         throw new Error("synthetic immutable binding mismatch");
       saved = { ...saved, nativeId, state: "bound" };
     },
+    async confirmStopped(record, observation) {
+      if (
+        !saved ||
+        saved.claimId !== record.claimId ||
+        saved.nativeId !== observation.native.nativeId
+      )
+        throw new Error("synthetic stop mismatch");
+    },
     async confirmRemoved(record, nativeId) {
       if (!saved || saved.claimId !== record.claimId || saved.nativeId !== nativeId)
         throw new Error("synthetic removal mismatch");
