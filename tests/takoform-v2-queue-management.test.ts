@@ -52,6 +52,45 @@ const consumerSpec = (
   ...extras,
 });
 
+/**
+ * Failure-only: when a Queue backend's claim-ownership probe answers "not
+ * owned", report why before the Operation settles unconfirmed. The extra read
+ * runs only on that path and the probe's own answer is returned unchanged.
+ */
+function observeQueueClaim(sql: Sql): Sql {
+  return {
+    ...sql,
+    async query(statement, params) {
+      const rows = await sql.query(statement, params);
+      if (
+        statement.startsWith("SELECT 1 WHERE EXISTS (") &&
+        statement.includes("op.lease_until_ms >") &&
+        rows.length !== 1
+      ) {
+        try {
+          const [op] = await sql.query(
+            "SELECT status, dispatch_possible, lease_until_ms, lease_token FROM tf_v2_operations WHERE id = ?",
+            [params?.[0] ?? ""],
+          );
+          const leaseUntil = Number(op?.lease_until_ms);
+          console.error(
+            JSON.stringify({
+              marker: "takoform.v2.queue_claim_probe.notowned.v1",
+              status: op?.status ?? null,
+              dispatchPossible: op?.dispatch_possible ?? null,
+              tokenMatches: op?.lease_token === (params?.[1] ?? null),
+              leaseRemainingMs: Number.isFinite(leaseUntil) ? leaseUntil - Date.now() : null,
+            }),
+          );
+        } catch {
+          // The observer never replaces the probe's own answer.
+        }
+      }
+      return rows;
+    },
+  };
+}
+
 function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise<void>) {
   if (databasePath !== ":memory:") writeMigratedDatabaseFile(databasePath);
   const database = databasePath === ":memory:" ? migratedDatabase() : new Database(databasePath);
@@ -195,7 +234,7 @@ function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise
     },
   };
   let servingDeploymentUid = "fixture-deployment";
-  const consumer = createQueueConsumerForm({ sql, targetKey, capability });
+  const consumer = createQueueConsumerForm({ sql: observeQueueClaim(sql), targetKey, capability });
   const engine = createTakoformV2Engine({
     sql,
     now,
@@ -203,7 +242,10 @@ function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise
     leaseMilliseconds: 1_000,
     authorize: async (who, where) => who === principal && where === space,
     forms: {
-      [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql: queueSql, targetKey }),
+      [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({
+        sql: observeQueueClaim(queueSql),
+        targetKey,
+      }),
       [MODULE_WORKER_FORM_URL]: worker,
       [WORKER_VERSION_FORM_URL]: version,
       [WORKER_DEPLOYMENT_FORM_URL]: deployment,
