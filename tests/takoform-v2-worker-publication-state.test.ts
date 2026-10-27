@@ -163,11 +163,25 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
     )`);
     // A real pre-0077 database has only the prefix. Later migrations depend on
     // 0077/0078 and must run through the normal migrator after the old row exists.
-    for (const migration of MIGRATIONS.slice(0, historicalMigrationCount)) {
-      db.exec(migration.sql);
-      db.query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))").run(
-        migration.name,
-      );
+    // The prefix is replayed in one transaction: autocommit made it the dominant
+    // cost (about 2,700 syncs), so a slow journal alone could time the case out.
+    // The resulting file is identical and FULL still syncs the one commit.
+    db.exec("BEGIN");
+    try {
+      for (const migration of MIGRATIONS.slice(0, historicalMigrationCount)) {
+        db.exec(migration.sql);
+        db.query(
+          "INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))",
+        ).run(migration.name);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Keep the replay's own failure.
+      }
+      throw error;
     }
   }
   const sql = createSqliteSql(db);
