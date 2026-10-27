@@ -9,18 +9,16 @@ import type {
   V2WorkerSQLiteDrainInput,
   V2WorkerSQLiteExternalUseInput,
 } from "../worker-invocation-port.ts";
+import { forwardWorkerNativeSchemaReady } from "./forward-worker-native-schema.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
   type ForwardFamilyWorkerDeploymentFormUrl,
   type ForwardFamilyWorkerVersionFormUrl,
   isForwardFamilyWorkerDeploymentForm,
   isForwardFamilyWorkerVersionForm,
   selectableWorkerVersionForms,
-} from "./forms/container-consumer-specs.ts";
-import {
-  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_VERSION_FORM_URL,
-} from "./forms/worker-specs.ts";
-import { forwardWorkerNativeSchemaReady } from "./forward-worker-native-schema.ts";
+} from "./worker-form-contract.ts";
 import {
   inspectV2WorkerInvocationSchema,
   v2WorkerInvocationDrainSchemaReady,

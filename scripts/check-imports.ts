@@ -126,7 +126,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-contract",
-    match: /^src\/takoform-v2\/(?:types|identity|references|form-frontface)\.ts$/u,
+    match:
+      /^src\/takoform-v2\/(?:types|identity|references|form-frontface|worker-form-contract)\.ts$/u,
     may: ["core", "v2-contract", "v2-private"],
   },
   {
