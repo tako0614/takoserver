@@ -126,6 +126,7 @@ const RUNTIME_EXPORTS = [
   "DURABLE_WORKFLOW_FORM_URL",
   "EdgeKVNamespaceValidationError",
   "MODULE_WORKER_FORM_URL",
+  "MODULE_WORKER_LIFECYCLE_BACKEND_ID",
   "OBJECT_BUCKET_FORM_URL",
   "OBJECT_BUCKET_LIMITS",
   "OBJECT_BUCKET_BACKEND_ID",
@@ -259,6 +260,9 @@ const RUNTIME_EXPORTS = [
 
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
+  expect(extension.MODULE_WORKER_LIFECYCLE_BACKEND_ID).toBe(
+    "selfhost-v2-module-worker-identity-v1",
+  );
   expect(extension.createV2ContainerHostAcceptance).toBe(createV2ContainerHostAcceptance);
   expect(extension.parseSQLiteMigrationManifest).toBe(parseSQLiteMigrationManifest);
   expect(extension.validateSQLiteMigrationPayload).toBe(validateSQLiteMigrationPayload);
