@@ -187,12 +187,12 @@ async function exerciseEndpoint(
   const databasePath = join(root, "state.sqlite");
   writeMigrateSqliteFile(databasePath);
   const db = new Database(databasePath);
-  // One create holds its one-second lease across about eight sequential commits.
-  // synchronous=FULL spends an fsync on each, so a host journal stall (seen as
-  // jbd2_log_wait_commit under the parallel gate) expires the lease before the
-  // create finishes. This single-connection file is never reopened or crash
-  // recovered, so WAL + NORMAL keeps the real file without a per-commit fsync.
-  // The one-second lease and the SQL lease guards are unchanged.
+  // The asset create holds its one-second lease across about eight sequential
+  // commits. synchronous=FULL spends an fsync on each, so a slow host journal
+  // (workers sat in jbd2_log_wait_commit under the parallel gate) can expire the
+  // lease before the create finishes. This single-connection file is never
+  // reopened or crash recovered, so WAL + NORMAL keeps the real file without a
+  // per-commit fsync. The one-second lease and the SQL lease guards are unchanged.
   db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;");
   const sql = createSqliteSql(db);
   let clockMs = Date.now();
