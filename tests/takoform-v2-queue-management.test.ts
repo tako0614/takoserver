@@ -94,6 +94,11 @@ function observeQueueClaim(sql: Sql): Sql {
 function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise<void>) {
   if (databasePath !== ":memory:") writeMigratedDatabaseFile(databasePath);
   const database = databasePath === ":memory:" ? migratedDatabase() : new Database(databasePath);
+  // File-backed cases keep synchronous=FULL on every commit. WAL needs one sync per
+  // commit where the DELETE journal needs several, so a one-second lease spans more
+  // commits before a slow journal can expire it. The content of the file is unchanged.
+  if (databasePath !== ":memory:")
+    database.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;");
   const sql = createSqliteSql(database);
   const queueSql = beforeRetentionWrite
     ? {
