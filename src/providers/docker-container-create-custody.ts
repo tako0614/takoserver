@@ -61,10 +61,30 @@ export interface DockerContainerCreateOwnerPort {
     use: (held: DockerContainerCreateHeldAuthority) => Promise<T>,
   ): Promise<T>;
   bindNative(record: DockerContainerCreateRecord, nativeId: string): Promise<void>;
+  /** Called only under the held remove authority, only after this helper itself
+   * observed the exact bound native object with a positive non-running state, and
+   * before any native DELETE. The owner records that observed exit durably for the
+   * exact start attempt of this claim; a 404, a timeout, a stop or DELETE ACK, or a
+   * caller-supplied boolean is never an observation. It never licenses a restart
+   * or another CREATE.
+   */
+  confirmStopped(
+    record: DockerContainerCreateRecord,
+    observation: DockerContainerStoppedObservation,
+  ): Promise<void>;
   /** Called only after this helper's definite DELETE ACK and exact-ID GET404.
-   * This commits a terminal tombstone; it never licenses another CREATE.
+   * This commits a terminal tombstone; it never licenses another CREATE. The owner's
+   * schema fence still refuses removal while a start attempt of the claim is pending or
+   * running; it is only as good as the exit recorded by confirmStopped, which rests on
+   * this helper's observation.
    */
   confirmRemoved(record: DockerContainerCreateRecord, nativeId: string): Promise<void>;
+}
+
+/** The exact native identity this helper inspected, with the positive state it saw. */
+export interface DockerContainerStoppedObservation {
+  readonly native: DockerContainerNativeIdentity;
+  readonly state: "stopped";
 }
 
 export interface DockerContainerCreateInspection {
@@ -94,6 +114,16 @@ export interface DockerContainerCreateDriver {
     secretOverrides: Readonly<Record<string, string>>,
     signal: AbortSignal,
   ): Promise<string>;
+  /** Stops the exact bound native object. Its ACK is never an observation: the helper
+   * inspects the exact ID again and needs a positive non-running state before the owner
+   * records an exit.
+   */
+  stop(
+    record: DockerContainerCreateRecord,
+    nativeId: string,
+    signal: AbortSignal,
+  ): Promise<"stopped" | "not-found">;
+  /** Deletes the exact bound native object. It never stops it. */
   remove(
     record: DockerContainerCreateRecord,
     nativeId: string,
@@ -332,7 +362,7 @@ export class DockerContainerCreateCustody {
       const owner = options.owner;
       if (
         !owner ||
-        !["read", "claim", "withAuthority", "bindNative", "confirmRemoved"].every(
+        !["read", "claim", "withAuthority", "bindNative", "confirmStopped", "confirmRemoved"].every(
           (key) => typeof owner[key as keyof DockerContainerCreateOwnerPort] === "function",
         )
       )
@@ -342,6 +372,7 @@ export class DockerContainerCreateCustody {
         claim: owner.claim.bind(owner),
         withAuthority: owner.withAuthority.bind(owner),
         bindNative: owner.bindNative.bind(owner),
+        confirmStopped: owner.confirmStopped.bind(owner),
         confirmRemoved: owner.confirmRemoved.bind(owner),
       });
       Object.freeze(this);
@@ -369,6 +400,7 @@ export class DockerContainerCreateCustody {
         !driver ||
         typeof driver.inspect !== "function" ||
         typeof driver.create !== "function" ||
+        typeof driver.stop !== "function" ||
         typeof driver.remove !== "function"
       )
         fail("invalid_request");
@@ -380,6 +412,7 @@ export class DockerContainerCreateCustody {
       driverSnapshot = Object.freeze({
         inspect: driver.inspect.bind(driver),
         create: driver.create.bind(driver),
+        stop: driver.stop.bind(driver),
         remove: driver.remove.bind(driver),
       });
     } catch {
@@ -624,11 +657,36 @@ export class DockerContainerCreateCustody {
                 // remove authority. No keyring/Env callback is involved.
                 {
                   const signal = lifetime.signal;
-                  const existing = await inspectRemoval();
+                  let observed = await inspectRemoval();
                   await guard();
-                  if (existing !== null && existing.native.nativeId !== nativeId)
+                  if (observed !== null && observed.native.nativeId !== nativeId)
                     return fail("conflict");
-                  if (existing !== null) {
+                  if (observed !== null && observed.state === "running") {
+                    const stopped = await abortable(
+                      driverSnapshot.stop(record, nativeId, signal),
+                      signal,
+                    );
+                    await guard();
+                    if (stopped !== "stopped" && stopped !== "not-found")
+                      return fail("unavailable");
+                    // The stop ACK is not an observation. Look at the exact ID again.
+                    observed = await inspectRemoval();
+                    await guard();
+                    if (observed !== null && observed.native.nativeId !== nativeId)
+                      return fail("conflict");
+                  }
+                  if (observed !== null) {
+                    // Only a positive non-running state of the exact bound object is
+                    // recorded as an exit, and only before the native DELETE. A still
+                    // running object is never deleted or recorded. An object that is
+                    // already absent proves nothing here: the owner's own removal
+                    // fence decides, and no exit is invented for it.
+                    if (observed.state !== "stopped") return fail("unavailable");
+                    await abortable(
+                      owner.confirmStopped(record, { native: observed.native, state: "stopped" }),
+                      signal,
+                    );
+                    await guard();
                     const acknowledgement = await abortable(
                       driverSnapshot.remove(record, nativeId, signal),
                       signal,

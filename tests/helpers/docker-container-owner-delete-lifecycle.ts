@@ -9,6 +9,10 @@ import {
   createDockerHttpRevisionRuntime,
   type DockerHttpRevisionOptions,
 } from "../../src/providers/docker-http-revision.ts";
+import {
+  type LinuxDockerPhysicalOwnerPort,
+  LinuxDockerRuntimePreparation,
+} from "../../src/providers/linux-docker-runtime-preparation.ts";
 import type { V2BackendResult, V2Execution } from "../../src/takoform-v2/types.ts";
 import { dockerOwnerFixture } from "./docker-container-configured-owner-snapshot.ts";
 import { SOURCE_SELECTION } from "./docker-container-configured-source-selection.ts";
@@ -21,8 +25,8 @@ import { SOURCE_SELECTION } from "./docker-container-configured-source-selection
  *
  * Observation only. Two pass-through seams record fixed-field phases and reasons and never
  * change a result, an error or an object identity:
- * - the owner port the custody calls (read, claim, withAuthority, bindNative, confirmRemoved)
- *   is wrapped; the real held authority is handed on untouched, errors are rethrown as they
+ * - the owner port the custody calls (read, claim, withAuthority, bindNative, confirmStopped,
+ *   confirmRemoved) is wrapped; the real held authority is handed on untouched, errors are rethrown as they
  *   are, and a failure records the error name, its message and the function names of its
  *   first frames;
  * - the Docker Engine double is wrapped to record method, path (without query or body, so no
@@ -201,6 +205,20 @@ export function observer() {
           throw error;
         }
       },
+      confirmStopped: async (record, observation) => {
+        try {
+          await source.confirmStopped(record, observation);
+          add({ phase: "owner.confirmStopped", ok: true, ...recordFields(record) });
+        } catch (error) {
+          add({
+            phase: "owner.confirmStopped",
+            ok: false,
+            ...recordFields(record),
+            thrown: thrown(error),
+          });
+          throw error;
+        }
+      },
       confirmRemoved: async (record, nativeId) => {
         try {
           await source.confirmRemoved(record, nativeId);
@@ -217,14 +235,17 @@ export function observer() {
       },
     };
   }
+  /** attempts, when given, is read at each native DELETE: the durable start-attempt state at that moment. */
   function engine(
     source: NonNullable<DockerHttpRevisionOptions["engine"]>,
+    attempts?: () => string,
   ): NonNullable<DockerHttpRevisionOptions["engine"]> {
     return async (method, path, body, signal) => {
       const response = await source(method, path, body, signal);
       add({
         phase: `engine.${method}`,
         ok: response.status < 400 || response.status === 404,
+        ...(method === "DELETE" && attempts ? { state: attempts() } : {}),
         path: (path.split("?")[0] ?? "").replace(/[a-f0-9]{64}/gu, (id) => id.slice(-8)),
         status: response.status,
       });
@@ -237,19 +258,50 @@ export function observer() {
 /** Everything the DELETE backend needs, built over the unchanged dockerOwnerFixture. */
 export async function deleteLifecycleFixture(options?: {
   /**
-   * CONTROL. The owner has no API that moves a start attempt from running to exited, and the
-   * owner schema refuses to mark a claim removed while any of its start attempts is pending or
-   * running. For the listed generations the test writes the schema-legal running -> exited
-   * transition itself (an equivalent of the exited() helper of the owner-schema tests, without
-   * their resource/attempt filter because there is one Resource) BEFORE the native removal.
-   * The resulting exited state is therefore temporally false and unreachable by product code;
-   * it only separates "the owner cannot record an exit" from probe wiring. Absent, nothing is
-   * written: the original flow.
+   * CONTROL, test-side only. Replaces the owner's confirmStopped by a no-op for the listed
+   * generations, so the custody still observes the stopped object and deletes it but the exit
+   * is never recorded. It separates "the exit record is what lets the removal complete" from
+   * the independent confirmRemoved fence. No success case uses it.
    */
-  readonly exitConfirmedFor?: readonly number[];
+  readonly skipExitRecordingFor?: readonly number[];
+  /**
+   * NEGATIVE, test-side only. The caller lies: the observation the custody made is replaced
+   * by this value before it reaches the REAL owner, under the real held remove authority.
+   */
+  readonly forgeObservation?: (observation: { native: unknown; state: unknown }) => unknown;
+  /** Calls the real owner's confirmStopped twice with the same observation (idempotency). */
+  readonly repeatConfirmStopped?: boolean;
+  /**
+   * CONTROL, test-side only. The Docker double acknowledges the stop (204) but leaves the object
+   * running. The custody must then neither record an exit nor delete. No success case uses it.
+   */
+  readonly stopLeavesRunning?: boolean;
+  /**
+   * FAULT, test-side only, once per fixture. "ack-lost": the daemon performs the first DELETE but
+   * the caller never sees the ACK. "refused": the first DELETE never reaches the daemon.
+   */
+  readonly deleteFault?: "ack-lost" | "refused";
+  /** FAULT, test-side only. The removal's cancellation signal is aborted right after the stop. */
+  readonly abortAfterStop?: boolean;
+  /**
+   * FAULT, test-side only. The stop of the first generation does not give a positive stopped
+   * observation: "not-found" (404, the object is gone), "timeout" (the request throws) or
+   * "vanishes" (the daemon stops it, then it is removed outside this system).
+   */
+  readonly stopFault?: "not-found" | "timeout" | "vanishes";
+  /** FAULT, test-side only, once per fixture. The removal's cancellation signal is aborted right after the owner recorded the exit. */
+  readonly abortAfterExit?: boolean;
+  /**
+   * Takes the custody from a LinuxDockerRuntimePreparation built over the (observed) real owner
+   * instead of building it directly, so the Linux wrapper's own owner forwarding is exercised.
+   * Only its constructor and custody are used; no native helper process is opened.
+   */
+  readonly custody?: "linux";
 }) {
   const ctx = await dockerOwnerFixture();
   const seam = observer();
+  let deleteFaulted = false;
+  let exitAborted = false;
   const outcome: { removed: number[]; failure?: Observation["thrown"] & { generation: number } } = {
     removed: [],
   };
@@ -285,28 +337,69 @@ export async function deleteLifecycleFixture(options?: {
   ): Promise<boolean> {
     retainedIntents.push(item.record.intent);
     const policy = item.record.intent.policy;
-    if (options?.exitConfirmedFor?.includes(policy.generation)) {
-      const changed = ctx.fx.database
-        .query(
-          `UPDATE tf_v2_container_start_attempts SET state = 'exited', confirmed_exited_at_ms = MAX(confirmed_running_at_ms, ?)
-               WHERE generation = ? AND state = 'running'`,
-        )
-        .run(Date.now(), policy.generation).changes;
+    const real = ctx.fx.owner.owner;
+    let source: DockerContainerCreateOwnerPort = real;
+    if (options?.skipExitRecordingFor?.includes(policy.generation)) {
+      source = { ...real, confirmStopped: async () => undefined };
       seam.add({
-        phase: "control.exitConfirmedByTest",
-        ok: changed === 1,
+        phase: "control.exitRecordingSkippedByTest",
+        ok: true,
         generation: policy.generation,
-        state: startAttempts().join(","),
       });
+    } else if (options?.abortAfterExit) {
+      source = {
+        ...real,
+        confirmStopped: async (record, observation) => {
+          await real.confirmStopped(record, observation);
+          if (!exitAborted) {
+            exitAborted = true;
+            abort.abort();
+          }
+        },
+      };
+    } else if (options?.forgeObservation || options?.repeatConfirmStopped) {
+      const forge = options.forgeObservation;
+      source = {
+        ...real,
+        confirmStopped: async (record, observation) => {
+          const sent = (
+            forge ? forge(structuredClone(observation)) : observation
+          ) as typeof observation;
+          await real.confirmStopped(record, sent);
+          if (options.repeatConfirmStopped) await real.confirmStopped(record, sent);
+        },
+      };
     }
+    const abort = new AbortController();
     const names = item.record.intent.requiredSecretNames;
+    const createCustody =
+      options?.custody === "linux"
+        ? new LinuxDockerRuntimePreparation({
+            policy,
+            requiredSecretNames: names,
+            owner: { ...real, ...seam.port(source) } as LinuxDockerPhysicalOwnerPort,
+            process: {
+              helper: "/synthetic/helper",
+              socketPath: "/synthetic/helper.sock",
+              peerPid: 1,
+              peerUid: 0,
+              ipBinary: "/synthetic/ip",
+              nftBinary: "/synthetic/nft",
+              guestNamespaceRoot: "/synthetic/ns",
+            },
+            host: { tcpPorts: [8080], conntrackMark: 1, deniedDestinations: [] },
+            dnsServers: policy.outboundInternet ? ["192.0.2.53"] : [],
+            maxConnections: 1,
+            packetLimitBytes: 1,
+          }).createCustody
+        : createDockerContainerCreateCustody({
+            policy,
+            requiredSecretNames: names,
+            owner: seam.port(source),
+          });
     const preparation = createDockerContainerRuntimePreparation({
       policy,
-      createCustody: createDockerContainerCreateCustody({
-        policy,
-        requiredSecretNames: names,
-        owner: seam.port(ctx.fx.owner.owner),
-      }),
+      createCustody,
       requiredSecretNames: names,
       readStartClaim: (native, claimPolicy) =>
         ctx.fx.owner.owner.readStartClaim(native, claimPolicy),
@@ -321,7 +414,39 @@ export async function deleteLifecycleFixture(options?: {
       maxMemoryBytes: 1024 * 1024 * 1024,
       maxNanoCpus: 2_000_000_000,
       pidsLimit: 128,
-      engine: seam.engine(ctx.docker.engine),
+      engine: seam.engine(
+        async (method, path, body, signal) => {
+          const stop = method === "POST" && /\/stop(?:\?|$)/u.test(path);
+          if (stop && options?.stopLeavesRunning) return { status: 204, body: "" };
+          if (stop && options?.stopFault) {
+            const id = /\/containers\/([a-f0-9]{64})\/stop/u.exec(path)?.[1];
+            const drop = () => {
+              for (const [name, container] of ctx.docker.containers)
+                if (container.Id === id) ctx.docker.containers.delete(name);
+            };
+            seam.add({ phase: `control.stopFault:${options.stopFault}`, ok: true });
+            if (options.stopFault === "timeout") throw new Error("synthetic stop timeout");
+            if (options.stopFault === "not-found") {
+              drop();
+              return { status: 404, body: "" };
+            }
+            const stopped = await ctx.docker.engine(method, path, body, signal);
+            drop();
+            return stopped;
+          }
+          if (method === "DELETE" && options?.deleteFault && !deleteFaulted) {
+            deleteFaulted = true;
+            seam.add({ phase: `control.deleteFault:${options.deleteFault}`, ok: true });
+            if (options.deleteFault === "ack-lost")
+              await ctx.docker.engine(method, path, body, signal);
+            throw new Error("synthetic DELETE fault");
+          }
+          const response = await ctx.docker.engine(method, path, body, signal);
+          if (stop && options?.abortAfterStop) abort.abort();
+          return response;
+        },
+        () => startAttempts().join(","),
+      ),
       healthFetch: async () => new Response("ok"),
       runtimePreparation: preparation,
     });
@@ -339,6 +464,7 @@ export async function deleteLifecycleFixture(options?: {
           environment: item.spec.environment as JsonObject as Record<string, string>,
         },
         item.record.nativeId ?? undefined,
+        options?.abortAfterStop || options?.abortAfterExit ? abort.signal : undefined,
       );
       outcome.removed.push(policy.generation);
       seam.add({ phase: "runtime.remove", ok: true, generation: policy.generation });
