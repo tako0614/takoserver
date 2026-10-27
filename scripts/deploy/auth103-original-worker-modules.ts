@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { canonicalJson } from "../../src/json.ts";
 import { readAuth103HistoricalPublication } from "./auth103-historical-publication.ts";
-import { type DeployPhase, preflightError, verificationError } from "./errors.ts";
+import { DeployError, type DeployPhase, preflightError, verificationError } from "./errors.ts";
 import {
   inspectMoneyNativeBuildDependencyTree,
   inspectMoneyNativeBuildSourceTree,
@@ -408,6 +408,27 @@ export function assertExactOriginalModuleBytes(
   return bundleDigestHex;
 }
 
+/** Original source/custody helpers are preflight primitives, even when the
+ * caller is checking an already acknowledged publication. Preserve that
+ * caller's phase so a replay refusal can never claim the target was untouched.
+ */
+function inspectOriginalModulesAtPhase(
+  phase: Extract<DeployPhase, "preflight" | "verification">,
+  inspect: () => void,
+): void {
+  try {
+    inspect();
+  } catch (error) {
+    if (phase === "preflight" || (error instanceof DeployError && error.phase === phase))
+      throw error;
+    throw verificationError(
+      error instanceof DeployError
+        ? `Auth103 post-mutation module inspection failed: ${error.message}`
+        : "Auth103 post-mutation module inspection failed",
+    );
+  }
+}
+
 /** Shared status/forward readback. The old two-module shape is accepted only
  * with an original build in a selected ancestor checkout; future uploads must
  * carry the one exact JavaScript module.
@@ -420,42 +441,44 @@ export function verifySelectedAuth103WorkerModules(
   versionValue: unknown,
   history: { readonly versionId: string; readonly deploymentId: string },
 ): void {
-  const selected = selectedTargetBytes(target);
-  const historical = readAuth103HistoricalPublication({
-    phase,
-    target,
-    targetDigest: digest(selected.bytes),
-    sourceCommit,
-    versionId: history.versionId,
-    deploymentId: history.deploymentId,
+  inspectOriginalModulesAtPhase(phase, () => {
+    const selected = selectedTargetBytes(target);
+    const historical = readAuth103HistoricalPublication({
+      phase,
+      target,
+      targetDigest: digest(selected.bytes),
+      sourceCommit,
+      versionId: history.versionId,
+      deploymentId: history.deploymentId,
+    });
+    if (historical !== null) {
+      const before = originalCheckout(sourceCommit);
+      assertExactOriginalModuleBytes(phase, versionValue, historical, annotatedBundleDigestHex);
+      const after = originalCheckout(sourceCommit);
+      if (before.root !== after.root) {
+        throw phase === "preflight"
+          ? preflightError("Auth103 historical original source changed during read")
+          : verificationError("Auth103 historical original source changed during read");
+      }
+      assertOriginalDependencyReplayUnchanged(
+        { selected: before.selectedDependencies, current: before.currentDependencies },
+        { selected: after.selectedDependencies, current: after.currentDependencies },
+      );
+      if (
+        targetFileIdentity(lstatSync(selected.path, { bigint: true })) !== selected.identity ||
+        !readFileSync(selected.path).equals(selected.bytes) ||
+        canonicalJson(loadTarget(selected.path, "integration")) !== canonicalJson(target)
+      ) {
+        throw phase === "preflight"
+          ? preflightError("Auth103 historical original target changed during read")
+          : verificationError("Auth103 historical original target changed during read");
+      }
+      historical.assertUnchanged();
+      return;
+    }
+    const capture = buildAuth103OriginalWorkerModules(target, sourceCommit);
+    verifyAuth103OriginalModuleClosure(phase, versionValue, capture, annotatedBundleDigestHex);
   });
-  if (historical !== null) {
-    const before = originalCheckout(sourceCommit);
-    assertExactOriginalModuleBytes(phase, versionValue, historical, annotatedBundleDigestHex);
-    const after = originalCheckout(sourceCommit);
-    if (before.root !== after.root) {
-      throw phase === "preflight"
-        ? preflightError("Auth103 historical original source changed during read")
-        : verificationError("Auth103 historical original source changed during read");
-    }
-    assertOriginalDependencyReplayUnchanged(
-      { selected: before.selectedDependencies, current: before.currentDependencies },
-      { selected: after.selectedDependencies, current: after.currentDependencies },
-    );
-    if (
-      targetFileIdentity(lstatSync(selected.path, { bigint: true })) !== selected.identity ||
-      !readFileSync(selected.path).equals(selected.bytes) ||
-      canonicalJson(loadTarget(selected.path, "integration")) !== canonicalJson(target)
-    ) {
-      throw phase === "preflight"
-        ? preflightError("Auth103 historical original target changed during read")
-        : verificationError("Auth103 historical original target changed during read");
-    }
-    historical.assertUnchanged();
-    return;
-  }
-  const capture = buildAuth103OriginalWorkerModules(target, sourceCommit);
-  verifyAuth103OriginalModuleClosure(phase, versionValue, capture, annotatedBundleDigestHex);
 }
 
 /** An uploaded but not yet deployed Version has no deployment identity and
@@ -467,8 +490,10 @@ export function verifyUnpublishedAuth103WorkerModules(
   annotatedBundleDigestHex: string,
   versionValue: unknown,
 ): void {
-  const capture = buildAuth103OriginalWorkerModules(target, sourceCommit);
-  verifyAuth103OriginalModuleClosure(phase, versionValue, capture, annotatedBundleDigestHex);
+  inspectOriginalModulesAtPhase(phase, () => {
+    const capture = buildAuth103OriginalWorkerModules(target, sourceCommit);
+    verifyAuth103OriginalModuleClosure(phase, versionValue, capture, annotatedBundleDigestHex);
+  });
 }
 
 function assertExactSingleModuleBytes(

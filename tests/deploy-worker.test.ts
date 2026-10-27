@@ -1894,6 +1894,9 @@ describe("split Takoserver Worker surfaces", () => {
       const uploads = current.calls.filter((call) => call.includes("--no-bundle"));
       expect(uploads).toHaveLength(1);
       expect(uploads[0]).toContain("--strict");
+      const uploadOutdirIndex = uploads[0]!.indexOf("--outdir");
+      expect(uploadOutdirIndex).toBeGreaterThan(-1);
+      expect(uploads[0]![uploadOutdirIndex + 1]).toBe(join(root, "upload"));
       expect(uploads[0]?.find((value) => value.startsWith("takoserver-worker:"))).toMatch(
         /^takoserver-worker:[0-9a-f]{40}:[0-9a-f]{64}$/u,
       );

@@ -1,13 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   assertBuiltAuth103ModuleClosure,
   assertExactOriginalModuleBytes,
   assertOriginalDependencyReplayUnchanged,
   isolatedAuth103OriginalBuildEnvironment,
   originalAuth103ModuleMode,
+  verifySelectedAuth103WorkerModules,
+  verifyUnpublishedAuth103WorkerModules,
 } from "../scripts/deploy/auth103-original-worker-modules.ts";
-import { DeployError } from "../scripts/deploy/errors.ts";
+import { DeployError, deployFailureAftermath, PHASE_EXIT_CODE } from "../scripts/deploy/errors.ts";
+import type { DeployTarget } from "../scripts/deploy/target.ts";
 
 const original = {
   worker: Buffer.from("export default { fetch() { return new Response('closed') } };\n"),
@@ -168,4 +174,63 @@ describe("original Auth103 Worker module byte closure", () => {
       );
     }
   });
+});
+
+test("original module replay failures preserve the publication phase and safe aftermath", () => {
+  const target: DeployTarget = {
+    kind: "takoserver.deploy-target@v2",
+    environment: "integration",
+    accountId: "a".repeat(32),
+    workerName: "takoserver-module-phase-test",
+    d1: { databaseName: "module-phase-test", databaseId: "00000000-0000-4000-8000-000000000000" },
+    r2: { bucketName: "module-phase-test" },
+    publicOrigin: "https://module-phase.example.test",
+    signing: { currentKeyId: "module-phase-test" },
+  };
+  for (const phase of ["preflight", "verification"] as const) {
+    let failure: unknown;
+    try {
+      verifyUnpublishedAuth103WorkerModules(phase, target, "a".repeat(40), digest, version());
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).phase).toBe(phase);
+    expect((failure as DeployError).message).toContain("selected quiesced target");
+    expect(PHASE_EXIT_CODE[(failure as DeployError).phase]).toBe(phase === "verification" ? 4 : 2);
+    if (phase === "verification")
+      expect(deployFailureAftermath((failure as DeployError).phase)).toContain(
+        "mutation was acknowledged",
+      );
+  }
+  const root = mkdtempSync(join(tmpdir(), "module-phase-"));
+  const previous = process.env.TAKOSERVER_DEPLOY_TARGET_INTEGRATION;
+  try {
+    process.env.TAKOSERVER_DEPLOY_TARGET_INTEGRATION = join(root, "missing-target.json");
+    let failure: unknown;
+    try {
+      verifySelectedAuth103WorkerModules(
+        "verification",
+        target,
+        "a".repeat(40),
+        digest,
+        version(),
+        {
+          versionId: "11111111-1111-4111-8111-111111111111",
+          deploymentId: "22222222-2222-4222-8222-222222222222",
+        },
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).phase).toBe("verification");
+    expect(deployFailureAftermath((failure as DeployError).phase)).toContain(
+      "mutation was acknowledged",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.TAKOSERVER_DEPLOY_TARGET_INTEGRATION;
+    else process.env.TAKOSERVER_DEPLOY_TARGET_INTEGRATION = previous;
+    rmSync(root, { recursive: true, force: true });
+  }
 });

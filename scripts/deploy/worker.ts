@@ -1250,6 +1250,10 @@ export async function runWorker(
             "deploy",
             bundlePath,
             "--no-bundle",
+            // Wrangler still allocates a build directory with --no-bundle.
+            // Keep it outside the closed source needed by post-upload replay.
+            "--outdir",
+            join(root, "upload"),
             "--config",
             configPath,
             "--strict",
