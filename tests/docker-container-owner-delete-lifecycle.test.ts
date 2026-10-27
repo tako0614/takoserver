@@ -524,16 +524,23 @@ test("a never-confirmed (pending) start attempt stays fail-closed: no exit, noth
   const ctx = await deleteLifecycleFixture();
   const { fx } = ctx;
   try {
-    // The CREATE runs through the real path but the health path never answers, so the runtime
-    // never reports ready, publishServing is never called and the attempt stays pending. The
-    // backend then settles the CREATE as failed.
+    // The daemon refuses the START: the object is created and the START is claimed, but it never
+    // runs, so the attempt stays pending and no observation can say it ever ran. (An object that
+    // IS running while its health never passes is resolved by the remove-phase confirmRunning:
+    // see tests/docker-container-pending-start-observation.test.ts.) The backend then settles
+    // the CREATE as failed.
+    const engine = ctx.docker.engine;
+    ctx.docker.engine = async (method, path, body, signal) =>
+      method === "POST" && path.includes("/start")
+        ? { status: 500, body: "" }
+        : engine(method, path, body, signal);
     fx.dispatch(async (input) => {
       const result = await ctx.dispatch(input);
       return input.action === "create" && result.kind === "unknown"
         ? {
             kind: "no_effect" as const,
-            code: "health_never_passed",
-            message: "the health check never passed",
+            code: "start_refused",
+            message: "the daemon refused the START",
           }
         : result;
     });
