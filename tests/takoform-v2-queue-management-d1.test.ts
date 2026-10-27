@@ -100,13 +100,26 @@ test("local Miniflare D1 atomically admits one v2 Consumer for a Queue", async (
     const queueIndex = MIGRATIONS.findIndex(
       (migration) => migration.name === "0090_v2_queue_sqlite_external_drain.sql",
     );
-    for (const migration of MIGRATIONS.slice(0, queueIndex)) {
-      for (const [index, statement] of splitMigration(migration.sql).entries()) {
-        try {
-          await database.prepare(statement).run();
-        } catch (error) {
-          throw new Error(`${migration.name} statement ${index + 1} failed`, { cause: error });
-        }
+    // Keep the exact ordered pre-0090 schema while avoiding one native HTTP
+    // round trip per fixture statement. The migration under test stays below.
+    const initialStatements = MIGRATIONS.slice(0, queueIndex).flatMap((migration) =>
+      splitMigration(migration.sql).map((statement, index) => ({
+        migration: migration.name,
+        index: index + 1,
+        statement,
+      })),
+    );
+    for (let offset = 0; offset < initialStatements.length; offset += 64) {
+      const group = initialStatements.slice(offset, offset + 64);
+      try {
+        const results = await database.batch(group.map((row) => database.prepare(row.statement)));
+        if (results.length !== group.length || results.some((result) => !result.success))
+          throw new Error("fixture initialization batch was not completely acknowledged");
+      } catch (error) {
+        const first = group[0];
+        throw new Error(`${first?.migration} fixture batch from statement ${first?.index} failed`, {
+          cause: error,
+        });
       }
     }
     const queueMigration = MIGRATIONS[queueIndex];

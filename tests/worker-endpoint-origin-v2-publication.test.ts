@@ -1515,7 +1515,11 @@ function formRouteFixtureSchema(db: Database): void {
     create_operation_id TEXT NOT NULL REFERENCES tf_v2_operations(id), current_operation_id TEXT NOT NULL REFERENCES tf_v2_operations(id))`);
 }
 
-async function formRouteFixture(releaseCount = 2, adopted = true) {
+async function formRouteFixture(
+  releaseCount = 2,
+  adopted = true,
+  moduleReferences: "sealed" | "absent" | "unsealed" = "sealed",
+) {
   const directory = mkdtempSync(join(tmpdir(), "form-route-receiver-"));
   const path = join(directory, "state.sqlite");
   writeMigrateSqliteFile(path);
@@ -1589,7 +1593,9 @@ async function formRouteFixture(releaseCount = 2, adopted = true) {
     validateCreate,
     validateUpdate,
     backend: backend(id),
-    references: (spec) => referencesForWorkerForm(form, spec),
+    ...(form === MODULE_WORKER_FORM_URL && moduleReferences !== "sealed"
+      ? {}
+      : { references: (spec: JsonObject) => referencesForWorkerForm(form, spec) }),
   });
   const ledger = createSharedAppLedger({
     environment: "staging",
@@ -1712,6 +1718,10 @@ async function formRouteFixture(releaseCount = 2, adopted = true) {
     ).toBe(true);
   };
   const worker = await accept(MODULE_WORKER_FORM_URL, "weighted-worker", {});
+  if (moduleReferences === "unsealed")
+    await sql.run("INSERT INTO tf_v2_operation_reference_sets (operation_id,sealed) VALUES (?,0)", [
+      worker.id,
+    ]);
   expect(await engine.runNext()).toMatchObject({ id: worker.id, status: "succeeded" });
   const bundle = await accept(WORKER_BUNDLE_FORM_URL, "weighted-bundle", {});
   expect(await engine.runNext()).toMatchObject({ id: bundle.id, status: "succeeded" });
@@ -2843,6 +2853,69 @@ test("complete native host inventory refuses a second incumbent instead of selec
         )
         .get(),
     ).toEqual({ n: 2 });
+  } finally {
+    f.close();
+  }
+});
+
+test("typed publication accepts the actual ModuleWorker's captured empty reference absence", async () => {
+  const f = await formRouteFixture(1, true, "absent");
+  try {
+    expect(
+      await f.sql.query("SELECT * FROM tf_v2_operation_reference_sets WHERE operation_id=?", [
+        f.worker.id,
+      ]),
+    ).toEqual([]);
+    const row = f.hostRow();
+    const prepared = await f.endpointPreparation(f.execution, row);
+    await f.apply([prepared], [row]);
+    expect(await prepared.observe()).toBe("confirmed");
+    expect(await f.ledger.readCurrentRoute(NAME)).toMatchObject({ kind: "form-v2@1" });
+  } finally {
+    f.close();
+  }
+});
+
+test("captured empty ModuleWorker references refuse a nonempty set and a late active edge", async () => {
+  for (const when of ["before-prepare", "before-batch"] as const) {
+    const f = await formRouteFixture(1, true, "absent");
+    try {
+      const row = f.hostRow();
+      const prepared =
+        when === "before-batch" ? await f.endpointPreparation(f.execution, row) : undefined;
+      await f.sql.run(
+        "INSERT INTO tf_v2_resource_references (target_uid,referrer_uid) VALUES (?,?)",
+        [f.worker.resourceUid, f.worker.resourceUid],
+      );
+      if (prepared) await expect(f.apply([prepared], [row])).rejects.toBeDefined();
+      else
+        expect(await f.receiver().prepareEndpointFormV2(f.execution, [row])).toEqual({
+          kind: "refused",
+        });
+      expect(await f.ledger.readCurrentRoute(NAME)).toBeNull();
+      expect(await f.sql.query("SELECT * FROM shared_app_staging_route_commands")).toEqual([]);
+      expect(
+        await f.sql.query("SELECT * FROM cloudflare_managed_worker_routes WHERE route_kind='host'"),
+      ).toEqual([]);
+    } finally {
+      f.close();
+    }
+  }
+});
+
+test("an unsealed ModuleWorker reference set is never treated as empty absence", async () => {
+  const f = await formRouteFixture(1, true, "unsealed");
+  try {
+    expect(
+      await f.sql.query("SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id=?", [
+        f.worker.id,
+      ]),
+    ).toEqual([{ sealed: 0 }]);
+    expect(await f.receiver().prepareEndpointFormV2(f.execution, [f.hostRow()])).toEqual({
+      kind: "refused",
+    });
+    expect(await f.ledger.readCurrentRoute(NAME)).toBeNull();
+    expect(await f.sql.query("SELECT * FROM shared_app_staging_route_commands")).toEqual([]);
   } finally {
     f.close();
   }
