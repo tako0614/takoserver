@@ -200,6 +200,15 @@ export async function dockerOwnerFixture() {
     failure?: Failure;
   }[] = [];
   const claimedViaOwner: string[] = [];
+  /**
+   * Fault arming only. afterAccepted runs once the owner's readAcceptedExecution has
+   * passed. For an executing Operation whose source is an EARLIER explicit generation, a
+   * read-visibility fault for that generation's row armed here is first read by the
+   * configured-input codec's exact-source read inside the environment loan: the owner's
+   * per-claim checks (load of the executing generation) do not read it. For a row of the
+   * executing Operation itself the owner's snapshot would read it first.
+   */
+  const hooks: { afterAccepted?: () => void } = {};
   const dispatch = async (input: V2Execution): Promise<V2BackendResult> =>
     fx.owner.withExecution(input, async () => {
       let accepted: Awaited<ReturnType<typeof fx.owner.readAcceptedExecution>>;
@@ -212,6 +221,7 @@ export async function dockerOwnerFixture() {
         });
         return { kind: "unknown" };
       }
+      hooks.afterAccepted?.();
       const policy: DockerContainerRuntimePolicy = {
         tenantRef: accepted.principal,
         generation: accepted.generation,
@@ -316,5 +326,5 @@ export async function dockerOwnerFixture() {
         return { kind: "unknown" };
       }
     });
-  return { fx, docker, outcomes, claimedViaOwner, dispatch, formUrl: V2_CONTAINER_F2_FORM };
+  return { fx, docker, outcomes, claimedViaOwner, dispatch, hooks, formUrl: V2_CONTAINER_F2_FORM };
 }
