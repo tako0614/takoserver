@@ -234,6 +234,7 @@ export {
 } from "./forward-container-binding-authority.ts";
 export {
   createInternalV2ModuleWorkerForm,
+  MODULE_WORKER_LIFECYCLE_BACKEND_ID,
   type V2WorkerRetirementReader,
   type V2WorkerServingReader,
 } from "./module-worker-lifecycle-backend.ts";

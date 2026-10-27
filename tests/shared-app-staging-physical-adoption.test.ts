@@ -532,3 +532,42 @@ test("staging physical statements and guarded atom execute under native D1 batch
     await runtime.dispose();
   }
 });
+
+test("partial native drain never qualifies an untouched legacy original for adoption", async () => {
+  for (const routeVersion of ["v1", "v2"] as const) {
+    for (const state of ["active", "tombstone"] as const) {
+      const f = fixture();
+      try {
+        f.legacy();
+        f.db
+          .query(`INSERT INTO cloudflare_managed_worker_routes
+          (provider_id,route_kind,route_key,owner_native_id,generation,operation_id,state,value_json)
+          VALUES ('provider','host',?,'native',1,'operation-uid',?,'{}')`)
+          .run(`host/${routeVersion}/held-app.app-staging.takos.jp`, state);
+        const before = {
+          original: f.db.query("SELECT * FROM worker_endpoint_origin_reservations").get(),
+          native: f.db.query("SELECT * FROM cloudflare_managed_worker_routes").all(),
+        };
+        await expect(
+          f.adoption.adopt({
+            organizationId: "org-one",
+            reservationId: "original-reservation",
+          }),
+        ).rejects.toBeInstanceOf(SharedAppStagingAdoptionError);
+        expect(f.db.query("SELECT * FROM worker_endpoint_origin_reservations").get()).toEqual(
+          before.original,
+        );
+        expect(f.db.query("SELECT * FROM cloudflare_managed_worker_routes").all()).toEqual(
+          before.native,
+        );
+        for (const table of ["assignments", "names", "adoptions", "batch_assertions"]) {
+          expect(f.db.query(`SELECT count(*) AS n FROM shared_app_staging_${table}`).get()).toEqual(
+            { n: 0 },
+          );
+        }
+      } finally {
+        f.db.close();
+      }
+    }
+  }
+});
