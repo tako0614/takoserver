@@ -31,6 +31,7 @@ import {
   HOSTED_BILLING_REALM_TEST_INSTANT,
   hostedBillingRealmTestMigrations,
 } from "./helpers/hosted-billing-realm-fixture.ts";
+import { beginNativeFixturePhase } from "./helpers/native-fixture-phase.ts";
 import { SHARED_AUTH_TEST_ONLY_DDL } from "./helpers/shared-auth-session-fixture.ts";
 
 // Native SQLite/D1 mechanical request origin only. The existing <=0099 fixture
@@ -90,6 +91,8 @@ interface NativeTrace {
 }
 
 async function fixture() {
+  const recordPhase = beginNativeFixturePhase("financial-origin");
+  recordPhase("fixture_begin");
   const id = `request-credential-d1-${crypto.randomUUID()}`;
   const runtime = new Miniflare({
     workers: [
@@ -114,11 +117,20 @@ async function fixture() {
     ],
   });
   try {
+    recordPhase("native_d1_begin");
     const database = await runtime.getD1Database("STATE_DB");
+    recordPhase("native_d1_ready");
     const setup = database.withSession("first-primary");
+    // The same sources in the same order. The first non-empty source keeps its own native
+    // round trip, as before: the native D1 binding creates its internal metadata table at the
+    // start of its second call, which keeps the complete sqlite_schema (rootpage and rowid
+    // order included) identical to the one-source-at-a-time setup. All the other statements
+    // go as ONE native primary batch (D1's implicit transaction) instead of one round trip
+    // per source.
     // Reuse the two owning fixtures' exact setup sources. No new DDL, schema
     // registration, Principal/class row seed or canonical SQL body copy.
-    for (const source of [
+    recordPhase("source_list_begin");
+    const sources = [
       ...(await hostedBillingRealmTestMigrations()),
       ...SHARED_AUTH_TEST_ONLY_DDL,
       MONEY_CUTOVER_FREEZE_DDL,
@@ -127,18 +139,28 @@ async function fixture() {
       MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
       moneyFenceInstallSql("0094"),
       additiveAuthTokenDDL,
-    ]) {
-      try {
-        const statements = frameHostMigrationSql(source);
-        if (statements.length > 0)
-          await setup.batch(statements.map((statement) => setup.prepare(statement)));
-      } catch (error) {
-        // A native setup error must not expose programmatically imported SQL.
-        // Preserve failure without attaching raw messages, queries or causes.
-        const message = error instanceof Error ? error.message : typeof error;
-        const digest = await bytesDigest(new TextEncoder().encode(message));
-        throw new Error(`Native request schema fixture failed (${digest})`);
+    ];
+    recordPhase("source_list_ready");
+    try {
+      const groups: (readonly string[])[] = [];
+      for (const source of sources) {
+        const framed = frameHostMigrationSql(source);
+        if (framed.length > 0) groups.push(framed);
       }
+      const [first, ...rest] = groups;
+      const remaining = rest.flat();
+      recordPhase("ddl_begin");
+      if (first) await setup.batch(first.map((statement) => setup.prepare(statement)));
+      recordPhase("ddl_first_ready");
+      if (remaining.length > 0)
+        await setup.batch(remaining.map((statement) => setup.prepare(statement)));
+      recordPhase("ddl_ready");
+    } catch (error) {
+      // A native setup error must not expose programmatically imported SQL.
+      // Preserve failure without attaching raw messages, queries or causes.
+      const message = error instanceof Error ? error.message : typeof error;
+      const digest = await bytesDigest(new TextEncoder().encode(message));
+      throw new Error(`Native request schema fixture failed (${digest})`);
     }
     await setup
       .prepare("INSERT INTO stripe_mode_realm VALUES (1, 'test', ?)")
@@ -152,6 +174,7 @@ async function fixture() {
       .prepare("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)")
       .bind(WRITER)
       .all();
+    recordPhase("setup_ready");
 
     const now = Date.now();
     const clock = () => new Date(now);
@@ -354,9 +377,12 @@ async function fixture() {
       if (!row) throw new Error("native count readback missing");
       return [row.principals, row.anchors, row.tokens, row.classes];
     }
-    return { runtime, requestScope, signedIn, counts };
+    recordPhase("fixture_ready");
+    return { runtime, requestScope, signedIn, counts, recordPhase };
   } catch (error) {
+    recordPhase("dispose_begin");
     await runtime.dispose();
+    recordPhase("dispose_ready");
     throw error;
   }
 }
@@ -479,7 +505,10 @@ for (const fault of [
   test(`native ${fault.stage} ${fault.kind} ACK refuses without requery or fallback`, async () => {
     const f = await fixture();
     try {
+      f.recordPhase("signed_in_begin");
       const r = await f.signedIn();
+      f.recordPhase("signed_in_ready");
+      f.recordPhase("body_begin");
       r.trace.fault = fault;
       r.trace.armed = true;
       const batches = r.trace.batches.length;
@@ -499,8 +528,11 @@ for (const fault of [
       expect(await f.counts()).toEqual([1, 1, 1, 1]);
       r.trace.armed = false;
       expect(await r.accounts.authenticate(r.authorization)).toMatchObject({ kind: "session" });
+      f.recordPhase("body_ready");
     } finally {
+      f.recordPhase("dispose_begin");
       await f.runtime.dispose();
+      f.recordPhase("dispose_ready");
     }
   }, 30_000);
 }
