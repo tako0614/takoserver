@@ -90,6 +90,14 @@ function fixture(requiredSecretNames: readonly string[] = ["TOKEN"]) {
       durable = { ...durable, nativeId, state: "bound" };
       if (bindAckLost) throw new Error("synthetic private binding diagnostic");
     },
+    async confirmRunning(record, observation) {
+      if (
+        !durable ||
+        durable.claimId !== record.claimId ||
+        durable.nativeId !== observation.native.nativeId
+      )
+        throw new Error("synthetic private running diagnostic");
+    },
     async confirmStopped(record, observation) {
       if (
         !durable ||

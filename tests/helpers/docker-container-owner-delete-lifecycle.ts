@@ -205,6 +205,20 @@ export function observer() {
           throw error;
         }
       },
+      confirmRunning: async (record, observation) => {
+        try {
+          await source.confirmRunning(record, observation);
+          add({ phase: "owner.confirmRunning", ok: true, ...recordFields(record) });
+        } catch (error) {
+          add({
+            phase: "owner.confirmRunning",
+            ok: false,
+            ...recordFields(record),
+            thrown: thrown(error),
+          });
+          throw error;
+        }
+      },
       confirmStopped: async (record, observation) => {
         try {
           await source.confirmStopped(record, observation);

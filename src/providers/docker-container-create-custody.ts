@@ -62,6 +62,21 @@ export interface DockerContainerCreateOwnerPort {
   ): Promise<T>;
   bindNative(record: DockerContainerCreateRecord, nativeId: string): Promise<void>;
   /** Called only under the held remove authority, only after this helper itself
+   * observed the exact bound native object with a positive Running=true state, and
+   * before it stops that object. The owner records the schema's own pending -> running
+   * for the exact start attempt of this claim, so that the exit recorded by
+   * confirmStopped has a confirmed run to end. The recorded time means "observed
+   * running no later than this owner time": it is not the native START time, not
+   * health and not serving, and the owner never writes the instance, the serving
+   * generation or the retention for it. A 404, a timeout, a stop or DELETE ACK, a
+   * stopped or absent object, or a caller-supplied boolean is never an observation;
+   * a pending attempt whose object was never seen running stays refused.
+   */
+  confirmRunning(
+    record: DockerContainerCreateRecord,
+    observation: DockerContainerRunningObservation,
+  ): Promise<void>;
+  /** Called only under the held remove authority, only after this helper itself
    * observed the exact bound native object with a positive non-running state, and
    * before any native DELETE. The owner records that observed exit durably for the
    * exact start attempt of this claim; a 404, a timeout, a stop or DELETE ACK, or a
@@ -75,10 +90,16 @@ export interface DockerContainerCreateOwnerPort {
   /** Called only after this helper's definite DELETE ACK and exact-ID GET404.
    * This commits a terminal tombstone; it never licenses another CREATE. The owner's
    * schema fence still refuses removal while a start attempt of the claim is pending or
-   * running; it is only as good as the exit recorded by confirmStopped, which rests on
-   * this helper's observation.
+   * running; it is only as good as the running recorded by confirmRunning and the exit
+   * recorded by confirmStopped, which rest on this helper's observations.
    */
   confirmRemoved(record: DockerContainerCreateRecord, nativeId: string): Promise<void>;
+}
+
+/** The exact native identity this helper inspected, with the positive state it saw. */
+export interface DockerContainerRunningObservation {
+  readonly native: DockerContainerNativeIdentity;
+  readonly state: "running";
 }
 
 /** The exact native identity this helper inspected, with the positive state it saw. */
@@ -362,9 +383,15 @@ export class DockerContainerCreateCustody {
       const owner = options.owner;
       if (
         !owner ||
-        !["read", "claim", "withAuthority", "bindNative", "confirmStopped", "confirmRemoved"].every(
-          (key) => typeof owner[key as keyof DockerContainerCreateOwnerPort] === "function",
-        )
+        ![
+          "read",
+          "claim",
+          "withAuthority",
+          "bindNative",
+          "confirmRunning",
+          "confirmStopped",
+          "confirmRemoved",
+        ].every((key) => typeof owner[key as keyof DockerContainerCreateOwnerPort] === "function")
       )
         fail("invalid_request");
       this.#owner = Object.freeze({
@@ -372,6 +399,7 @@ export class DockerContainerCreateCustody {
         claim: owner.claim.bind(owner),
         withAuthority: owner.withAuthority.bind(owner),
         bindNative: owner.bindNative.bind(owner),
+        confirmRunning: owner.confirmRunning.bind(owner),
         confirmStopped: owner.confirmStopped.bind(owner),
         confirmRemoved: owner.confirmRemoved.bind(owner),
       });
@@ -662,6 +690,13 @@ export class DockerContainerCreateCustody {
                   if (observed !== null && observed.native.nativeId !== nativeId)
                     return fail("conflict");
                   if (observed !== null && observed.state === "running") {
+                    // The fresh exact-ID Running=true is a positive fact of its own: record it
+                    // (pending -> running) before the stop. The stop is not what proves it.
+                    await abortable(
+                      owner.confirmRunning(record, { native: observed.native, state: "running" }),
+                      signal,
+                    );
+                    await guard();
                     const stopped = await abortable(
                       driverSnapshot.stop(record, nativeId, signal),
                       signal,

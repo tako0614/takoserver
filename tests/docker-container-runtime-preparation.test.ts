@@ -290,6 +290,9 @@ test("secret preparation cannot bypass typed custody or mix its declared names a
       bindNative: async () => {
         throw new Error("synthetic unreachable owner");
       },
+      confirmRunning: async () => {
+        throw new Error("synthetic unreachable owner");
+      },
       confirmStopped: async () => {
         throw new Error("synthetic unreachable owner");
       },

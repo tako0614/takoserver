@@ -227,6 +227,9 @@ async function create(root: string, mode: ReadbackMode) {
     bindNative: async () => {
       throw new Error("already bound");
     },
+    confirmRunning: async () => {
+      throw new Error("no retirement");
+    },
     confirmStopped: async () => {
       throw new Error("no retirement");
     },
