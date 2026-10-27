@@ -1,215 +1,32 @@
 import { expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 import { Miniflare } from "miniflare";
-import { MIGRATIONS } from "../src/db-schema.ts";
-import type { JsonObject, Sql } from "../src/ports.ts";
-import { createD1Sql } from "../src/sql-d1.ts";
+import type { Sql, SqlParam, SqlStatement, SqlWrite } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
-import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "../src/takoform-v2/forms/durable-workflow.ts";
-import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
-import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
-import {
-  referencesForWorkerDeployment,
-  referencesForWorkerVersion,
-} from "../src/takoform-v2/forms/worker-references.ts";
 import {
   MODULE_WORKER_FORM_URL,
-  parseWorkerDeploymentSpec,
-  parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
-  WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
-import type { V2Form } from "../src/takoform-v2/types.ts";
 import {
   createDurableWorkflowForm,
   DURABLE_WORKFLOW_BACKEND_ID,
 } from "../src/takoform-v2/workflow-backend.ts";
 import { createV2WorkflowClassAdmission } from "../src/takoform-v2/workflow-class-admission.ts";
 import { createWorkerdWorkerModuleInspector } from "../src/workerd-worker-module-inspector.ts";
-import { createWorkflowRuntime } from "../src/workflow-execution.ts";
-import { createV2WorkflowResourceAuthority } from "../src/workflow-v2-resource-authority.ts";
 import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
+import {
+  createWorkflowAdmissionFixture,
+  PRINCIPAL,
+  SPEC_CLASS,
+  TARGET,
+} from "./helpers/workflow-class-admission-fixture.ts";
+import type { WorkflowWorkerObservation } from "./helpers/workflow-class-admission-worker.ts";
 
-const PRINCIPAL = "org:workflow-admission";
-const SPACE = "production";
-const TARGET = "workflow-admission-local-target";
-const SPEC_CLASS = "ReportWorkflow";
-
-function fixture(sqlOverride?: Sql) {
+function fixture() {
   const db = migrateSqliteDatabase();
-  const sql = sqlOverride ?? createSqliteSql(db);
-  const source = new Map<string, Uint8Array>();
-  const bundleHost = createWorkerBundleHost({
-    sql,
-    targetKey: TARGET,
-    source: {
-      async read({ url }) {
-        const bytes = source.get(url);
-        if (!bytes) throw new Error("fixture artifact missing");
-        return bytes;
-      },
-    },
-  });
-  const inspected: string[] = [];
-  let verdict: "valid" | "invalid" | "unavailable" = "valid";
-  const inspector = {
-    async inspectWorkflowClass(input: {
-      readonly className: string;
-      readonly modules: readonly { readonly bytes: Uint8Array }[];
-    }) {
-      inspected.push(new TextDecoder().decode(input.modules[0]?.bytes));
-      expect(input.className).toBe(SPEC_CLASS);
-      return verdict === "valid"
-        ? ({ outcome: "valid" } as const)
-        : verdict === "invalid"
-          ? ({ outcome: "invalid", error: "workflow_class_invalid" } as const)
-          : ({ outcome: "unavailable", retryable: true } as const);
-    },
-  };
-  const admission = createV2WorkflowClassAdmission({
-    sql,
-    targetKey: TARGET,
-    bundleCustody: bundleHost.custody,
-    inspector,
-  });
-  const runtime = createWorkflowRuntime({
-    sql,
-    clock: () => new Date(),
-    randomId: () => "unused-workflow-owner",
-    waitUntil: async () => {},
-    v2ResourceAuthority: createV2WorkflowResourceAuthority(sql),
-    host: {
-      async openPaused() {
-        throw new Error("no instance opened in class admission fixture");
-      },
-      async stop() {
-        return "stopped" as const;
-      },
-    },
-  });
-  const backend = {
-    id: "workflow-admission-fixture-only",
-    targetKey: TARGET,
-    async execute(input: { form: string; spec: JsonObject }) {
-      return {
-        kind: "complete" as const,
-        observed:
-          input.form === WORKER_VERSION_FORM_URL
-            ? { ready: true, resolvedBindings: true, bundleVerified: true }
-            : input.form === WORKER_DEPLOYMENT_FORM_URL
-              ? {
-                  ready: true,
-                  active: true,
-                  selectedVersions: parseWorkerDeploymentSpec(input.spec).versions.map(
-                    ({ workerVersion, weight }) => ({
-                      resourceUid: workerVersion.resourceUid,
-                      weight,
-                    }),
-                  ),
-                }
-              : { ready: true },
-        output: {},
-      };
-    },
-    async reconcile() {
-      return { kind: "unknown" as const };
-    },
-  };
-  const form = (extras: Partial<V2Form> = {}): V2Form => ({
-    validateCreate() {},
-    validateUpdate() {},
-    backend,
-    ...extras,
-  });
-  const engine = createTakoformV2Engine({
-    sql,
-    replayWindowSeconds: 3_600,
-    authorize: async () => true,
-    forms: {
-      [MODULE_WORKER_FORM_URL]: form(),
-      [WORKER_BUNDLE_FORM_URL]: bundleHost.form,
-      [WORKER_VERSION_FORM_URL]: form({
-        references: (spec) => referencesForWorkerVersion(parseWorkerVersionSpec(spec)),
-      }),
-      [WORKER_DEPLOYMENT_FORM_URL]: form({
-        references: (spec) => referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec)),
-      }),
-      [DURABLE_WORKFLOW_FORM_URL]: createDurableWorkflowForm({
-        sql,
-        clock: () => new Date(),
-        targetKey: TARGET,
-        classAdmission: admission,
-        runtime,
-      }),
-    },
-  });
-  async function create(formUrl: string, name: string, spec: JsonObject, settle = true) {
-    const operation = await engine.acceptCreate({
-      principal: PRINCIPAL,
-      key: `workflow-admission-create-${name}`,
-      input: { form: formUrl, space: SPACE, name, spec },
-    });
-    if (settle)
-      expect(await engine.runNext()).toMatchObject({ id: operation.id, status: "succeeded" });
-    return operation;
-  }
-  const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
-  async function version(workerUid: string, name: string) {
-    const moduleUrl = `https://artifacts.example.test/${name}/index.mjs`;
-    const manifestUrl = `https://artifacts.example.test/${name}/manifest.json`;
-    const moduleBytes = new TextEncoder().encode(
-      `// ${name}\nexport class ReportWorkflow { run() { return {}; } }`,
-    );
-    const manifestBytes = new TextEncoder().encode(
-      JSON.stringify({
-        entrypoint: "index.mjs",
-        files: [
-          {
-            path: "index.mjs",
-            url: moduleUrl,
-            sha256: digest(moduleBytes),
-            mediaType: "application/javascript+module",
-          },
-        ],
-      }),
-    );
-    source.set(moduleUrl, moduleBytes);
-    source.set(manifestUrl, manifestBytes);
-    const bundle = await create(WORKER_BUNDLE_FORM_URL, `${name}-bundle`, {
-      artifact: { url: manifestUrl, sha256: digest(manifestBytes) },
-    });
-    return create(WORKER_VERSION_FORM_URL, name, {
-      worker: { resourceUid: workerUid },
-      bundle: { resourceUid: bundle.resourceUid },
-      handlers: ["fetch"],
-    });
-  }
-  function request(workerUid: string) {
-    return {
-      principal: PRINCIPAL,
-      space: SPACE,
-      targetKey: TARGET,
-      resourceUid: "workflow-new-resource",
-      spec: { worker: { resourceUid: workerUid }, className: SPEC_CLASS },
-    };
-  }
-  return {
-    db,
-    sql,
-    engine,
-    admission,
-    bundleCustody: bundleHost.custody,
-    create,
-    version,
-    request,
-    inspected,
-    setVerdict(value: typeof verdict) {
-      verdict = value;
-    },
-    source,
-  };
+  return { db, ...createWorkflowAdmissionFixture(createSqliteSql(db)) };
 }
 
 test("Durable Workflow Form accepts a terminate-only execution owner port", () => {
@@ -374,31 +191,15 @@ test("accepted v2 Workflow Resource becomes Ready only after held weighted class
   }
 });
 
-function splitMigration(source: string): readonly string[] {
-  const statements: string[] = [];
-  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
-  while (rest.length > 0) {
-    if (/^CREATE\s+(?:TEMP\s+)?TRIGGER\b/iu.test(rest)) {
-      const end = /^END\s*;/imu.exec(rest);
-      if (!end || end.index === undefined) throw new Error("incomplete migration trigger");
-      const boundary = end.index + end[0].length;
-      statements.push(rest.slice(0, boundary).trim());
-      rest = rest.slice(boundary).trim();
-      continue;
-    }
-    const boundary = rest.indexOf(";");
-    if (boundary < 0) {
-      statements.push(rest);
-      break;
-    }
-    const statement = rest.slice(0, boundary).trim();
-    if (statement) statements.push(statement);
-    rest = rest.slice(boundary + 1).trim();
-  }
-  return statements;
-}
-
 test("Miniflare D1 atomically accepts 1 and 8 weighted Workflow class graphs and refuses drift", async () => {
+  const build = await Bun.build({
+    entrypoints: [resolve(import.meta.dir, "helpers/workflow-class-admission-worker.ts")],
+    target: "browser",
+    format: "esm",
+  });
+  if (!build.success) throw new Error(build.logs.map(String).join("\n"));
+  const bundle = build.outputs[0];
+  if (!bundle) throw new Error("Workflow admission Worker bundle is unavailable");
   const runtime = new Miniflare({
     workers: [
       {
@@ -411,7 +212,7 @@ test("Miniflare D1 atomically accepts 1 and 8 weighted Workflow class graphs and
             modules: {
               "worker.js": {
                 type: "esm",
-                contents: "export default { fetch() { return new Response('ok'); } };",
+                contents: await bundle.text(),
               },
             },
           },
@@ -421,53 +222,205 @@ test("Miniflare D1 atomically accepts 1 and 8 weighted Workflow class graphs and
       },
     ],
   });
-  let f: ReturnType<typeof fixture> | undefined;
   try {
-    const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS)
-      await database.batch(
-        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
-      );
-    f = fixture(createD1Sql(database));
-    // Two weighted Versions take the same graph path as eight; that case runs
-    // on bun:sqlite in "all active weighted Versions use held bytes...". D1
-    // keeps the single-Version and the eight-Version graphs.
-    for (const count of [1, 8]) {
-      const worker = await f.create(MODULE_WORKER_FORM_URL, `d1-worker-${count}`, {});
-      const versions = [];
-      for (let index = 0; index < count; index++) {
-        versions.push(await f.version(worker.resourceUid, `d1-version-${count}-${index}`));
-      }
-      const weight = 10_000 / count;
-      await f.create(WORKER_DEPLOYMENT_FORM_URL, `d1-deployment-${count}`, {
-        worker: { resourceUid: worker.resourceUid },
-        versions: versions.map((version) => ({
-          workerVersion: { resourceUid: version.resourceUid },
-          weight,
-        })),
-      });
-      const prepared = await f.admission.prepare(f.request(worker.resourceUid));
-      expect(prepared.kind).toBe("qualified");
-      if (prepared.kind !== "qualified") throw new Error("expected qualified D1 graph");
-      expect(
-        await f.sql.query(`SELECT 1 WHERE ${prepared.predicate.sql}`, prepared.predicate.params),
-      ).toHaveLength(1);
-      await f.create(
-        DURABLE_WORKFLOW_FORM_URL,
-        `d1-workflow-${count}`,
-        f.request(worker.resourceUid).spec,
-      );
-      expect(await f.admission.observe(f.request(worker.resourceUid))).toBe("ready");
-      await f.sql.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
-        '{"ready":false}',
-        versions[0]?.resourceUid ?? "",
-      ]);
-      expect(
-        await f.sql.query(`SELECT 1 WHERE ${prepared.predicate.sql}`, prepared.predicate.params),
-      ).toHaveLength(0);
+    const response = await runtime.dispatchFetch(
+      "https://workflow-admission.test/__test/workflow-admission",
+      { method: "POST" },
+    );
+    expect(response.status).toBe(200);
+    const observation = (await response.json()) as WorkflowWorkerObservation;
+    expect(observation.graphs).toHaveLength(2);
+    for (const [index, count] of [1, 8].entries()) {
+      const graph = observation.graphs[index];
+      if (!graph) throw new Error(`missing ${count}-Version Worker observation`);
+      expect(graph.count).toBe(count);
+      expect(graph.versionCount).toBe(count);
+      expect(graph.weights).toEqual(Array(count).fill(10_000 / count));
+      expect(graph.preparedKind).toBe("qualified");
+      expect(graph.predicateBeforeCount).toBe(1);
+      expect(graph.observed).toBe("ready");
+      expect(graph.predicateAfterCount).toBe(0);
+      expect(graph.inspectedClassNames.length).toBeGreaterThan(0);
+      for (const className of graph.inspectedClassNames) expect(className).toBe(SPEC_CLASS);
+      expect(graph.settlements).toHaveLength(3 + 2 * count);
+      for (const settlement of graph.settlements)
+        expect({ id: settlement.actualId, status: settlement.status }).toMatchObject({
+          id: settlement.acceptedId,
+          status: "succeeded",
+        });
     }
   } finally {
-    f?.db.close();
     await runtime.dispose();
   }
 }, 120_000);
+
+function measuredReadFixture() {
+  const db = migrateSqliteDatabase();
+  const original = createSqliteSql(db);
+  let roundtrips = 0;
+  let fault: "truncated" | "extra-result" | "malformed-rows" | null = null;
+  const sql: Sql = {
+    async query(statement, params) {
+      roundtrips++;
+      return await original.query(statement, params);
+    },
+    run: original.run.bind(original),
+    async batch(statements: readonly SqlStatement[]) {
+      roundtrips++;
+      const results = await original.batch(statements);
+      if (fault && statements.every(({ sql }) => /^\s*SELECT\b/iu.test(sql))) {
+        if (fault === "truncated") return results.slice(1);
+        if (fault === "extra-result") return [...results, ...results.slice(0, 1)];
+        return results.map((result, index) =>
+          index === 0 ? { ...result, rows: { 0: result.rows[0], length: 1 } } : result,
+        ) as unknown as readonly SqlWrite[];
+      }
+      return results;
+    },
+  };
+  return {
+    db,
+    original,
+    ...createWorkflowAdmissionFixture(sql),
+    resetRoundtrips() {
+      roundtrips = 0;
+    },
+    get roundtrips() {
+      return roundtrips;
+    },
+    setFault(value: typeof fault) {
+      fault = value;
+    },
+  };
+}
+
+async function createMeasuredGraph(f: ReturnType<typeof measuredReadFixture>, count: number) {
+  const worker = await f.create(MODULE_WORKER_FORM_URL, `read-plan-worker-${count}`, {});
+  const versions = [];
+  for (let index = 0; index < count; index++)
+    versions.push(await f.version(worker.resourceUid, `read-plan-version-${count}-${index}`));
+  const deployment = await f.create(WORKER_DEPLOYMENT_FORM_URL, `read-plan-deployment-${count}`, {
+    worker: { resourceUid: worker.resourceUid },
+    versions: versions.map((version) => ({
+      workerVersion: { resourceUid: version.resourceUid },
+      weight: 10_000 / count,
+    })),
+  });
+  return { worker, versions, deployment };
+}
+
+test("Workflow currentness bounds roundtrips for one and eight Versions", async () => {
+  const f = measuredReadFixture();
+  const roundtrips: number[] = [];
+  try {
+    for (const count of [1, 8]) {
+      const { worker } = await createMeasuredGraph(f, count);
+      f.resetRoundtrips();
+      expect((await f.admission.prepare(f.request(worker.resourceUid))).kind).toBe("qualified");
+      roundtrips.push(f.roundtrips);
+    }
+    // Every boundary still checks the full graph; it must not pay one D1
+    // request per row again for every inspected Version.
+    expect(roundtrips[1]).toBeLessThan((roundtrips[0] ?? 0) * 12);
+  } finally {
+    f.db.close();
+  }
+});
+
+for (const fault of ["truncated", "extra-result", "malformed-rows"] as const) {
+  test(`Workflow currentness refuses fresh read acknowledgement: ${fault}`, async () => {
+    const f = measuredReadFixture();
+    try {
+      const { worker } = await createMeasuredGraph(f, 1);
+      f.setFault(fault);
+      expect((await f.admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    } finally {
+      f.db.close();
+    }
+  });
+}
+
+test("Workflow currentness re-reads the graph after awaited class inspection", async () => {
+  const f = measuredReadFixture();
+  try {
+    const { worker, versions } = await createMeasuredGraph(f, 1);
+    let inspections = 0;
+    let drifted = false;
+    const admission = createV2WorkflowClassAdmission({
+      sql: f.sql,
+      targetKey: TARGET,
+      bundleCustody: f.bundleCustody,
+      inspector: {
+        async inspectWorkflowClass() {
+          inspections++;
+          await f.original.run("UPDATE tf_v2_resources SET observed_json = ? WHERE uid = ?", [
+            '{"ready":false}',
+            versions[0]?.resourceUid ?? "",
+          ]);
+          const [row] = await f.original.query(
+            "SELECT observed_json FROM tf_v2_resources WHERE uid = ?",
+            [versions[0]?.resourceUid ?? ""],
+          );
+          drifted = row?.observed_json === '{"ready":false}';
+          return { outcome: "valid" };
+        },
+      },
+    });
+    expect((await admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    expect(drifted).toBe(true);
+    expect(inspections).toBe(1);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("Workflow currentness retains the ambiguous completed-history refusal", async () => {
+  const f = measuredReadFixture();
+  try {
+    const { worker, deployment } = await createMeasuredGraph(f, 1);
+    let inspections = 0;
+    let completedRows: unknown;
+    const admission = createV2WorkflowClassAdmission({
+      sql: f.sql,
+      targetKey: TARGET,
+      bundleCustody: f.bundleCustody,
+      inspector: {
+        async inspectWorkflowClass() {
+          inspections++;
+          const [operation] = await f.original.query(
+            "SELECT * FROM tf_v2_operations WHERE id = ?",
+            [deployment.id],
+          );
+          if (!operation) throw new Error("missing completed Deployment");
+          // The schema permits direct terminal inserts even though the ordinary
+          // writer only mints queued Operations. Keep the recapture's refusal.
+          const extra = {
+            ...operation,
+            id: "read-plan-ambiguous-completed-operation",
+            replay_key: "read-plan-ambiguous-completed-key",
+            backend_key: "read-plan-ambiguous-completed-backend",
+            acceptance_order: null,
+          };
+          const columns = Object.keys(extra);
+          await f.original.run(
+            `INSERT INTO tf_v2_operations (${columns.map((column) => `"${column}"`).join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+            Object.values(extra) as SqlParam[],
+          );
+          const [count] = await f.original.query(
+            "SELECT count(*) AS n FROM tf_v2_operations WHERE resource_uid = ? AND generation = 1 AND action IN ('create','update') AND status = 'succeeded' AND effect = 'complete'",
+            [deployment.resourceUid],
+          );
+          completedRows = count?.n;
+          return { outcome: "valid" };
+        },
+      },
+    });
+    expect((await admission.prepare(f.request(worker.resourceUid))).kind).toBe("unavailable");
+    // Inspector exceptions are translated to unavailable: prove the mutation
+    // completed outside that catchable callback before accepting the refusal.
+    expect(completedRows).toBe(2);
+    expect(inspections).toBe(1);
+  } finally {
+    f.db.close();
+  }
+});

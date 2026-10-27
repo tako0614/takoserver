@@ -1094,6 +1094,61 @@ test("serialized owner state transitions rebase after a delayed durable write", 
   expect(writer.current()).toEqual({ incarnation: "retiring", admissionClosedBy: "delete-op" });
 });
 
+test("a rejected owner state precondition does not poison later durable transitions", async () => {
+  const initial = { revision: 0 };
+  const refusal = new Error("observed snapshot changed");
+  let commits = 0;
+  const writer = createSerializedWorkerdOwnerStateWriter(initial, async (next) => {
+    commits += 1;
+    return next;
+  });
+  await expect(
+    writer.transition(() => {
+      throw refusal;
+    }),
+  ).rejects.toBe(refusal);
+  expect(commits).toBe(0);
+  expect(writer.current()).toBe(initial);
+  await expect(writer.transition(() => ({ revision: 1 }))).resolves.toEqual({ revision: 1 });
+  expect(commits).toBe(1);
+  expect(writer.current()).toEqual({ revision: 1 });
+});
+
+test("a stale queued owner snapshot does not poison the following retirement", async () => {
+  let announceFirst!: () => void;
+  let releaseFirst!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    announceFirst = resolve;
+  });
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  let commits = 0;
+  const writer = createSerializedWorkerdOwnerStateWriter(
+    { revision: 0, retired: false },
+    async (next) => {
+      commits += 1;
+      if (commits === 1) {
+        announceFirst();
+        await firstGate;
+      }
+      return next;
+    },
+  );
+  const first = writer.transition((current) => ({ ...current, revision: 1 }));
+  await firstStarted;
+  const stale = writer.transition((current) => {
+    if (current.revision !== 0) throw new Error("snapshot changed before commit");
+    return { ...current, revision: 99 };
+  });
+  const retired = writer.transition((current) => ({ ...current, revision: 2, retired: true }));
+  releaseFirst();
+  await first;
+  await expect(stale).rejects.toThrow("snapshot changed before commit");
+  await expect(retired).resolves.toEqual({ revision: 2, retired: true });
+  expect(commits).toBe(2);
+});
+
 test("an ambiguous durable state commit poisons later writes instead of overwriting possible disk state", async () => {
   const initial = { incarnation: "active", admissionClosedBy: null as string | null };
   let possibleDiskState = initial;
@@ -1104,9 +1159,14 @@ test("an ambiguous durable state commit poisons later writes instead of overwrit
   await expect(
     writer.transition((current) => ({ ...current, admissionClosedBy: "delete-op" })),
   ).rejects.toThrow("directory fsync failed after rename");
+  let laterPreconditionCalled = false;
   await expect(
-    writer.transition((current) => ({ ...current, incarnation: "retired" })),
+    writer.transition((current) => {
+      laterPreconditionCalled = true;
+      return { ...current, incarnation: "retired" };
+    }),
   ).rejects.toThrow("directory fsync failed after rename");
+  expect(laterPreconditionCalled).toBe(false);
   expect(possibleDiskState).toEqual({ incarnation: "active", admissionClosedBy: "delete-op" });
   expect(writer.current()).toEqual(initial);
 });
@@ -2043,6 +2103,8 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     continueActorTurn?.();
     return activeActorTurnRead ?? owner.selectWorkflowExecution(request);
   };
+  let releaseLease: (() => Promise<void>) | undefined;
+  let deletion: ReturnType<typeof owner.execute> | undefined;
   try {
     expect(await owner.selectWorkflowExecution(request)).toEqual({ kind: "unknown" });
     expect(await owner.execute(execution(workerUid, createId, "create"))).toMatchObject({
@@ -2063,6 +2125,7 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     expect(selection.selected.hostModules.size).toBeGreaterThan(0);
     expect(await selection.stillCurrent()).toBe(true);
     const lease = await selection.acquirePrivateServiceBindings(new AbortController().signal);
+    releaseLease = () => lease.release();
     expect(lease.services).toEqual([]);
     const mutable = { ...request };
     const pending = owner.selectWorkflowExecution(mutable);
@@ -2086,14 +2149,24 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
       continueActorTurn = resolve;
     }).then(() => owner.selectWorkflowExecution(request));
     let deleteFinished = false;
-    const deletion = owner.execute(execution(workerUid, deleteId, "delete")).then((result) => {
+    deletion = owner.execute(execution(workerUid, deleteId, "delete")).then((result) => {
       deleteFinished = true;
       return result;
     });
-    await Bun.sleep(30);
+    const workerKey = createHash("sha256").update(workerUid, "utf8").digest("hex");
+    const statePath = join(owned.root, "owners", workerKey, "runtime-owner.json");
+    await until(() => {
+      const state = JSON.parse(readFileSync(statePath, "utf8")) as {
+        incarnations: readonly { operationId: string; status: string }[];
+      };
+      return state.incarnations.some(
+        (record) => record.operationId === createId && record.status === "retiring",
+      );
+    });
     expect(deleteFinished).toBe(false);
     expect(await selection.stillCurrent()).toBe(false);
     await lease.release();
+    releaseLease = undefined;
     expect(await deletion).toMatchObject({
       kind: "confirmed",
       identity: null,
@@ -2101,6 +2174,12 @@ test("Workflow selection returns only the exact live SQL-held code Version and a
     expect(actorDrainCalls).toBe(2);
     expect(await selection.stillCurrent()).toBe(false);
   } finally {
+    // An assertion failure must also finish the private lease and its DELETE;
+    // otherwise close correctly refuses and the abandoned lock reaches GC.
+    await releaseLease?.();
+    allowActorDrain = true;
+    if (deletion) await deletion;
+    else await owner.execute(execution(workerUid, deleteId, "delete"));
     await owner.close().catch(() => undefined);
     await owned.cleanup();
   }

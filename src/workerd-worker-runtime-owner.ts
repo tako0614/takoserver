@@ -1744,8 +1744,11 @@ export function createSerializedWorkerdOwnerStateWriter<State>(
     transition(change) {
       const task = tail.then(async () => {
         if (poisoned) throw poisonReason;
+        // A rejected precondition has not attempted a durable write. Only a
+        // commit failure can leave a possibly renamed snapshot on disk.
+        const next = change(current);
         try {
-          current = await commit(change(current));
+          current = await commit(next);
           return current;
         } catch (error) {
           // A failed durable commit may have renamed the snapshot before its

@@ -2,7 +2,7 @@ module github.com/tako0614/takoserver/services/takoform-core-verifier
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require github.com/tako0614/takoform v1.1.0
 

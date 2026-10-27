@@ -629,6 +629,14 @@ describe("durable deferred Takoform operations", () => {
     expect(stored.request_body_json).not.toContain("must-not-persist");
     opened.close();
 
+    opened = harness.open();
+    const beforeExpiry = await opened.host.handle(
+      request(`${lane}/operations/${operationId}`, "primary"),
+    );
+    expect(await beforeExpiry?.json()).toMatchObject({ id: operationId, done: false });
+    expect(opened.database.query("SELECT name FROM tf_resources").all()).toEqual([]);
+    opened.close();
+
     now += 1_001;
     opened = harness.open();
     const recovered = await opened.host.handle(
@@ -3178,8 +3186,16 @@ describe("durable deferred Takoform operations", () => {
   });
 });
 
+// Persistence latency is not the logical lease clock. Tests that exercise
+// expiry pass an explicitly advanced clock; real inline budgets still use
+// the Host's timer and retain their existing bounds.
+function fixtureClock(): () => Date {
+  const timestamp = Date.now();
+  return () => new Date(timestamp);
+}
+
 function persistentHarness(
-  clock: () => Date = () => new Date(),
+  clock: () => Date = fixtureClock(),
   driver: TakoformResourceDriver = new InMemoryTakoformResourceDriver(),
   forms: readonly InstalledTakoformForm[] = [form],
   /** The production shape defers every provider-backed mutation inline. */

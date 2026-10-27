@@ -162,7 +162,17 @@ test("fresh v2-0100-money-preserved generation starts the current Worker with it
       throw new Error(`unexpected local test command ${key}`);
     };
     const reader = { read: async () => await d1State(d1) };
-    const freshV2DataReader = { read: async () => await miniflareData(d1) };
+    const freshV2DataReader = {
+      async read() {
+        try {
+          return await miniflareData(d1);
+        } catch (error) {
+          // Status catches readback failures; retain the fixture's raw D1 cause.
+          console.error("fresh Money fixture D1 readback failed", error);
+          throw error;
+        }
+      },
+    };
     const invocation = {
       action: "apply",
       environment: "integration",

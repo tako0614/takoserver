@@ -83,14 +83,14 @@ as `KEY` and `ORG`; keep it open between steps.
   Keep a note of `$COMMIT`: an update later moves from it to a newer reviewed
   commit.
 
-- Bun at the version in `.bun-version` (currently 1.4.0), installed where the
+- Bun at the version in `.bun-version` (currently 1.4.3), installed where the
   `takoserver` user can run it. The installer's default location is the
   installing user's home, which `takoserver` cannot read when root runs it. As
   root, this installs `/usr/local/bin/bun`, the path the wrapper script of
   step 3 runs:
 
   ```sh
-  curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s bun-v1.4.0
+  curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash -s bun-v1.4.3
   ```
 
 - For the complete local Worker profile, two native binaries. Install both
@@ -131,15 +131,15 @@ as `KEY` and `ORG`; keep it open between steps.
     Host never falls back to the npm `workerd`.
   - The Workflow execution guard, built from the same checkout with the Go
     toolchain named on the `toolchain` line of
-    `services/workflow-execution-guard/go.mod` (currently go1.26.9). Set
+    `services/workflow-execution-guard/go.mod` (currently go1.26.10). Set
     `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` to its absolute path. As root,
     install that toolchain from <https://go.dev/dl/>, comparing the printed
     SHA-256 with the one listed there for the file, and build:
 
     ```sh
-    curl -fsSLO https://go.dev/dl/go1.26.9.linux-amd64.tar.gz
-    sha256sum go1.26.9.linux-amd64.tar.gz
-    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.9.linux-amd64.tar.gz   # replaces any Go there
+    curl -fsSLO https://go.dev/dl/go1.26.10.linux-amd64.tar.gz
+    sha256sum go1.26.10.linux-amd64.tar.gz
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.10.linux-amd64.tar.gz   # replaces any Go there
     export PATH=/usr/local/go/bin:$PATH
     cd /opt/takoserver/services/workflow-execution-guard
     go build -o /usr/local/libexec/takoserver/workflow-execution-guard ./cmd/workflow-execution-guard

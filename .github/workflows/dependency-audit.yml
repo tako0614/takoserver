@@ -100,7 +100,7 @@ jobs:
       # stale digest fails the build. The portable gate
       # (tests/go-vulnerability-audit.test.ts) keeps all of them in agreement;
       # change them together.
-      GO_TOOLCHAIN_VERSION: "1.26.9"
+      GO_TOOLCHAIN_VERSION: "1.26.10"
       GOVULNCHECK_VERSION: v1.8.0
       GOTOOLCHAIN: local
     steps:

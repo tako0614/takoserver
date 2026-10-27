@@ -929,7 +929,46 @@ class LocalCloudflare {
         status: 409,
       });
     }
-    return (await this.runtime.dispatchFetch(request as never)) as unknown as Response;
+    // Bun and the SDK's Undici objects have different native brands. Cross
+    // the HTTP boundary with URL/wire fields and a streamed native Response.
+    const response = await this.runtime.dispatchFetch(request.url, {
+      method: request.method,
+      headers: [...request.headers],
+      redirect: request.redirect,
+      signal: request.signal,
+      ...(request.body === null ? {} : { body: request.body, duplex: "half" }),
+    });
+    const reader = response.body?.getReader();
+    const body = reader
+      ? new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            try {
+              const chunk = await reader.read();
+              if (chunk.done) {
+                controller.close();
+                reader.releaseLock();
+              } else {
+                controller.enqueue(chunk.value);
+              }
+            } catch (error) {
+              controller.error(error);
+              reader.releaseLock();
+            }
+          },
+          async cancel(reason) {
+            try {
+              await reader.cancel(reason);
+            } finally {
+              reader.releaseLock();
+            }
+          },
+        })
+      : null;
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: [...response.headers],
+    });
   }
 
   async exerciseNativeHandlers(): Promise<{
@@ -950,8 +989,8 @@ class LocalCloudflare {
       "yurucommu-stable-local",
     );
     await producer.send({ kind: "stable-local-invalid-probe" });
-    await this.runtime.dispatchFetch(
-      new Request("http://stable-local.invalid/cdn-cgi/local/scheduled?cron=0+*+*+*+*") as never,
+    await this.dispatch(
+      new Request("http://stable-local.invalid/cdn-cgi/local/scheduled?cron=0+*+*+*+*"),
     );
     const deadline = Date.now() + 8_000;
     let lastReport: {
@@ -962,9 +1001,9 @@ class LocalCloudflare {
       queueIdentity?: unknown;
     } = {};
     while (Date.now() < deadline) {
-      const response = (await this.runtime.dispatchFetch(
-        new Request("http://stable-local.invalid/__stable_local_runtime_report") as never,
-      )) as unknown as Response;
+      const response = await this.dispatch(
+        new Request("http://stable-local.invalid/__stable_local_runtime_report"),
+      );
       const report = (await response.json()) as {
         queueHandlerInvocations?: number;
         scheduledHandlerInvocations?: number;
