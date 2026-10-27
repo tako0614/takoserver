@@ -243,3 +243,285 @@ test("guard: an explicit PUT whose own material the owner cannot read is refused
     fx.database.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// Finding (b): an UPDATE that carries no map of its own (omitted PUT, explicit empty map,
+// name removal, a plain UPDATE of a Resource without secrets) captured the Resource-owned
+// CREATE envelope (or null) at admission. The owner has to accept that evidence, and the
+// configured-input codec then selects the latest exact map as the source.
+
+/** CREATE (A) and an explicit full-map PUT (B), both served through the owner. */
+async function servedCreateAndExplicit(ctx: Awaited<ReturnType<typeof dockerOwnerFixture>>) {
+  const { fx } = ctx;
+  fx.dispatch(ctx.dispatch);
+  const created = await fx.create("owner-chain", A, NAMES);
+  expect(await fx.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+  const explicit = await fx.update(created.resourceUid, 1, revision("2"), B, NAMES);
+  expect(await fx.engine.runNext()).toMatchObject({ id: explicit.id, status: "succeeded" });
+  return { created, explicit };
+}
+
+test("an omitted PUT after CREATE and an explicit PUT delivers the latest exact map, not the CREATE map", async () => {
+  const ctx = await dockerOwnerFixture();
+  const { fx, docker, outcomes } = ctx;
+  try {
+    const { created } = await servedCreateAndExplicit(ctx);
+    const omitted = await fx.update(created.resourceUid, 2, revision("3"), undefined, NAMES);
+
+    const result = await fx.engine.runNext();
+
+    expect(outcomes.map((outcome) => outcome.failure)).toEqual([undefined, undefined, undefined]);
+    expect(result).toMatchObject({ id: omitted.id, status: "succeeded", effect: "complete" });
+    expect(docker.creates()).toHaveLength(3);
+    expect(secretEnv(docker.creates()[2], NAMES)).toEqual([
+      "OTHER=synthetic-other-B",
+      "SECRET=synthetic-secret-B",
+    ]);
+    // The omitted PUT has no material row of its own and the CREATE map never reappears.
+    expect(
+      sql(fx, "SELECT operation_id FROM tf_v2_operation_configured_private_inputs"),
+    ).toHaveLength(1);
+    expect(
+      sql(fx, "SELECT generation, retention FROM tf_v2_container_revisions ORDER BY generation"),
+    ).toEqual([
+      { generation: 1, retention: "draining" },
+      { generation: 2, retention: "draining" },
+      { generation: 3, retention: "serving" },
+    ]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("an omitted PUT after CREATE alone inherits the CREATE map", async () => {
+  const { fx, docker, outcomes, dispatch } = await dockerOwnerFixture();
+  try {
+    fx.dispatch(dispatch);
+    const created = await fx.create("owner-inherit", A, NAMES);
+    expect(await fx.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+    const omitted = await fx.update(created.resourceUid, 1, revision("2"), undefined, NAMES);
+
+    const result = await fx.engine.runNext();
+
+    expect(outcomes.map((outcome) => outcome.failure)).toEqual([undefined, undefined]);
+    expect(result).toMatchObject({ id: omitted.id, status: "succeeded" });
+    expect(docker.creates()).toHaveLength(2);
+    expect(secretEnv(docker.creates()[1], NAMES)).toEqual([
+      "OTHER=synthetic-other-A",
+      "SECRET=synthetic-secret-A",
+    ]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("an omitted PUT that drops a name delivers only the retained subset of the latest map", async () => {
+  const ctx = await dockerOwnerFixture();
+  const { fx, docker, outcomes } = ctx;
+  try {
+    const { created } = await servedCreateAndExplicit(ctx);
+    const omitted = await fx.update(created.resourceUid, 2, revision("3"), undefined, ["SECRET"]);
+
+    const result = await fx.engine.runNext();
+
+    expect(outcomes.map((outcome) => outcome.failure)).toEqual([undefined, undefined, undefined]);
+    expect(result).toMatchObject({ id: omitted.id, status: "succeeded" });
+    // OTHER was removed from the declaration: it is not delivered, and SECRET is B's, not A's.
+    expect(docker.creates()).toHaveLength(3);
+    expect(secretEnv(docker.creates()[2], NAMES)).toEqual(["SECRET=synthetic-secret-B"]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("an omitted PUT that removes every name executes with no secrets", async () => {
+  const ctx = await dockerOwnerFixture();
+  const { fx, docker, outcomes } = ctx;
+  try {
+    const { created } = await servedCreateAndExplicit(ctx);
+    const removal = await fx.update(created.resourceUid, 2, revision("3"), undefined, []);
+
+    const result = await fx.engine.runNext();
+
+    expect(outcomes.map((outcome) => outcome.failure)).toEqual([undefined, undefined, undefined]);
+    expect(result).toMatchObject({ id: removal.id, status: "succeeded" });
+    expect(docker.creates()).toHaveLength(3);
+    expect(secretEnv(docker.creates()[2], NAMES)).toEqual([]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("an explicit empty map and a following omitted PUT with no names execute with no secrets", async () => {
+  const { fx, docker, outcomes, dispatch } = await dockerOwnerFixture();
+  try {
+    fx.dispatch(dispatch);
+    const created = await fx.create("owner-empty", A, NAMES);
+    expect(await fx.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+    const emptied = await fx.update(created.resourceUid, 1, revision("2"), {}, []);
+    expect(await fx.engine.runNext()).toMatchObject({ id: emptied.id, status: "succeeded" });
+    const removal = await fx.update(created.resourceUid, 2, revision("3"), undefined, []);
+
+    const result = await fx.engine.runNext();
+
+    expect(outcomes.map((outcome) => outcome.failure)).toEqual([undefined, undefined, undefined]);
+    expect(result).toMatchObject({ id: removal.id, status: "succeeded" });
+    expect(docker.creates()).toHaveLength(3);
+    expect(secretEnv(docker.creates()[1], NAMES)).toEqual([]);
+    expect(secretEnv(docker.creates()[2], NAMES)).toEqual([]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("a plain revision UPDATE of a Resource without secrets executes", async () => {
+  const { fx, docker, outcomes, dispatch } = await dockerOwnerFixture();
+  try {
+    fx.dispatch(dispatch);
+    const created = await fx.create("owner-plain-update", {}, []);
+    expect(await fx.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+    const update = await fx.update(created.resourceUid, 1, revision("2"), undefined, []);
+
+    const result = await fx.engine.runNext();
+
+    expect(outcomes.map((outcome) => outcome.failure)).toEqual([undefined, undefined]);
+    expect(result).toMatchObject({ id: update.id, status: "succeeded" });
+    expect(docker.creates()).toHaveLength(2);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("an empty CREATE, an explicit map that adds a name, then an omitted PUT delivers that map", async () => {
+  const { fx, docker, outcomes, dispatch } = await dockerOwnerFixture();
+  try {
+    fx.dispatch(dispatch);
+    const created = await fx.create("owner-add-name", {}, []);
+    expect(await fx.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+    const added = await fx.update(created.resourceUid, 1, revision("2"), { SECRET: B.SECRET }, [
+      "SECRET",
+    ]);
+    expect(await fx.engine.runNext()).toMatchObject({ id: added.id, status: "succeeded" });
+    const omitted = await fx.update(created.resourceUid, 2, revision("3"), undefined, ["SECRET"]);
+
+    const result = await fx.engine.runNext();
+
+    expect(outcomes.map((outcome) => outcome.failure)).toEqual([undefined, undefined, undefined]);
+    expect(result).toMatchObject({ id: omitted.id, status: "succeeded" });
+    expect(docker.creates()).toHaveLength(3);
+    expect(secretEnv(docker.creates()[2], NAMES)).toEqual(["SECRET=synthetic-secret-B"]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("latest explicit map unreadable only inside the loan: refused by the codec, no new native create, no older map", async () => {
+  const ctx = await dockerOwnerFixture();
+  const { fx, docker, outcomes, hooks } = ctx;
+  try {
+    const { created, explicit } = await servedCreateAndExplicit(ctx);
+    const omitted = await fx.update(created.resourceUid, 2, revision("3"), undefined, NAMES);
+    // Armed after the owner's acceptance snapshot has passed: the first reader of the hidden
+    // row is the codec's exact-source read inside the environment loan.
+    hooks.afterAccepted = () => fx.visibility.hide(explicit.id);
+
+    const result = await fx.engine.runNext();
+
+    // First the property that matters: neither the CREATE map nor the previous explicit map
+    // reached a new native create (a failure here prints the map that was delivered).
+    expect(
+      docker
+        .creates()
+        .slice(2)
+        .map((create) => secretEnv(create, NAMES)),
+    ).toEqual([]);
+    expect(docker.creates()).toHaveLength(2);
+    expect(docker.starts()).toHaveLength(2);
+    expect(result).toMatchObject({ id: omitted.id, status: "reconciling", effect: "unknown" });
+    // Then which layer refused. The runtime only sees the custody's generic refusal, so the
+    // attribution rests on the state below: the pending generation-3 claim exists, so the
+    // owner's claim/load of generation 3 passed after the row was hidden (that load never
+    // reads another generation's material), and the pre-f106 JOIN codec delivers the CREATE
+    // map to a third native create in the same setup (see the mutation list in the result).
+    expect(fx.visibility.hits()).toBeGreaterThan(0);
+    expect(outcomes.at(-1)?.failure).toMatchObject({
+      at: "runtime",
+      name: "DockerHttpRevisionError",
+    });
+    // The owner still issued the pending claim before the loan; nothing was bound or started.
+    expect(
+      sql(
+        fx,
+        "SELECT generation, state, native_id IS NOT NULL AS bound FROM tf_v2_container_create_claims ORDER BY generation",
+      ),
+    ).toEqual([
+      { generation: 1, state: "bound", bound: 1 },
+      { generation: 2, state: "bound", bound: 1 },
+      { generation: 3, state: "pending", bound: 0 },
+    ]);
+    expect(
+      sql(fx, "SELECT desired_generation, serving_generation FROM tf_v2_container_instances"),
+    ).toEqual([{ desired_generation: 3, serving_generation: 2 }]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("guard: the CREATE anchor unreadable only after the acceptance read refuses an omitted PUT at the owner's per-claim snapshot", async () => {
+  const ctx = await dockerOwnerFixture();
+  const { fx, docker, outcomes, hooks } = ctx;
+  try {
+    const { created } = await servedCreateAndExplicit(ctx);
+    const omitted = await fx.update(created.resourceUid, 2, revision("3"), undefined, NAMES);
+    // The omitted PUT captured the CREATE envelope, so its own snapshot compares that capture
+    // with the CREATE anchor. Hidden (read visibility only) after readAcceptedExecution has
+    // passed, the first reader is the owner's claim/load of generation 3.
+    hooks.afterAccepted = () =>
+      fx.database.exec(
+        `CREATE TEMP VIEW tf_v2_configured_private_inputs AS
+         SELECT * FROM main.tf_v2_configured_private_inputs WHERE resource_uid <> '${created.resourceUid}'`,
+      );
+
+    const result = await fx.engine.runNext();
+
+    expect(
+      docker
+        .creates()
+        .slice(2)
+        .map((create) => secretEnv(create, NAMES)),
+    ).toEqual([]);
+    expect(docker.creates()).toHaveLength(2);
+    expect(result).toMatchObject({ id: omitted.id, status: "reconciling", effect: "unknown" });
+    expect(outcomes.at(-1)?.failure).toMatchObject({ at: "runtime" });
+    // No claim for generation 3: the owner refused before issuing one.
+    expect(
+      sql(fx, "SELECT generation FROM tf_v2_container_create_claims ORDER BY generation"),
+    ).toEqual([{ generation: 1 }, { generation: 2 }]);
+  } finally {
+    fx.database.close();
+  }
+});
+
+test("latest explicit map unreadable before execution: refused by the owner snapshot of that revision, before any claim", async () => {
+  const ctx = await dockerOwnerFixture();
+  const { fx, docker, outcomes } = ctx;
+  try {
+    const { created, explicit } = await servedCreateAndExplicit(ctx);
+    const omitted = await fx.update(created.resourceUid, 2, revision("3"), undefined, NAMES);
+    fx.visibility.hide(explicit.id);
+
+    const result = await fx.engine.runNext();
+
+    expect(result).toMatchObject({ id: omitted.id, status: "reconciling", effect: "unknown" });
+    expect(outcomes.at(-1)?.failure).toMatchObject({
+      at: "readAcceptedExecution",
+      message: "Docker Core owner authority refused",
+    });
+    expect(docker.creates()).toHaveLength(2);
+    expect(
+      sql(fx, "SELECT generation FROM tf_v2_container_create_claims ORDER BY generation"),
+    ).toEqual([{ generation: 1 }, { generation: 2 }]);
+  } finally {
+    fx.database.close();
+  }
+});

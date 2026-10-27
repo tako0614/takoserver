@@ -684,7 +684,13 @@ export function createDockerContainerCoreOwner(
       (a("action") === "create" &&
         names.length > 0 &&
         (configured === null || o("private_inputs_present") !== 1)) ||
-      (a("action") === "update" && configured === null)
+      // An explicit map that declares names must carry its own sealed envelope. An UPDATE
+      // without a map keeps what Core captured at admission, which is null when the CREATE
+      // had no envelope; its retained source is proved separately at admission.
+      (a("action") === "update" &&
+        configured === null &&
+        names.length > 0 &&
+        o("private_inputs_present") === 1)
     )
       fail();
     // A live preparation keeps its exact original identity; durable recovery
@@ -730,6 +736,26 @@ export function createDockerContainerCoreOwner(
     }
     fail();
   }
+  function ownsAcceptedUpdateMaterial(proof: Proof, alias: "a" | "la"): boolean {
+    const a = (key: string) => proof[alias + "_" + key];
+    const o = (key: string) => proof[(alias === "a" ? "o" : "lo") + "_" + key];
+    if (a("action") !== "update" || o("private_inputs_present") !== 1) return false;
+    const spec = parseStrictJson(
+      new TextEncoder().encode(String(a("accepted_spec_json"))),
+      1048576,
+    );
+    if (!isJsonObject(spec)) return fail();
+    const environment = spec[C.fields.environment];
+    if (environment !== undefined && !isJsonObject(environment)) return fail();
+    return (
+      validateV2ContainerF2SensitiveNames(
+        spec[C.fields.requiredSensitiveVars] === undefined
+          ? []
+          : spec[C.fields.requiredSensitiveVars],
+        environment === undefined ? [] : Object.keys(environment),
+      ).length > 0
+    );
+  }
   async function configuredSnapshot(proof: Proof, alias: "a" | "la"): Promise<void> {
     const a = (key: string) => proof[alias + "_" + key];
     if (proof.i_form_url !== V2_CONTAINER_F2_FORM || a("action") === "delete") return;
@@ -742,10 +768,14 @@ export function createDockerContainerCoreOwner(
         name: String(a("name")),
         form: String(a("form_url")),
       },
-      // A CREATE's configured material is Resource-owned and has no accepted-UPDATE row.
-      a("action") === "create"
-        ? undefined
-        : { operationId: String(a("operation_id")), generation: Number(a("generation")) },
+      // Only an UPDATE that carries its own map with declared names owns an accepted-UPDATE
+      // row. A CREATE, an omitted PUT, an explicit empty map and a name removal captured the
+      // Resource-owned CREATE envelope (or null) at admission. The shape is decided from the
+      // accepted evidence, never from whether a row can be read, so a missing own map still
+      // fails closed and never falls back to the CREATE anchor.
+      ownsAcceptedUpdateMaterial(proof, alias)
+        ? { operationId: String(a("operation_id")), generation: Number(a("generation")) }
+        : undefined,
     );
     const raw = a("configured_private_inputs_json");
     const captured =
