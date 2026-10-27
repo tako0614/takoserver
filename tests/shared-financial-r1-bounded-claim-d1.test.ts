@@ -66,12 +66,9 @@ async function copyExactSyntheticFixture(source: Awaited<ReturnType<typeof fixtu
       });
     }
   }
-  for (let offset = 0; offset < statements.length; offset += 64) {
-    const chunk = statements.slice(offset, offset + 64);
-    const acknowledgements = await target.batch(chunk);
-    if (acknowledgements.length !== chunk.length)
-      throw new Error("fixture bootstrap returned an incomplete batch acknowledgement");
-  }
+  const acknowledgements = await target.batch(statements);
+  if (acknowledgements.length !== statements.length)
+    throw new Error("fixture bootstrap returned an incomplete batch acknowledgement");
 }
 
 async function harness() {
