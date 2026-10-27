@@ -268,6 +268,8 @@ describe("Wrangler staged Version secrets option", () => {
         "--name",
         WORKER,
         "--no-bundle",
+        "--outdir",
+        `${root}/omitted/upload`,
         "--config",
         `${root}/wrangler.jsonc`,
         "--strict",
@@ -324,6 +326,8 @@ describe("Wrangler staged Version secrets option", () => {
         "--name",
         WORKER,
         "--no-bundle",
+        "--outdir",
+        `${root}/provided/upload`,
         "--config",
         `${root}/wrangler.jsonc`,
         "--strict",
@@ -410,6 +414,7 @@ describe("Wrangler version publication output", () => {
       workerName: target.workerName,
       release: async () => {},
     };
+    const commands: string[][] = [];
     try {
       const failure = await deployWranglerLifecycleChange({
         root,
@@ -420,9 +425,16 @@ describe("Wrangler version publication output", () => {
         message: syntheticBearer,
         lease,
         assertCurrentStillExpected: async () => {},
-        run: async () => ({ exitCode: 1, stdout: rawDiagnostics, stderr: rawDiagnostics }),
+        run: async (command) => {
+          commands.push([...command]);
+          return { exitCode: 1, stdout: rawDiagnostics, stderr: rawDiagnostics };
+        },
       }).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
+      expect(commands).toHaveLength(1);
+      const outdir = commands[0]!.indexOf("--outdir");
+      expect(outdir).toBeGreaterThan(-1);
+      expect(commands[0]![outdir + 1]).toBe(`${root}/upload`);
       const error = failure as DeployError;
       expect(error.phase).toBe("mutation");
       expect(error.message).toContain("acknowledgement is indeterminate");
