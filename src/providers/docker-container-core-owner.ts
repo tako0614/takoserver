@@ -742,7 +742,10 @@ export function createDockerContainerCoreOwner(
         name: String(a("name")),
         form: String(a("form_url")),
       },
-      { operationId: String(a("operation_id")), generation: Number(a("generation")) },
+      // A CREATE's configured material is Resource-owned and has no accepted-UPDATE row.
+      a("action") === "create"
+        ? undefined
+        : { operationId: String(a("operation_id")), generation: Number(a("generation")) },
     );
     const raw = a("configured_private_inputs_json");
     const captured =
