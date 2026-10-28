@@ -54,6 +54,11 @@ interface Layer {
 
 const LAYERS: readonly Layer[] = [
   {
+    name: "v2-container-parent-io",
+    match: /^src\/takoform-v2\/container-parent-completion\.ts$/u,
+    may: ["core"],
+  },
+  {
     name: "v2-host-acceptance-contract",
     match: /^src\/takoform-v2\/host-acceptance\.ts$/u,
     may: ["core", "v2-private"],
@@ -101,6 +106,7 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/takoform-v2\/index\.ts$/u,
     may: [
       "core",
+      "v2-container-parent-io",
       "v2-contract",
       "v2-config",
       "v2-private",

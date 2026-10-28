@@ -1039,6 +1039,58 @@ It refuses composition before restoration or after owner suspension; a closed
 boot cannot supply a positive TLS witness. This resolves the composition cycle
 without adding another frontend or Resource ledger.
 
+## Host-private parent-bound Container I/O originals
+
+The additive `takoserver.container-parent-io-binding@1` and
+`takoserver.container-parent-io-original@1` source contracts describe **one child
+HTTP I/O attempt** for WorkerVersion 0.7.0 / Container 0.1.0. They do not change
+those Forms, their frozen definitions, existing RPC methods or default dispatch.
+This first contract refuses WorkerVersion 0.8.0 and Container 0.2.0 by exact
+Form URL. It does not inspect or qualify native schema 0106; that source/apply
+work remains separate and on hold.
+
+The Core qualifier captures the exact accepted parent invocation/custody and full
+Worker selection, then compares the durable parent row and the source-selected
+accepted-binding/native-owner authorization before and after asynchronous hashing.
+The binding contains domain-separated custody and selection digests; plaintext
+custody tokens are not persisted in it. It also fixes the Host-issued one-use
+child producer ID, binding name, accepted target Form/UID/generation/operation,
+provider installation, physical incarnation, serving revision and owner identity.
+The qualified bytes are data, not a transferable admission grant. `authorize`
+must also verify Host issuance of the child producer ID; the private journal
+enforces one-use with durable CAS. The Host must issue unpredictable custody
+tokens with at least 128 bits of entropy: the unkeyed custody digest is not a
+password-hiding mechanism. The currentness closure retains plaintext custody in
+Host memory only and must never be logged, serialized or exposed through RPC.
+Body finished/canceled and independent SQLite drain states neither retire the
+parent nor authorize new Container I/O. Actual native caller currentness and
+closed-admission fencing belong to the source-selected owner authorization.
+The producer
+must recheck the captured currentness port after durable pending admission and
+before native dispatch. These checks do not make two owners' actions atomic.
+
+The private owner must commit pending before physical entry, refuse replay of an
+existing attempt, and record a positive immutable original only after its owned
+raw fetch settles, upload reaches its defined terminal EOF and raw response
+reaches EOF or a genuine null body, with no abort, error or uncertain work.
+Outer response filtering, cancellation/disposal acknowledgements, borrow release,
+Tail, local counters and empty maps cannot establish this fact. The existing
+owner's durable storage must preserve a committed original across restart;
+unresolved prior-epoch attempts become unknown and stale callbacks cannot settle
+the successor epoch. Core supplies a closed version/shape, exact-binding and
+content-digest validator through a **fixed trusted owner readback port**. The
+hash authenticates neither issuer nor durability. Synthetic contract tests do
+not qualify the private journal, Container execution or a live provider.
+
+Readback distinguishes absent, pending, unknown and complete. Missing or malformed
+originals, wrong scope and unreadable acknowledgements remain nonpositive. A
+complete child original proves only that exact transport attempt. Parent
+retirement or Deployment DELETE additionally requires durable inventory of all
+children, a closed-admission seal, aggregation of every admitted attempt and the
+existing native retirement/currentness proofs. This source addition supplies no
+parent-complete verdict, retirement grant or physical qualification. The private
+producer/consumer and those aggregation pieces remain separate implementations.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Keeping
