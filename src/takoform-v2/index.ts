@@ -51,10 +51,16 @@ export {
   type V2ContainerParentIoBindingScope,
   type V2ContainerParentIoClaim,
   type V2ContainerParentIoOriginal,
+  type V2ContainerParentIoParent,
   type V2ContainerParentIoReadback,
   type V2ContainerParentIoTarget,
   v2ContainerParentIoOriginalDigest,
 } from "./container-parent-completion.ts";
+export {
+  createV2ContainerParentIoInventory,
+  type V2ContainerParentIoInventoryReadback,
+  type V2ContainerParentIoInventoryStorage,
+} from "./container-parent-io-inventory.ts";
 export {
   createV2EdgeKvNativeCustody,
   type V2EdgeKvConfirmedIdentity,

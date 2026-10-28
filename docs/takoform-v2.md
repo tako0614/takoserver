@@ -1099,8 +1099,40 @@ complete child original proves only that exact transport attempt. Parent
 retirement or Deployment DELETE additionally requires durable inventory of all
 children, a closed-admission seal, aggregation of every admitted attempt and the
 existing native retirement/currentness proofs. This source addition supplies no
-parent-complete verdict, retirement grant or physical qualification. The private
-producer/consumer and those aggregation pieces remain separate implementations.
+parent-complete verdict, retirement grant or physical qualification.
+
+`createV2ContainerParentIoInventory` supplies an additive Host-private durable
+child-set protocol through fixed custody/authorization/original-reader ports and
+the existing owner's transactional KV. It must open the parent before native
+dispatch and commit a distinct Host-issued child intent and exact binding before
+each physical invocation. It stores digest scopes and exact owner/revision
+locators, never plaintext custody or the currentness closure. Each issuance
+returns the same qualifier's Host-memory currentness check, which also refuses
+after the set is sealed or its physical owner's epoch changes. A dropped reply
+does not remove the admitted intent or authorize a resend.
+
+Sealing atomically closes new child admission. Reading a sealed set validates
+every retained binding and its own fixed-owner original; absent, pending,
+unknown, malformed, unreadable and unbound attempts remain nonpositive. Reads
+may report `absent` for a missing set or for a retained child's absent original;
+that state never means the set is empty or that no physical attempt occurred.
+Reads
+page the child rows without imposing a child-count admission limit. A successor
+epoch fences old callbacks and readers. An unsealed prior-epoch set remains
+unknown and cannot be reopened or sealed by reconstruction; a previously sealed
+set can be read through its retained exact owner locators. These records do not
+share the independent SQLite external-use ledger or its alarm domain.
+
+`sealed_io_complete` reports only all registered children's transport I/O. Even
+a sealed zero-child set requires a durable pre-dispatch open. Before this can
+gate parent release, the private composition must prove that every possible
+Container entry path participates and must independently verify the genuine
+native parent retirement. This library neither mounts that composition nor
+issues a parent/process retirement or Deployment DELETE grant. Private actor
+gating, complete source-path coverage and the genuine Host-to-native currentness
+bridge remain separate source work; live/native physical qualification remains
+separate as well. In-memory storage-port tests do not qualify platform KV
+durability or native Container execution.
 
 ## Existing installations
 

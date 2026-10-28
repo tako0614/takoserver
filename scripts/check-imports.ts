@@ -25,7 +25,10 @@ const manifest = JSON.parse(readFileSync("package.json", "utf8")) as {
   readonly dependencies?: Readonly<Record<string, string>>;
   readonly devDependencies?: Readonly<Record<string, string>>;
 };
-for (const name of Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })) {
+for (const name of Object.keys({
+  ...manifest.dependencies,
+  ...manifest.devDependencies,
+})) {
   if (forbidden.test(name)) violations.push(`package.json: ${name}`);
 }
 
@@ -57,6 +60,11 @@ const LAYERS: readonly Layer[] = [
     name: "v2-container-parent-io",
     match: /^src\/takoform-v2\/container-parent-completion\.ts$/u,
     may: ["core"],
+  },
+  {
+    name: "v2-container-parent-io-inventory",
+    match: /^src\/takoform-v2\/container-parent-io-inventory\.ts$/u,
+    may: ["core", "v2-container-parent-io"],
   },
   {
     name: "v2-host-acceptance-contract",
@@ -107,6 +115,7 @@ const LAYERS: readonly Layer[] = [
     may: [
       "core",
       "v2-container-parent-io",
+      "v2-container-parent-io-inventory",
       "v2-contract",
       "v2-config",
       "v2-private",
