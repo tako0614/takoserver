@@ -62,7 +62,11 @@ const target: Omit<V2ContainerParentIoClaim["target"], "producerId"> = {
 
 // An atomic, clone-on-read storage port; reopen() retains only durable bytes.
 function fixture(
-  hooks: { authorize?: () => Promise<void>; readOriginal?: () => Promise<void> } = {},
+  hooks: {
+    authorize?: () => Promise<void>;
+    readOriginal?: () => Promise<void>;
+    readParent?: () => Promise<void>;
+  } = {},
 ) {
   let rows = new Map<string, unknown>();
   let queue = Promise.resolve();
@@ -118,7 +122,10 @@ function fixture(
   const reads: string[] = [];
   const options = {
     storage,
-    readParent: async () => structuredClone(current),
+    readParent: async () => {
+      await hooks.readParent?.();
+      return structuredClone(current);
+    },
     authorize: async (claim: V2ContainerParentIoClaim) => {
       await hooks.authorize?.();
       return authorized && claim.target.ownerId === "owner-1";
@@ -139,6 +146,9 @@ function fixture(
     },
     revoke: () => {
       authorized = false;
+    },
+    setRecord: (value: V2WorkerInvocationRecord) => {
+      current = value;
     },
     retire: () => {
       current = {
@@ -382,4 +392,206 @@ test("missing, surplus and re-keyed stored children cannot certify a complete se
     }
     expect(await owner.read(parent)).toEqual({ state: "unknown" });
   }
+});
+
+test("an explicit fixed-row native-retirement seal can close the retained old set without dropping or replaying a child", async () => {
+  const f = fixture();
+  const owner = await f.reopen();
+  expect(await owner.open(parent)).toBe(true);
+  const child = required(await owner.issue(parent, target));
+  f.originals.set(child.producerId, await original(child));
+  const successor = await f.reopen();
+  expect(await child.stillCurrent()).toBe(false);
+  expect(await successor.seal(parent)).toBe(false);
+  expect(await successor.sealAfterNativeRetirement(parent)).toBe(false);
+  f.retire();
+  expect(await successor.sealAfterNativeRetirement(parent)).toBe(true);
+  expect(await successor.read(parent)).toEqual({ state: "sealed_io_complete", childCount: 1 });
+  expect(await successor.issue(parent, target)).toBeNull();
+  expect(await owner.sealAfterNativeRetirement(parent)).toBe(false);
+});
+
+test("a native marker cannot manufacture an absent set or qualify a mismatched parent", async () => {
+  const f = fixture();
+  const owner = await f.reopen();
+  f.retire();
+  expect(await owner.sealAfterNativeRetirement(parent)).toBe(false);
+  expect(await owner.read(parent)).toEqual({ state: "absent" });
+  expect(
+    await owner.sealAfterNativeRetirement({
+      ...parent,
+      handle: { ...handle, custodyToken: "foreign-custody-token" },
+    }),
+  ).toBe(false);
+  expect(
+    await owner.sealAfterNativeRetirement({
+      ...parent,
+      expected: { ...expected, nativeIdentity: "other-native" },
+    }),
+  ).toBe(false);
+});
+
+test("recovery rejects non-native, malformed and no-dispatch retirement markers", async () => {
+  for (const changed of [
+    { ...record, retirement: { retiredAtMs: 0, receiptDigest: digest } },
+    { ...record, retirement: { retiredAtMs: 1, receiptDigest: "sha256:wrong" as const } },
+    {
+      ...record,
+      phase: "pre_effect_refused" as const,
+      retirement: { retiredAtMs: 1, receiptDigest: digest },
+    },
+    { ...record, noNativeDispatchAtMs: 1, retirement: { retiredAtMs: 1, receiptDigest: digest } },
+  ]) {
+    const f = fixture();
+    const owner = await f.reopen();
+    expect(await owner.open(parent)).toBe(true);
+    const successor = await f.reopen();
+    f.setRecord(changed);
+    expect(await successor.sealAfterNativeRetirement(parent)).toBe(false);
+    expect(await successor.read(parent)).toEqual({ state: "unknown" });
+  }
+});
+
+test("closing an old set never completes a retained absent, pending, unknown or unbound child", async () => {
+  for (const state of ["absent", "pending", "unknown", "unbound"] as const) {
+    const f = fixture();
+    const owner = await f.reopen();
+    expect(await owner.open(parent)).toBe(true);
+    if (state === "unbound") {
+      f.loseNextCommitAcknowledgement();
+      expect(await owner.issue(parent, target)).toBeNull();
+    } else {
+      const child = required(await owner.issue(parent, target));
+      f.originals.set(child.producerId, { state });
+    }
+    const successor = await f.reopen();
+    f.retire();
+    expect(await successor.sealAfterNativeRetirement(parent)).toBe(true);
+    expect(await successor.read(parent)).toEqual({
+      state: state === "unbound" ? "unknown" : state,
+    });
+    expect(await successor.issue(parent, target)).toBeNull();
+  }
+});
+
+test("retirement revocation during the post-commit read prevents a positive recovery acknowledgement", async () => {
+  const b = barrier();
+  let armed = false;
+  const f = fixture({
+    readParent: async () => {
+      if (armed && hasSealedHeader(f)) await b.wait();
+    },
+  });
+  const owner = await f.reopen();
+  expect(await owner.open(parent)).toBe(true);
+  const successor = await f.reopen();
+  f.retire();
+  armed = true;
+  const pending = successor.sealAfterNativeRetirement(parent);
+  await b.entered;
+  f.setRecord(record);
+  b.release();
+  expect(await pending).toBe(false);
+  expect(await successor.read(parent)).toEqual({ state: "sealed_io_complete", childCount: 0 });
+});
+
+test("a lost seal acknowledgement can be read back without replay or an invented child original", async () => {
+  const f = fixture();
+  const owner = await f.reopen();
+  expect(await owner.open(parent)).toBe(true);
+  const child = required(await owner.issue(parent, target));
+  f.originals.set(child.producerId, await original(child));
+  const successor = await f.reopen();
+  f.retire();
+  f.loseNextCommitAcknowledgement();
+  expect(await successor.sealAfterNativeRetirement(parent)).toBe(false);
+  expect(await successor.read(parent)).toEqual({ state: "sealed_io_complete", childCount: 1 });
+  expect(await successor.sealAfterNativeRetirement(parent)).toBe(true);
+  expect(await successor.issue(parent, target)).toBeNull();
+  expect(await owner.sealAfterNativeRetirement(parent)).toBe(false);
+});
+
+function hasSealedHeader(f: ReturnType<typeof fixture>): boolean {
+  return [...f.rows().values()].some(
+    (value) =>
+      typeof value === "object" &&
+      value !== null &&
+      "format" in value &&
+      value.format === "takoserver.container-parent-io-inventory@1" &&
+      "state" in value &&
+      value.state === "sealed",
+  );
+}
+
+test("a changed native receipt digest after sealing cannot acknowledge recovery", async () => {
+  const b = barrier();
+  let armed = false;
+  const f = fixture({
+    readParent: async () => {
+      if (armed && hasSealedHeader(f)) await b.wait();
+    },
+  });
+  const owner = await f.reopen();
+  expect(await owner.open(parent)).toBe(true);
+  const successor = await f.reopen();
+  f.retire();
+  armed = true;
+  const pending = successor.sealAfterNativeRetirement(parent);
+  await b.entered;
+  f.setRecord({
+    ...record,
+    retirement: {
+      retiredAtMs: 1000,
+      receiptDigest: `sha256:${"b".repeat(64)}`,
+    },
+  });
+  b.release();
+  expect(await pending).toBe(false);
+  // Closing admission is durable even when the final acknowledgement refuses.
+  expect(await successor.read(parent)).toEqual({ state: "sealed_io_complete", childCount: 0 });
+});
+
+test("recovery rejects surplus caller authority and malformed native retirement shapes", async () => {
+  const inputs = [
+    { ...record, retirement: { retiredAtMs: 0.5, receiptDigest: digest } },
+    { ...record, retirement: { retiredAtMs: 1000, receiptDigest: digest, grant: true } },
+  ];
+  for (const changed of inputs) {
+    const f = fixture();
+    const owner = await f.reopen();
+    expect(await owner.open(parent)).toBe(true);
+    const successor = await f.reopen();
+    f.setRecord(changed);
+    expect(await successor.sealAfterNativeRetirement(parent)).toBe(false);
+    expect(await successor.read(parent)).toEqual({ state: "unknown" });
+  }
+  const f = fixture();
+  const owner = await f.reopen();
+  expect(await owner.open(parent)).toBe(true);
+  const successor = await f.reopen();
+  f.retire();
+  const callerAuthority = { ...parent, retirement: { retiredAtMs: 1000, receiptDigest: digest } };
+  expect(await successor.sealAfterNativeRetirement(callerAuthority)).toBe(false);
+  expect(await successor.read(parent)).toEqual({ state: "unknown" });
+});
+
+test("recovery seals around a pending current-epoch issuance without dropping its unresolved intent", async () => {
+  const b = barrier();
+  let armed = false;
+  const f = fixture({
+    authorize: async () => {
+      if (armed) await b.wait();
+    },
+  });
+  const owner = await f.reopen();
+  expect(await owner.open(parent)).toBe(true);
+  armed = true;
+  const pending = owner.issue(parent, target);
+  await b.entered;
+  f.retire();
+  expect(await owner.sealAfterNativeRetirement(parent)).toBe(true);
+  b.release();
+  expect(await pending).toBeNull();
+  expect(await owner.read(parent)).toEqual({ state: "unknown" });
+  expect(await owner.issue(parent, target)).toBeNull();
 });
