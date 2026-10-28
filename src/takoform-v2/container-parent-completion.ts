@@ -29,6 +29,7 @@ export interface V2ContainerParentIoClaim {
   readonly expected: V2WorkerInvocationRetirementIdentity;
   readonly target: V2ContainerParentIoTarget;
 }
+export type V2ContainerParentIoParent = Pick<V2ContainerParentIoClaim, "handle" | "expected">;
 /** Canonical Host-private data. Possession of these bytes is not an admission grant. */
 export interface V2ContainerParentIoBinding {
   readonly producerId: string;
@@ -57,7 +58,10 @@ export interface V2ContainerParentIoOriginal {
 }
 export type V2ContainerParentIoReadback =
   | { readonly state: "absent" | "pending" | "unknown" }
-  | { readonly state: "complete"; readonly original: V2ContainerParentIoOriginal };
+  | {
+      readonly state: "complete";
+      readonly original: V2ContainerParentIoOriginal;
+    };
 
 type Row = Record<string, unknown>;
 function row(value: unknown): value is Row {
@@ -169,6 +173,52 @@ function selected(record: V2WorkerInvocationRecord): unknown {
   );
 }
 
+/** Internal shared derivation. These digests are data, never custody authority. */
+export async function containerParentIoScope(
+  input: V2ContainerParentIoParent,
+): Promise<V2ContainerParentIoBindingScope["parent"] | null> {
+  try {
+    const parent = structuredClone(input);
+    if (
+      !exact(parent, ["handle", "expected"]) ||
+      !exact(parent.handle, ["invocationId", "custodyToken"]) ||
+      !text(parent.handle.invocationId) ||
+      !text(parent.handle.custodyToken) ||
+      parent.handle.custodyToken.length < 16 ||
+      !identity(parent.expected)
+    )
+      return null;
+    return Object.freeze({
+      invocationId: parent.handle.invocationId,
+      custodyDigest: await hash(
+        "takoserver.container-parent-custody@1",
+        canonicalJson(parent.handle),
+      ),
+      selectionDigest: await hash(
+        "takoserver.container-parent-selection@1",
+        canonicalJson(parent.expected),
+      ),
+    });
+  } catch {
+    return null;
+  }
+}
+
+/** Internal exact comparison; it does not require fresh-send authority after Tail. */
+export function containerParentIoMatchesRecord(
+  parent: V2ContainerParentIoParent,
+  record: V2WorkerInvocationRecord | null,
+): boolean {
+  return (
+    record !== null &&
+    record.handle.invocationId === parent.handle.invocationId &&
+    record.handle.custodyToken === parent.handle.custodyToken &&
+    canonicalJson(selected(record)) === canonicalJson(parent.expected)
+  );
+}
+
+export const isContainerParentIoTarget = target;
+
 /**
  * Both ports are source-selected Host custody. authorize must compare accepted
  * binding references AND exact physical caller/target/owner currentness. A row,
@@ -192,7 +242,10 @@ export function createV2ContainerParentIoQualifier(options: {
   return async (
     input: V2ContainerParentIoClaim,
   ): Promise<
-    (V2ContainerParentIoBinding & { readonly stillCurrent: () => Promise<boolean> }) | null
+    | (V2ContainerParentIoBinding & {
+        readonly stillCurrent: () => Promise<boolean>;
+      })
+    | null
   > => {
     try {
       // Copy before the first await. No caller mutation can retarget later checks.
@@ -230,14 +283,10 @@ export function createV2ContainerParentIoQualifier(options: {
       if (!(await stillCurrent())) return null;
       const canonical = canonicalJson({
         format: BINDING_FORMAT,
-        parent: {
-          invocationId: claim.handle.invocationId,
-          custodyDigest: await hash(
-            "takoserver.container-parent-custody@1",
-            canonicalJson(claim.handle),
-          ),
-          selectionDigest: await hash("takoserver.container-parent-selection@1", canonicalExpected),
-        },
+        parent: await containerParentIoScope({
+          handle: claim.handle,
+          expected: claim.expected,
+        }),
         target: claim.target,
       });
       const digest = await hash(BINDING_FORMAT, canonical);
