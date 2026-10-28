@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { bytesDigest, canonicalJson } from "../src/json.ts";
 import {
   createV2ContainerParentIoQualifier,
+  decodeV2ContainerParentIoBinding,
   readV2ContainerParentIoOriginal,
   type V2ContainerParentIoClaim,
   type V2ContainerParentIoOriginal,
@@ -10,11 +11,149 @@ import {
 import type { V2WorkerInvocationRecord } from "../src/worker-invocation-port.ts";
 
 const digest = `sha256:${"a".repeat(64)}` as const;
+
+test("decodes the exact child scope as data without disclosing custody", async () => {
+  const f = fixture();
+  const binding = required(await f.qualify(f.claim));
+  const scope = await decodeV2ContainerParentIoBinding(binding);
+  expect(scope).not.toBeNull();
+  expect(scope?.format).toBe("takoserver.container-parent-io-binding@1");
+  expect(scope?.parent.invocationId).toBe("parent-1");
+  expect(scope?.target).toEqual(f.claim.target);
+  expect(JSON.stringify(scope)).not.toContain(f.claim.handle.custodyToken);
+  expect(Object.keys(required(scope)).sort()).toEqual(["format", "parent", "target"]);
+});
+
+test("decoded scope is detached before hashing and deeply immutable", async () => {
+  const f = fixture();
+  const binding = { ...required(await f.qualify(f.claim)) };
+  const pending = decodeV2ContainerParentIoBinding(binding);
+  Object.assign(binding, { producerId: "substituted", canonical: "{}", digest });
+  const scope = required(await pending);
+  expect(scope.parent.invocationId).toBe("parent-1");
+  expect(scope.target.ownerId).toBe("owner-1");
+  expect(Object.isFrozen(scope)).toBe(true);
+  expect(Object.isFrozen(scope.parent)).toBe(true);
+  expect(Object.isFrozen(scope.target)).toBe(true);
+  expect(Reflect.set(scope.parent, "invocationId", "other-parent")).toBe(false);
+  expect(Reflect.set(scope.target, "ownerId", "other-owner")).toBe(false);
+});
+
+test("decoder rejects malformed scope, foreign Forms and self-rehashed surplus fields", async () => {
+  const f = fixture();
+  const binding = required(await f.qualify(f.claim));
+  const scope = required(await decodeV2ContainerParentIoBinding(binding));
+  for (const changed of [
+    { ...scope, format: "takoserver.container-parent-io-binding@2" },
+    { ...scope, ready: true },
+    { ...scope, parent: { ...scope.parent, custodyToken: "not-admission" } },
+    { ...scope, parent: { ...scope.parent, custodyDigest: "invalid" } },
+    { ...scope, target: { ...scope.target, ready: true } },
+    { ...scope, target: { ...scope.target, targetGeneration: 0 } },
+    { ...scope, target: { ...scope.target, ownerId: "" } },
+    {
+      ...scope,
+      target: {
+        ...scope.target,
+        workerVersionFormUrl: "https://edge.forms.takoform.com/forms/WorkerVersion/0.8.0/",
+      },
+    },
+    {
+      ...scope,
+      target: {
+        ...scope.target,
+        targetFormUrl: "https://edge.forms.takoform.com/forms/Container/0.2.0/",
+      },
+    },
+  ]) {
+    const canonical = canonicalJson(changed);
+    const changedDigest = await bytesDigest(
+      new TextEncoder().encode(`takoserver.container-parent-io-binding@1\0${canonical}`),
+    );
+    expect(
+      await decodeV2ContainerParentIoBinding({ ...binding, canonical, digest: changedDigest }),
+    ).toBeNull();
+  }
+  for (const patch of [
+    { producerId: "different-child" },
+    { canonical: "invalid-json" },
+    { canonical: ` ${binding.canonical}` },
+    { canonical: "x".repeat(65537) },
+    { digest },
+  ])
+    expect(await decodeV2ContainerParentIoBinding({ ...binding, ...patch })).toBeNull();
+  for (const noncanonical of [
+    ` ${binding.canonical}`,
+    JSON.stringify({ target: scope.target, parent: scope.parent, format: scope.format }),
+    binding.canonical.replace('"format":', '"format":"duplicate", "format":'),
+  ]) {
+    const changedDigest = await bytesDigest(
+      new TextEncoder().encode(`takoserver.container-parent-io-binding@1\0${noncanonical}`),
+    );
+    expect(
+      await decodeV2ContainerParentIoBinding({
+        ...binding,
+        canonical: noncanonical,
+        digest: changedDigest,
+      }),
+    ).toBeNull();
+  }
+  expect(
+    await decodeV2ContainerParentIoBinding({
+      ...binding,
+      get canonical(): never {
+        throw new Error("unreadable binding");
+      },
+    }),
+  ).toBeNull();
+});
+
+test("decodable self-hashed data remains data after actual parent authorization is revoked", async () => {
+  const f = fixture((claim) => claim.target.ownerId === "owner-1");
+  const binding = required(await f.qualify(f.claim));
+  const scope = required(await decodeV2ContainerParentIoBinding(binding));
+  const altered = { ...scope, target: { ...scope.target, ownerId: "untrusted-self-selection" } };
+  const canonical = canonicalJson(altered);
+  const selfHashed = {
+    ...binding,
+    canonical,
+    digest: await bytesDigest(
+      new TextEncoder().encode(`takoserver.container-parent-io-binding@1\0${canonical}`),
+    ),
+  };
+  expect((await decodeV2ContainerParentIoBinding(selfHashed))?.target.ownerId).toBe(
+    "untrusted-self-selection",
+  );
+  expect(await f.qualify({ ...f.claim, target: altered.target })).toBeNull();
+  expect(await f.qualify(f.claim)).not.toBeNull();
+  f.revoke();
+  expect(await binding.stillCurrent()).toBe(false);
+  expect(await f.qualify(f.claim)).toBeNull();
+  expect(await decodeV2ContainerParentIoBinding(binding)).toEqual(scope);
+  expect(
+    await readV2ContainerParentIoOriginal(selfHashed, async () => ({ state: "absent" })),
+  ).toEqual({
+    state: "absent",
+  });
+});
+
+test("original reader refuses undecodable bindings before contacting its fixed owner", async () => {
+  const f = fixture();
+  const binding = required(await f.qualify(f.claim));
+  let calls = 0;
+  expect(
+    await readV2ContainerParentIoOriginal({ ...binding, producerId: "foreign" }, async () => {
+      calls++;
+      return { state: "complete", original: await complete(binding) };
+    }),
+  ).toEqual({ state: "unknown" });
+  expect(calls).toBe(0);
+});
 function required<T>(value: T): NonNullable<T> {
   if (value === null || value === undefined) throw new Error("expected qualified binding");
   return value;
 }
-function fixture() {
+function fixture(authorizeTarget: (claim: V2ContainerParentIoClaim) => boolean = () => true) {
   const record: V2WorkerInvocationRecord = {
     handle: { invocationId: "parent-1", custodyToken: "secret-custody-token-1" },
     backendId: "worker-backend",
@@ -70,7 +209,7 @@ function fixture() {
   let authorized = true;
   const qualify = createV2ContainerParentIoQualifier({
     readParent: async () => structuredClone(current),
-    authorize: async () => authorized,
+    authorize: async (claim) => authorized && authorizeTarget(claim),
   });
   return {
     claim,

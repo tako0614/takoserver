@@ -119,6 +119,7 @@ import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-s
 
 const RUNTIME_EXPORTS = [
   "createV2ContainerParentIoQualifier",
+  "decodeV2ContainerParentIoBinding",
   "readV2ContainerParentIoOriginal",
   "v2ContainerParentIoOriginalDigest",
   "ACTOR_NAMESPACE_FORM_URL",

@@ -43,8 +43,10 @@ export {
 export { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";
 export {
   createV2ContainerParentIoQualifier,
+  decodeV2ContainerParentIoBinding,
   readV2ContainerParentIoOriginal,
   type V2ContainerParentIoBinding,
+  type V2ContainerParentIoBindingScope,
   type V2ContainerParentIoClaim,
   type V2ContainerParentIoOriginal,
   type V2ContainerParentIoReadback,
