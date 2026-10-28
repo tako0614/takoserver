@@ -1263,16 +1263,30 @@ function createPublicationState(
     };
   }
   async function references(id: string): Promise<ReferenceRow[] | null> {
-    const set = await sql.query(
-      "SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id = ?",
-      [id],
+    // One read-only statement observes the seal and its rows together. Sql.batch
+    // would acquire a SQLite writer lock even for these SELECTs.
+    const [set, ...rows] = await sql.query(
+      `SELECT 0 AS record_kind, sealed, NULL AS target_uid, NULL AS form_url,
+              NULL AS readiness, NULL AS target_spec_path, NULL AS target_spec_equals
+       FROM tf_v2_operation_reference_sets WHERE operation_id = ?
+       UNION ALL
+       SELECT 1 AS record_kind, NULL AS sealed, target_uid, form_url,
+              readiness, target_spec_path, target_spec_equals
+       FROM tf_v2_operation_references WHERE operation_id = ?
+       ORDER BY record_kind, target_uid`,
+      [id, id],
     );
-    if (set.length !== 1 || set[0]?.sealed !== 1) return null;
-    return (await sql.query(
-      `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
-       FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
-      [id],
-    )) as ReferenceRow[];
+    if (set?.record_kind !== 0 || set.sealed !== 1 || rows.some((row) => row.record_kind !== 1))
+      return null;
+    return rows.map(
+      ({ target_uid, form_url, readiness, target_spec_path, target_spec_equals }) => ({
+        target_uid,
+        form_url,
+        readiness,
+        target_spec_path,
+        target_spec_equals,
+      }),
+    ) as ReferenceRow[];
   }
   async function exactVersionReferences(
     operationId: string,
