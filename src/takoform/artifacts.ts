@@ -1,6 +1,7 @@
 import { bytesDigest, canonicalDigest } from "../json.ts";
 import type { Clock, ObjectStoreAccess, Sql, SqlStatement } from "../ports.ts";
 import { SqlError } from "../ports.ts";
+import { readBoundedRequestBody } from "../request-body.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
 import { admitArtifactBlobWrite, commitArtifactBlobWrite } from "./artifact-blob-io.ts";
 import {
@@ -352,8 +353,13 @@ export function createTakoformArtifacts(
         const digest = requiredDigest(match[2]);
         const declaration = declarations(upload.manifest).find((entry) => entry.digest === digest);
         if (!declaration) return failure("artifact_invalid", 400);
-        const bytes = new Uint8Array(await request.arrayBuffer());
-        if (bytes.byteLength !== declaration.size || (await bytesDigest(bytes)) !== digest) {
+        // The manifest already fixed this blob's size: read no further than it.
+        const bytes = await readBoundedRequestBody(request, declaration.size);
+        if (
+          bytes === null ||
+          bytes.byteLength !== declaration.size ||
+          (await bytesDigest(bytes)) !== digest
+        ) {
           return failure("artifact_invalid", 400);
         }
         const lease = await admitArtifactBlobWrite(
@@ -785,10 +791,8 @@ async function strictJsonObject(request: Request): Promise<Record<string, unknow
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     throw new ArtifactInputError();
   }
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength === 0 || bytes.byteLength > MAXIMUM_REQUEST_BODY_BYTES) {
-    throw new ArtifactInputError();
-  }
+  const bytes = await readBoundedRequestBody(request, MAXIMUM_REQUEST_BODY_BYTES);
+  if (bytes === null || bytes.byteLength === 0) throw new ArtifactInputError();
   try {
     const parsed = parseStrictJson(bytes, MAXIMUM_REQUEST_BODY_BYTES);
     if (!isRecord(parsed)) throw new ArtifactInputError();

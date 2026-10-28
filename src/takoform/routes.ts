@@ -40,6 +40,7 @@ import {
   failure,
   parsedResourcePath,
   portableResourceView,
+  requestJsonProbe,
   requiredQuery,
   resourceResponse,
   safeSegment,
@@ -803,18 +804,14 @@ async function assertTenantRunScope(
 }
 
 async function bodySpaceMatches(space: string, request: Request): Promise<boolean> {
-  try {
-    const value = await request.clone().json();
-    return (
-      typeof value === "object" &&
-      value !== null &&
-      !Array.isArray(value) &&
-      typeof (value as Record<string, unknown>).metadata === "object" &&
-      (value as { metadata?: { space?: unknown } }).metadata?.space === space
-    );
-  } catch {
-    return false;
-  }
+  const value = await requestJsonProbe(request);
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as Record<string, unknown>).metadata === "object" &&
+    (value as { metadata?: { space?: unknown } }).metadata?.space === space
+  );
 }
 
 type ExactResourcePrincipalScope = Exclude<
@@ -851,12 +848,7 @@ async function scopeBodyMatches(
   scope: ExactResourcePrincipalScope,
   request: Request,
 ): Promise<boolean> {
-  let value: unknown;
-  try {
-    value = await request.clone().json();
-  } catch {
-    return false;
-  }
+  const value = await requestJsonProbe(request);
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const body = value as Record<string, unknown>;
   const metadata = body.metadata;
@@ -1016,12 +1008,8 @@ async function assertProvisionBody(
   offering: ProvisionOfferingView,
   claims: ProvisionTokenClaimsView,
 ): Promise<void> {
-  let probe: unknown;
-  try {
-    probe = await request.clone().json();
-  } catch {
-    throw new TakoformHostError();
-  }
+  const probe = await requestJsonProbe(request);
+  if (probe === undefined) throw new TakoformHostError();
   const body = probe as {
     readonly form?: { readonly formRef?: Record<string, unknown> };
     readonly metadata?: { readonly space?: unknown };
