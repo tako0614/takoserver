@@ -23,6 +23,7 @@ import {
   applyRequest,
   exactQuery,
   failure,
+  hostBudgetBody,
   idempotencyKey,
   importRequest,
   jsonBody,
@@ -796,7 +797,9 @@ async function acceptedMutation(
   readonly authority?: Awaited<ReturnType<TakoformHostAuthority["authorizeMutation"]>>;
 }> {
   if (operation === "apply" || operation === "import") {
-    const body = await context.request.clone().text();
+    // Kept as Body.text() decodes it: a deferred replay re-sends these exact
+    // characters. The read itself holds the Host budget.
+    const body = new TextDecoder().decode(await hostBudgetBody(context.request.clone()));
     const parsed =
       operation === "apply"
         ? applyRequest(await jsonBody(context.request.clone()))

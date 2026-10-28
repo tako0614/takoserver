@@ -70,6 +70,7 @@ import {
 } from "./payment-events.ts";
 import type { Clock } from "./ports.ts";
 import { requestAuthorization } from "./request-authorization.ts";
+import { MAX_JSON_REQUEST_BODY_BYTES, readBoundedRequestBody } from "./request-body.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import type { ResourceExecutionEvidenceResponse } from "./resource-execution-evidence.ts";
@@ -133,7 +134,6 @@ import {
  * organization that issued it.
  */
 
-const MAX_BODY_BYTES = 64 * 1_024;
 const PAYMENT_NOTIFICATION_PATH = "/v1/payments/stripe/webhook";
 const OPERATOR_PAYMENTS_RECONCILE_PATH = "/v1/operator/payments/reconcile";
 const PAYMENT_NOTIFICATION_MAX_BYTES = 256 * 1_024;
@@ -2587,12 +2587,12 @@ function organizationOf(actor: Actor): string {
 
 async function jsonObject(
   request: Request,
-  limit: number = MAX_BODY_BYTES,
+  limit: number = MAX_JSON_REQUEST_BODY_BYTES,
 ): Promise<Record<string, unknown>> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     controlError("invalid_argument", 400);
   }
-  const bytes = await boundedBody(request, limit);
+  const bytes = await readBoundedRequestBody(request, limit);
   if (bytes === null || bytes.byteLength === 0) {
     controlError("invalid_argument", 400);
   }
@@ -2617,7 +2617,7 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
   if (declared !== null && (!/^[0-9]{1,12}$/u.test(declared) || Number(declared) > limit)) {
     throw new PaymentEventError("payload_too_large");
   }
-  const bytes = await boundedBody(request, limit);
+  const bytes = await readBoundedRequestBody(request, limit);
   if (bytes === null) throw new PaymentEventError("payload_too_large");
   if (bytes.byteLength === 0) controlError("invalid_argument", 400);
   return bytes;
@@ -2630,44 +2630,7 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
 async function emptyBody(request: Request): Promise<void> {
   const declared = request.headers.get("content-length");
   if (declared !== null && declared !== "0") controlError("invalid_argument", 400);
-  if ((await boundedBody(request, 0)) === null) controlError("invalid_argument", 400);
-}
-
-/**
- * The request bytes, or `null` as soon as they would pass `limit`; the rest is
- * cancelled, never buffered. An absent body and an empty stream are the same
- * zero bytes: Bun presents a bodiless POST as `null`, but workerd presents it
- * as a stream that ends at once, so `request.body !== null` never means "has
- * a body" on a Worker.
- */
-async function boundedBody(request: Request, limit: number): Promise<Uint8Array | null> {
-  if (request.body === null) return new Uint8Array(0);
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    while (true) {
-      const part = await reader.read();
-      if (part.done) break;
-      if (!(part.value instanceof Uint8Array) || part.value.byteLength > limit - total) {
-        // A cloned Request tees its body: cancellation may wait for the unread
-        // sibling. Refusal must not await that sibling or drain it.
-        void reader.cancel().catch(() => undefined);
-        return null;
-      }
-      chunks.push(part.value);
-      total += part.value.byteLength;
-    }
-  } finally {
-    reader.releaseLock();
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  if ((await readBoundedRequestBody(request, 0)) === null) controlError("invalid_argument", 400);
 }
 
 /**
