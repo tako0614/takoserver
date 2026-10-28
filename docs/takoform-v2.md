@@ -1069,6 +1069,17 @@ The producer
 must recheck the captured currentness port after durable pending admission and
 before native dispatch. These checks do not make two owners' actions atomic.
 
+`decodeV2ContainerParentIoBinding` exposes the existing closed canonical/hash
+validation as a content-only decoder. It returns a detached, deeply immutable
+parent-digest/target scope or null, without contacting an owner or checking live
+currentness. A caller can self-hash arbitrary well-shaped content, so decoded
+owner/target fields must not select an authority from unverified input. The fixed
+Host composition must verify issuer, accepted parent, target and child issuance
+through its existing trusted source channels before admission. Retained bindings
+remain decodable after parent retirement; decoding does not grant a new send or
+prove an original. The original reader uses this same decoder before invoking
+its fixed trusted owner reader.
+
 The private owner must commit pending before physical entry, refuse replay of an
 existing attempt, and record a positive immutable original only after its owned
 raw fetch settles, upload reaches its defined terminal EOF and raw response

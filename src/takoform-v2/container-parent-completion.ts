@@ -35,6 +35,16 @@ export interface V2ContainerParentIoBinding {
   readonly canonical: string;
   readonly digest: Digest;
 }
+/** Content only. These fields neither authenticate an issuer nor admit a send. */
+export interface V2ContainerParentIoBindingScope {
+  readonly format: typeof BINDING_FORMAT;
+  readonly parent: {
+    readonly invocationId: string;
+    readonly custodyDigest: Digest;
+    readonly selectionDigest: Digest;
+  };
+  readonly target: V2ContainerParentIoTarget;
+}
 export interface V2ContainerParentIoOriginal {
   readonly format: typeof ORIGINAL_FORMAT;
   readonly bindingDigest: Digest;
@@ -254,6 +264,52 @@ function originalPayload(input: Omit<V2ContainerParentIoOriginal, "receiptDigest
     outcome: input.outcome,
   };
 }
+
+/** Content decoder only; it does not verify current parent/target or grant admission. */
+export async function decodeV2ContainerParentIoBinding(
+  input: V2ContainerParentIoBinding,
+): Promise<V2ContainerParentIoBindingScope | null> {
+  try {
+    const binding = {
+      producerId: input.producerId,
+      canonical: input.canonical,
+      digest: input.digest,
+    };
+    if (
+      !text(binding.producerId) ||
+      typeof binding.canonical !== "string" ||
+      binding.canonical.length === 0 ||
+      binding.canonical.length > 65536 ||
+      !isSha256Digest(binding.digest)
+    )
+      return null;
+    const scope: unknown = JSON.parse(binding.canonical);
+    if (
+      !exact(scope, ["format", "parent", "target"]) ||
+      scope.format !== BINDING_FORMAT ||
+      !target(scope.target) ||
+      scope.target.producerId !== binding.producerId ||
+      !exact(scope.parent, ["invocationId", "custodyDigest", "selectionDigest"]) ||
+      !text(scope.parent.invocationId) ||
+      !isSha256Digest(scope.parent.custodyDigest) ||
+      !isSha256Digest(scope.parent.selectionDigest) ||
+      canonicalJson(scope) !== binding.canonical ||
+      (await hash(BINDING_FORMAT, binding.canonical)) !== binding.digest
+    )
+      return null;
+    return Object.freeze({
+      format: BINDING_FORMAT,
+      parent: Object.freeze({
+        invocationId: scope.parent.invocationId,
+        custodyDigest: scope.parent.custodyDigest,
+        selectionDigest: scope.parent.selectionDigest,
+      }),
+      target: Object.freeze({ ...scope.target }),
+    });
+  } catch {
+    return null;
+  }
+}
 /** Content fingerprint only. Computing it does not attest I/O or authenticate an issuer. */
 export function v2ContainerParentIoOriginalDigest(
   input: Omit<V2ContainerParentIoOriginal, "receiptDigest">,
@@ -276,28 +332,7 @@ export async function readV2ContainerParentIoOriginal(
       canonical: input.canonical,
       digest: input.digest,
     };
-    if (
-      !text(binding.producerId) ||
-      typeof binding.canonical !== "string" ||
-      binding.canonical.length === 0 ||
-      binding.canonical.length > 65536 ||
-      !isSha256Digest(binding.digest)
-    )
-      return { state: "unknown" };
-    const scope: unknown = JSON.parse(binding.canonical);
-    if (
-      !exact(scope, ["format", "parent", "target"]) ||
-      scope.format !== BINDING_FORMAT ||
-      !target(scope.target) ||
-      scope.target.producerId !== binding.producerId ||
-      !exact(scope.parent, ["invocationId", "custodyDigest", "selectionDigest"]) ||
-      !text(scope.parent.invocationId) ||
-      !isSha256Digest(scope.parent.custodyDigest) ||
-      !isSha256Digest(scope.parent.selectionDigest) ||
-      canonicalJson(scope) !== binding.canonical ||
-      (await hash(BINDING_FORMAT, binding.canonical)) !== binding.digest
-    )
-      return { state: "unknown" };
+    if (!(await decodeV2ContainerParentIoBinding(binding))) return { state: "unknown" };
     const result: unknown = structuredClone(await readOriginal(Object.freeze({ ...binding })));
     if (
       exact(result, ["state"]) &&
