@@ -2,10 +2,17 @@ import { appendFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
 type FixtureFile = "financial-origin" | "shared-auth";
-type FixturePhase =
+export type FixturePhase =
   | "fixture_begin"
   | "d1_fixture_begin"
   | "d1_fixture_ready"
+  | "d1_engine_begin"
+  | "d1_engine_ready"
+  | "d1_schema_begin"
+  | "d1_first_schema_ready"
+  | "d1_schema_ready"
+  | "d1_failed_setup_dispose_begin"
+  | "d1_failed_setup_dispose_ready"
   | "native_d1_begin"
   | "native_d1_ready"
   | "source_list_begin"

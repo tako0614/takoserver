@@ -71,7 +71,7 @@ async function fixture(
   const recordPhase = beginNativeFixturePhase("shared-auth");
   recordPhase("fixture_begin");
   recordPhase("d1_fixture_begin");
-  const d1 = await createSharedAuthSessionStoreD1Fixture();
+  const d1 = await createSharedAuthSessionStoreD1Fixture(recordPhase);
   recordPhase("d1_fixture_ready");
   let stamp = INITIAL_TIME;
   try {
