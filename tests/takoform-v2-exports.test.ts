@@ -118,6 +118,9 @@ import { createV2WorkflowClassAdmission } from "../src/takoform-v2/workflow-clas
 import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 
 const RUNTIME_EXPORTS = [
+  "createV2ContainerParentIoQualifier",
+  "readV2ContainerParentIoOriginal",
+  "v2ContainerParentIoOriginalDigest",
   "ACTOR_NAMESPACE_FORM_URL",
   "EDGE_KV_NAMESPACE_BACKEND_ID",
   "EDGE_KV_NAMESPACE_FORM_URL",
