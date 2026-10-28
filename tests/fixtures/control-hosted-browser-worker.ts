@@ -117,6 +117,7 @@ interface Env {
 const dispatched = new Set<string>();
 const sessions = new Map<string, TopUpSession>();
 const processor = { create: 0, read: 0, recover: 0 };
+let financialGetReads = 0;
 const prepared = new Map<string, ReturnType<typeof originalFor>>();
 const TOP_UP_COMMAND_READBACK_SQL =
   "SELECT org_id, reference, state, command_json, dispatched_at FROM stripe_top_up_commands";
@@ -374,7 +375,28 @@ export default {
       sharedAuth,
       accounts,
       hostedBrowserBillingRpc: env.HOSTED,
-      checkout: topups,
+      checkout: {
+        ...topups,
+        async receipt(...args: Parameters<typeof topups.receipt>) {
+          const receipt = await topups.receipt(...args);
+          if (request.method === "GET") {
+            financialGetReads++;
+            const interleave = request.headers.get("x-test-financial-get-interleave");
+            if (interleave === "revoke-owner" || interleave === "revoke-and-reject") {
+              const revoked = await env.REVOKER.fetch(
+                new Request("https://fixture.invalid/revoke"),
+              );
+              if (revoked.status !== 204)
+                throw new Error("local Owner revocation did not complete");
+            }
+            if (interleave === "mutate-request")
+              request.headers.set("x-test-financial-get-drift", "changed");
+            if (interleave === "revoke-and-reject")
+              throw new Error("fixture financial GET refused");
+          }
+          return receipt;
+        },
+      },
       inventory: {} as never,
       deployments: {} as never,
       attachments: {} as never,
@@ -388,8 +410,13 @@ export default {
       settlement: {} as never,
       clock: () => new Date(NOW),
     });
-    const response =
+    let response =
       (await control(request, new URL(request.url))) ?? new Response(null, { status: 404 });
+    if (request.method === "GET" && url.pathname.includes("/wallet/checkout/")) {
+      const headers = new Headers(response.headers);
+      headers.set("x-fixture-financial-get-count", String(financialGetReads));
+      response = new Response(response.body, { status: response.status, headers });
+    }
     if (url.pathname.endsWith("/wallet/checkout")) {
       // Same-request diagnostics read the actual owning command table before
       // the local platform proxy can close on a denied RPC response.

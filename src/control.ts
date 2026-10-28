@@ -680,7 +680,13 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         producer.dispose();
       }
     }
-    if (request.method === "GET") return await route(request, url);
+    if (request.method === "GET") {
+      const response = await route(request, url);
+      assertRequest();
+      await hostedBrowserOwner(request, initial, scope);
+      assertRequest();
+      return response;
+    }
     if (selected.kind !== "payment") controlError("invalid_argument", 400);
     if (selected.custody.phase !== "prepared") controlError("conflict", 409);
     const original = selected.original;

@@ -209,6 +209,106 @@ test("only continuation-selected financial GETs use the request-bound Owner read
   }
 }, 30_000);
 
+test("native selected financial GET completion refuses Owner revoked during its original read", async () => {
+  const f = await fixture();
+  try {
+    expect((await f.claim("a")).status).toBe(201);
+    const response = await f.selectedGet(
+      `/v1/organizations/${ORGANIZATION}/wallet/checkout/${REFERENCE}`,
+      "a",
+      "revoke-owner",
+    );
+    expect(response.headers.get("x-fixture-financial-get-count")).toBe("1");
+    expect(f.revocations()).toBe(1);
+    expect((await f.hostedState()).readCallback).toMatchObject({
+      callbackCount: 1,
+      callbackRejected: false,
+    });
+    expect(response.status).toBe(404);
+    const body = await response.json();
+    expect(body).toMatchObject({ error: { code: "not_found" } });
+    expect(body).not.toHaveProperty("checkout");
+    expect(body).not.toHaveProperty("reference");
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native selected financial GET completion refuses mutation of the original Request", async () => {
+  const f = await fixture();
+  try {
+    expect((await f.claim("a")).status).toBe(201);
+    const response = await f.selectedGet(
+      `/v1/organizations/${ORGANIZATION}/wallet/checkout/${REFERENCE}`,
+      "a",
+      "mutate-request",
+    );
+    expect(response.headers.get("x-fixture-financial-get-count")).toBe("1");
+    expect(response.status).toBe(503);
+    const body = await response.json();
+    expect(body).toMatchObject({ error: { code: "backend_unavailable" } });
+    expect(body).not.toHaveProperty("checkout");
+    expect(body).not.toHaveProperty("reference");
+    expect(f.revocations()).toBe(0);
+    expect((await f.hostedState()).readCallback).toMatchObject({
+      callbackCount: 1,
+      callbackRejected: false,
+    });
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native selected financial GET completion preserves read rejection before a later Owner refusal", async () => {
+  const f = await fixture();
+  try {
+    expect((await f.claim("a")).status).toBe(201);
+    const response = await f.selectedGet(
+      `/v1/organizations/${ORGANIZATION}/wallet/checkout/${REFERENCE}`,
+      "a",
+      "revoke-and-reject",
+    );
+    expect(response.headers.get("x-fixture-financial-get-count")).toBe("1");
+    expect(f.revocations()).toBe(1);
+    expect(response.status).toBe(500);
+    const body = await response.json();
+    expect(body).toMatchObject({ error: { code: "internal_error" } });
+    expect(body).not.toHaveProperty("checkout");
+    expect(body).not.toHaveProperty("reference");
+    expect((await f.hostedState()).readCallback).toMatchObject({
+      callbackCount: 1,
+      callbackRejected: false,
+    });
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native selected financial GET completion returns the original receipt for the same current Owner", async () => {
+  const f = await fixture();
+  try {
+    expect((await f.claim("a")).status).toBe(201);
+    const response = await f.selectedGet(
+      `/v1/organizations/${ORGANIZATION}/wallet/checkout/${REFERENCE}`,
+      "a",
+    );
+    expect(response.headers.get("x-fixture-financial-get-count")).toBe("1");
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      reference: REFERENCE,
+      state: "ready",
+      checkout: { url: "https://checkout.stripe.com/c/pay/cs_native_fixture" },
+    });
+    expect(f.revocations()).toBe(0);
+    expect((await f.hostedState()).readCallback).toMatchObject({
+      callbackCount: 1,
+      callbackRejected: false,
+    });
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
 test("native prepare receiver cannot substitute a different live selection scope", async () => {
   const f = await fixture();
   try {
@@ -282,6 +382,15 @@ async function fixture() {
   const contents = await output.text();
   let databaseForRevocation: Awaited<ReturnType<Miniflare["getD1Database"]>> | undefined;
   let revocations = 0;
+  const revokeOwner = async () => {
+    if (!databaseForRevocation) throw new Error("local D1 is not ready");
+    await databaseForRevocation
+      .prepare("UPDATE org_memberships SET role = 'member' WHERE org_id = ? AND principal_id = ?")
+      .bind(ORGANIZATION, PRINCIPAL)
+      .run();
+    revocations++;
+    return new Response(null, { status: 204 });
+  };
   const records: { selector: string; original?: unknown; outcome: unknown }[] = [];
   const runtime = new Miniflare({
     workers: [
@@ -297,6 +406,7 @@ async function fixture() {
           env: {
             AUTH_DB: { type: "d1", id: "native-consumer-d1" },
             ISSUER: { type: "fetcher", handler: issuer.send },
+            REVOKER: { type: "fetcher", handler: revokeOwner },
             HOSTED: miniflareServiceBinding("worker", "native-consumer-hosted", "Hosted"),
           },
           triggers: [],
@@ -314,17 +424,7 @@ async function fixture() {
           env: {
             REVOKER: {
               type: "fetcher",
-              handler: async () => {
-                if (!databaseForRevocation) throw new Error("local D1 is not ready");
-                await databaseForRevocation
-                  .prepare(
-                    "UPDATE org_memberships SET role = 'member' WHERE org_id = ? AND principal_id = ?",
-                  )
-                  .bind(ORGANIZATION, PRINCIPAL)
-                  .run();
-                revocations++;
-                return new Response(null, { status: 204 });
-              },
+              handler: revokeOwner,
             },
             EVENTS: {
               type: "fetcher",
@@ -439,13 +539,18 @@ async function fixture() {
           body: JSON.stringify(body),
         });
       },
-      selectedGet(path: string, selector: "a" | "1") {
+      selectedGet(
+        path: string,
+        selector: "a" | "1",
+        interleave?: "revoke-owner" | "mutate-request" | "revoke-and-reject",
+      ) {
         return send(path, {
           method: "GET",
           headers: {
             cookie: browserCookie,
             "x-test-origin": SESSION_TEST_CONSOLE,
             "Takoserver-Billing-Continuation": `hosted-browser-v1.${selector.repeat(64)}`,
+            ...(interleave ? { "x-test-financial-get-interleave": interleave } : {}),
           },
         });
       },
