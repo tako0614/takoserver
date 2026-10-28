@@ -1118,10 +1118,26 @@ may report `absent` for a missing set or for a retained child's absent original;
 that state never means the set is empty or that no physical attempt occurred.
 Reads
 page the child rows without imposing a child-count admission limit. A successor
-epoch fences old callbacks and readers. An unsealed prior-epoch set remains
-unknown and cannot be reopened or sealed by reconstruction; a previously sealed
-set can be read through its retained exact owner locators. These records do not
-share the independent SQLite external-use ledger or its alarm domain.
+epoch fences old callbacks and readers. Construct the inventory once per physical
+owner and retain that instance; even an extra reader construction advances the
+epoch and fences the live issuer. The original `open` and `seal` methods cannot
+reopen or seal an unsealed prior-epoch set. A previously sealed set can be read
+through its retained exact owner locators. These records do not share the
+independent SQLite external-use ledger or its alarm domain.
+
+The explicit `sealAfterNativeRetirement(parent)` recovery method can close an
+existing current- or prior-epoch set only when the fixed Core parent reader
+matches the full custody and selection and supplies the same valid native
+retirement before and after sealing. The current physical owner epoch must still
+match. Recovery preserves the set's original epoch, full child count and all
+unresolved intents; it cannot manufacture a missing set, replay a child or
+supply its I/O original. The caller cannot provide a retirement DTO. A `false`
+acknowledgement may still leave the durable set sealed, for example after a
+committed write whose acknowledgement was lost or a changed final parent read.
+Neither that side effect nor a positive closed-set read proves parent retirement:
+every consumer must independently reassert native retirement, complete source
+coverage and every child's fixed-owner original. The method closes admission
+only and does not release a process or authorize Deployment DELETE.
 
 `sealed_io_complete` reports only all registered children's transport I/O. Even
 a sealed zero-child set requires a durable pre-dispatch open. Before this can

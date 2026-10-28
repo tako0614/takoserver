@@ -1,4 +1,4 @@
-import { bytesDigest, canonicalJson } from "../json.ts";
+import { bytesDigest, canonicalJson, isSha256Digest } from "../json.ts";
 import type {
   V2WorkerInvocationHandle,
   V2WorkerInvocationRecord,
@@ -88,6 +88,21 @@ function childKey(key: string, sequence: number): string {
   return `${key}/child/${sequence.toString().padStart(16, "0")}`;
 }
 
+function nativeRetired(
+  record: V2WorkerInvocationRecord | null,
+): record is V2WorkerInvocationRecord & {
+  readonly retirement: NonNullable<V2WorkerInvocationRecord["retirement"]>;
+} {
+  return (
+    record !== null &&
+    record.phase === "send_authorized" &&
+    record.noNativeDispatchAtMs === null &&
+    exact(record.retirement, ["retiredAtMs", "receiptDigest"]) &&
+    integer(record.retirement.retiredAtMs, 1) &&
+    isSha256Digest(record.retirement.receiptDigest)
+  );
+}
+
 /**
  * Fixed Host source ports, never tenant-selected callbacks or RPC-ready data.
  * open must complete BEFORE parent native dispatch, and every actual Container
@@ -95,6 +110,9 @@ function childKey(key: string, sequence: number): string {
  * source-path coverage are separate requirements for parent retirement/DELETE.
  * A sealed_io_complete result attests only this stored set of child transport I/O.
  * No raw custody or currentness closure is stored or returned by the storage port.
+ * Construct once per physical owner; even a read-only reconstruction fences
+ * the earlier issuer. Explicit native-retirement recovery closes admission only.
+ * A false recovery acknowledgement may still leave the durable set sealed.
  */
 export async function createV2ContainerParentIoInventory(options: {
   readonly storage: V2ContainerParentIoInventoryStorage;
@@ -150,6 +168,41 @@ export async function createV2ContainerParentIoInventory(options: {
     record.retirement === null &&
     record.noNativeDispatchAtMs === null;
   return Object.freeze({
+    /**
+     * Explicit recovery, never the old seal's implicit fallback. Only the fixed
+     * Core parent reader can supply native retirement. An existing durable set
+     * and the current owner epoch are mandatory; every old child stays retained.
+     * This closes admission only, not child I/O or parent/process retirement.
+     */
+    async sealAfterNativeRetirement(input: V2ContainerParentIoParent): Promise<boolean> {
+      try {
+        const s = await scope(input);
+        if (!s || !nativeRetired(s.record)) return false;
+        const retirement = canonicalJson(s.record.retirement);
+        const sealed = await storage.transaction(async (tx) => {
+          const h = await current(tx, s.key, s.derived);
+          if (!h) return false;
+          // Preserve its epoch and full count: an old unresolved child cannot
+          // disappear or be replayed just because the parent is now terminal.
+          if (h.state === "open") await tx.put(s.key, { ...h, state: "sealed" });
+          return true;
+        });
+        if (!sealed) return false;
+        const latest = structuredClone(await readParent(structuredClone(s.parent.handle)));
+        if (
+          !containerParentIoMatchesRecord(s.parent, latest) ||
+          !nativeRetired(latest) ||
+          canonicalJson(latest.retirement) !== retirement
+        )
+          return false;
+        return await storage.transaction(async (tx) => {
+          const h = await current(tx, s.key, s.derived);
+          return h !== null && h.state === "sealed";
+        });
+      } catch {
+        return false;
+      }
+    },
     async open(input: V2ContainerParentIoParent): Promise<boolean> {
       try {
         const s = await scope(input);
