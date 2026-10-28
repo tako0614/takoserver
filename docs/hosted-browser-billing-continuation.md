@@ -197,13 +197,16 @@ remote calls actually occurred or that a Hosted supplier followed that ordering;
 the paired implementation and its native regression remain required. These
 cross-service reads are not an atomic ownership snapshot.
 
-The existing Console metadata/receipt path continues to call `read(lookup)` and
-its existing local current-owner checks. This opt-in source does not introduce a
-new public HTTP route or default caller. Root owns the actual GET callsite using
-its selected Request/Shared RP/Accounts graph, and Hosted owns its counterpart
-and default composition. No default mount or native/live qualification follows
-from this source interface alone. Command preparation, final claim callbacks and
-all payment effect fences are unchanged.
+The ordinary Console metadata endpoint and POST preparation, claim and outcome
+flows continue to use `read(lookup)` and their existing local current-owner
+checks. Root's existing continuation-header-selected financial GET routes use
+`readWithCurrentOwner` with their original Request and selected Shared RP/Accounts
+graph. After the local GET returns, Root reasserts that same Request and Accounts
+Owner with the captured scope before returning the original response. This opt-in
+source does not introduce a public HTTP route or default caller. Hosted owns its
+counterpart and default composition. No default mount or native/live qualification
+follows from this source interface alone. Command preparation, final claim
+callbacks and all payment effect fences are unchanged.
 
 ## Currentness and one-way acceptance
 

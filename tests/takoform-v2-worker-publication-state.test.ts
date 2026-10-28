@@ -1585,6 +1585,43 @@ test("graph read and stillCurrent refuse a claim whose lease expires during the 
   }
 });
 
+test("publication graph reads remain available while another SQLite connection holds the writer lock", async () => {
+  const f = fixture();
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(
+      WORKER_DEPLOYMENT_FORM_URL,
+      "deployment",
+      {
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+      },
+      false,
+    );
+    const execution = await f.claim(deployment.id);
+    const writer = new Database(f.path);
+    try {
+      writer.exec("BEGIN IMMEDIATE");
+      try {
+        const reader = createV2WorkerPublicationState({
+          sql: f.sql,
+          now: () => new Date(f.currentClock()),
+        });
+        const current = await reader.resolve({ execution });
+        expect(current.kind).toBe("ready");
+        if (current.kind !== "ready") throw new Error("read-only graph became unavailable");
+        expect(await current.stillCurrent()).toBe(true);
+      } finally {
+        writer.exec("ROLLBACK");
+      }
+    } finally {
+      writer.close();
+    }
+  } finally {
+    f.close();
+  }
+});
+
 test("a live Deployment claim rematerializes settled Version bytes from verified custody after a fresh SQL handle", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-held-version-"));
   const path = join(root, "state.sqlite");

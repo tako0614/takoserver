@@ -167,15 +167,32 @@ export function createObjectBucketWorkerBindingAuthority(options: {
       return null;
     }
 
-    const refSet = await options.sql.query(
-      "SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id = ?",
-      [version.operation_id as string],
+    // Keep this observation read-only on SQLite; batch() takes a writer lock.
+    const [refSet, ...referenceRows] = await options.sql.query(
+      `SELECT 0 AS record_kind, sealed, NULL AS target_uid, NULL AS form_url,
+              NULL AS readiness, NULL AS target_spec_path, NULL AS target_spec_equals
+       FROM tf_v2_operation_reference_sets WHERE operation_id = ?
+       UNION ALL
+       SELECT 1 AS record_kind, NULL AS sealed, target_uid, form_url,
+              readiness, target_spec_path, target_spec_equals
+       FROM tf_v2_operation_references WHERE operation_id = ?
+       ORDER BY record_kind, target_uid`,
+      [version.operation_id as string, version.operation_id as string],
     );
-    if (refSet.length !== 1 || refSet[0]?.sealed !== 1) return null;
-    const references = await options.sql.query(
-      `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
-       FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
-      [version.operation_id as string],
+    if (
+      refSet?.record_kind !== 0 ||
+      refSet.sealed !== 1 ||
+      referenceRows.some((row) => row.record_kind !== 1)
+    )
+      return null;
+    const references = referenceRows.map(
+      ({ target_uid, form_url, readiness, target_spec_path, target_spec_equals }) => ({
+        target_uid,
+        form_url,
+        readiness,
+        target_spec_path,
+        target_spec_equals,
+      }),
     );
     let expected: ReturnType<typeof referencesForWorkerVersion>;
     try {
