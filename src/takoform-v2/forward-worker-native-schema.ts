@@ -125,6 +125,7 @@ function exactCatalog(
     readonly tbl_name: string;
     readonly sql: string | null;
   }[],
+  balanced = false,
 ): string {
   const names = AFFECTED_TABLES.map(literal).join(", ");
   const members = objects.map(
@@ -133,11 +134,21 @@ function exactCatalog(
         tbl_name = ${literal(entry.tbl_name)} AND
         ${entry.sql === null ? "sql IS NULL" : `sql = ${literal(entry.sql)}`})`,
   );
+  // This complete seal is embedded in authority-changing statements. A flat
+  // left-associated OR chain exceeds D1's expression depth when combined with
+  // the invocation/Cron predicates. Keep every exact member, with logarithmic
+  // boolean depth rather than moving any part to an earlier schema probe.
+  const disjunction = (start: number, end: number): string => {
+    if (end - start === 1) return members[start] ?? "0";
+    if (start === end) return "0";
+    const middle = start + Math.floor((end - start) / 2);
+    return `(${disjunction(start, middle)} OR ${disjunction(middle, end)})`;
+  };
   return `(SELECT count(*) FROM main.sqlite_schema
     WHERE type IN ('table','index','trigger') AND tbl_name IN (${names})) = ${objects.length}
     AND (SELECT count(*) FROM main.sqlite_schema
       WHERE type IN ('table','index','trigger') AND tbl_name IN (${names})
-        AND (${members.join(" OR ")})) = ${objects.length}
+        AND (${balanced ? disjunction(0, members.length) : members.join(" OR ")})) = ${objects.length}
     AND NOT EXISTS (SELECT 1 FROM sqlite_temp_schema
       WHERE name IN (${objects.map((entry) => literal(entry.name)).join(", ")}, ${literal(ASSERTION)})
         OR tbl_name IN (${names}))`;
@@ -170,6 +181,9 @@ const PHYSICAL_READY = `(SELECT foreign_keys FROM pragma_foreign_keys) = 1
 const SOURCE_READY = `(${v2WorkerNativeIdentityDomainReady("opaque255")}) AND
   (${exactCatalog(sourceObjects)}) AND (${INDEX_ABSENT})`;
 const SUCCESSOR_READY = `(${PHYSICAL_READY}) AND (${exactCatalog(successorObjects)}) AND (${INDEX_READY})`;
+// The registered recipe's assertion bytes above are immutable. Runtime guards
+// use the same complete catalog with a shallower boolean expression instead.
+const RUNTIME_SUCCESSOR_READY = `(${PHYSICAL_READY}) AND (${exactCatalog(successorObjects, true)}) AND (${INDEX_READY})`;
 
 /** Core physical predecessor only; the owning Root wrapper pins any formal lineage. */
 export function forwardWorkerNativePredecessorReady(): string {
@@ -178,7 +192,7 @@ export function forwardWorkerNativePredecessorReady(): string {
 
 /** Exact installed successor closure, evaluated within every Forward authority write. */
 export function forwardWorkerNativeSchemaReady(): string {
-  return SUCCESSOR_READY;
+  return RUNTIME_SUCCESSOR_READY;
 }
 
 function assertion(condition: string): string {
