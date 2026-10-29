@@ -87,7 +87,11 @@ export interface V2WorkerInvocationCustody {
   /** One physical Cron attempt for one durable match lease, atomically resolved from SQL. */
   admitCron(claim: V2WorkerCronInvocationClaim): Promise<V2WorkerInvocationAdmission>;
   read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null>;
-  /** Atomic row presence plus the same custody/schema validation. No execution grant. */
+  /**
+   * Row presence plus the original custody/schema validation; no execution grant.
+   * Atomic with Sql.batch, sequential otherwise; completeness follows the selected
+   * Sql transport and does not prove raw D1 result acknowledgement.
+   */
   readPresence?(
     handle: V2WorkerInvocationHandle,
   ): Promise<

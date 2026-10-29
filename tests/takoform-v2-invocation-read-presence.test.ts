@@ -68,7 +68,10 @@ test("atomic invocation presence preserves absence, invalid custody and the orig
     expect(await owner.readPresence?.({ ...handle, invocationId: "missing" })).toEqual({
       kind: "missing",
     });
-    expect((await owner.readPresence?.(handle))?.kind).toBe("valid");
+    const originalRecord = await owner.read(handle);
+    expect(originalRecord).not.toBeNull();
+    if (!originalRecord) throw new Error("fixture invocation record missing");
+    expect(await owner.readPresence?.(handle)).toEqual({ kind: "valid", record: originalRecord });
     expect(await owner.read({ ...handle, custodyToken: "wrong-token" })).toBeNull();
     expect(await owner.readPresence?.({ ...handle, custodyToken: "wrong-token" })).toEqual({
       kind: "invalid",
@@ -155,6 +158,61 @@ test("presence batch shape and contradictory rows never authorize absence; mutab
     release();
     expect((await pending)?.kind).toBe("valid");
     expect(gets).toBe(1);
+  } finally {
+    db.close();
+  }
+});
+
+test("presence uses legacy SELECTs only when batch is absent and never falls back after a selected batch fails", async () => {
+  const db = new Database(":memory:");
+  try {
+    migrateSqlite(db);
+    const sql = createSqliteSql(db);
+    const expected = createV2WorkerInvocationLifecycle({ sql });
+    await seed(sql);
+    const record = await expected.read(handle);
+    expect(record).not.toBeNull();
+    if (!record) throw new Error("fixture invocation record missing");
+    let queries = 0;
+    const query: Sql["query"] = async (statement, params) => {
+      queries++;
+      return sql.query(statement, params);
+    };
+    const legacy: Sql = { ...sql, query, batch: undefined as unknown as Sql["batch"] };
+    const owner = createV2WorkerInvocationLifecycle({ sql: legacy });
+    expect(await owner.readPresence?.({ ...handle, invocationId: "missing" })).toEqual({
+      kind: "missing",
+    });
+    expect(queries).toBe(1);
+    expect(await owner.readPresence?.(handle)).toEqual({ kind: "valid", record });
+    expect(queries).toBe(3);
+    expect(await owner.readPresence?.({ ...handle, custodyToken: "wrong-token" })).toEqual({
+      kind: "invalid",
+    });
+    expect(queries).toBe(5);
+    for (const batch of [0, null]) {
+      queries = 0;
+      const invalid: Sql = { ...sql, query, batch: batch as unknown as Sql["batch"] };
+      await expect(
+        createV2WorkerInvocationLifecycle({ sql: invalid }).readPresence?.(handle),
+      ).rejects.toThrow();
+      expect(queries).toBe(0);
+    }
+    queries = 0;
+    let batches = 0;
+    const rejected: Sql = {
+      ...sql,
+      query,
+      batch: async () => {
+        batches++;
+        throw new Error("controlled batch refusal");
+      },
+    };
+    await expect(
+      createV2WorkerInvocationLifecycle({ sql: rejected }).readPresence?.(handle),
+    ).rejects.toThrow("controlled batch refusal");
+    expect(batches).toBe(1);
+    expect(queries).toBe(0);
   } finally {
     db.close();
   }
