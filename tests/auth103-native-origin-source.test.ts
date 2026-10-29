@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ import {
   readAuth103NativeBuildProfileDefine,
 } from "../scripts/deploy/auth103-native-source.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { prepareWorkerArtifact } from "../scripts/deploy/worker-artifact.ts";
 import { additiveAuthFull103DDL } from "../src/auth-authority-schema-plan.ts";
@@ -30,18 +31,44 @@ import {
   AUTH103_NATIVE_PROJECTED_CATALOG_QUERY,
   AUTH103_NATIVE_REGISTRATION_DDL,
   AUTH103_NATIVE_REGISTRATION_QUERY,
+  auth103NativeCurrentnessSql,
+  auth103RpRegistrationRecord,
 } from "../src/auth103-native-source-contract.ts";
+import { createAuth103SourceClock } from "../src/auth103-source-clock.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { canonicalJson } from "../src/json.ts";
-import { SqlError } from "../src/ports.ts";
+import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
+import { canonicalDigest, canonicalJson } from "../src/json.ts";
+import {
+  MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+  MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+} from "../src/money-cutover-sql.ts";
+import { type Row, SqlError, type SqlParam } from "../src/ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
+import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import {
+  captureWorkerSharedAuthStaging,
+  createWorkerOrdinaryPrimaryRequestSql,
+  initializeWorkerRequestNativeInputs,
+  queryWorkerRequestOrdinaryAuth103CurrentRegistration,
+  readWorkerRequestNativeInitializationInputs,
+} from "../src/worker-request-composition.ts";
+import {
+  createHostedBillingRealmTestDatabase,
+  seedHostedBillingRealmTestPin,
+} from "./helpers/hosted-billing-realm-fixture.ts";
 
 // Local source-assembly/negative tests only. A local build original is not a
 // native request, installed103, physical target or Financial permission.
 const root = resolve(import.meta.dir, "..");
 const hash = (value: string): `sha256:${string}` =>
   `sha256:${createHash("sha256").update(value).digest("hex")}`;
+const fresh9dOrigin =
+  "https://integration-root-ga-9d9c84f4281649c884e0579d93e5c926.shoutatomiyama0614.workers.dev";
+const old8732Origin =
+  "https://integration-money-8732b77a789fd563406269261bf09e71.shoutatomiyama0614.workers.dev";
 const target = {
   kind: "takoserver.deploy-target@v2",
   environment: "integration",
@@ -69,6 +96,21 @@ test("registered source assembly retains the original full103 recipe and fixed p
   expect(actual.clockSourceDigest).not.toBe(actual.recipeDigest);
   expect(createAuth103CanonicalSourceArtifacts(root).files.map(({ sql }) => hash(sql))).toEqual(
     actual.files.map(({ sql }) => hash(sql)),
+  );
+});
+
+test("native source currentness keeps Money bytes and ten binds while ordinary excludes physical guards", () => {
+  const money = auth103NativeCurrentnessSql("money-preserved");
+  expect(money).toBe(
+    `(${AUTH103_NATIVE_CURRENT_PREDICATE}) AND (${AUTH103_NATIVE_INSTALL_CURRENT_PREDICATE})`,
+  );
+  const ordinary = auth103NativeCurrentnessSql("ordinary");
+  expect(ordinary).toContain(`(${AUTH103_NATIVE_CURRENT_PREDICATE} AND (NOT EXISTS (`);
+  expect(ordinary).toContain("FROM main.sqlite_schema WHERE name IN (");
+  expect([...ordinary.matchAll(/\?/gu)]).toHaveLength(10);
+  expect([...money.matchAll(/\?/gu)]).toHaveLength(10);
+  expect(() => auth103NativeCurrentnessSql("unknown" as never)).toThrow(
+    "Auth103 native currentness source profile is invalid",
   );
 });
 
@@ -115,9 +157,11 @@ test("source compiler stops on a non-final constraint and never returns a catalo
 
 test("registration is a single immutable original, including duplicate identical rows", () => {
   const actual = createAuth103CanonicalSourceArtifacts(root);
+  const schemaFile = actual.files[2];
+  if (schemaFile === undefined) throw new Error("fixed source artifact missing");
   const database = new Database(":memory:", { strict: true });
   try {
-    const suffix = actual.files[2]!.sql.slice(additiveAuthFull103DDL.length);
+    const suffix = schemaFile.sql.slice(additiveAuthFull103DDL.length);
     for (const statement of frameHostMigrationSql(suffix)) database.query(statement).all();
     const before = database.query(AUTH103_NATIVE_REGISTRATION_QUERY).all();
     expect(before).toHaveLength(1);
@@ -263,11 +307,13 @@ test("a mandatory deployment receipt requires the exact separate RP original and
   // Synthetic DATA for fixed SQL mechanics only. No native origin/factory is
   // constructed or mocked, and none of these rows can qualify this Bun process.
   const actual = createAuth103CanonicalSourceArtifacts(root);
+  const authSchemaFile = actual.files[2];
+  if (authSchemaFile === undefined) throw new Error("fixed source artifact missing");
   const database = new Database(":memory:", { strict: true });
   try {
     database.query("PRAGMA foreign_keys = ON").all();
     for (const statement of frameHostMigrationSql(
-      actual.files[2]!.sql.slice(additiveAuthFull103DDL.length),
+      authSchemaFile.sql.slice(additiveAuthFull103DDL.length),
     ))
       database.query(statement).all();
     const rpRef = hash("component RP original"),
@@ -284,7 +330,7 @@ test("a mandatory deployment receipt requires the exact separate RP original and
       issuerSourceRef: hash("component issuer"),
       configDigest: hash(canonicalJson(SHARED_AUTH_STAGING_PROFILE)),
       targetRef,
-      authSchemaRef: hash(actual.files[2]!.sql),
+      authSchemaRef: hash(authSchemaFile.sql),
       clockPolicyRef: actual.clockPolicyRef,
     });
     const snapshot = () =>
@@ -442,20 +488,320 @@ test("artifact construction refuses alternating run and config accessors without
   }
 });
 
-test("an explicit Root profile refuses absent source and an ordinary Host cannot activate its transport", async () => {
+test("an ordinary registered installation qualifies its exact first-primary and real Financial realm graph", async () => {
+  const database = await createHostedBillingRealmTestDatabase();
+  try {
+    await seedHostedBillingRealmTestPin(database.sql, {
+      accountId: "acct_auth103ordinary",
+      billingAuthority: "auth103-ordinary-component",
+    });
+    for (const migration of MIGRATIONS.filter(({ name }) => Number(name.slice(0, 4)) >= 100))
+      for (const statement of frameHostMigrationSql(migration.sql))
+        database.db.query(statement).all();
+    const canonical = createAuth103CanonicalSourceArtifacts(root);
+    for (const file of canonical.files)
+      for (const statement of frameHostMigrationSql(file.sql)) database.db.query(statement).all();
+
+    const catalog = database.db.query(AUTH103_NATIVE_CATALOG_QUERY).all() as {
+      type: string;
+      name: string;
+      tbl_name: string;
+      sql: string | null;
+    }[];
+    const sourceCommit = "c".repeat(40);
+    const targetRef = hash("ordinary installed target");
+    const sourceRef = hash("ordinary installed source");
+    const artifactDigest = hash("ordinary installed local artifact");
+    const authSchemaFile = canonical.files[2];
+    if (authSchemaFile === undefined) throw new Error("fixed source artifact missing");
+    const authSchemaRef = hash(authSchemaFile.sql);
+    const issuerSourceRef = hash("ordinary selected RP issuer source");
+    const configDigest = hash(canonicalJson(SHARED_AUTH_STAGING_PROFILE));
+    const rpRegistrationRef = hash("ordinary RP registration");
+    const rpRegistrationDigest = hash("ordinary RP registration digest");
+    const rpReceiptRef = hash("ordinary RP receipt");
+    const manifest = Object.freeze({
+      version: 1 as const,
+      sourceCommit,
+      sourceRef,
+      targetRef,
+      authSchemaRef,
+      catalogDigest: await canonicalDigest(catalog),
+      catalogProjection: Object.freeze(
+        catalog.map(({ type, name, tbl_name }) => Object.freeze([type, name, tbl_name] as const)),
+      ),
+      registrationRef: canonical.registrationRef,
+      recipeDigest: canonical.recipeDigest,
+      clockSourceDigest: canonical.clockSourceDigest,
+      clockPolicyRef: canonical.clockPolicyRef,
+      rpRegistration: Object.freeze({
+        registrationRef: rpRegistrationRef,
+        registrationDigest: rpRegistrationDigest,
+        receiptRef: rpReceiptRef,
+        issuerSourceRef,
+        configDigest,
+        profile: SHARED_AUTH_STAGING_PROFILE,
+      }),
+    });
+    const rpRecordJson = canonicalJson(auth103RpRegistrationRecord(manifest));
+    const deploymentRef = await canonicalDigest([
+      "takoserver.auth103.native-deployment.v1",
+      targetRef,
+      sourceRef,
+      artifactDigest,
+      "ordinary",
+    ]);
+    const deploymentReceiptRef = await canonicalDigest([
+      "takoserver.auth103.native-deployment-receipt.v1",
+      deploymentRef,
+    ]);
+    const deploymentRecordJson = canonicalJson({
+      receiptRef: deploymentReceiptRef,
+      manifest,
+      artifactDigest,
+      sourceProfile: "ordinary",
+      rpRecordJson,
+    });
+    await database.sql.run("INSERT INTO auth103_native_rp_registrations VALUES (?,?,?)", [
+      rpRegistrationRef,
+      rpRegistrationDigest,
+      rpRecordJson,
+    ]);
+    await database.sql.run("INSERT INTO auth103_native_rp_registration_receipts VALUES (?,?,?)", [
+      rpReceiptRef,
+      rpRegistrationRef,
+      rpRecordJson,
+    ]);
+    await database.sql.run("INSERT INTO auth103_native_deployments VALUES (?,?,?,?,?)", [
+      deploymentRef,
+      targetRef,
+      sourceRef,
+      artifactDigest,
+      deploymentRecordJson,
+    ]);
+    await database.sql.run("INSERT INTO auth103_native_deployment_receipts VALUES (?,?,?)", [
+      deploymentReceiptRef,
+      deploymentRef,
+      deploymentRecordJson,
+    ]);
+
+    const originals = new WeakMap<
+      object,
+      { readonly sql: string; readonly params: readonly SqlParam[] }
+    >();
+    let replaceBatchOnCurrentnessRead: (() => void) | undefined;
+    const binding = {
+      prepare(sql: string) {
+        const statement = {
+          bind(...params: readonly SqlParam[]) {
+            originals.set(statement, { sql, params });
+            return statement;
+          },
+          async all() {
+            const original = originals.get(statement);
+            if (!original) throw new Error("ordinary native fixture statement differs");
+            const resultRows = database.db
+              .query<Row, never[]>(original.sql)
+              .all(...(original.params as never[]));
+            if (
+              replaceBatchOnCurrentnessRead &&
+              original.sql.toLowerCase().includes("auth103_native_source_registration") &&
+              original.sql.toLowerCase().includes("money_cutover_freeze")
+            ) {
+              const replace = replaceBatchOnCurrentnessRead;
+              replaceBatchOnCurrentnessRead = undefined;
+              replace();
+            }
+            return {
+              success: true,
+              results: resultRows,
+              meta: { changes: 0 },
+            };
+          },
+        };
+        originals.set(statement, { sql, params: [] });
+        return statement;
+      },
+      async batch() {
+        throw new Error("native qualification must not write or batch");
+      },
+      withSession(constraint: "first-primary") {
+        expect(constraint).toBe("first-primary");
+        return this;
+      },
+    };
+    const connection = await createWorkerOrdinaryPrimaryRequestSql({ database: binding });
+    await expect(
+      queryWorkerRequestOrdinaryAuth103CurrentRegistration(connection, new Array(10)),
+    ).rejects.toMatchObject({ code: "invalid" });
+    const accessorParams = Array.from({ length: 10 }, () => "fixed");
+    let accessorCalls = 0;
+    Object.defineProperty(accessorParams, "0", {
+      get() {
+        accessorCalls++;
+        return "fixed";
+      },
+    });
+    await expect(
+      queryWorkerRequestOrdinaryAuth103CurrentRegistration(connection, accessorParams),
+    ).rejects.toMatchObject({ code: "invalid" });
+    expect(accessorCalls).toBe(0);
+    const client = createStripeBillingClient({
+      secretKey: "sk_test_auth103_native_component",
+      mode: "test",
+      async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path === "/v1/account")
+          return Response.json({ object: "account", id: "acct_auth103ordinary" });
+        if (path === "/v1/prices/price_auth103ordinary")
+          return Response.json({
+            object: "price",
+            id: "price_auth103ordinary",
+            livemode: false,
+            currency: "usd",
+            type: "recurring",
+            billing_scheme: "per_unit",
+            unit_amount: 1000,
+            recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+          });
+        throw new Error(`unexpected read-only processor request: ${path}`);
+      },
+    });
+    const realm = await verifyHostedBillingFinancialRealm({
+      sql: connection.sql,
+      reader: { client },
+      expected: {
+        accountId: "acct_auth103ordinary",
+        billingAuthority: "auth103-ordinary-component",
+        mode: "test",
+      },
+      prices: [{ priceId: "price_auth103ordinary", monthlyAmountMinor: 1000 }],
+    });
+    const sharedAuth = captureWorkerSharedAuthStaging({
+      kind: "shared-auth-staging-v1",
+      clientSecret: "test-only-auth103-component-secret",
+      encryptionKey: new Uint8Array(32).fill(3),
+      principals: {
+        async resolve() {
+          throw new Error("positive source qualification grants no principal");
+        },
+      },
+    });
+    const options = {
+      connection,
+      sql: connection.sql,
+      client,
+      realm,
+      identity: {
+        async verify(): Promise<never> {
+          throw new Error("positive source qualification grants no identity");
+        },
+      },
+      clock: createAuth103SourceClock(),
+      randomId: () => crypto.randomUUID(),
+      publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+      consoleOrigin: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
+      sharedAuth,
+    };
+    initializeWorkerRequestNativeInputs(options);
+
+    const env = {
+      STATE_DB: binding,
+      TAKOSERVER_SOURCE_COMMIT: sourceCommit,
+      TAKOSERVER_WORKER_ARTIFACT_DIGEST: artifactDigest,
+    };
+    const globals = globalThis as Record<string, unknown>;
+    const savedSource = globals.__TAKOSERVER_AUTH103_NATIVE_SOURCE__;
+    const savedProfile = globals.__TAKOSERVER_AUTH103_NATIVE_PROFILE__;
+    globals.__TAKOSERVER_AUTH103_NATIVE_SOURCE__ = manifest;
+    globals.__TAKOSERVER_AUTH103_NATIVE_PROFILE__ = {
+      profile: "root-shared-auth-staging-v1",
+      sourceProfile: "ordinary",
+    };
+    mock.module("cloudflare:workers", () => ({ env }));
+    try {
+      const native = await import("../src/auth103-native-origin-source.ts" + "?ordinary-positive");
+      expect(native.auth103NativeSourceCodeSelected()).toBe(true);
+      expect(native.auth103NativeStorageSourceProfile()).toBe("ordinary");
+      const capture = await native.qualifyAuth103NativeRequestOrigin(connection);
+      expect(native.readAuth103NativeRequestOrigin(capture, connection)).toEqual({
+        authSchemaRef,
+        targetRef,
+        sourceRef,
+        clockPolicyRef: canonical.clockPolicyRef,
+        sourceProfile: "ordinary",
+      });
+      const capturedCurrentness = native.auth103NativeRequestCurrentness(capture, connection);
+      expect(capturedCurrentness.params).toHaveLength(10);
+      await expect(
+        connection.sql.query(capturedCurrentness.sql, capturedCurrentness.params),
+      ).rejects.toMatchObject({ code: "invalid" });
+      const evaluateCurrentness = () =>
+        database.db
+          .query(`SELECT CASE WHEN (${capturedCurrentness.sql}) THEN 1 ELSE 0 END AS current`)
+          .get(...(capturedCurrentness.params as never[]));
+      expect(evaluateCurrentness()).toEqual({ current: 1 });
+      expect(readWorkerRequestNativeInitializationInputs(connection)).toEqual({
+        sql: connection.sql,
+        client,
+        realm,
+        clock: options.clock,
+        writerEpoch: undefined,
+      });
+      const originalBatch = binding.batch;
+      try {
+        replaceBatchOnCurrentnessRead = () => {
+          binding.batch = async () => {
+            throw new Error("ordinary native fixture method was replaced");
+          };
+        };
+        await expect(native.qualifyAuth103NativeRequestOrigin(connection)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        expect(binding.batch).not.toBe(originalBatch);
+      } finally {
+        binding.batch = originalBatch;
+        replaceBatchOnCurrentnessRead = undefined;
+      }
+      for (const ddl of [
+        MONEY_CUTOVER_FREEZE_DDL,
+        MONEY_CUTOVER_PERMIT_DDL,
+        MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+        MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+        moneyFenceInstallSql("0094"),
+      ])
+        database.db.exec(ddl);
+      expect(evaluateCurrentness()).toEqual({ current: 0 });
+      await expect(native.qualifyAuth103NativeRequestOrigin(connection)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+    } finally {
+      mock.restore();
+      if (savedSource === undefined) delete globals.__TAKOSERVER_AUTH103_NATIVE_SOURCE__;
+      else globals.__TAKOSERVER_AUTH103_NATIVE_SOURCE__ = savedSource;
+      if (savedProfile === undefined) delete globals.__TAKOSERVER_AUTH103_NATIVE_PROFILE__;
+      else globals.__TAKOSERVER_AUTH103_NATIVE_PROFILE__ = savedProfile;
+    }
+  } finally {
+    database.db.close();
+  }
+});
+
+test("the selected fresh Root origin reaches source qualification while old and foreign origins refuse", async () => {
   const directory = mkdtempSync(resolve(tmpdir(), "auth103-profile-source-"));
   try {
     mkdirSync(resolve(directory, "migrations"));
+    const selected = {
+      ...target,
+      publicOrigin: fresh9dOrigin,
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+    } satisfies DeployTarget;
     let failure: unknown;
     try {
       prepareAuth103NativeBuildSource({
         sourceRoot: directory,
         commit: "a".repeat(40),
-        target: {
-          ...target,
-          publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
-          auth103NativeProfile: "root-shared-auth-staging-v1",
-        },
+        target: selected,
       });
     } catch (error) {
       failure = error;
@@ -463,9 +809,17 @@ test("an explicit Root profile refuses absent source and an ordinary Host cannot
     expect(failure).toBeInstanceOf(DeployError);
     if (!(failure instanceof DeployError))
       throw new Error("missing selected-profile source refusal");
-    expect(failure.message).toBe(
-      "selected Auth103 profile requires its original canonical source registration",
-    );
+    expect(failure.message).toBe("Auth103 selected Money source profile is invalid");
+    expect(SHARED_AUTH_STAGING_PROFILE.publicOrigin).toBe(fresh9dOrigin);
+    for (const publicOrigin of [old8732Origin, "https://foreign-auth.example.test"]) {
+      expect(() =>
+        prepareAuth103NativeBuildSource({
+          sourceRoot: directory,
+          commit: "a".repeat(40),
+          target: { ...selected, publicOrigin },
+        }),
+      ).toThrow("Auth103 selected profile must retain its actual Root staging origin");
+    }
     let transport: unknown;
     try {
       await captureAuth103NativeRpTransportInputs();

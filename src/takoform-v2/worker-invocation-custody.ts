@@ -9,6 +9,16 @@ import type {
   V2WorkerSQLiteDrainInput,
   V2WorkerSQLiteExternalUseInput,
 } from "../worker-invocation-port.ts";
+import { forwardWorkerNativeSchemaReady } from "./forward-worker-native-schema.ts";
+import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  type ForwardFamilyWorkerDeploymentFormUrl,
+  type ForwardFamilyWorkerVersionFormUrl,
+  isForwardFamilyWorkerDeploymentForm,
+  isForwardFamilyWorkerVersionForm,
+  selectableWorkerVersionForms,
+} from "./worker-form-contract.ts";
 import {
   inspectV2WorkerInvocationSchema,
   v2WorkerInvocationDrainSchemaReady,
@@ -596,10 +606,71 @@ export function createV2WorkerInvocationLifecycle(options: {
   readonly sql: Sql;
   readonly now?: Clock;
 }): V2WorkerInvocationCustody {
+  return createWorkerInvocationLifecycle(options, false, VERSION_FORM);
+}
+
+/**
+ * Source-selected Forward deployment lifecycle. The selected Version may be
+ * retained WV0.5 while the deployment's full release set mixes old and new.
+ */
+export function createForwardV2WorkerInvocationLifecycle(options: {
+  readonly sql: Sql;
+  readonly now?: Clock;
+  readonly selectedVersionForm?: typeof VERSION_FORM | ForwardFamilyWorkerVersionFormUrl;
+  /**
+   * The exact Deployment Form whose active graph this lifecycle admits; 0.6.0 by default.
+   * `0.7.0` constructs, but Cron admission for it fails closed against the installed 106
+   * forward native schema (its guards admit only WorkerDeployment 0.4.0 / 0.6.0). This is
+   * established by the schema guards; the new-Form test covers construction, not Cron execution.
+   */
+  readonly deploymentForm?: ForwardFamilyWorkerDeploymentFormUrl;
+}): V2WorkerInvocationCustody {
+  const selectedVersionForm = options.selectedVersionForm ?? FORWARD_WORKER_VERSION_FORM_URL;
+  const deploymentForm = options.deploymentForm ?? FORWARD_WORKER_DEPLOYMENT_FORM_URL;
+  if (!isForwardFamilyWorkerDeploymentForm(deploymentForm))
+    throw new TypeError("unsupported WorkerDeployment Form");
+  if (
+    selectedVersionForm !== VERSION_FORM &&
+    !isForwardFamilyWorkerVersionForm(selectedVersionForm)
+  )
+    throw new TypeError("unsupported selected WorkerVersion Form");
+  // A Deployment never admits a Version Form outside its own closed set (0.6.0 never 0.8.0).
+  if (!selectableWorkerVersionForms(deploymentForm)?.includes(selectedVersionForm))
+    throw new TypeError("selected WorkerVersion Form is not selectable by this Deployment Form");
+  return createWorkerInvocationLifecycle(options, true, selectedVersionForm, deploymentForm);
+}
+
+function createWorkerInvocationLifecycle(
+  options: { readonly sql: Sql; readonly now?: Clock },
+  forward: boolean,
+  selectedVersionForm: typeof VERSION_FORM | ForwardFamilyWorkerVersionFormUrl,
+  forwardDeploymentForm: ForwardFamilyWorkerDeploymentFormUrl = FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+): V2WorkerInvocationCustody {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
-  const anyReady = `(${v2WorkerInvocationSchemaReady("endpoint")}) OR (${v2WorkerInvocationSchemaReady("service")}) OR (${v2WorkerInvocationSchemaReady("cron")})`;
-  const readReady = `(${v2WorkerInvocationLegacySchemaReady("endpoint")}) OR (${v2WorkerInvocationLegacySchemaReady("service")}) OR (${v2WorkerInvocationLegacySchemaReady("cron")}) OR (${v2WorkerInvocationDrainSchemaReady()})`;
+  const successorReady = forward ? forwardWorkerNativeSchemaReady() : null;
+  const ready = (predicate: string) =>
+    successorReady === null ? predicate : `(${predicate}) AND (${successorReady})`;
+  const deploymentForm = forward ? forwardDeploymentForm : DEPLOYMENT_FORM;
+  const releaseForms = (selectableWorkerVersionForms(deploymentForm) ?? [])
+    .map((form) => `'${form}'`)
+    .join(", ");
+  const versionForm = selectedVersionForm;
+  const cronAdmissionSql = forward
+    ? ADMIT_CRON_SQL.replaceAll(DEPLOYMENT_FORM, deploymentForm)
+        .replaceAll(VERSION_FORM, versionForm)
+        .replace(`rv.form_url IS NOT '${versionForm}'`, `rv.form_url NOT IN (${releaseForms})`)
+        .replace(
+          `(${v2WorkerInvocationSchemaReady("cron")})`,
+          `(${ready(v2WorkerInvocationSchemaReady("cron"))})`,
+        )
+    : ADMIT_CRON_SQL;
+  const anyReady = ready(
+    `(${v2WorkerInvocationSchemaReady("endpoint")}) OR (${v2WorkerInvocationSchemaReady("service")}) OR (${v2WorkerInvocationSchemaReady("cron")})`,
+  );
+  const readReady = ready(
+    `(${v2WorkerInvocationLegacySchemaReady("endpoint")}) OR (${v2WorkerInvocationLegacySchemaReady("service")}) OR (${v2WorkerInvocationLegacySchemaReady("cron")}) OR (${v2WorkerInvocationDrainSchemaReady()})`,
+  );
   function instant(): number {
     const value = now().getTime();
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError("invalid invocation clock");
@@ -668,7 +739,7 @@ export function createV2WorkerInvocationLifecycle(options: {
       const rows = await sql.query(
         `SELECT * FROM tf_v2_worker_invocations
          WHERE invocation_id = ? AND custody_token = ?
-           AND (${v2WorkerInvocationDrainSchemaReady()}) LIMIT 2`,
+           AND (${ready(v2WorkerInvocationDrainSchemaReady())}) LIMIT 2`,
         [handle.invocationId, handle.custodyToken],
       );
       return rows.length === 1 ? record(rows[0], handle) : null;
@@ -764,7 +835,7 @@ export function createV2WorkerInvocationLifecycle(options: {
       let changed = 0;
       try {
         changed = (
-          await sql.run(ADMIT_CRON_SQL, [
+          await sql.run(cronAdmissionSql, [
             ownedHandle.invocationId,
             ownedHandle.custodyToken,
             instant(),
@@ -797,7 +868,7 @@ export function createV2WorkerInvocationLifecycle(options: {
         const rows = await sql.query(
           `SELECT * FROM tf_v2_worker_invocations
            WHERE cron_match_id=? AND cron_attempt=? AND cron_lease_token=?
-             AND (${v2WorkerInvocationSchemaReady("cron")}) LIMIT 2`,
+             AND (${ready(v2WorkerInvocationSchemaReady("cron"))}) LIMIT 2`,
           [ownedMatch.matchId, ownedMatch.attempt, ownedMatch.leaseToken],
         );
         const row = rows.length === 1 ? rows[0] : undefined;
@@ -861,7 +932,7 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND retired_at_ms IS NULL AND retirement_receipt_digest IS NULL
              AND no_native_dispatch_at_ms IS NULL
              AND sqlite_drain_state IS NULL AND sqlite_drain_receipt_digest IS NULL
-             AND (${v2WorkerInvocationDrainSchemaReady()})
+             AND (${ready(v2WorkerInvocationDrainSchemaReady())})
            RETURNING invocation_id`,
           sqliteExpectedParams(handle, expected),
         );
@@ -893,7 +964,7 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND retired_at_ms IS NOT NULL AND retirement_receipt_digest IS NOT NULL
              AND no_native_dispatch_at_ms IS NULL
              AND sqlite_drain_state = 'pending' AND sqlite_drain_receipt_digest IS NULL
-             AND (${v2WorkerInvocationDrainSchemaReady()})
+             AND (${ready(v2WorkerInvocationDrainSchemaReady())})
            RETURNING invocation_id`,
           [receiptDigest, ...sqliteExpectedParams(handle, expected)],
         );
@@ -950,7 +1021,7 @@ export function createV2WorkerInvocationLifecycle(options: {
                AND json_type(worker.observed_json,'$.ready')='true'
                AND json_extract(worker.observed_json,'$.activeDeploymentUid')=deployment.uid)
                AND (deployment.principal=m.principal AND deployment.space=m.space
-               AND deployment.target_key=m.target_key AND deployment.form_url='${DEPLOYMENT_FORM}'
+               AND deployment.target_key=m.target_key AND deployment.form_url='${deploymentForm}'
                AND deployment.deleted_at IS NULL AND deployment.phase='idle'
                AND deployment.busy_operation IS NULL
                AND deployment.generation=tf_v2_worker_invocations.deployment_generation
@@ -977,7 +1048,7 @@ export function createV2WorkerInvocationLifecycle(options: {
                    AND json_extract(observed.value,'$.weight')=json_extract(desired.value,'$.weight')
                  WHERE json_extract(desired.value,'$.workerVersion.resourceUid')=version.uid))
                AND (version.principal=m.principal AND version.space=m.space
-               AND version.target_key=m.target_key AND version.form_url='${VERSION_FORM}'
+               AND version.target_key=m.target_key AND version.form_url='${versionForm}'
                AND version.deleted_at IS NULL AND version.phase='idle'
                AND version.busy_operation IS NULL
                AND version.generation=tf_v2_worker_invocations.version_generation
@@ -995,7 +1066,7 @@ export function createV2WorkerInvocationLifecycle(options: {
         const result = await sql.run(
           `UPDATE tf_v2_worker_invocations SET phase = 'send_authorized', send_authorized_at_ms = ?
          WHERE invocation_id = ? AND custody_token = ? AND phase = 'admitted'
-           AND (${v2WorkerInvocationSchemaReady(schema)}) ${cronGate}`,
+           AND (${ready(v2WorkerInvocationSchemaReady(schema))}) ${cronGate}`,
           [instant(), ownedHandle.invocationId, ownedHandle.custodyToken],
         );
         return result.changes === 1;
@@ -1152,7 +1223,7 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
              AND phase = 'send_authorized' AND retired_at_ms IS NULL
              AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL
-             AND (${v2WorkerInvocationSchemaReady(schema)})`
+             AND (${ready(v2WorkerInvocationSchemaReady(schema))})`
             : `UPDATE tf_v2_worker_invocations
            SET retired_at_ms = max(?, send_authorized_at_ms),
                retirement_receipt_digest = ?
@@ -1164,7 +1235,7 @@ export function createV2WorkerInvocationLifecycle(options: {
              AND native_identity = ? AND closure_digest = ? AND confirmed_receipt = ?
              AND phase = 'send_authorized' AND retired_at_ms IS NULL
              AND retirement_receipt_digest IS NULL AND no_native_dispatch_at_ms IS NULL
-             AND (${v2WorkerInvocationSchemaReady("endpoint")})`,
+             AND (${ready(v2WorkerInvocationSchemaReady("endpoint"))})`,
           serviceSchema
             ? [
                 instant(),
@@ -1252,10 +1323,11 @@ export function createV2WorkerInvocationLifecycle(options: {
       if (schema === null) throw new TypeError("invocation inventory unavailable");
       const drainReady =
         schema === "cron" &&
-        (await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationDrainSchemaReady()}`)).length === 1;
-      const ready = drainReady
-        ? v2WorkerInvocationDrainSchemaReady()
-        : v2WorkerInvocationLegacySchemaReady(schema);
+        (await sql.query(`SELECT 1 WHERE ${ready(v2WorkerInvocationDrainSchemaReady())}`))
+          .length === 1;
+      const inventoryReady = drainReady
+        ? ready(v2WorkerInvocationDrainSchemaReady())
+        : ready(v2WorkerInvocationLegacySchemaReady(schema));
       const rows = await sql.query(
         `SELECT * FROM (SELECT count(*) AS outstanding,
            coalesce(sum(CASE WHEN body_state = 'finished' THEN 1 ELSE 0 END), 0) AS body_finished
@@ -1263,7 +1335,7 @@ export function createV2WorkerInvocationLifecycle(options: {
          WHERE deployment_uid = ? AND phase <> 'pre_effect_refused'
            AND no_native_dispatch_at_ms IS NULL
            AND ${drainReady ? "(retired_at_ms IS NULL OR sqlite_drain_state = 'pending')" : "retired_at_ms IS NULL"})
-         WHERE (${ready})`,
+         WHERE (${inventoryReady})`,
         [deploymentUid],
       );
       const row = rows[0];

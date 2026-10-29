@@ -1,10 +1,13 @@
 import { canonicalJson } from "../json.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../workerd-worker-runtime-owner.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  selectableWorkerVersionForms,
+  WORKER_DEPLOYMENT_SLOT_FORM_URLS,
+} from "./forms/container-consumer-specs.ts";
 import { referencesForWorkerEndpoint } from "./forms/worker-references.ts";
 import {
-  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
   FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_VERSION_FORM_URL,
   parseWorkerEndpointSpec,
   validateWorkerEndpointUpdate,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -110,18 +113,35 @@ function endpointAdmission(
   forwardFamily: boolean,
 ): V2AdmissionPredicate {
   const workerUid = parseWorkerEndpointSpec(input.spec).worker.resourceUid;
-  // This owner serves Deployment04 with Version05 and Deployment06 with05/07.
-  // Container Deployment05/Version06 stay unsupported; all families occupy slots.
+  // This owner serves Deployment04 with Version05, Deployment06 with 05/07 and Deployment07
+  // with 05/07/08. Container Deployment05/Version06 stay unsupported; all families occupy slots.
+  const served = forwardFamily
+    ? [
+        WORKER_DEPLOYMENT_FORM_URL,
+        FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+        CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+      ]
+    : [WORKER_DEPLOYMENT_FORM_URL];
+  const servedPairs = served.map((deployment) => ({
+    deployment,
+    versions: selectableWorkerVersionForms(deployment) ?? [],
+  }));
   const deploymentForm = forwardFamily
-    ? "deployment.form_url IN (?, ?)"
+    ? `deployment.form_url IN (${served.map(() => "?").join(", ")})`
     : "deployment.form_url = ?";
   const versionForm = forwardFamily
-    ? "((deployment.form_url = ? AND version.form_url = ?) OR (deployment.form_url = ? AND version.form_url IN (?, ?)))"
+    ? `(${servedPairs
+        .map(
+          ({ versions }) =>
+            `(deployment.form_url = ? AND version.form_url IN (${versions.map(() => "?").join(", ")}))`,
+        )
+        .join(" OR ")})`
     : "version.form_url = ?";
+  const slotPlaceholders = WORKER_DEPLOYMENT_SLOT_FORM_URLS.map(() => "?").join(", ");
   const deploymentSlot = forwardFamily
     ? `
       AND (SELECT COUNT(*) FROM tf_v2_resources slot
-        WHERE slot.form_url IN (?, ?, ?) AND slot.principal = ? AND slot.space = ?
+        WHERE slot.form_url IN (${slotPlaceholders}) AND slot.principal = ? AND slot.space = ?
           AND slot.deleted_at IS NULL
           AND json_extract(slot.spec_json, '$.worker.resourceUid') = ?) = 1`
     : "";
@@ -185,22 +205,14 @@ function endpointAdmission(
           AND other.deleted_at IS NULL AND other.uid <> ?
           AND json_extract(other.spec_json, '$.worker.resourceUid') = ?)`,
     params: [
-      ...(forwardFamily
-        ? [WORKER_DEPLOYMENT_FORM_URL, FORWARD_WORKER_DEPLOYMENT_FORM_URL]
-        : [WORKER_DEPLOYMENT_FORM_URL]),
+      ...served,
       input.principal,
       input.space,
       workerUid,
       ...(forwardFamily
         ? [
-            WORKER_DEPLOYMENT_FORM_URL,
-            WORKER_VERSION_FORM_URL,
-            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-            WORKER_VERSION_FORM_URL,
-            FORWARD_WORKER_VERSION_FORM_URL,
-            WORKER_DEPLOYMENT_FORM_URL,
-            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+            ...servedPairs.flatMap(({ deployment, versions }) => [deployment, ...versions]),
+            ...WORKER_DEPLOYMENT_SLOT_FORM_URLS,
             input.principal,
             input.space,
             workerUid,

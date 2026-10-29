@@ -858,23 +858,20 @@ describe("private request-origin local-currentness DATA reader: source cases", (
     expect(f.native.calls).toEqual([]);
   });
 
-  test("query method replacement before a read or across its SQL await fails actual owning-origin checks", async () => {
+  test("frozen actual graph rejects query replacement before a read and across its SQL await", async () => {
     const f = await graphFixture();
     const reader = createSharedAuthFinancialConsentLocalCurrentnessReader(f.connection);
     const original = f.connection.sql.query;
-    Object.defineProperty(f.connection.sql, "query", {
-      value: async () => [],
-      configurable: true,
-      writable: true,
-    });
-    await expect(reader.readLocalCurrentnessData(f.input)).rejects.toMatchObject({
-      code: "unavailable",
-    });
-    Object.defineProperty(f.connection.sql, "query", {
+    expect(Object.getOwnPropertyDescriptor(f.connection.sql, "query")).toMatchObject({
       value: original,
-      configurable: true,
-      writable: true,
+      configurable: false,
+      writable: false,
     });
+    expect(Reflect.set(f.connection.sql, "query", async () => [])).toBe(false);
+    expect(f.connection.sql.query).toBe(original);
+    const before = snapshot(f.db);
+    const first = await reader.readLocalCurrentnessData(f.input);
+    expect(first?.command).toEqual(f.input.command);
     let announce!: () => void;
     let release!: () => void;
     const started = new Promise<void>((r) => {
@@ -883,19 +880,31 @@ describe("private request-origin local-currentness DATA reader: source cases", (
     const gate = new Promise<void>((r) => {
       release = r;
     });
-    f.native.beforeRead = async () => {
+    f.native.beforeRead = async (sql) => {
+      if (!isLocal(sql)) return;
       announce();
       await gate;
     };
     const pending = reader.readLocalCurrentnessData(f.input);
-    await started;
-    Object.defineProperty(f.connection.sql, "query", {
-      value: async () => [],
-      configurable: true,
-      writable: true,
-    });
-    release();
-    await expect(pending).rejects.toMatchObject({ code: "unavailable" });
+    try {
+      const reachedLocalRead = await Promise.race([
+        started.then(() => true),
+        pending.then(
+          () => false,
+          () => false,
+        ),
+      ]);
+      expect(reachedLocalRead).toBe(true);
+      expect(Reflect.set(f.connection.sql, "query", async () => [])).toBe(false);
+      expect(f.connection.sql.query).toBe(original);
+    } finally {
+      release();
+    }
+    const second = await pending;
+    expect(second?.command).toEqual(f.input.command);
+    expect(f.native.calls.filter((q) => isLocal(q.sql))).toHaveLength(2);
+    expectQueryOnly(f);
+    expect(snapshot(f.db)).toEqual(before);
     expect(f.native.batchCalls).toBe(0);
   });
 

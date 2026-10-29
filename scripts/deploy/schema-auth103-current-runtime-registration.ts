@@ -66,6 +66,7 @@ import {
 const SHA = /^sha256:[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
 const ASSIGNMENT = "define_TAKOSERVER_AUTH103_NATIVE_SOURCE_default";
+const PROFILE_ASSIGNMENT = "define_TAKOSERVER_AUTH103_NATIVE_PROFILE_default";
 const digest = (value: string | Uint8Array): `sha256:${string}` =>
   `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -92,7 +93,10 @@ export const AUTH103_CURRENT_RUNTIME_DEPLOYED_SOURCE_PATHS = Object.freeze([
 ] as const);
 
 /** Read a single esbuild define assignment as data. No bundle code is run. */
-function embeddedManifest(worker: Uint8Array): Auth103NativeSourceManifest {
+function embeddedManifest(worker: Uint8Array): {
+  readonly manifest: Auth103NativeSourceManifest;
+  readonly sourceProfile: "ordinary" | "money-preserved";
+} {
   const source = ts.createSourceFile(
     "worker.js",
     Buffer.from(worker).toString("utf8"),
@@ -106,6 +110,7 @@ function embeddedManifest(worker: Uint8Array): Auth103NativeSourceManifest {
   )
     throw preflightError("Auth103 current module syntax is invalid");
   const matches: ts.Expression[] = [];
+  const profileMatches: ts.Expression[] = [];
   const visit = (node: ts.Node): void => {
     if (
       ts.isBinaryExpression(node) &&
@@ -114,10 +119,17 @@ function embeddedManifest(worker: Uint8Array): Auth103NativeSourceManifest {
       node.left.text === ASSIGNMENT
     )
       matches.push(node.right);
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      ts.isIdentifier(node.left) &&
+      node.left.text === PROFILE_ASSIGNMENT
+    )
+      profileMatches.push(node.right);
     ts.forEachChild(node, visit);
   };
   visit(source);
-  if (matches.length !== 1)
+  if (matches.length !== 1 || profileMatches.length !== 1)
     throw preflightError("Auth103 current manifest assignment is not unique");
   const decode = (node: ts.Node, depth: number): unknown => {
     if (depth > 6) throw preflightError("Auth103 current manifest is too deeply nested");
@@ -147,6 +159,14 @@ function embeddedManifest(worker: Uint8Array): Auth103NativeSourceManifest {
     }
     throw preflightError("Auth103 current manifest has a non-data value");
   };
+  const profileValue = decode(profileMatches[0]!, 0);
+  if (
+    !isRecord(profileValue) ||
+    !exactKeys(profileValue, ["profile", "sourceProfile"]) ||
+    profileValue.profile !== AUTH103_NATIVE_PROFILE ||
+    (profileValue.sourceProfile !== "ordinary" && profileValue.sourceProfile !== "money-preserved")
+  )
+    throw preflightError("Auth103 current source profile is invalid");
   const value = decode(matches[0]!, 0);
   if (
     !isRecord(value) ||
@@ -203,7 +223,10 @@ function embeddedManifest(worker: Uint8Array): Auth103NativeSourceManifest {
     canonicalJson(value.rpRegistration.profile) !== canonicalJson(SHARED_AUTH_STAGING_PROFILE)
   )
     throw preflightError("Auth103 current manifest shape is invalid");
-  return value as unknown as Auth103NativeSourceManifest;
+  return Object.freeze({
+    manifest: value as unknown as Auth103NativeSourceManifest,
+    sourceProfile: profileValue.sourceProfile,
+  });
 }
 
 /** Pure pair verifier used by the owning readback and focused regressions. */
@@ -251,15 +274,20 @@ export function exactCurrentAuth103NativePair(
     digest(worker) !== `sha256:${bundleDigestHex}`
   )
     throw preflightError("Auth103 current module digest differs from Version identity");
-  const manifest = embeddedManifest(worker);
+  const { manifest, sourceProfile } = embeddedManifest(worker);
   if (manifest.sourceCommit !== sourceCommit)
     throw preflightError("Auth103 current source commit differs");
-  const record = auth103NativeDeploymentRecord(manifest, digest(worker));
-  const compiled = compileAuth103NativeSourceInstallContribution(manifest, digest(worker));
+  const record = auth103NativeDeploymentRecord(manifest, digest(worker), sourceProfile);
+  const compiled = compileAuth103NativeSourceInstallContribution(
+    manifest,
+    digest(worker),
+    sourceProfile,
+  );
   if (!Buffer.from(install).equals(Buffer.from(compiled)))
     throw preflightError("Auth103 current install module differs from its owner compiler");
   return Object.freeze({
     manifest,
+    sourceProfile,
     record,
     bundleDigest: digest(worker),
     installDigest: digest(install),
@@ -312,7 +340,11 @@ export function compileAuth103CurrentRuntimePairSql(input: {
 } {
   const { current, historical } = input;
   const frames = frameHostMigrationSql(
-    compileAuth103NativeSourceInstallContribution(current.manifest, current.bundleDigest),
+    compileAuth103NativeSourceInstallContribution(
+      current.manifest,
+      current.bundleDigest,
+      current.sourceProfile,
+    ),
   );
   if (
     frames.length !== 4 ||

@@ -44,6 +44,10 @@ import {
   randomSelfhostDeploymentBasisPoint,
   selectSelfhostWeightedVersion,
 } from "./selfhost-weighted-deployment.ts";
+import {
+  isForwardFamilyWorkerDeploymentForm,
+  isForwardFamilyWorkerVersionForm,
+} from "./takoform-v2/forms/container-consumer-specs.ts";
 import type { KvWorkerBindingClaim } from "./takoform-v2/forms/kv-worker-binding-authority.ts";
 import type {
   ObjectBucketWorkerBindingClaim,
@@ -55,8 +59,6 @@ import type {
 } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import {
-  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_VERSION_FORM_URL,
   parseForwardWorkerVersionSpec,
   parseWorkerEndpointSpec,
   parseWorkerVersionSpec,
@@ -200,15 +202,15 @@ function parseHeldVersion(
     "form" | "spec"
   >,
 ) {
-  if (version.form !== undefined && version.form !== FORWARD_WORKER_VERSION_FORM_URL)
+  if (version.form !== undefined && !isForwardFamilyWorkerVersionForm(version.form))
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-  return version.form === FORWARD_WORKER_VERSION_FORM_URL
+  return version.form !== undefined
     ? parseForwardWorkerVersionSpec(version.spec)
     : parseWorkerVersionSpec(version.spec);
 }
 function isDeploymentForm(form: string, forward: boolean): boolean {
   return (
-    form === WORKER_DEPLOYMENT_FORM_URL || (forward && form === FORWARD_WORKER_DEPLOYMENT_FORM_URL)
+    form === WORKER_DEPLOYMENT_FORM_URL || (forward && isForwardFamilyWorkerDeploymentForm(form))
   );
 }
 
@@ -3879,7 +3881,7 @@ async function openRuntimeOwner(
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
       const spec = parseHeldVersion(version);
-      if (version.form === FORWARD_WORKER_VERSION_FORM_URL && selected.site.kind !== "static") {
+      if (version.form !== undefined && selected.site.kind !== "static") {
         const configured =
           spec.requiredSensitiveVars.length > 0
             ? await options.configuredInputs?.read({

@@ -78,6 +78,8 @@ export function createDockerPhysicalRuntimePreparation(options: {
     claim: source.claim.bind(source),
     withAuthority: source.withAuthority.bind(source),
     bindNative: source.bindNative.bind(source),
+    confirmRunning: source.confirmRunning.bind(source),
+    confirmStopped: source.confirmStopped.bind(source),
     confirmRemoved: source.confirmRemoved.bind(source),
     readStartClaim: source.readStartClaim.bind(source),
     claimStart: source.claimStart.bind(source),

@@ -118,6 +118,9 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
     ...(target.auth103NativeProfile === undefined
       ? []
       : [{ binding: "ACCOUNTS_FINANCIAL_PROOF", ...SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF }]),
+    ...(target.hostedBrowserBillingRpc === undefined
+      ? []
+      : [{ binding: "HOSTED_BROWSER_BILLING_RPC", ...HOSTED_BROWSER_BILLING_STAGING_RPC }]),
     ...(target.cloudflareProviderExecutor === undefined || isArtifactBlobIoQuiescedTarget(target)
       ? []
       : [
@@ -177,6 +180,12 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
   }
   const realized = {
     ...neutralConfig,
+    // The registered source-install SQL is sealed beside worker.js for the
+    // owning D1 importer. Wrangler otherwise discovers that .sql sibling as
+    // a Text module during --no-bundle upload.
+    ...(target.auth103NativeProfile === "root-shared-auth-staging-v1"
+      ? { find_additional_modules: false }
+      : {}),
     name: target.workerName,
     main: options.main,
     account_id: target.accountId,
@@ -368,6 +377,12 @@ function exactPublicWorkerProvenance(
 export const SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF = Object.freeze({
   service: "takosumi-auth-staging",
   entrypoint: "AccountsFinancialProof",
+} as const);
+
+/** The optional Hosted browser billing supplier (same account, fixed entrypoint). */
+export const HOSTED_BROWSER_BILLING_STAGING_RPC = Object.freeze({
+  service: "takosumi-hosted-staging",
+  entrypoint: "HostedBrowserBillingEntrypoint",
 } as const);
 
 /** Names only; Cloudflare never returns or receives secret bytes here. */

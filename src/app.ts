@@ -17,6 +17,7 @@ import { createCatalog, type Offering } from "./catalog.ts";
 import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "./container-contract.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
+import type { HostedBrowserBillingRpcSupplier } from "./financial-hosted-browser-rpc.ts";
 import {
   assertHostedBillingComposition,
   type HostedBillingComposition,
@@ -168,6 +169,8 @@ export interface AppPorts {
   readonly hostedPaidFreeExclusion?: boolean;
   /** Prequalified local Hosted wallet policy; its missing payment authority is explicit. */
   readonly hostedBilling?: HostedBillingComposition;
+  /** Entry-selected Hosted continuation transport; Control retains request/Owner admission. */
+  readonly hostedBrowserBillingRpc?: HostedBrowserBillingRpcSupplier;
   /** Starts a payment, where this deployment can take one. */
   readonly checkout?: Checkout | undefined;
   /**
@@ -1139,6 +1142,9 @@ export function buildApp(ports: AppPorts): App {
   const control = createControlRoutes({
     publicOrigin: ports.publicOrigin,
     ...(workerRequest ? { sharedAuth: workerRequest.sharedAuth } : {}),
+    ...(ports.hostedBrowserBillingRpc
+      ? { hostedBrowserBillingRpc: ports.hostedBrowserBillingRpc }
+      : {}),
     accounts,
     inventory,
     deployments,

@@ -2,8 +2,8 @@
  * Source extension seam for an operator-owned v2 backend.
  *
  * Resource and Operation authority remains with the public v2 SQL engine.
- * This entrypoint only reexports its existing contracts and the read-only
- * Worker publication resolver; it does not register Forms or publish traffic.
+ * This entrypoint exposes contracts and read-only accepted graph readers;
+ * it does not register Forms or publish traffic.
  */
 export type { JsonObject, Sql } from "../ports.ts";
 export {
@@ -36,9 +36,11 @@ export {
 } from "./actor-namespace-sql-graph.ts";
 export { parseTakoformV2PublicConfig } from "./config.ts";
 export {
+  createV2RetiredConfiguredUpdateDiscard,
   readV2ConfiguredPrivateInputs,
   type V2ConfiguredPrivateInputIdentity,
   type V2ConfiguredPrivateInputs,
+  type V2RetiredConfiguredUpdateInput,
 } from "./configured-private-inputs.ts";
 export { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";
 export {
@@ -76,6 +78,37 @@ export {
   type V2HeldArtifactSourceOptions,
 } from "./forms/artifact-source.ts";
 export { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./forms/at-least-once-queue.ts";
+export {
+  fixedReferencesForContainerConsumerWorkerDeployment,
+  fixedReferencesForContainerConsumerWorkerVersion,
+  fixedReferencesForForwardFamilyWorkerVersion,
+  prepareContainerConsumerWorkerDeploymentReferences,
+  prepareContainerConsumerWorkerVersionReferences,
+  referencesForContainerConsumerWorkerDeployment,
+  referencesForContainerConsumerWorkerVersion,
+  referencesForForwardFamilyWorkerVersion,
+} from "./forms/container-consumer-references.ts";
+export {
+  CONTAINER_0_1_FORM_URL,
+  CONTAINER_0_2_FORM_URL,
+  CONTAINER_CONSUMER_TARGET_FORM_URLS,
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  type ContainerConsumerTargetFormUrl,
+  FORWARD_FAMILY_WORKER_DEPLOYMENT_FORM_URLS,
+  FORWARD_FAMILY_WORKER_VERSION_FORM_URLS,
+  type ForwardFamilyWorkerDeploymentFormUrl,
+  type ForwardFamilyWorkerVersionFormUrl,
+  isContainerConsumerTargetFormUrl,
+  isForwardFamilyWorkerDeploymentForm,
+  isForwardFamilyWorkerVersionForm,
+  parseContainerConsumerWorkerDeploymentSpec,
+  parseContainerConsumerWorkerVersionSpec,
+  selectableWorkerVersionForms,
+  validateContainerConsumerWorkerDeploymentUpdate,
+  validateContainerConsumerWorkerVersionUpdate,
+  WORKER_DEPLOYMENT_SLOT_FORM_URLS,
+} from "./forms/container-consumer-specs.ts";
 export { DURABLE_WORKFLOW_FORM_URL } from "./forms/durable-workflow.ts";
 export {
   EDGE_KV_NAMESPACE_FORM_URL,
@@ -244,6 +277,11 @@ export {
   type WorkerVersionSpec,
 } from "./forms/worker-specs.ts";
 export {
+  createV2ForwardContainerBindingReader,
+  type V2ForwardContainerBindingClaim,
+  type V2ForwardContainerBindingSnapshot,
+} from "./forward-container-binding-authority.ts";
+export {
   createInternalV2ModuleWorkerForm,
   MODULE_WORKER_LIFECYCLE_BACKEND_ID,
   type V2WorkerRetirementReader,
@@ -287,6 +325,7 @@ export {
   type WorkerCronTriggerTickResult,
 } from "./worker-cron-trigger-scheduler.ts";
 export {
+  createForwardV2WorkerInvocationLifecycle,
   createV2WorkerInvocationLifecycle,
   type V2WorkerCronInvocationClaim,
   type V2WorkerCronRouteRelease,
@@ -310,12 +349,15 @@ export {
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
 export {
+  createForwardV2NativeDeletionCustody,
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
   type V2NativeDeletionInspection,
   type V2NativeDeletionItem,
 } from "./worker-native-deletions.ts";
 export {
+  createForwardV2NativeEffectCustody,
+  createRetainedV2NativeEffectCustody,
   createV2NativeEffectCustody,
   type V2NativeEffectCustody,
   type V2NativeEffectIdentity,
@@ -327,6 +369,7 @@ export {
 } from "./worker-native-identity-schema.ts";
 export type { V2ForwardWorkerFamilyProfile } from "./worker-publication-state.ts";
 export {
+  createV2ForwardContainerWorkerPublicationState,
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,
   type V2WorkerPublicationSnapshot,

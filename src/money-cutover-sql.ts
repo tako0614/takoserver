@@ -1,9 +1,16 @@
+import {
+  AUTH103_NATIVE_MONEY_FINANCIAL_TABLES,
+  AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES,
+  AUTH103_NATIVE_MONEY_STRIPE_CUSTOMER_TABLES,
+  AUTH103_NATIVE_MONEY_WRITER_EPOCH_PATTERN,
+  AUTH103_NATIVE_MONEY_WRITER_POLICY,
+} from "./auth103-native-source-contract.ts";
 import { type Sql, SqlError, type SqlStatement, type SqlWrite } from "./ports.ts";
 
 /** A selected Host may write money only inside its own D1 batch permit. */
-export const MONEY_CUTOVER_WRITER_POLICY = "transaction-fenced-usd-micros-v1" as const;
+export const MONEY_CUTOVER_WRITER_POLICY = AUTH103_NATIVE_MONEY_WRITER_POLICY;
 export const MONEY_CUTOVER_EPOCH = "usd-micros-v2" as const;
-export const MONEY_CUTOVER_WRITER_EPOCH_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+export const MONEY_CUTOVER_WRITER_EPOCH_PATTERN = AUTH103_NATIVE_MONEY_WRITER_EPOCH_PATTERN;
 export const MONEY_CUTOVER_FREEZE_TABLE = "money_cutover_freeze" as const;
 export const MONEY_CUTOVER_FREEZE_DDL = `CREATE TABLE ${MONEY_CUTOVER_FREEZE_TABLE} (singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1), binding_digest TEXT NOT NULL, origin_digest TEXT NOT NULL, backup_digest TEXT NOT NULL, writer_digest TEXT NOT NULL, source_digest TEXT NOT NULL)`;
 export const MONEY_CUTOVER_PERMIT_TABLE = "money_cutover_writer_permit" as const;
@@ -13,28 +20,7 @@ export const MONEY_CUTOVER_PERMIT_DDL = `CREATE TABLE ${MONEY_CUTOVER_PERMIT_TAB
 export const MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL = `CREATE TRIGGER money_cutover_permit_epoch_guard BEFORE INSERT ON ${MONEY_CUTOVER_PERMIT_TABLE} WHEN NEW.writer_epoch <> (SELECT writer_epoch FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} WHERE singleton = 1) OR NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} WHERE singleton = 1) BEGIN SELECT RAISE(ABORT, 'money cutover Writer epoch revoked'); END`;
 
 /** Fixed 0092 public financial write surface, including indirect sponsorship writes. */
-export const MONEY_CUTOVER_FINANCIAL_TABLES = [
-  "ledger",
-  "wallet_credit_lots",
-  "wallet_credit_allocations",
-  "wallet_allocation_guards",
-  "quotes",
-  "reservations",
-  "usage_statements",
-  "usage_events",
-  "idempotency",
-  "reseller_settlement_intents",
-  "reseller_settlement_guards",
-  "stripe_events",
-  "org_wallet_holds",
-  "org_wallet_usage_records",
-  "org_wallet_grant_snapshots",
-  "org_wallet_pricing_revisions",
-  "org_wallet_monthly_tariffs",
-  "sponsorship_tenants",
-  "sponsorship_resources",
-  "sponsorship_credential_issuance_operations",
-] as const;
+export const MONEY_CUTOVER_FINANCIAL_TABLES = AUTH103_NATIVE_MONEY_FINANCIAL_TABLES;
 
 /**
  * The later Stripe customer guard generation: the Stripe tables a Financial
@@ -44,14 +30,15 @@ export const MONEY_CUTOVER_FINANCIAL_TABLES = [
  * these fences in the same import. Never installed by a numbered migration;
  * pre-cutover and self-host primaries keep raw Sql and carry no fence.
  */
-export const MONEY_CUTOVER_STRIPE_CUSTOMER_TABLES = [
-  "stripe_billing_customers",
-  "stripe_billing_customer_commands",
-  "stripe_customer_admission_links",
-] as const;
+export const MONEY_CUTOVER_STRIPE_CUSTOMER_TABLES = AUTH103_NATIVE_MONEY_STRIPE_CUSTOMER_TABLES;
 /** The 0104 table whose presence on a guarded primary selects that generation. */
 export const MONEY_CUTOVER_STRIPE_CUSTOMER_GENERATION_TABLE = "stripe_customer_admission_links";
 export type MoneyCutoverGuardGeneration = "financial-0092" | "stripe-customer-0104";
+
+/** Fixed catalog names that distinguish a guarded Money primary from an ordinary one. */
+export function moneyCutoverGuardObjectNames(): readonly string[] {
+  return AUTH103_NATIVE_MONEY_GUARD_OBJECT_NAMES;
+}
 
 function moneyCutoverFenceTriggerSql(table: string, verb: "INSERT" | "UPDATE" | "DELETE"): string {
   return `CREATE TRIGGER money_cutover_fence_${table}_${verb.toLowerCase()} BEFORE ${verb} ON ${table} WHEN EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_FREEZE_TABLE}) OR NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE} AS permit JOIN ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} AS authorized ON authorized.singleton = 1 AND authorized.writer_epoch = permit.writer_epoch WHERE permit.singleton = 1 AND permit.epoch = '${MONEY_CUTOVER_EPOCH}') BEGIN SELECT RAISE(ABORT, 'money cutover writer permit required'); END`;

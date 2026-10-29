@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 
-test("selected consent proof mismatch rejects fixed SQL in an isolated process", async () => {
+test("consent mismatch and unselected Money epoch reject fixed SQL in an isolated process", async () => {
   const child = Bun.spawn({
     cmd: [
       process.execPath,
@@ -29,7 +29,7 @@ test("selected consent proof mismatch rejects fixed SQL in an isolated process",
     exit: 0,
     diagnostics: "",
   });
-  expect(stderr).toMatch(/(?:^|\n)\s*1 pass\s*(?:\n|$)/u);
+  expect(stderr).toMatch(/(?:^|\n)\s*2 pass\s*(?:\n|$)/u);
   expect(stderr).toMatch(/(?:^|\n)\s*0 fail\s*(?:\n|$)/u);
-  expect(stderr.match(/^\(pass\) /gmu)).toHaveLength(1);
+  expect(stderr.match(/^\(pass\) /gmu)).toHaveLength(2);
 }, 100_000);

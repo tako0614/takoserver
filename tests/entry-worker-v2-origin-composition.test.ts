@@ -4,6 +4,7 @@
  * UNALLOCATED test-only preparation, not migration/adoption/PR376 qualification.
  */
 import { expect, test } from "bun:test";
+import { resolve } from "node:path";
 import {
   createWorkerEntry,
   type WorkerEntryOptions,
@@ -51,6 +52,55 @@ const BINDINGS = "shared_app_staging_endpoint_bindings";
 const REQUEST_WRITER = `sha256:${"c".repeat(64)}`;
 type Composer = NonNullable<WorkerEntryOptions["composeV2WorkerEndpointOrigin"]>;
 type Selection = Exclude<Awaited<ReturnType<Composer>>, undefined>;
+
+const setupWorkerModule = Bun.build({
+  entrypoints: [resolve(import.meta.dir, "helpers/entry-worker-origin-setup-worker.ts")],
+  target: "browser",
+  format: "esm",
+}).then(async (build) => {
+  if (!build.success) throw new Error(build.logs.map(String).join("\n"));
+  const bundle = build.outputs[0];
+  if (!bundle) throw new Error("Entry origin setup Worker bundle is unavailable");
+  return bundle.text();
+});
+
+async function applyFixtureSetup(
+  runtime: Miniflare,
+  input:
+    | { readonly kind: "migrations"; readonly batches: readonly (readonly string[])[] }
+    | {
+        readonly kind: "request-writer";
+        readonly statements: readonly string[];
+        readonly epoch: string;
+      },
+): Promise<void> {
+  const response = await runtime.dispatchFetch(
+    "https://entry-origin-setup.test/__test/entry-origin-setup",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(input),
+    },
+  );
+  const body = await response.text();
+  if (response.status !== 200) throw new Error("Entry origin Worker fixture setup failed");
+  const result = JSON.parse(body) as {
+    readonly kind: string;
+    readonly batchCount?: number;
+    readonly statementCount: number;
+    readonly epochChanges?: number;
+  };
+  expect(result.kind).toBe(input.kind);
+  if (input.kind === "migrations") {
+    expect(result.batchCount).toBe(input.batches.length);
+    expect(result.statementCount).toBe(
+      input.batches.reduce((total, batch) => total + batch.length, 0),
+    );
+  } else {
+    expect(result.statementCount).toBe(input.statements.length);
+    expect(result.epochChanges).toBe(1);
+  }
+}
 
 // Same unchanged SQL fixture constraints, collected for actual D1 execution.
 function sharedSchema(
@@ -162,7 +212,7 @@ async function fixture(name: string, shared = true, typed = false, carrier = fal
             modules: {
               "worker.js": {
                 type: "esm",
-                contents: "export default { fetch() { return new Response('fixture') } }",
+                contents: await setupWorkerModule,
               },
             },
           },
@@ -174,10 +224,10 @@ async function fixture(name: string, shared = true, typed = false, carrier = fal
   });
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS)
-      await database.batch(
-        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
-      );
+    await applyFixtureSetup(runtime, {
+      kind: "migrations",
+      batches: MIGRATIONS.map((migration) => splitMigration(migration.sql)),
+    });
     const nativeStatements = new WeakMap<D1StatementLike, ReturnType<typeof database.prepare>>();
     const statementInputs = new WeakMap<D1StatementLike, SqlStatement>();
     const coreBatches: (readonly SqlStatement[])[] = [];
@@ -419,6 +469,7 @@ async function fixture(name: string, shared = true, typed = false, carrier = fal
 
 /** Existing owning Money setup on this fixture's real Miniflare database only. */
 async function selectRequestWriter(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  const statements: string[] = [];
   for (const source of [
     MONEY_CUTOVER_FREEZE_DDL,
     MONEY_CUTOVER_PERMIT_DDL,
@@ -426,9 +477,13 @@ async function selectRequestWriter(f: Awaited<ReturnType<typeof fixture>>): Prom
     MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
     moneyFenceInstallSql("0094"),
   ]) {
-    for (const statement of frameHostMigrationSql(source)) await f.sql.run(statement);
+    statements.push(...frameHostMigrationSql(source));
   }
-  await f.sql.run("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)", [REQUEST_WRITER]);
+  await applyFixtureSetup(f.runtime, {
+    kind: "request-writer",
+    statements,
+    epoch: REQUEST_WRITER,
+  });
   Object.assign(f.env, {
     TAKOSERVER_ENVIRONMENT: "integration",
     TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY: MONEY_CUTOVER_WRITER_POLICY,

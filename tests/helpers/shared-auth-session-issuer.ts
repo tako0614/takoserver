@@ -1,16 +1,15 @@
 import { base64UrlEncode } from "../../src/json.ts";
-import type { SharedAuthOidcConfig } from "../../src/shared-auth-oidc-client.ts";
+import {
+  SHARED_AUTH_STAGING_PROFILE,
+  type SharedAuthOidcConfig,
+} from "../../src/shared-auth-oidc-client.ts";
 import type { SharedWorkspaceChoice } from "../../src/shared-auth-session.ts";
 
 export const SESSION_TEST_CONFIG: SharedAuthOidcConfig = {
-  environment: "staging",
-  issuer: "https://auth-staging.takos.jp",
-  publicOrigin: "https://integration-root-ga-573f46e4.shoutatomiyama0614.workers.dev",
-  clientId: "takoserver-console-staging-v1",
+  ...SHARED_AUTH_STAGING_PROFILE,
   clientSecret: "synthetic-test-only:client+credential",
 };
-export const SESSION_TEST_CONSOLE =
-  "https://takoserver-console-integration.shoutatomiyama0614.workers.dev";
+export const SESSION_TEST_CONSOLE = SHARED_AUTH_STAGING_PROFILE.consoleOrigin;
 export const SESSION_TEST_ACCOUNT = "canonical-account-123";
 export const SESSION_TEST_PERSONAL: SharedWorkspaceChoice = {
   id: "personal-workspace-123",

@@ -30,6 +30,11 @@ import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-
 import { ACTOR_NAMESPACE_FORM_URL } from "./takoform-v2/forms/actor-namespace.ts";
 import { createV2HeldArtifactSource } from "./takoform-v2/forms/artifact-source.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "./takoform-v2/forms/at-least-once-queue.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  FORWARD_FAMILY_WORKER_DEPLOYMENT_FORM_URLS,
+} from "./takoform-v2/forms/container-consumer-specs.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "./takoform-v2/forms/durable-workflow.ts";
 import { EDGE_KV_NAMESPACE_FORM_URL } from "./takoform-v2/forms/edge-kv-namespace.ts";
 import { createEdgeKVNamespaceForm } from "./takoform-v2/forms/edge-kv-namespace-backend.ts";
@@ -72,12 +77,14 @@ import {
 import type { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
 import { createV2ServiceBindingAuthority } from "./takoform-v2/service-binding-authority.ts";
 import {
+  createContainerConsumerWorkerCronTriggerAdmissionReader,
   createForwardWorkerCronTriggerAdmissionReader,
   createWorkerCronTriggerAdmissionReader,
   createWorkerCronTriggerForm,
 } from "./takoform-v2/worker-cron-trigger-backend.ts";
 import type { WorkerCronTriggerTickResult } from "./takoform-v2/worker-cron-trigger-scheduler.ts";
 import {
+  createContainerConsumerWorkerDeploymentForm,
   createForwardWorkerDeploymentForm,
   createWorkerDeploymentForm,
 } from "./takoform-v2/worker-deployment-backend.ts";
@@ -86,6 +93,7 @@ import {
   createWorkerEndpointForm,
 } from "./takoform-v2/worker-endpoint-backend.ts";
 import {
+  createInternalV2ContainerConsumerWorkerVersionForm,
   createInternalV2ForwardWorkerVersionForm,
   createInternalV2ModuleWorkerForm,
   createInternalV2WorkerVersionForm,
@@ -1145,13 +1153,14 @@ function createWorkerComposition(
       )),
     ];
     if (forwardFamily)
-      deployments.push(
-        ...(await sql.query(
-          `SELECT spec_json FROM tf_v2_resources WHERE form_url = ? AND target_key = ?
+      for (const form of FORWARD_FAMILY_WORKER_DEPLOYMENT_FORM_URLS)
+        deployments.push(
+          ...(await sql.query(
+            `SELECT spec_json FROM tf_v2_resources WHERE form_url = ? AND target_key = ?
         AND deleted_at IS NULL AND json_extract(observed_json, '$.active') = 1`,
-          [FORWARD_WORKER_DEPLOYMENT_FORM_URL, targetKey],
-        )),
-      );
+            [form, targetKey],
+          )),
+        );
     for (const row of deployments) {
       if (typeof row.spec_json !== "string") throw new Error("v2 Deployment inventory malformed");
       const workerUid = parseWorkerDeploymentSpec(JSON.parse(row.spec_json)).worker.resourceUid;
@@ -1397,6 +1406,28 @@ function createWorkerComposition(
                 return await openOwner(uid);
               },
             }),
+          }
+        : {}),
+      // WorkerVersion 0.8.0 / WorkerDeployment 0.7.0: new identities on the 0.7.0 / 0.6.0
+      // execution ABI. They are registered with the forward family and reuse the same
+      // publication state, owner and Cron reader, but never the configured-input sealer:
+      // a 0.8.0 Version needing a private input is refused at admission, not sealed here.
+      ...(forwardFamily
+        ? {
+            [CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL]:
+              createInternalV2ContainerConsumerWorkerVersionForm(versionOptions),
+            [CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL]:
+              createContainerConsumerWorkerDeploymentForm({
+                targetKey,
+                publicationState,
+                scheduledAttachments: createContainerConsumerWorkerCronTriggerAdmissionReader({
+                  sql,
+                }),
+                ownerForWorker: async (uid) => {
+                  await restoration;
+                  return await openOwner(uid);
+                },
+              }),
           }
         : {}),
       [MODULE_WORKER_FORM_URL]: createInternalV2ModuleWorkerForm({

@@ -1,9 +1,11 @@
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, SqlParam } from "../ports.ts";
 import {
-  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_VERSION_FORM_URL,
+  isForwardFamilyWorkerDeploymentForm,
+  selectableWorkerVersionForms,
+  WORKER_DEPLOYMENT_SLOT_FORM_URLS,
+} from "./forms/container-consumer-specs.ts";
+import {
   parseForwardWorkerVersionSpec,
   parseWorkerDeploymentSpec,
   parseWorkerEndpointSpec,
@@ -21,6 +23,7 @@ export interface V2WorkerPublicationSqlGuard {
 }
 
 type SqlRow = Record<string, unknown>;
+const slotPlaceholders = WORKER_DEPLOYMENT_SLOT_FORM_URLS.map(() => "?").join(", ");
 type Rows = Map<string, SqlRow>;
 
 function isRow(value: unknown): value is SqlRow {
@@ -136,7 +139,7 @@ export function createWorkerPublicationSqlGuard(input: {
   readonly referenceSetIds: readonly string[];
   readonly evidence: unknown;
 }): V2WorkerPublicationSqlGuard {
-  if (input.forwardDeployment && input.execution.form !== FORWARD_WORKER_DEPLOYMENT_FORM_URL)
+  if (input.forwardDeployment && !isForwardFamilyWorkerDeploymentForm(input.execution.form))
     throw new Error("Forward publication source mismatch");
   const resources: Rows = new Map();
   const operations: Rows = new Map();
@@ -163,7 +166,7 @@ export function createWorkerPublicationSqlGuard(input: {
       if (
         !deployment ||
         !source ||
-        deployment.form_url !== FORWARD_WORKER_DEPLOYMENT_FORM_URL ||
+        !isForwardFamilyWorkerDeploymentForm(deployment.form_url) ||
         deployment.uid !== endpointSource.resourceUid ||
         source.id !== endpointSource.sourceOperationId ||
         source.resource_uid !== deployment.uid ||
@@ -185,12 +188,14 @@ export function createWorkerPublicationSqlGuard(input: {
       const spec = parseWorkerDeploymentSpec(JSON.parse(source.accepted_spec_json));
       if (spec.worker.resourceUid !== input.workerUid)
         throw new Error("Forward Endpoint accepted Worker mismatch");
+      // The captured Deployment's own Form decides which Version Forms it may have selected.
+      const selectable = selectableWorkerVersionForms(deployment.form_url) ?? [];
       for (const selected of spec.versions) {
         const version = resources.get(selected.workerVersion.resourceUid);
         if (
           !version ||
-          (version.form_url !== WORKER_VERSION_FORM_URL &&
-            version.form_url !== FORWARD_WORKER_VERSION_FORM_URL) ||
+          typeof version.form_url !== "string" ||
+          !selectable.includes(version.form_url) ||
           version.principal !== input.principal ||
           version.space !== input.space ||
           typeof version.spec_json !== "string"
@@ -273,17 +278,10 @@ export function createWorkerPublicationSqlGuard(input: {
   if (forwardScope) {
     add(
       exactIdSet(
-        `tf_v2_resources r WHERE r.form_url IN (?, ?, ?) AND r.principal=? AND r.space=? AND r.deleted_at IS NULL AND json_extract(r.spec_json,'$.worker.resourceUid')=?`,
+        `tf_v2_resources r WHERE r.form_url IN (${slotPlaceholders}) AND r.principal=? AND r.space=? AND r.deleted_at IS NULL AND json_extract(r.spec_json,'$.worker.resourceUid')=?`,
         "r.uid",
         input.deploymentIds,
-        [
-          WORKER_DEPLOYMENT_FORM_URL,
-          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-          input.principal,
-          input.space,
-          input.workerUid,
-        ],
+        [...WORKER_DEPLOYMENT_SLOT_FORM_URLS, input.principal, input.space, input.workerUid],
       ),
     );
     add(
@@ -296,16 +294,10 @@ export function createWorkerPublicationSqlGuard(input: {
     );
     add(
       exactIdSet(
-        `tf_v2_operations op JOIN tf_v2_resources r ON r.uid=op.resource_uid WHERE r.form_url IN (?, ?, ?, ?) AND r.deleted_at IS NULL AND op.status IN ('queued','running','waiting_input','reconciling') AND json_extract(op.accepted_spec_json,'$.worker.resourceUid')=?`,
+        `tf_v2_operations op JOIN tf_v2_resources r ON r.uid=op.resource_uid WHERE r.form_url IN (${slotPlaceholders}, ?) AND r.deleted_at IS NULL AND op.status IN ('queued','running','waiting_input','reconciling') AND json_extract(op.accepted_spec_json,'$.worker.resourceUid')=?`,
         "op.id",
         input.pendingIds,
-        [
-          WORKER_DEPLOYMENT_FORM_URL,
-          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-          WORKER_ENDPOINT_FORM_URL,
-          input.workerUid,
-        ],
+        [...WORKER_DEPLOYMENT_SLOT_FORM_URLS, WORKER_ENDPOINT_FORM_URL, input.workerUid],
       ),
     );
   } else {

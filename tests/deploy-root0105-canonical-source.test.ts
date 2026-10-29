@@ -35,7 +35,11 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { workerMoneyUnitSchemaReady, workerSchemaAllowsPending } from "../scripts/deploy/worker.ts";
 import { AUTH103_NATIVE_CATALOG_QUERY } from "../src/auth103-native-source-contract.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { FINANCIAL_0104_DDL } from "../src/financial-0104-source-contract.ts";
+import {
+  FINANCIAL_0104_CATALOG_QUERY,
+  FINANCIAL_0104_DDL,
+  FINANCIAL_0104_OBJECTS,
+} from "../src/financial-0104-source-contract.ts";
 import { canonicalJson } from "../src/json.ts";
 import {
   inspectMoneyCutoverGuard,
@@ -127,6 +131,36 @@ function state(database: Database, local: readonly string[]) {
 
 const count = (database: Database, table: string) =>
   database.query<{ n: number }, []>(`SELECT count(*) AS n FROM ${table}`).get()?.n ?? -1;
+
+function tableData(database: Database): string {
+  const tables = database
+    .query<{ name: string }, []>(
+      "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' ORDER BY name",
+    )
+    .all();
+  return canonicalJson(
+    tables.map(({ name }) => {
+      const quoted = `"${name.replaceAll('"', '""')}"`;
+      return [name, database.query(`SELECT * FROM ${quoted}`).all()];
+    }),
+  );
+}
+
+function expectMissingMoneyDependency(database: Database, sql: string): void {
+  let failure: unknown;
+  try {
+    database.exec(sql);
+  } catch (error) {
+    failure = error;
+  }
+  const message = String(failure);
+  // Pin the causal class while allowing SQLite's optional `main.` qualification
+  // and platform-specific error prefixes. Generic throws and constraint errors
+  // do not count as reaching the missing Money dependency.
+  expect(message).toMatch(
+    /no such table: (?:main\.)?money_cutover_(?:freeze|writer_permit|authorized_epoch)/u,
+  );
+}
 
 // Each source root regenerates the same exact bytes, so the compiled shapes are
 // shared per profile and chain digest; every test still builds its own steps.
@@ -356,6 +390,89 @@ test(
       expect(database.query("PRAGMA foreign_key_check").all()).toHaveLength(0);
       expect(() => run(database, import105.sql)).toThrow();
       expect(count(database, "d1_migrations")).toBe(105);
+    } finally {
+      database.close();
+      source.dispose();
+    }
+  },
+  LONG,
+);
+
+test(
+  "ordinary exact105 schema and catalog readiness do not imply Financial writes have Money SQL dependencies",
+  () => {
+    const root = sourceRoot("100");
+    const source = readFinancial0104CanonicalMigrationSource(root);
+    const { step104, step105 } = inputs(source, "ordinary");
+    const database = ordinary103(source);
+    try {
+      const local = source.physicalNames;
+      run(database, composeFinancial0104ImportData(step104).sql);
+      run(database, composeFinancial0104ImportData(step105).sql);
+
+      const ready = state(database, local);
+      expect(ready.applied).toEqual([...source.artifact105.names]);
+      expect(financial0104SourceSchemaReady(ready, root, "normal")).toBe(true);
+      expect(financial0104LedgerApplied(local, ready.applied, root)).toBe(true);
+      const installedCatalog = database.query(FINANCIAL_0104_CATALOG_QUERY).all();
+      const catalogRows = new Set(installedCatalog.map((row) => canonicalJson(row)));
+      const recipeRows = new Set(
+        FINANCIAL_0104_OBJECTS.map(({ type, name, tbl_name, sql }) =>
+          canonicalJson({ type, name, tbl_name, sql }),
+        ),
+      );
+      expect(catalogRows).toEqual(recipeRows);
+
+      const missingMoneyTables = [
+        "money_cutover_freeze",
+        "money_cutover_writer_permit",
+        "money_cutover_authorized_epoch",
+      ] as const;
+      // The historical 0094 money_unit_policy remains part of this exact chain;
+      // it does not install the request-time cutover writer frame.
+      expect(
+        database.query("SELECT name FROM sqlite_schema WHERE name='money_unit_policy'").get(),
+      ).toEqual({ name: "money_unit_policy" });
+      for (const name of missingMoneyTables)
+        expect(database.query("SELECT name FROM sqlite_schema WHERE name=?").get(name)).toBeNull();
+
+      // These are structural SQL dependency probes only. Their sentinel JSON is
+      // not a Financial original, Customer consent, H0 enrollment, or authority;
+      // they establish that ordinary 0105's exact schema still has executable
+      // Financial fences whose named Root Money dependencies are absent.
+      const probes = [
+        {
+          table: "financial_retained_r1_originals",
+          sql: `INSERT INTO financial_retained_r1_originals
+            (r1_ref,challenge_ref,preparation_ref,receipt_ref,command_json,original_json,original_digest,terms_ref,terms_digest,source_registration_ref,source_registration_digest,source_incarnation,scope_json)
+            VALUES('probe:r1','probe:challenge','probe:preparation','probe:receipt','{}','{"scopeRealm":{"writerEpoch":"probe:unselected"}}','probe:digest','probe:terms','probe:terms-digest','probe:source','probe:source-digest','probe:incarnation','{"writerEpoch":"probe:unselected"}')`,
+        },
+        {
+          table: "financial_customer_admissions",
+          sql: `INSERT INTO financial_customer_admissions
+            (admission_ref,challenge_ref,grant_ref,issuance_attempt,expected_receipt_ref,organization_id,action_kind,action_ref,request_fingerprint,action_json,selection_json,terms_json,context_json,realm_json,customer_request_json,customer_fingerprint,stripe_key,created_at)
+            VALUES('probe:admission','probe:challenge','probe:grant','probe:attempt','probe:receipt','probe:org','topup','probe:action','probe:fingerprint','{}','{}','{}','{}','{}','{}','probe:fingerprint','probe:key','2026-10-24T00:00:00.000Z')`,
+        },
+        {
+          table: "financial_history_primary_roots",
+          sql: `INSERT INTO financial_history_primary_roots
+            (primary_ref,primary_incarnation,physical_binding_ref,physical_binding_incarnation,root_json)
+            VALUES('probe:primary','probe:primary-inc','probe:binding','probe:binding-inc','{"primaryRef":"probe:primary","primaryIncarnation":"probe:primary-inc","physicalBindingRef":"probe:binding","physicalBindingIncarnation":"probe:binding-inc","writerEpoch":"probe:unselected"}')`,
+        },
+      ] as const;
+      const beforeState = state(database, local);
+      const beforeData = tableData(database);
+      for (const probe of probes) {
+        expect(
+          database
+            .query("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?")
+            .get(`${probe.table}_money_fence`),
+        ).toBeTruthy();
+        expectMissingMoneyDependency(database, probe.sql);
+        expect(count(database, probe.table)).toBe(0);
+        expect(state(database, local)).toEqual(beforeState);
+        expect(tableData(database)).toBe(beforeData);
+      }
     } finally {
       database.close();
       source.dispose();

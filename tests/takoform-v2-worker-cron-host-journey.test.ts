@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
@@ -11,6 +12,11 @@ import {
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
+import {
+  type LinuxProcessIdentity,
+  linuxProcessLiveness,
+  workerPortOwnership,
+} from "../src/workerd-linux-process.ts";
 import { removeOwnerPrivateSocketDirectories } from "./helpers/owner-private-sockets.ts";
 
 const API = "/apis/forms.takoform.com/v2";
@@ -27,6 +33,160 @@ type Match = {
   readonly attempts: number;
   readonly result_version_uid: string | null;
 };
+
+type RecordedChild = {
+  readonly identity: LinuxProcessIdentity;
+  readonly listenerPort: number;
+};
+
+function recordedChildren(text: string, workerUid: string): readonly RecordedChild[] {
+  const state = JSON.parse(text) as Record<string, unknown>;
+  if (
+    !state ||
+    state.workerResourceUid !== workerUid ||
+    typeof state.activeOperationId !== "string" ||
+    !Array.isArray(state.incarnations)
+  )
+    throw new Error("Cron fixture owner record is unavailable");
+  const relevant: RecordedChild[] = [];
+  const ports = new Set<number>();
+  let activeCount = 0;
+  for (const value of state.incarnations) {
+    if (!value || typeof value !== "object")
+      throw new Error("Cron fixture owner incarnation is unavailable");
+    const record = value as Record<string, unknown>;
+    if (record.status === "retired") continue;
+    if (
+      (record.status !== "active" &&
+        record.status !== "draining" &&
+        record.status !== "retiring") ||
+      typeof record.operationId !== "string" ||
+      !Number.isSafeInteger(record.listenerPort) ||
+      (record.listenerPort as number) < 1 ||
+      (record.listenerPort as number) > 65_535 ||
+      !record.processIdentity ||
+      typeof record.processIdentity !== "object"
+    )
+      throw new Error("Cron fixture owner incarnation is unavailable");
+    const identity = record.processIdentity as Record<string, unknown>;
+    if (
+      !Number.isSafeInteger(identity.pid) ||
+      (identity.pid as number) <= 1 ||
+      typeof identity.bootId !== "string" ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(identity.bootId) ||
+      typeof identity.pidNamespace !== "string" ||
+      !/^\d{1,32}:\d{1,32}$/u.test(identity.pidNamespace) ||
+      typeof identity.startTimeTicks !== "string" ||
+      !/^\d{1,32}$/u.test(identity.startTimeTicks)
+    )
+      throw new Error("Cron fixture child identity is unavailable");
+    if (record.status === "active") {
+      activeCount += 1;
+      if (record.operationId !== state.activeOperationId)
+        throw new Error("Cron fixture active incarnation changed");
+    }
+    if (ports.has(record.listenerPort as number))
+      throw new Error("Cron fixture owner listener is ambiguous");
+    ports.add(record.listenerPort as number);
+    relevant.push({
+      identity: identity as unknown as LinuxProcessIdentity,
+      listenerPort: record.listenerPort as number,
+    });
+  }
+  if (activeCount !== 1) throw new Error("Cron fixture active incarnation is unavailable");
+  return relevant;
+}
+
+async function waitForRecordedChildrenToExit(
+  root: string,
+  workerUid: string,
+  observation: {
+    readonly liveness: typeof linuxProcessLiveness;
+    readonly ownership: typeof workerPortOwnership;
+  } = { liveness: linuxProcessLiveness, ownership: workerPortOwnership },
+  deadlineMs = 10_000,
+): Promise<void> {
+  const key = createHash("sha256").update(workerUid).digest("hex");
+  const statePath = join(root, "worker-owners", key, "runtime-owner.json");
+  const text = await readFile(statePath, "utf8");
+  const children = recordedChildren(text, workerUid);
+  const deadline = performance.now() + deadlineMs;
+  for (;;) {
+    let allAbsent = true;
+    for (const child of children) {
+      const liveness = await observation.liveness(child.identity);
+      if (liveness === "unknown") throw new Error("Cron fixture child liveness is unknown");
+      const ownership = await observation.ownership(
+        child.listenerPort,
+        liveness === "live" ? child.identity.pid : undefined,
+      );
+      if (ownership === "foreign") throw new Error("Cron fixture listener is not vacant");
+      if (liveness !== "stale" || ownership !== "vacant") allAbsent = false;
+    }
+    if (allAbsent) {
+      if (performance.now() >= deadline)
+        throw new Error("Cron fixture recorded child did not exit");
+      if ((await readFile(statePath, "utf8")) !== text)
+        throw new Error("Cron fixture owner record changed");
+      return;
+    }
+    if (performance.now() >= deadline) throw new Error("Cron fixture recorded child did not exit");
+    await Bun.sleep(10);
+  }
+}
+
+test("Cron restart observation rejects missing, unknown, foreign and live child state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "v2-cron-owner-observation-"));
+  const workerUid = "cron-fixture-worker";
+  const key = createHash("sha256").update(workerUid).digest("hex");
+  const statePath = join(root, "worker-owners", key, "runtime-owner.json");
+  const identity: LinuxProcessIdentity = {
+    pid: 12_345,
+    bootId: "11111111-1111-1111-1111-111111111111",
+    pidNamespace: "1:2",
+    startTimeTicks: "3",
+  };
+  try {
+    await expect(waitForRecordedChildrenToExit(root, workerUid)).rejects.toThrow();
+    await mkdir(join(root, "worker-owners", key), { recursive: true });
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        workerResourceUid: workerUid,
+        activeOperationId: "operation-1",
+        incarnations: [
+          {
+            operationId: "operation-1",
+            status: "active",
+            processIdentity: identity,
+            listenerPort: 18_731,
+          },
+        ],
+      }),
+    );
+    const observer = (
+      liveness: "live" | "stale" | "unknown",
+      ownership: "owned" | "vacant" | "foreign",
+    ) => ({
+      liveness: async () => liveness,
+      ownership: async () => ownership,
+    });
+    await expect(
+      waitForRecordedChildrenToExit(root, workerUid, observer("unknown", "vacant")),
+    ).rejects.toThrow("liveness is unknown");
+    await expect(
+      waitForRecordedChildrenToExit(root, workerUid, observer("stale", "foreign")),
+    ).rejects.toThrow("listener is not vacant");
+    await expect(
+      waitForRecordedChildrenToExit(root, workerUid, observer("live", "owned"), 0),
+    ).rejects.toThrow("did not exit");
+    await expect(
+      waitForRecordedChildrenToExit(root, workerUid, observer("stale", "vacant")),
+    ).resolves.toBeUndefined();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function startHost(
   root: string,
@@ -364,6 +524,7 @@ test(
       // child must recover solely from exact held custody and accepted SQL state.
       expect(await objects.delete("cron/manifest")).toBe(true);
       expect(await objects.delete("cron/index.js")).toBe(true);
+      await waitForRecordedChildrenToExit(root, worker.resourceUid);
       second = await startHost(root, binary, worker.resourceUid, manifestSha, moduleSha);
       expect(second.child.pid).not.toBe(firstPid);
       const cronReplay = await request(

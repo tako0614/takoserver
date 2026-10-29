@@ -337,7 +337,7 @@ describe("stored proof reference to local predicate DATA without caller original
       }
   });
 
-  test("foreign connections and original query or run method drift across await cannot supply the captured graph", async () => {
+  test("foreign connections and frozen query or run methods cannot replace the original local read", async () => {
     const f = await committed();
     expect(() =>
       createSharedAuthFinancialConsentLocalProofDataReader({ ...f.connection }),
@@ -346,20 +346,18 @@ describe("stored proof reference to local predicate DATA without caller original
       const g = await committed();
       const before = checkpoint(g);
       const reader = createSharedAuthFinancialConsentLocalProofDataReader(g.connection);
-      const original = Object.getOwnPropertyDescriptor(g.graph.sql, method);
-      if (!original) throw new Error("original own method required");
+      let replaced: boolean | undefined;
       g.native.beforeRead = async (sql) => {
         if (isLocal(sql))
-          Object.defineProperty(g.graph.sql, method, {
-            ...original,
+          replaced = Reflect.defineProperty(g.graph.sql, method, {
             value: () => Promise.resolve([]),
           });
       };
-      try {
-        await unavailable(reader.readLocalProofOriginalData(input(g)));
-      } finally {
-        Object.defineProperty(g.graph.sql, method, original);
-      }
+      const actual = await reader.readLocalProofOriginalData(input(g));
+      expect(Object.isFrozen(g.graph.sql)).toBe(true);
+      expect(replaced).toBe(false);
+      expect(actual?.consentProofRef).toBe(g.input.command.key.consentRef);
+      expect(actual?.original.command).toEqual(g.input.command);
       readonly(g, before);
     }
   });

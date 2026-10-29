@@ -59,6 +59,7 @@ const UPGRADE_DECISION_HEADER = "x-takoserver-private-actor-upgrade-decision";
 const UPGRADE_SOCKET_ID_HEADER = "x-takoserver-private-actor-upgrade-socket-id";
 const EVENT_SECRET_HEADER = "x-takoserver-private-actor-event-secret";
 const RESERVATION_HEADER = "x-takoserver-private-actor-reservation";
+const RESERVATION_OFFER_HEADER = "x-takoserver-private-actor-reservation-offer";
 const RESERVATION_ACTION_HEADER = "x-takoserver-private-actor-reservation-action";
 const OBSERVATION_HEADER = "x-takoserver-private-actor-observation";
 const RESERVATION_MS = 30_000;
@@ -80,12 +81,21 @@ const HTTP_PRODUCER_MS = 300_000;
 // request now: application top-level code may replace globals and prototypes.
 const SafeHeaders = Headers;
 const SafeRequest = Request;
+const SafeResponse = Response;
 const SafeReflectApply = Reflect.apply;
 const SafeWebSocketClose = WebSocket.prototype.close;
 const SafeHeadersSet = Headers.prototype.set;
+const SafeHeadersGet = Headers.prototype.get;
+const SafeHeadersHas = Headers.prototype.has;
+const SafeHeadersDelete = Headers.prototype.delete;
+const SafeRequestHeaders = Object.getOwnPropertyDescriptor(Request.prototype, "headers")?.get;
+const SafeRequestMethod = Object.getOwnPropertyDescriptor(Request.prototype, "method")?.get;
+const SafeStringCharCodeAt = String.prototype.charCodeAt;
+const SafeStringToLowerCase = String.prototype.toLowerCase;
 const SafeResponseJson = Response.prototype.json;
 const SafeResponseOk = Object.getOwnPropertyDescriptor(Response.prototype, "ok")?.get;
 const SafeResponseStatus = Object.getOwnPropertyDescriptor(Response.prototype, "status")?.get;
+const SafeResponseHeaders = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;
 const SafeEncodeURIComponent = encodeURIComponent;
 const SafeString = String;
 const SafeHasOwn = Object.hasOwn;
@@ -101,16 +111,41 @@ const SafeSubtle = crypto.subtle;
 const SafeSubtleImportKey = crypto.subtle.importKey;
 const SafeSubtleSign = crypto.subtle.sign;
 const SafeSubtleVerify = crypto.subtle.verify;
+const SafeSubtleDigest = crypto.subtle.digest;
 const SafeCrypto = crypto;
 const SafeCryptoRandomUUID = crypto.randomUUID;
 const SafeCryptoGetRandomValues = crypto.getRandomValues;
 const SafeNow = Date.now;
 const SafeMathMin = Math.min;
 const SafeJsonStringify = JSON.stringify;
-const SafeEncoder = new TextEncoder();
-const SafeEncode = TextEncoder.prototype.encode;
+const SafeTextEncoder = TextEncoder;
+const SafeEncoder = new SafeTextEncoder();
+const SafeEncode = SafeTextEncoder.prototype.encode;
 const SafeUint8Array = Uint8Array;
 const HEX = "0123456789abcdef";
+
+function validReservationOffer(offer: string): boolean {
+  if (offer.length !== 64) return false;
+  for (let index = 0; index < 64; index += 1) {
+    const code = SafeReflectApply(SafeStringCharCodeAt, offer, [index]) as number;
+    if (!(code >= 48 && code <= 57) && !(code >= 97 && code <= 102)) return false;
+  }
+  return true;
+}
+
+async function reservationOfferDigest(offer: string): Promise<string> {
+  const bytes = (await SafeReflectApply(SafeSubtleDigest, SafeSubtle, [
+    "SHA-256",
+    SafeReflectApply(SafeEncode, SafeEncoder, [`actor-socket-offer-v1\n${offer}`]),
+  ])) as ArrayBuffer;
+  let digest = "";
+  const view = new SafeUint8Array(bytes);
+  for (let index = 0; index < 32; index += 1) {
+    const byte = view[index] as number;
+    digest += (HEX[byte >> 4] as string) + (HEX[byte & 15] as string);
+  }
+  return digest;
+}
 
 function randomBearer(): string {
   const bytes = new SafeUint8Array(32);
@@ -546,7 +581,7 @@ export function createActorNativeSocketPort(
 // empty replacement Headers. Rebuild from the URL so the private hop headers
 // cannot reach the application even when they were the only headers present.
 function withHeaders(request: Request, headers: Headers, signal = request.signal): Request {
-  return new Request(request.url, {
+  return new SafeRequest(request.url, {
     method: request.method,
     headers,
     body: request.body,
@@ -625,6 +660,10 @@ export function createActorNativeOwner(
     admissionToken === undefined
       ? new SafeHeaders()
       : new SafeHeaders({ "x-takoserver-private-alarm-admission": admissionToken });
+  const socketAdmissionBody = (value: object): Uint8Array<ArrayBuffer> =>
+    SafeReflectApply(SafeEncode, SafeEncoder, [
+      SafeJsonStringify(value),
+    ]) as Uint8Array<ArrayBuffer>;
   if (
     !SafeIsSafeInteger(deadlines.handlerMs) ||
     deadlines.handlerMs <= 0 ||
@@ -642,6 +681,7 @@ export function createActorNativeOwner(
       readonly CLASS: unknown;
       readonly [name: string]: unknown;
       readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
+      readonly SOCKET_ADMISSION?: { fetch(request: Request): Promise<Response> };
     };
     private tail: Promise<void> = Promise.resolve();
     private alarmTail: Promise<void> = Promise.resolve();
@@ -674,6 +714,7 @@ export function createActorNativeOwner(
         readonly CLASS: unknown;
         readonly [name: string]: unknown;
         readonly ADMISSION?: { fetch(request: Request): Promise<Response> };
+        readonly SOCKET_ADMISSION?: { fetch(request: Request): Promise<Response> };
       },
     ) {
       this.state = state;
@@ -688,6 +729,14 @@ export function createActorNativeOwner(
         );
         storage.sql.exec(
           "CREATE TABLE IF NOT EXISTS actor_socket_reservations (socket_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, bearer TEXT NOT NULL, expires_at INTEGER NOT NULL)",
+        );
+        storage.sql.exec(
+          "CREATE UNIQUE INDEX IF NOT EXISTS actor_socket_reservations_bearer ON actor_socket_reservations(bearer)",
+        );
+        // The deadline describes the original pending reservation. Its hashed
+        // offer receipt remains durable after that deadline to refuse replay.
+        storage.sql.exec(
+          "CREATE TABLE IF NOT EXISTS actor_socket_offer_receipts (offer_digest TEXT PRIMARY KEY, expires_at INTEGER NOT NULL)",
         );
         storage.sql.exec(
           "CREATE TABLE IF NOT EXISTS actor_observation_state (id INTEGER PRIMARY KEY CHECK(id = 1), instance TEXT NOT NULL, revision INTEGER NOT NULL CHECK(revision >= 0))",
@@ -1836,7 +1885,8 @@ export function createActorNativeOwner(
       readonly generationKey: string;
       readonly epoch: string;
     }> {
-      const admission = this.env.ADMISSION;
+      const admission =
+        this.env.SOCKET_ADMISSION === undefined ? this.env.ADMISSION : this.env.SOCKET_ADMISSION;
       if (!admission || !SafeResponseStatus) throw new Error("Actor socket admission unavailable");
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5_000);
@@ -1845,7 +1895,7 @@ export function createActorNativeOwner(
           new SafeRequest("http://actor.invalid/", {
             method: "POST",
             headers: admissionHeaders(),
-            body: SafeJsonStringify({ action: "socket", id: actorId, attemptNonce, deadlineAt }),
+            body: socketAdmissionBody({ action: "socket", id: actorId, attemptNonce, deadlineAt }),
             signal: controller.signal,
           }),
         ])) as Response;
@@ -1881,7 +1931,8 @@ export function createActorNativeOwner(
       }
     }
     private async completeSocketAdmission(attemptNonce: string, deadlineAt: number): Promise<void> {
-      const admission = this.env.ADMISSION;
+      const admission =
+        this.env.SOCKET_ADMISSION === undefined ? this.env.ADMISSION : this.env.SOCKET_ADMISSION;
       if (!admission || !SafeResponseStatus) throw new Error("Actor socket completion unavailable");
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const controller = new AbortController();
@@ -1891,7 +1942,7 @@ export function createActorNativeOwner(
             new SafeRequest("http://actor.invalid/", {
               method: "POST",
               headers: admissionHeaders(),
-              body: SafeJsonStringify({ action: "socket-complete", attemptNonce, deadlineAt }),
+              body: socketAdmissionBody({ action: "socket-complete", attemptNonce, deadlineAt }),
               signal: controller.signal,
             }),
           ])) as Response;
@@ -2228,10 +2279,35 @@ export function createActorNativeOwner(
       return this.webSocketClose(socket, 1006, "transport_error", false);
     }
     fetch(request: Request): Promise<Response> {
-      if (request.headers.has(OBSERVATION_HEADER)) return this.observeControl(request);
-      if (request.headers.has(ALARM_ACTION_HEADER)) return this.alarmControl(request);
-      if (request.headers.has(SOCKET_ACTION_HEADER)) return this.socketControl(request);
-      if (request.headers.has(RESERVATION_ACTION_HEADER)) return this.reservationControl(request);
+      if (!SafeRequestHeaders) throw new Error("Actor request headers unavailable");
+      const requestHeaders = SafeReflectApply(SafeRequestHeaders, request, []) as Headers;
+      const offer = SafeReflectApply(SafeHeadersGet, requestHeaders, [RESERVATION_OFFER_HEADER]) as
+        | string
+        | null;
+      if (
+        offer !== null &&
+        (!validReservationOffer(offer) ||
+          !SafeRequestMethod ||
+          SafeReflectApply(SafeRequestMethod, request, []) !== "GET" ||
+          SafeReflectApply(
+            SafeStringToLowerCase,
+            (SafeReflectApply(SafeHeadersGet, requestHeaders, ["upgrade"]) as string | null) ?? "",
+            [],
+          ) !== "websocket" ||
+          SafeReflectApply(SafeHeadersHas, requestHeaders, [OBSERVATION_HEADER]) ||
+          SafeReflectApply(SafeHeadersHas, requestHeaders, [ALARM_ACTION_HEADER]) ||
+          SafeReflectApply(SafeHeadersHas, requestHeaders, [SOCKET_ACTION_HEADER]) ||
+          SafeReflectApply(SafeHeadersHas, requestHeaders, [RESERVATION_ACTION_HEADER]))
+      )
+        throw new Error("Actor socket reservation unavailable");
+      if (SafeReflectApply(SafeHeadersHas, requestHeaders, [OBSERVATION_HEADER]))
+        return this.observeControl(request);
+      if (SafeReflectApply(SafeHeadersHas, requestHeaders, [ALARM_ACTION_HEADER]))
+        return this.alarmControl(request);
+      if (SafeReflectApply(SafeHeadersHas, requestHeaders, [SOCKET_ACTION_HEADER]))
+        return this.socketControl(request);
+      if (SafeReflectApply(SafeHeadersHas, requestHeaders, [RESERVATION_ACTION_HEADER]))
+        return this.reservationControl(request);
       let resolve!: (response: Response) => void;
       let reject!: (error: unknown) => void;
       const head = new Promise<Response>((accept, refuse) => {
@@ -2266,9 +2342,10 @@ export function createActorNativeOwner(
             }
           });
         }
-        const headers = new Headers(request.headers);
-        headers.delete("x-takoserver-private-actor-id");
-        headers.delete(VARIANT_HEADER);
+        const headers = new SafeHeaders(requestHeaders);
+        SafeReflectApply(SafeHeadersDelete, headers, [RESERVATION_OFFER_HEADER]);
+        SafeReflectApply(SafeHeadersDelete, headers, [ID_HEADER]);
+        SafeReflectApply(SafeHeadersDelete, headers, [VARIANT_HEADER]);
         for (const name of [
           SOCKET_ACTION_HEADER,
           SOCKET_ABI_HEADER,
@@ -2280,9 +2357,10 @@ export function createActorNativeOwner(
           UPGRADE_SOCKET_ID_HEADER,
           EVENT_SECRET_HEADER,
           RESERVATION_HEADER,
+          RESERVATION_OFFER_HEADER,
           RESERVATION_ACTION_HEADER,
         ])
-          headers.delete(name);
+          SafeReflectApply(SafeHeadersDelete, headers, [name]);
         let childRequest: Request | undefined;
         let retirementError: unknown;
         const turnAbort = new AbortController();
@@ -2306,8 +2384,9 @@ export function createActorNativeOwner(
             graphBeforeDelivery.variantKeys[variantIndex] !== variantKey
           )
             throw new Error("Actor graph changed before dispatch");
-          headers.set(UPGRADE_NONCE_HEADER, nonce);
-          if (deliveryToken === undefined) headers.set(EVENT_SECRET_HEADER, eventDeliveryToken);
+          SafeReflectApply(SafeHeadersSet, headers, [UPGRADE_NONCE_HEADER, nonce]);
+          if (deliveryToken === undefined)
+            SafeReflectApply(SafeHeadersSet, headers, [EVENT_SECRET_HEADER, eventDeliveryToken]);
           childRequest = withHeaders(
             request,
             headers,
@@ -2331,9 +2410,27 @@ export function createActorNativeOwner(
           if (headTimer) clearTimeout(headTimer);
           headTimer = undefined;
           if (this.activeSocketInvocation) this.activeSocketInvocation.accepting = false;
-          if (response.status === 204 && response.headers.has(UPGRADE_DECISION_HEADER)) {
-            const socketId = response.headers.get(UPGRADE_SOCKET_ID_HEADER);
-            const protocol = response.headers.get("sec-websocket-protocol") ?? "";
+          if (!SafeResponseStatus || !SafeResponseHeaders)
+            throw new Error("Actor response unavailable");
+          let responseStatus: number;
+          let responseHeaders: Headers;
+          try {
+            responseStatus = SafeReflectApply(SafeResponseStatus, response, []) as number;
+            responseHeaders = SafeReflectApply(SafeResponseHeaders, response, []) as Headers;
+          } catch {
+            throw new Error("Actor socket reservation unavailable");
+          }
+          if (
+            responseStatus === 204 &&
+            SafeReflectApply(SafeHeadersHas, responseHeaders, [UPGRADE_DECISION_HEADER])
+          ) {
+            const socketId = SafeReflectApply(SafeHeadersGet, responseHeaders, [
+              UPGRADE_SOCKET_ID_HEADER,
+            ]) as string | null;
+            const protocol =
+              (SafeReflectApply(SafeHeadersGet, responseHeaders, ["sec-websocket-protocol"]) as
+                | string
+                | null) ?? "";
             const proposed = socketId ? this.sockets.get(socketId) : undefined;
             if (
               response.body !== null ||
@@ -2348,20 +2445,22 @@ export function createActorNativeOwner(
                 encodedId,
                 socketId as string,
                 protocol,
-                response.headers.get(UPGRADE_DECISION_HEADER),
+                SafeReflectApply(SafeHeadersGet, responseHeaders, [UPGRADE_DECISION_HEADER]) as
+                  | string
+                  | null,
               ))
             )
               throw new Error("Actor socket reservation unavailable");
             upgrade = proposed;
-            upgradeHeaders = new Headers(response.headers);
-            upgradeHeaders.delete(UPGRADE_DECISION_HEADER);
-            upgradeHeaders.delete(UPGRADE_SOCKET_ID_HEADER);
+            upgradeHeaders = new SafeHeaders(responseHeaders);
+            SafeReflectApply(SafeHeadersDelete, upgradeHeaders, [UPGRADE_DECISION_HEADER]);
+            SafeReflectApply(SafeHeadersDelete, upgradeHeaders, [UPGRADE_SOCKET_ID_HEADER]);
           } else {
             this.discardProvisional(nonce);
             // Until a broker-owned, invocation-bound reservation is transferred,
             // a native 101 (including an application-created WebSocketPair) must
             // never escape this facet as an Actor upgrade.
-            if (response.status === 101) throw new Error("Actor socket reservation unavailable");
+            if (responseStatus === 101) throw new Error("Actor socket reservation unavailable");
             if (response.body === null) {
               resolve(response);
             } else {
@@ -2453,6 +2552,7 @@ export function createActorNativeOwner(
         if (upgrade) {
           let server: NativeActorWebSocket | undefined;
           try {
+            const offerDigest = offer === null ? null : await reservationOfferDigest(offer);
             const graphAtHandoff = await this.currentGraph();
             if (
               graphAtHandoff.generationKey !== currentGraph.generationKey ||
@@ -2465,9 +2565,22 @@ export function createActorNativeOwner(
             const pair = new NativeWebSocketPair();
             const client = pair[0];
             server = pair[1];
-            const bearer = randomBearer();
+            if (offer !== null && !this.env.SOCKET_ADMISSION)
+              throw new Error("Actor socket admission unavailable");
+            const bearer = offer ?? randomBearer();
             const expiresAt = (SafeReflectApply(SafeNow, Date, []) as number) + RESERVATION_MS;
             const storage = this.requireStorage();
+            if (
+              offerDigest !== null &&
+              storage.sql
+                .exec(
+                  "SELECT 1 FROM actor_socket_offer_receipts WHERE offer_digest = ? LIMIT 1",
+                  offerDigest,
+                )
+                [Symbol.iterator]()
+                .next().value
+            )
+              throw new Error("Actor socket reservation unavailable");
             const actorAlarm = this.readAlarm();
             const actorWake = actorAlarm.obligation ? actorAlarm.retryAt : actorAlarm.pending;
             const otherPending = storage.sql
@@ -2481,6 +2594,12 @@ export function createActorNativeOwner(
             ]) as number;
             await storage.setAlarm(wake);
             this.advanceObservation();
+            if (offerDigest !== null)
+              storage.sql.exec(
+                "INSERT INTO actor_socket_offer_receipts (offer_digest, expires_at) VALUES (?, ?)",
+                offerDigest,
+                expiresAt,
+              );
             storage.sql.exec(
               "INSERT INTO actor_socket_reservations (socket_id, actor_id, bearer, expires_at) VALUES (?, ?, ?, ?)",
               upgrade.socketId,
@@ -2498,10 +2617,13 @@ export function createActorNativeOwner(
             upgrade.reservationVariantKey = variantKey as string;
             this.persistSocket(upgrade);
             await this.reconcile();
-            const transportHeaders = new Headers(upgradeHeaders);
-            transportHeaders.set(RESERVATION_HEADER, bearer);
+            const transportHeaders = new SafeHeaders(upgradeHeaders);
+            SafeReflectApply(SafeHeadersDelete, transportHeaders, [RESERVATION_HEADER]);
+            SafeReflectApply(SafeHeadersDelete, transportHeaders, [RESERVATION_OFFER_HEADER]);
+            if (offer === null)
+              SafeReflectApply(SafeHeadersSet, transportHeaders, [RESERVATION_HEADER, bearer]);
             resolve(
-              new Response(null, {
+              new SafeResponse(null, {
                 status: 101,
                 webSocket: client,
                 headers: transportHeaders,
@@ -2564,6 +2686,7 @@ export function createActorNativeIngress(token: string, alarmSecret?: string) {
       if (!id) return new Response(null, { status: control ? 404 : 204 });
       const headers = new Headers(request.headers);
       headers.delete(TOKEN_HEADER);
+      SafeReflectApply(SafeHeadersDelete, headers, [RESERVATION_OFFER_HEADER]);
       // Only the separate host-private port can carry a control action.
       if (!control) {
         headers.delete(OBSERVATION_HEADER);

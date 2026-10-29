@@ -79,7 +79,7 @@ export async function workspaceAttributionSchemaReady(sql: Sql): Promise<boolean
  * otherwise bind it before the owner's first login and make that owner's
  * issuance abort with no repair. Every other reference keeps lazy first binding.
  */
-export const SHARED_WORKSPACE_REF = /^wrk_[0-9a-f]{32}$/u;
+export const SHARED_WORKSPACE_REF = /^wrk_(?:[0-9a-f]{16}|[0-9a-f]{32})$/u;
 
 /**
  * Whether `org` may create the first binding of `workspaceRef`. Without a

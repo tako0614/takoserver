@@ -127,6 +127,21 @@ test("accepted Deployment create, update, replay and delete settle only through 
         workerResourceUid: selectedOwner.workerResourceUid,
         async execute(input) {
           const confirmed = await selectedOwner.execute(input);
+          // Failure-only: the owner's own non-confirmation, never the injected ACK loss
+          // below. Only enums and child exit state are printed.
+          try {
+            if (confirmed.kind !== "confirmed")
+              console.error(
+                JSON.stringify({
+                  marker: "takoform.v2.deployment_owner_result.nonconfirmed.v1",
+                  action: input.action,
+                  result: confirmed.kind,
+                  children: children.map((child) => [child.exitCode, child.signalCode]),
+                }),
+              );
+          } catch {
+            // A failing sink must not replace the owner's result.
+          }
           if (loseNextOwnerAcknowledgement && confirmed.kind === "confirmed") {
             loseNextOwnerAcknowledgement = false;
             return { kind: "unknown" as const };

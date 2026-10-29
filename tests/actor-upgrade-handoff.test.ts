@@ -349,6 +349,131 @@ test("ordinary headers may be deleted and changed; commit snapshots before yield
   expect(result.headers.get("x-keep")).toBe("before");
 });
 
+test("finish returns the sanitized reservation head with the captured middleware headers", async () => {
+  const cleanHead = new NativeResponse(null, {
+    status: 101,
+    headers: { "x-origin": "old", "set-cookie": "a=1" },
+  });
+  let commits = 0;
+  const handoff = createActorUpgradeHandoff(request(), {
+    async open() {
+      return {
+        response: cleanHead,
+        commit() {
+          commits++;
+        },
+        abandon() {},
+      };
+    },
+  });
+  try {
+    const appResponse = await handoff.actor.fetch(request());
+    appResponse.headers.delete("x-origin");
+    appResponse.headers.append("set-cookie", "b=2");
+    appResponse.headers.set("x-middleware", "before");
+    const finishing = handoff.finish(appResponse);
+    appResponse.headers.set("x-middleware", "after");
+    const published = await finishing;
+    expect(published).toBe(cleanHead);
+    expect(published.headers.has("x-origin")).toBe(false);
+    expect(published.headers.get("x-middleware")).toBe("before");
+    expect(published.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
+    expect(commits).toBe(1);
+  } finally {
+    await handoff.abandon();
+  }
+});
+
+test("unchanged native 101 headers commit without touching an immutable head", async () => {
+  const nativeHeaders = new Headers({ "x-native": "kept" });
+  nativeHeaders.append("set-cookie", "a=1");
+  nativeHeaders.append("set-cookie", "b=2");
+  const head = new NativeResponse(null, { status: 101, headers: nativeHeaders });
+  const immutableHeaders = head.headers;
+  const originalDelete = Headers.prototype.delete;
+  const originalAppend = Headers.prototype.append;
+  let commits = 0;
+  let abandons = 0;
+  Headers.prototype.delete = function (name) {
+    if (this === immutableHeaders) throw new TypeError("immutable native response headers");
+    return originalDelete.call(this, name);
+  };
+  Headers.prototype.append = function (name, value) {
+    if (this === immutableHeaders) throw new TypeError("immutable native response headers");
+    return originalAppend.call(this, name, value);
+  };
+  try {
+    globalThis.Response = NativeResponse;
+    const isolated = (await import(
+      `../src/actor-upgrade-handoff.ts?immutable-${Date.now()}`
+    )) as typeof import("../src/actor-upgrade-handoff.ts");
+    isolated.installActorResponseRuntime();
+    const handoff = isolated.createActorUpgradeHandoff(request(), {
+      async open() {
+        return {
+          response: head,
+          commit() {
+            commits += 1;
+          },
+          abandon() {
+            abandons += 1;
+          },
+        };
+      },
+    });
+    try {
+      const appResponse = await handoff.actor.fetch(request());
+      const inheritedZero = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+      let published: Response;
+      try {
+        Object.defineProperty(Array.prototype, "0", {
+          configurable: true,
+          set() {
+            throw new Error("inherited array slot used");
+          },
+        });
+        published = await handoff.finish(appResponse);
+      } finally {
+        if (inheritedZero) Object.defineProperty(Array.prototype, "0", inheritedZero);
+        else Reflect.deleteProperty(Array.prototype, "0");
+      }
+      expect(published).toBe(head);
+      expect(commits).toBe(1);
+      expect(abandons).toBe(0);
+      expect(published.headers.get("x-native")).toBe("kept");
+      expect(published.headers.getSetCookie()).toEqual(["a=1", "b=2"]);
+    } finally {
+      await handoff.abandon();
+    }
+    const changed = isolated.createActorUpgradeHandoff(request(), {
+      async open() {
+        return {
+          response: head,
+          commit() {
+            commits += 1;
+          },
+          abandon() {
+            abandons += 1;
+          },
+        };
+      },
+    });
+    try {
+      const appResponse = await changed.actor.fetch(request());
+      appResponse.headers.set("x-middleware", "changed");
+      expect((await changed.finish(appResponse)).status).toBe(503);
+      expect(commits).toBe(1);
+      expect(abandons).toBe(1);
+      expect(head.headers.has("x-middleware")).toBe(false);
+    } finally {
+      await changed.abandon();
+    }
+  } finally {
+    Headers.prototype.delete = originalDelete;
+    Headers.prototype.append = originalAppend;
+  }
+});
+
 test("abort, expiry, abandonment and failed commit settle every alias", async () => {
   const abort = new AbortController();
   const cases = [

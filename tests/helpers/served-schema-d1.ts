@@ -52,16 +52,21 @@ export async function createServedSchemaD1(mode: ServedSqlMode) {
   });
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const source of [
+    // Preserve native metadata creation after the first nonempty source. Only
+    // fresh fixture genesis is grouped; request/settlement batches stay native.
+    const groups = [
       ...MIGRATIONS.filter(({ name }) => Number(name.slice(0, 4)) <= 100).map(({ sql }) => sql),
       ...createAuth103CanonicalSourceArtifacts(ROOT).files.map(({ sql }) => sql),
       FINANCIAL_0104_DDL,
       ROOT_0105_DDL,
-    ]) {
-      const statements = frameHostMigrationSql(source);
-      if (statements.length > 0)
-        await database.batch(statements.map((statement) => database.prepare(statement)));
-    }
+    ]
+      .map(frameHostMigrationSql)
+      .filter((statements) => statements.length > 0);
+    const [first, ...rest] = groups;
+    const remaining = rest.flat();
+    if (first) await database.batch(first.map((statement) => database.prepare(statement)));
+    if (remaining.length > 0)
+      await database.batch(remaining.map((statement) => database.prepare(statement)));
     const raw = createD1Sql(database.withSession("first-primary"), {
       acknowledgement: "explicit-d1-result",
     });

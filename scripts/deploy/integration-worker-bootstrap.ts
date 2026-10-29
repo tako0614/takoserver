@@ -19,7 +19,12 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parseRuntimeInputSealKeyRing } from "../../src/runtime-input-seal-keyring.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
+import {
+  verifySelectedAuth103WorkerModules,
+  verifyUnpublishedAuth103WorkerModules,
+} from "./auth103-original-worker-modules.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -995,6 +1000,35 @@ interface NativePresence {
   readonly absent: boolean;
 }
 
+export function assertAuth103StatusCurrent(
+  initial: {
+    readonly history: unknown;
+    readonly chain: readonly unknown[];
+    readonly scriptPresent: boolean;
+    readonly routeOwner: boolean;
+    readonly domainOwner: boolean;
+  },
+  current: {
+    readonly absent: boolean;
+    readonly history: unknown;
+    readonly chain: readonly unknown[];
+    readonly scriptPresent: boolean;
+    readonly routeOwner: boolean;
+    readonly domainOwner: boolean;
+  },
+): void {
+  if (
+    current.absent ||
+    canonicalJson(current.history) !== canonicalJson(initial.history) ||
+    canonicalJson(current.chain) !== canonicalJson(initial.chain) ||
+    current.scriptPresent !== initial.scriptPresent ||
+    current.routeOwner !== initial.routeOwner ||
+    current.domainOwner !== initial.domainOwner
+  ) {
+    throw preflightError("Auth103 Worker deployment history changed during module verification");
+  }
+}
+
 interface SigningEvidence {
   readonly row: SigningPublicKeyRow;
   readonly keyId: string;
@@ -1416,6 +1450,9 @@ async function runOriginalMoneyMaintenanceSuccessor(
       signingKeyId: target.signing.currentKeyId,
       expectedSecrets: [],
       workerArtifactDigest: `sha256:${prepared.bundleDigestHex}`,
+      ...(target.auth103NativeProfile === undefined
+        ? {}
+        : { nativeSourceCommit: invocation.commit }),
     });
     if (expectedSuccessor.TAKOSERVER_ENVIRONMENT?.fields.text !== "integration")
       throw preflightError(
@@ -1490,7 +1527,7 @@ async function runOriginalMoneyMaintenanceSuccessor(
           "preflight",
           target,
           state,
-          { versionId },
+          { versionId, unpublished: true },
           version,
           invocation.commit,
           target.signing.currentKeyId,
@@ -1611,7 +1648,7 @@ async function runOriginalMoneyMaintenanceSuccessor(
       "verification",
       target,
       state,
-      { versionId: publication.versionId },
+      { versionId: publication.versionId, deploymentId: publication.deploymentId },
       afterCleanupVersion,
       invocation.commit,
       target.signing.currentKeyId,
@@ -1676,6 +1713,15 @@ export async function runIntegrationWorkerBootstrap(
     invocation = maintenanceData(invocation) as unknown as IntegrationWorkerBootstrapInvocation;
   }
   validateInvocation(invocation, target);
+  if (
+    (target.auth103NativeProfile !== undefined ||
+      target.schemaMaintenanceMode === "pre-auth103-quiesced") &&
+    !freshAuth103QuiescedBootstrap(target)
+  ) {
+    throw preflightError(
+      "Auth103 first Worker bootstrap requires the exact fresh v2-0100 quiesced profile",
+    );
+  }
   // Pure, before any credential or provider call: a fresh Money-preserved
   // first Host must carry the writer, its minted epoch and the retained mint.
   const freshMoneyWriter =
@@ -2287,8 +2333,13 @@ async function statusExisting(
             ORIGINAL_MONEY_MAINTENANCE_MODE,
           );
     const originalCustody = originalMaintenance?.readCustody();
+    if (freshAuth103QuiescedBootstrap(target)) {
+      const current = await readNativePresence("preflight", target, state);
+      assertAuth103StatusCurrent(initial, current);
+    }
     const ready =
       originalMaintenance === undefined &&
+      !freshAuth103QuiescedBootstrap(target) &&
       identity.commit === invocation.commit &&
       moneyUnitSchemaReady(schema.applied) &&
       orgBillingSchemaReady(target, schema.applied) &&
@@ -2467,24 +2518,30 @@ async function verifyBootstrap(input: {
   await input.originalMaintenance?.assertCurrent();
   const probe =
     input.originalMaintenance === undefined
-      ? await probeProduct(
-          input.target.publicOrigin,
-          input.options.fetcher ?? ((url, init) => fetch(url, init)),
-        )
+      ? freshAuth103QuiescedBootstrap(input.target)
+        ? await probeSchemaMaintenance(
+            input.target.publicOrigin,
+            input.options.fetcher ?? ((url, init) => fetch(url, init)),
+            "pre-auth103-quiesced",
+          )
+        : await probeProduct(
+            input.target.publicOrigin,
+            input.options.fetcher ?? ((url, init) => fetch(url, init)),
+          )
       : await probeSchemaMaintenance(
           input.target.publicOrigin,
           (url, init) => fetch(url, init),
           ORIGINAL_MONEY_MAINTENANCE_MODE,
         );
-  if (input.originalMaintenance !== undefined) {
+  if (input.originalMaintenance !== undefined || freshAuth103QuiescedBootstrap(input.target)) {
     const final = await readNativePresence("verification", input.target, input.state);
     if (
       final.history?.versionId !== after.history.versionId ||
       final.history.deploymentId !== after.history.deploymentId ||
       final.chain.length !== 1
     )
-      throw verificationError("original money maintenance Version changed after503 readback");
-    await input.originalMaintenance.assertCurrent();
+      throw verificationError("quiesced Worker Version changed after503 readback");
+    await input.originalMaintenance?.assertCurrent();
   }
   return {
     kind:
@@ -2492,7 +2549,9 @@ async function verifyBootstrap(input: {
         ? "takoserver.integration-worker-bootstrap-apply@v1"
         : ORIGINAL_MONEY_MAINTENANCE_RESULT,
     ...(input.originalMaintenance === undefined
-      ? {}
+      ? freshAuth103QuiescedBootstrap(input.target)
+        ? { maintenanceOnly: true, normalHostReady: false }
+        : {}
       : {
           maintenanceOnly: true,
           normalHostReady: false,
@@ -2543,7 +2602,9 @@ async function inspectVersion(
   phase: "preflight" | "verification",
   target: DeployTarget,
   state: IntegrationWorkerBootstrapState,
-  history: Pick<WorkerDeploymentHistory, "versionId">,
+  history:
+    | Pick<WorkerDeploymentHistory, "versionId" | "deploymentId">
+    | { readonly versionId: string; readonly unpublished: true },
   version: unknown,
   selectedCommit: string,
   signingKeyId: string,
@@ -2581,6 +2642,7 @@ async function inspectVersion(
       ...(maintenanceOnly ? { expectedSecrets: [] } : {}),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
       workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+      ...(target.auth103NativeProfile === undefined ? {} : { nativeSourceCommit: identity.commit }),
     }),
   };
   // This exact historical exception is reachable only after the repair owner
@@ -2603,7 +2665,30 @@ async function inspectVersion(
   assertNoTargetOwners(phase, target, native);
   assertWorkerSettings(phase, await state.workerSettings(target.workerName));
   assertImmutableVersion(phase, version);
-  const moduleDigest = exactModuleDigest(phase, version);
+  let moduleDigest: string;
+  if (freshAuth103QuiescedBootstrap(target)) {
+    if ("unpublished" in history) {
+      verifyUnpublishedAuth103WorkerModules(
+        phase,
+        target,
+        identity.commit,
+        identity.bundleDigestHex,
+        version,
+      );
+    } else {
+      verifySelectedAuth103WorkerModules(
+        phase,
+        target,
+        identity.commit,
+        identity.bundleDigestHex,
+        version,
+        history,
+      );
+    }
+    moduleDigest = identity.bundleDigestHex;
+  } else {
+    moduleDigest = exactModuleDigest(phase, version);
+  }
   if (moduleDigest !== identity.bundleDigestHex) {
     throw phaseError(phase, "Worker Version module bytes differ from its bundle annotation");
   }
@@ -2621,6 +2706,20 @@ async function prepareBootstrapArtifact(
   maintenanceOnly = false,
   versionOnly = false,
 ): Promise<PreparedWorkerArtifact> {
+  if (freshAuth103QuiescedBootstrap(target) && !maintenanceOnly && !versionOnly) {
+    // The owning default writer alone can bind the registered Auth103 source,
+    // exact checkout and build define to the artifact and its module digest.
+    // A caller's build process/config override is deliberately not transferable.
+    return await prepareWorkerArtifact({
+      root,
+      target,
+      commit,
+      sourceRepositoryRoot,
+      ...(wranglerPath === undefined ? {} : { wranglerPath }),
+      run: runCommand,
+      environment: {},
+    });
+  }
   const buildRun: WorkerProcess = async (command, input = {}) => {
     const childEnvironment = input.env ?? {};
     if (
@@ -2671,6 +2770,17 @@ async function prepareBootstrapArtifact(
               }),
       }),
   });
+}
+
+function freshAuth103QuiescedBootstrap(target: DeployTarget): boolean {
+  return (
+    target.environment === "integration" &&
+    target.takoformV2?.storageLineage === "v2-0100" &&
+    target.auth103NativeProfile === "root-shared-auth-staging-v1" &&
+    target.schemaMaintenanceMode === "pre-auth103-quiesced" &&
+    target.publicOrigin === SHARED_AUTH_STAGING_PROFILE.publicOrigin &&
+    target.publicOrigin.startsWith(`https://${target.workerName}.`)
+  );
 }
 
 function writeInspectionConfig(

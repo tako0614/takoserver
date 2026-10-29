@@ -279,10 +279,11 @@ describe("unmounted same-request pending29 persistence and historical DATA recov
     noDownstream(f);
   });
 
-  test("method drift rejects the ACK while once-only factory reconstruction preserves the original pending graph", async () => {
+  test("frozen method refuses replacement while once-only factory reconstruction preserves the original pending graph", async () => {
     for (const kind of ["method", "factory-refusal"] as const) {
       const f = await graphFixture({ seedPending: false });
       const rootsBefore = snapshot(f.db).root;
+      let replaced: boolean | undefined;
       f.native.afterBatch = (results) => {
         if (kind === "factory-refusal") {
           expect(() => f.replaceGraph()).toThrow(
@@ -290,7 +291,7 @@ describe("unmounted same-request pending29 persistence and historical DATA recov
           );
           expect(readWorkerRequestConsumers(f.connection)).toBe(f.graph);
         } else {
-          Object.defineProperty(f.graph.sql, "query", {
+          replaced = Reflect.defineProperty(f.graph.sql, "query", {
             value: async () => [],
             enumerable: true,
             writable: true,
@@ -305,12 +306,13 @@ describe("unmounted same-request pending29 persistence and historical DATA recov
         () => undefined,
       );
       try {
+        const actual = await attempt;
+        expect(actual.state).toBe("pending-persistence-postimage-data");
+        expect(actual.pending).toEqual(f.input.pending);
         if (kind === "method") {
-          await unavailable(attempt);
+          expect(Object.isFrozen(f.graph.sql)).toBe(true);
+          expect(replaced).toBe(false);
         } else {
-          const actual = await attempt;
-          expect(actual.state).toBe("pending-persistence-postimage-data");
-          expect(actual.pending).toEqual(f.input.pending);
           expect(readWorkerRequestConsumers(f.connection)).toBe(f.graph);
         }
         expect(f.native.batchCalls).toBe(1);
@@ -319,7 +321,7 @@ describe("unmounted same-request pending29 persistence and historical DATA recov
         expect(snapshot(f.db).root).toEqual(rootsBefore);
         noDownstream(f);
       } finally {
-        // Waiting for cleanup does not turn the main awaited rejection into success.
+        // Cleanup settles the original flight even if a later assertion fails.
         await settled;
       }
     }

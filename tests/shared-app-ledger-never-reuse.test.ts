@@ -13,7 +13,9 @@ import {
   type TrustedSharedAppRouteGuards,
   type TrustedSharedAppRouteInput,
 } from "../src/shared-app-ledger.ts";
+import { SHARED_APP_STAGING_PHYSICAL_DDL } from "../src/shared-app-staging-adoption.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const START = Date.parse("2026-10-15T00:00:00Z");
 // Test boundary only: the authority no longer has a cooldown or elapsed-time eligibility.
@@ -22,12 +24,14 @@ const FAR_FUTURE = START + 100 * 365 * 24 * 60 * 60 * 1_000;
 const OWNER = { organizationId: "org-original", product: "takoserver" as const };
 const HOSTNAME = "held-name.app-staging.takos.jp";
 
-function fixture(routeSchema = true) {
-  const db = new Database(":memory:");
+function fixture(routeSchema = true, physical = false) {
+  const db = physical ? migrateSqliteDatabase() : new Database(":memory:");
   const raw = createSqliteSql(db);
-  for (const realm of ["staging", "production"]) {
-    const prefix = `shared_app_${realm}`;
-    db.exec(`CREATE TABLE ${prefix}_assignments (
+  if (physical) for (const statement of SHARED_APP_STAGING_PHYSICAL_DDL) db.exec(statement);
+  else {
+    for (const realm of ["staging", "production"]) {
+      const prefix = `shared_app_${realm}`;
+      db.exec(`CREATE TABLE ${prefix}_assignments (
       incarnation TEXT PRIMARY KEY
         CHECK(length(incarnation)=32 AND incarnation NOT GLOB '*[^0-9a-f]*'),
       name TEXT NOT NULL
@@ -42,7 +46,7 @@ function fixture(routeSchema = true) {
       CHECK((state='released')=(released_at IS NOT NULL)),
       CHECK(released_at IS NULL OR released_at>=created_at),
       CHECK(state<>'reserved' OR script IS NULL), CHECK(state<>'active' OR script IS NOT NULL))`);
-    db.exec(`CREATE TABLE ${prefix}_names (
+      db.exec(`CREATE TABLE ${prefix}_names (
       normalized_name TEXT PRIMARY KEY
         CHECK(length(normalized_name) BETWEEN 3 AND 32
           AND normalized_name NOT GLOB '*[^a-z0-9-]*'),
@@ -51,8 +55,8 @@ function fixture(routeSchema = true) {
       state TEXT NOT NULL CHECK(state IN ('reserved','active','released')),
       released_at INTEGER, updated_at INTEGER NOT NULL,
       CHECK((state='released')=(released_at IS NOT NULL)))`);
-    if (!routeSchema) continue;
-    db.exec(`CREATE TABLE ${prefix}_route_commands (
+      if (!routeSchema) continue;
+      db.exec(`CREATE TABLE ${prefix}_route_commands (
       organization_id TEXT NOT NULL, product TEXT NOT NULL, reservation_id TEXT NOT NULL,
       name TEXT NOT NULL, incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
       action TEXT NOT NULL CHECK(action IN ('activate','advance','retire')),
@@ -70,9 +74,10 @@ function fixture(routeSchema = true) {
         OR (action<>'activate' AND prior_state='active' AND prior_script IS NOT NULL)),
       CHECK((action='retire' AND next_state='reserved' AND next_script IS NULL)
         OR (action<>'retire' AND next_state='active' AND next_script IS NOT NULL)))`);
-    db.exec(`CREATE TABLE ${prefix}_batch_assertions (
+      db.exec(`CREATE TABLE ${prefix}_batch_assertions (
       witness TEXT PRIMARY KEY, ok INTEGER NOT NULL CHECK(ok=1),
       apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
+    }
   }
   db.exec(`CREATE TABLE fixture_accepted (
     endpoint_uid TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
@@ -507,6 +512,44 @@ test("prepared same-tenant route updates retain incarnation before permanent rel
       reserved.incarnation,
     );
     expect(await f.ledger.readCurrent("held-name")).toBeNull();
+  } finally {
+    f.close();
+  }
+});
+
+test("physical 0107 candidate admits actual prepared activate, advance and retire atoms", async () => {
+  const f = fixture(true, true);
+  try {
+    const owner = f.ledger.forTrustedOwner(OWNER);
+    let current = await owner.reserve({
+      reservationId: "physical-route-original",
+      name: "held-name",
+    });
+    const steps = [
+      { action: "activate", script: "script-one" },
+      { action: "advance", script: "script-two" },
+      { action: "retire", script: null },
+    ] as const;
+    for (const [index, step] of steps.entries()) {
+      const input = command(current, index + 1, step.script);
+      await acceptFixture(f, input);
+      const plan =
+        step.action === "activate"
+          ? owner.prepareActivate(input, guards(input))
+          : step.action === "advance"
+            ? owner.prepareAdvance(input, guards(input))
+            : owner.prepareRetire(input, guards(input));
+      await f.sql.batch(batch(plan));
+      current = (await owner.settleRoute(plan.original, "acknowledged")).assignment;
+      expect(current.generation).toBe(index + 2);
+      expect(current.state).toBe(step.script === null ? "reserved" : "active");
+    }
+    expect(f.db.query("SELECT count(*) AS n FROM shared_app_staging_route_commands").get()).toEqual(
+      { n: 3 },
+    );
+    expect(
+      f.db.query("SELECT count(*) AS n FROM shared_app_staging_batch_assertions").get(),
+    ).toEqual({ n: 0 });
   } finally {
     f.close();
   }

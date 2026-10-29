@@ -42,6 +42,7 @@ import {
 import { boundCurrentPredicate } from "../scripts/deploy/schema-auth103-native-source.ts";
 import {
   AUTH103_NATIVE_INSTALL_DDL,
+  AUTH103_NATIVE_PROFILE,
   type Auth103NativeSourceManifest,
   auth103RpRegistrationRecord,
 } from "../src/auth103-native-source-contract.ts";
@@ -113,17 +114,24 @@ function manifestFor(sourceCommit: string): Auth103NativeSourceManifest {
   };
 }
 
-function currentPair(manifest: Auth103NativeSourceManifest) {
+function currentPair(
+  manifest: Auth103NativeSourceManifest,
+  sourceProfile: "ordinary" | "money-preserved" = "money-preserved",
+) {
   expect(canonicalJson(manifest.rpRegistration.profile)).toBe(
     canonicalJson(SHARED_AUTH_STAGING_PROFILE),
   );
   const worker = Buffer.from(
-    `let define_TAKOSERVER_AUTH103_NATIVE_SOURCE_default;\ndefine_TAKOSERVER_AUTH103_NATIVE_SOURCE_default = ${canonicalJson(manifest)};`,
+    `let define_TAKOSERVER_AUTH103_NATIVE_SOURCE_default;\nlet define_TAKOSERVER_AUTH103_NATIVE_PROFILE_default;\ndefine_TAKOSERVER_AUTH103_NATIVE_SOURCE_default = ${canonicalJson(manifest)};\ndefine_TAKOSERVER_AUTH103_NATIVE_PROFILE_default = ${canonicalJson({ profile: AUTH103_NATIVE_PROFILE, sourceProfile })};`,
     "utf8",
   );
   const bundleDigest = digest(worker);
   const install = Buffer.from(
-    compileAuth103NativeSourceInstallContribution(manifest, `sha256:${bundleDigest}`),
+    compileAuth103NativeSourceInstallContribution(
+      manifest,
+      `sha256:${bundleDigest}`,
+      sourceProfile,
+    ),
     "utf8",
   );
   const response = {
@@ -177,6 +185,7 @@ test("current runtime source and install are one exact commit and artifact pair"
   const historical = currentPair(historicalManifest);
   expect(current.pair.manifest.sourceCommit).toBe(SOURCE_COMMIT);
   expect(current.pair.bundleDigest).not.toBe(historical.pair.bundleDigest);
+  expect(current.pair.sourceProfile).toBe("money-preserved");
   expect(current.pair.record.rpJson).toBe(historical.pair.record.rpJson);
   expect(current.pair.manifest.rpRegistration).toEqual(historical.pair.manifest.rpRegistration);
   expect(() =>
@@ -184,6 +193,60 @@ test("current runtime source and install are one exact commit and artifact pair"
       current.response,
       "f".repeat(40),
       current.pair.bundleDigest.slice(7),
+    ),
+  ).toThrow();
+
+  const ordinary = currentPair(currentManifest, "ordinary");
+  expect(ordinary.pair.sourceProfile).toBe("ordinary");
+  const ordinaryWorker = ordinary.response.modules[0];
+  if (!ordinaryWorker) throw new Error("fixture worker module is incomplete");
+  const ordinarySource = Buffer.from(ordinaryWorker.content_base64, "base64").toString("utf8");
+  const profileAssignment = `define_TAKOSERVER_AUTH103_NATIVE_PROFILE_default = ${canonicalJson({ profile: AUTH103_NATIVE_PROFILE, sourceProfile: "ordinary" })};`;
+  expect(ordinarySource.includes(profileAssignment)).toBe(true);
+  const withWorkerSource = (source: string) => ({
+    ...ordinary.response,
+    modules: [
+      { ...ordinaryWorker, content_base64: Buffer.from(source).toString("base64") },
+      ordinary.response.modules[1],
+    ],
+  });
+  const mismatchedWorker = ordinarySource.replace(
+    '"sourceProfile":"ordinary"',
+    '"sourceProfile":"money-preserved"',
+  );
+  const mismatchDigest = digest(mismatchedWorker);
+  expect(() =>
+    exactCurrentAuth103NativePair(
+      withWorkerSource(mismatchedWorker),
+      currentManifest.sourceCommit,
+      mismatchDigest,
+    ),
+  ).toThrow();
+  const withoutProfile = ordinarySource.replace(profileAssignment, "");
+  expect(() =>
+    exactCurrentAuth103NativePair(
+      withWorkerSource(withoutProfile),
+      currentManifest.sourceCommit,
+      digest(withoutProfile),
+    ),
+  ).toThrow();
+  const ambiguousProfile = `${ordinarySource}\n${profileAssignment}`;
+  expect(() =>
+    exactCurrentAuth103NativePair(
+      withWorkerSource(ambiguousProfile),
+      currentManifest.sourceCommit,
+      digest(ambiguousProfile),
+    ),
+  ).toThrow();
+  const unknownProfile = ordinarySource.replace(
+    '"sourceProfile":"ordinary"',
+    '"sourceProfile":"other"',
+  );
+  expect(() =>
+    exactCurrentAuth103NativePair(
+      withWorkerSource(unknownProfile),
+      currentManifest.sourceCommit,
+      digest(unknownProfile),
     ),
   ).toThrow();
   expect(() =>
@@ -290,7 +353,11 @@ test("compiler emits only the new current pair against canonical schema guards",
     try {
       database.exec(AUTH103_NATIVE_INSTALL_DDL);
       for (const statement of frameHostMigrationSql(
-        compileAuth103NativeSourceInstallContribution(historical.manifest, historical.bundleDigest),
+        compileAuth103NativeSourceInstallContribution(
+          historical.manifest,
+          historical.bundleDigest,
+          historical.sourceProfile,
+        ),
       ))
         database.query(statement).all();
       const count = (table: string) =>
@@ -636,7 +703,7 @@ test("a sealed prior runtime pair permits only the exact third-generation append
     };
     const first = compileAuth103CurrentRuntimePairSql({ ...common, current: predecessor });
     expect(digest(first.sql)).toBe(
-      "01e7cf42904d6e897efeb402b5f4a4edd104f426f34cd5c5e5376890c03e4d70",
+      "2a87518c8543418374a887b73757dc96108e1907623a61bc4739a6fd01f226e7",
     );
     const third = compileAuth103CurrentRuntimePairSql({
       ...common,
@@ -881,7 +948,11 @@ test("a sealed prior runtime pair permits only the exact third-generation append
 
     database.exec(AUTH103_NATIVE_INSTALL_DDL);
     for (const statement of frameHostMigrationSql(
-      compileAuth103NativeSourceInstallContribution(historical.manifest, historical.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        historical.manifest,
+        historical.bundleDigest,
+        historical.sourceProfile,
+      ),
     ))
       database.query(statement).all();
     const inserts = (sql: string) =>
@@ -1003,7 +1074,11 @@ test("a sealed prior runtime pair permits only the exact third-generation append
       rpRegistration: sixth.manifest.rpRegistration,
     }).pair;
     const foreignInserts = inserts(
-      compileAuth103NativeSourceInstallContribution(foreign.manifest, foreign.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        foreign.manifest,
+        foreign.bundleDigest,
+        foreign.sourceProfile,
+      ),
     );
     expect(foreignInserts).toHaveLength(4);
     database.exec("BEGIN");
@@ -1189,7 +1264,11 @@ test("a sealed fifth runtime permits only the exact sixth-runtime append", () =>
     // Physical D1 inventory: historical + v1..v5 are 5 RP and 6 deployment originals.
     database.exec(AUTH103_NATIVE_INSTALL_DDL);
     for (const statement of frameHostMigrationSql(
-      compileAuth103NativeSourceInstallContribution(historical.manifest, historical.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        historical.manifest,
+        historical.bundleDigest,
+        historical.sourceProfile,
+      ),
     ))
       database.query(statement).all();
     const inserts = (sql: string) =>
@@ -1292,7 +1371,11 @@ test("a sealed fifth runtime permits only the exact sixth-runtime append", () =>
     }).pair;
     database.exec("BEGIN");
     for (const statement of inserts(
-      compileAuth103NativeSourceInstallContribution(foreign.manifest, foreign.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        foreign.manifest,
+        foreign.bundleDigest,
+        foreign.sourceProfile,
+      ),
     ).slice(2))
       database.query(statement).all();
     expect(() => database.query(inventoryGuard).get()).toThrow();
@@ -1322,11 +1405,8 @@ test("a sealed fifth runtime permits only the exact sixth-runtime append", () =>
   }
 });
 
-// Fixed source pins were read from the original Git blobs, not from the tool tree.
-// R27 deployed 8bca57a6 / served 16c19624 and R29 73c43297 have identical Auth
-// paths. R30 6bc6cc57 changes only session.ts; predecessor v5 0082119b differs
-// from R27 only in principal issuance. Keep these historical bytes testable in a
-// depth-one checkout, where the unpublished commits and old blobs are unavailable.
+// Fixed source pins preserve historical served R27/R30 bytes and the R31
+// candidate. The ordinary candidate changes exactly two Auth source paths.
 type AuthSourceSnapshot = Readonly<Record<string, Readonly<{ blob: string; digest: string }>>>;
 const R27_AUTH_SOURCES: AuthSourceSnapshot = {
   "src/auth103-native-origin-source.ts": {
@@ -1364,6 +1444,39 @@ const R30_AUTH_SOURCES: AuthSourceSnapshot = {
     digest: "sha256:cd7cc832eaa4e4299460716d3417e814ab1043187478fa44714302a4d452d8c8",
   },
 };
+const R31_AUTH_SOURCES: AuthSourceSnapshot = {
+  ...R30_AUTH_SOURCES,
+  "src/auth103-native-origin-source.ts": {
+    blob: "62560c0c70c77f9e2f53f36c9535307d5203fce7",
+    digest: "sha256:7562e600a10046067f2b36a9a2d20c0bbb5a31fcaa40ad25386516242498bba2",
+  },
+  "src/auth103-native-source-contract.ts": {
+    blob: "54bec08ecaa3ba04ab92576d36e6177d2e9902e1",
+    digest: "sha256:adc4881fd1523e1ced983fcff3dd137cdc08db27fccdeee47c71320a18e907eb",
+  },
+  "src/shared-auth-oidc-client.ts": {
+    blob: "80c692077869c7959376badcb5a00d2a7d11de57",
+    digest: "sha256:24f2aacca326b0bec5c41fac8e0a23148032c462cc815f75111fc49eca7b696a",
+  },
+};
+const ORDINARY_AUTH_SOURCES: AuthSourceSnapshot = {
+  ...R31_AUTH_SOURCES,
+  "src/auth103-native-origin-source.ts": {
+    blob: "437a86ba4c1f7e7546ede33bf387cee164ed9f5d",
+    digest: "sha256:46f773d41607834bd96be7987096ae5e5120f486b61ebd69b22242c2f6647f69",
+  },
+  "src/auth103-native-source-contract.ts": {
+    blob: "c027681fd9c01092b6bf944c512c57819b7505c9",
+    digest: "sha256:971b5dbc73237efc51cf7700615f1acc7cbf62d56970e3a4b03e440c27b2fa64",
+  },
+};
+const REPAIRED_ORDINARY_AUTH_SOURCES: AuthSourceSnapshot = {
+  ...ORDINARY_AUTH_SOURCES,
+  "src/auth103-native-origin-source.ts": {
+    blob: "6aa757e2b2fb49b3fa7ea2e4853fdca96a1545b4",
+    digest: "sha256:9234a5660825ce5033e1ee454aa948598ba08f6f3ccfef4fdcb46cf7d5094616",
+  },
+};
 const R27_TARGET_REF = "sha256:5a401af9c8b60ea27b81019fe8add7b75ca70a9646ffc3481880c47b2f0140ae";
 
 function authSourcePin(sources: AuthSourceSnapshot, path: string) {
@@ -1393,7 +1506,7 @@ function authSourcePathsDiff(from: AuthSourceSnapshot, to: AuthSourceSnapshot): 
   );
 }
 
-test("the tool tree carries the served runtime's Auth paths byte-identically", () => {
+test("the current tool tree carries the ordinary candidate Auth paths byte-identically", () => {
   expect([...AUTH103_CURRENT_RUNTIME_DEPLOYED_SOURCE_PATHS]).toEqual([
     "src/auth103-native-origin-source.ts",
     "src/auth103-native-source-contract.ts",
@@ -1403,7 +1516,14 @@ test("the tool tree carries the served runtime's Auth paths byte-identically", (
   ]);
   // Read actual working-tree bytes; neither HEAD nor an old Git object can stand in.
   const current = currentAuthSources();
-  expect(current).toEqual(R30_AUTH_SOURCES);
+  expect(current).toEqual(REPAIRED_ORDINARY_AUTH_SOURCES);
+  expect(authSourcePathsDiff(ORDINARY_AUTH_SOURCES, current)).toEqual([
+    "src/auth103-native-origin-source.ts",
+  ]);
+  expect(authSourcePathsDiff(R31_AUTH_SOURCES, current)).toEqual([
+    "src/auth103-native-origin-source.ts",
+    "src/auth103-native-source-contract.ts",
+  ]);
   expect(authSourcePathsDiff(R27_AUTH_SOURCES, R30_AUTH_SOURCES)).toEqual([
     "src/shared-auth-session.ts",
   ]);
@@ -1411,11 +1531,21 @@ test("the tool tree carries the served runtime's Auth paths byte-identically", (
     "src/worker-request-shared-principal-issuance.ts",
   ]);
   // This tree cannot pass the guard for either earlier served runtime.
-  expect(authSourcePathsDiff(R27_AUTH_SOURCES, current)).toEqual(["src/shared-auth-session.ts"]);
+  expect(authSourcePathsDiff(R30_AUTH_SOURCES, current)).toEqual([
+    "src/auth103-native-origin-source.ts",
+    "src/auth103-native-source-contract.ts",
+    "src/shared-auth-oidc-client.ts",
+  ]);
+  expect(authSourcePathsDiff(R27_AUTH_SOURCES, current)).toEqual([
+    "src/auth103-native-origin-source.ts",
+    "src/auth103-native-source-contract.ts",
+    "src/shared-auth-oidc-client.ts",
+    "src/shared-auth-session.ts",
+  ]);
   expect(authSourcePathsDiff(V5_AUTH_SOURCES, current).length).toBeGreaterThan(0);
 });
 
-test("the served RP successor digests equal the offline R27 and R30 values", () => {
+test("candidate RP successor digest derives from its exact Auth source/profile pins", () => {
   const issuerPaths = [
     "src/shared-auth-oidc-client.ts",
     "src/shared-auth-session.ts",
@@ -1428,7 +1558,7 @@ test("the served RP successor digests equal the offline R27 and R30 values", () 
   const authSchemaRef = reference(authSchemaFile.sql);
   const configDigest = dataDigest(SHARED_AUTH_STAGING_PROFILE);
   expect(configDigest).toBe(
-    "sha256:a23cbbab4f96c8b532d5ebef70bd51965b8142727135c61562188a678b001067",
+    "sha256:d1319cdbff67a2710844086b7d7e1dc3a343acb5354630b595a9aaedfa4aac6d",
   );
   expect(authSchemaRef).toBe(
     "sha256:6f26b9403a576c989d595c92f337368246a252e727664282f5fe6e45330ebaa6",
@@ -1465,31 +1595,14 @@ test("the served RP successor digests equal the offline R27 and R30 values", () 
     ]);
     return { issuerSourceRef, registrationRef, registrationDigest, receiptRef };
   };
-  // The installed v5 RP original (0082119b) is reproduced by the same derivation.
-  expect(rpFor((path) => authSourcePin(V5_AUTH_SOURCES, path).digest)).toEqual({
-    issuerSourceRef: "sha256:a588bdaac11c1bb0962a99bde46f67fbb290609924c9b43c14b632a9f7b70208",
-    registrationRef: "sha256:5011da2f7257bc2d396c1bd3bdfc3562ea245c43f6f2e1734680b43f00ac9f3c",
-    registrationDigest: "sha256:1ab49278adfd7bd3adb3bbb8e8e0ccaf5899e481317e786837a1f4cd03078eb8",
-    receiptRef: "sha256:9b121e5a4b26455d2174574f27e9fa448f44c6beaaae90b85db536e6bacf3b91",
-  });
-  // v6 (R27) and v7 (R29, same RP).
-  const r27 = {
-    issuerSourceRef: "sha256:437ec9ea6eefb0de75ce144267dc4d36c3a5c0751c9f68dddaa285d89d83855e",
-    registrationRef: "sha256:83e46d52d16111364bd8c1d1c157f307736afcfeebeb90341f42346c0e1cc25e",
-    registrationDigest: "sha256:fd6cda037857cc840f322b3dcb98b15182557f68584be313362023afac7bbe59",
-    receiptRef: "sha256:9b6f3ccac22550f9a3309473836956921444bbf4918c136cbd99d95785005005",
+  const r31 = {
+    issuerSourceRef: "sha256:a9800eeacb456ecff3727b1cbc23e7b33450e8690ae9c61e5ff8b8e68cfb854d",
+    registrationRef: "sha256:241e2489ddc6ddbdd8fef1371cc7cd8750a4b324815ab2391dab389436e6203f",
+    registrationDigest: "sha256:4f5f4d065677ed1068c40a4f7c18817eb9b5c740ca63ad74a1ccc1f36ee0c9f5",
+    receiptRef: "sha256:188c461b1ce42578fd6f19844f2a83106b1b80e89cdfb1a32f065314ec148254",
   };
-  expect(rpFor((path) => authSourcePin(R27_AUTH_SOURCES, path).digest)).toEqual(r27);
-  // v8 (R30): a new RP successor.
-  const r30 = {
-    issuerSourceRef: "sha256:8e26bb1486521cb3c2d27a0cff4a0f9dbbea02fa3cf3ec17f066847cc5e7029a",
-    registrationRef: "sha256:35b441b6f84fe6f862a188acd86fc9bd42300d6e49e7355960b8edbb7816e2a6",
-    registrationDigest: "sha256:5ef66a3341390409633ac8daead545a5842d2aa61734c019d8101506176a0bf9",
-    receiptRef: "sha256:d7a8bf7f378e59c2dfac6fdc9cb6634bc5da74e0cc7e3a4110ab73cc4465085c",
-  };
-  expect(rpFor((path) => authSourcePin(R30_AUTH_SOURCES, path).digest)).toEqual(r30);
-  // The tool tree's own issuer sources produce the RP of the runtime it serves.
-  expect(rpFor((path) => reference(readFileSync(join(REPOSITORY, path), "utf8")))).toEqual(r30);
+  expect(rpFor((path) => authSourcePin(R31_AUTH_SOURCES, path).digest)).toEqual(r31);
+  expect(rpFor((path) => reference(readFileSync(join(REPOSITORY, path), "utf8")))).toEqual(r31);
 });
 
 const D1_MAX_STATEMENT_BYTES = 100_000;
@@ -1538,7 +1651,11 @@ test("the sixth-runtime postimage is split into per-pair reads under the D1 stat
     // Same logic as the single statement: every read is 1 only after the exact append.
     database.exec(AUTH103_NATIVE_INSTALL_DDL);
     for (const statement of frameHostMigrationSql(
-      compileAuth103NativeSourceInstallContribution(historical.manifest, historical.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        historical.manifest,
+        historical.bundleDigest,
+        historical.sourceProfile,
+      ),
     ))
       database.query(statement).all();
     const inserts = (sql: string) =>
@@ -1631,7 +1748,11 @@ test("the sixth-runtime postimage is split into per-pair reads under the D1 stat
       rpRegistration: v5.manifest.rpRegistration,
     }).pair;
     for (const statement of inserts(
-      compileAuth103NativeSourceInstallContribution(foreign.manifest, foreign.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        foreign.manifest,
+        foreign.bundleDigest,
+        foreign.sourceProfile,
+      ),
     ).slice(2))
       database.query(statement).all();
     const afterForeign = read();
@@ -2093,7 +2214,11 @@ test("a sealed sixth runtime permits only the exact same-RP seventh append", () 
     // Physical D1: historical + v1..v6 are 6 RP and 7 deployment originals.
     database.exec(AUTH103_NATIVE_INSTALL_DDL);
     for (const statement of frameHostMigrationSql(
-      compileAuth103NativeSourceInstallContribution(historical.manifest, historical.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        historical.manifest,
+        historical.bundleDigest,
+        historical.sourceProfile,
+      ),
     ))
       database.query(statement).all();
     const inserts = (sql: string) =>
@@ -2521,7 +2646,11 @@ test("a sealed same-RP seventh runtime permits only the exact RP-successor eight
     // Physical D1: historical + v1..v7 are 6 RP and 8 deployment originals.
     database.exec(AUTH103_NATIVE_INSTALL_DDL);
     for (const statement of frameHostMigrationSql(
-      compileAuth103NativeSourceInstallContribution(historical.manifest, historical.bundleDigest),
+      compileAuth103NativeSourceInstallContribution(
+        historical.manifest,
+        historical.bundleDigest,
+        historical.sourceProfile,
+      ),
     ))
       database.query(statement).all();
     const inserts = (sql: string) =>
