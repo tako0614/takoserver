@@ -806,6 +806,12 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/shared-app-staging-adoption\.ts$/u,
     may: ["core", "domain"],
   },
+  {
+    // Retained predecessor metadata uses only SQL ports and the staging predicate.
+    name: "domain",
+    match: /^src\/shared-app-staging-origin-history\.ts$/u,
+    may: ["core", "domain"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {

@@ -10,6 +10,7 @@ import type { PostAuth103Count } from "./post-auth103-recipes.ts";
 import { root0105Recipe } from "./root0105-recipe.ts";
 import { root0106Recipe } from "./root0106-recipe.ts";
 import { root0107Recipe } from "./root0107-recipe.ts";
+import { root0108Recipe } from "./root0108-recipe.ts";
 
 const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
   Object.freeze({
@@ -23,7 +24,8 @@ const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
  * Materializes the Root post-Auth103 chain candidates: the UNCHANGED Auth103
  * artifact (audited100 + generated 0101/0102/0103) followed by the exact
  * Financial0104 recipe (the 104 artifact), Root's exact 0105, then the pinned
- * Forward native 0106 and shared staging 0107 recipes. The Auth103 artifact, digest and receipts remain;
+ * Forward native 0106, shared staging 0107 and predecessor history 0108 recipes.
+ * The Auth103 artifact, digest and receipts remain;
  * each successor artifact is a distinct digest and never replaces it.
  */
 export function readFinancial0104CanonicalMigrationSource(
@@ -37,6 +39,7 @@ export function readFinancial0104CanonicalMigrationSource(
     const recipe105 = root0105Recipe();
     const recipe106 = root0106Recipe();
     const recipe107 = root0107Recipe();
+    const recipe108 = root0108Recipe();
     if (
       auth103.artifact.files.length !== 103 ||
       JSON.stringify(auth103.artifact.names.slice(100)) !==
@@ -61,6 +64,8 @@ export function readFinancial0104CanonicalMigrationSource(
     const generated105 = generate("105", [recipe, recipe105]);
     const generated106 = generate("106", [recipe, recipe105, recipe106]);
     const generated107 = generate("107", [recipe, recipe105, recipe106, recipe107]);
+    const generated108 = generate("108", [recipe, recipe105, recipe106, recipe107, recipe108]);
+    const artifact108 = generated108.artifact;
     const artifact = generated104.artifact;
     const artifact105 = generated105.artifact;
     const artifact106 = generated106.artifact;
@@ -106,7 +111,19 @@ export function readFinancial0104CanonicalMigrationSource(
             file.digest === artifact106.files[index]?.digest &&
             file.bytes === artifact106.files[index]?.bytes,
         ) &&
-      artifact107.files[106]?.digest === recipe107.digest;
+      artifact107.files[106]?.digest === recipe107.digest &&
+      artifact108.files.length === 108 &&
+      JSON.stringify(artifact108.names) ===
+        JSON.stringify([...artifact107.names, recipe108.name]) &&
+      unchangedPrefix(artifact108) &&
+      artifact108.files
+        .slice(0, 107)
+        .every(
+          (file, index) =>
+            file.digest === artifact107.files[index]?.digest &&
+            file.bytes === artifact107.files[index]?.bytes,
+        ) &&
+      artifact108.files[107]?.digest === recipe108.digest;
     if (!exact()) throw preflightError("post-Auth103 generated source differs from its recipes");
     const assertCurrent = () => {
       auth103.assertCurrent();
@@ -114,11 +131,13 @@ export function readFinancial0104CanonicalMigrationSource(
       root0105Recipe();
       root0106Recipe();
       root0107Recipe();
+      root0108Recipe();
       if (
         readMigrationArtifact(generated104.directory).digest !== artifact.digest ||
         readMigrationArtifact(generated105.directory).digest !== artifact105.digest ||
         readMigrationArtifact(generated106.directory).digest !== artifact106.digest ||
-        readMigrationArtifact(generated107.directory).digest !== artifact107.digest
+        readMigrationArtifact(generated107.directory).digest !== artifact107.digest ||
+        readMigrationArtifact(generated108.directory).digest !== artifact108.digest
       )
         throw preflightError("post-Auth103 generated source changed during read");
     };
@@ -135,6 +154,8 @@ export function readFinancial0104CanonicalMigrationSource(
       recipe106,
       artifact107,
       recipe107,
+      artifact108,
+      recipe108,
       /** The generated chain artifact whose ledger has exactly `count` names. */
       artifactFor: (count: PostAuth103Count): MigrationArtifact =>
         count === 104
@@ -143,7 +164,9 @@ export function readFinancial0104CanonicalMigrationSource(
             ? artifact105
             : count === 106
               ? artifact106
-              : artifact107,
+              : count === 107
+                ? artifact107
+                : artifact108,
       physicalNames: auth103.physicalNames,
       physicalDigest: auth103.physicalDigest,
       assertCurrent,

@@ -1602,10 +1602,12 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/root0105-recipe.ts",
         "scripts/deploy/root0106-recipe.ts",
         "scripts/deploy/root0107-recipe.ts",
+        "scripts/deploy/root0108-recipe.ts",
         "scripts/deploy/post-auth103-recipes.ts",
         "src/root-0105-org-capture-triggers.ts",
         "src/takoform-v2/forward-worker-native-schema.ts",
         "src/shared-app-staging-adoption.ts",
+        "src/shared-app-staging-origin-history.ts",
         "scripts/deploy/schema-money-unit-cutover.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
@@ -1655,6 +1657,9 @@ export const DEPLOY_CONTRACT = {
           "and old-writer fences after exact106; it must finish at the exact107 ledger, full schema " +
           "and physical FK/check state with its own once-only dispatch. It does not adopt old rows " +
           "or prove the incumbent staging target and old deployed writers drained. " +
+          "Separate integration-only 0108 adds only immutable predecessor-origin metadata and new-allocation exclusions after exact107, " +
+          "with exact108 shape/ledger and once-only dispatch. It imports no originals and grants no route, custody, census or drain proof; " +
+          "retention must precede new allocation, and a destination conflict needs its real owner disposition. " +
           "Optional fresh-origin input: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
           "selects the existing protected custody locator reader only for integration 0093/0094. " +
           "The same money declaration then requires originalOrigin with the original exact six-field " +

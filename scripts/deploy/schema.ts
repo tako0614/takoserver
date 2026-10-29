@@ -3291,7 +3291,8 @@ export function readCurrentAuditedMigrationSourceArtifact(
       artifact.files.length !== 104 &&
       artifact.files.length !== 105 &&
       artifact.files.length !== 106 &&
-      artifact.files.length !== 107) ||
+      artifact.files.length !== 107 &&
+      artifact.files.length !== 108) ||
     !isPostAuth103RecipeSuffix(artifact.files.slice(103)) ||
     artifact.files.slice(100, 103).some((file, index) => {
       const expected = owner.files[index];

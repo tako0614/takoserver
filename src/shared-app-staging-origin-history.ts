@@ -18,6 +18,12 @@ export const SHARED_APP_STAGING_ORIGIN_HISTORY_DDL: readonly string[] = Object.f
       OR EXISTS (SELECT 1 FROM shared_app_staging_assignments WHERE name=NEW.name)
       OR EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations l
         WHERE l.requested_subdomain=NEW.name OR ${legacyOriginForName("l.canonical_public_origin", "NEW.name")})
+      OR EXISTS (SELECT 1 FROM shared_app_staging_origin_history h
+        WHERE (h.name=NEW.name OR (h.predecessor=NEW.predecessor AND h.original_key=NEW.original_key))
+          AND (h.name IS NOT NEW.name OR h.predecessor IS NOT NEW.predecessor
+            OR h.original_key IS NOT NEW.original_key OR h.owner_ref IS NOT NEW.owner_ref
+            OR h.original_state IS NOT NEW.original_state OR h.original_json IS NOT NEW.original_json
+            OR h.retained_at IS NOT NEW.retained_at))
     BEGIN SELECT RAISE(ABORT,'destination staging origin already retained'); END`,
   `CREATE TRIGGER shared_app_staging_origin_history_no_update BEFORE UPDATE ON shared_app_staging_origin_history
     BEGIN SELECT RAISE(ABORT,'predecessor staging origin retained'); END`,
@@ -170,9 +176,20 @@ export function createSharedAppStagingOriginHistory(options: {
           ],
         );
       } catch (error) {
-        throw new SharedAppStagingOriginHistoryError(
-          error instanceof SqlError && error.code === "constraint" ? "conflict" : "indeterminate",
-        );
+        if (error instanceof SqlError && error.code === "constraint") {
+          // A concurrent retainer may have stored the same original with its
+          // own timestamp. Read once; never retry or replace the write.
+          let retained: readonly Row[];
+          try {
+            retained = await read();
+          } catch {
+            throw new SharedAppStagingOriginHistoryError("indeterminate");
+          }
+          const row = retained[0];
+          if (retained.length === 1 && row && same(row, value)) return;
+          throw new SharedAppStagingOriginHistoryError("conflict");
+        }
+        throw new SharedAppStagingOriginHistoryError("indeterminate");
       }
       let stored: readonly Row[];
       try {

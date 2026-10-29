@@ -117,6 +117,8 @@ const USAGE = `takoserver deploy
   recipe after exact installed 0105 in one guarded import.
   Integration --through-migration=0107 then appends only the pinned shared staging physical
   source after exact installed 0106 in one guarded import.
+  Integration --through-migration=0108 appends only immutable predecessor-origin metadata and
+  non-reuse fences after exact installed 0107; it imports no originals and grants no route/drain proof.
   Integration original-custody held post94 status also accepts --through-migration=0098.
   It requires the original convert declaration, TAKOSERVER_D1_MONEY_POST94_DECLARATION_PATH,
   and TAKOSERVER_D1_MONEY_NORMAL_WORKER_SELECTOR_PATH; apply remains unavailable.
@@ -245,7 +247,15 @@ type Invocation =
       readonly surface: "takoserver-d1-schema";
       readonly action: "status" | "apply";
       readonly environment: "integration";
-      readonly throughMigration: "0098" | "0100" | "0103" | "0104" | "0105" | "0106" | "0107";
+      readonly throughMigration:
+        | "0098"
+        | "0100"
+        | "0103"
+        | "0104"
+        | "0105"
+        | "0106"
+        | "0107"
+        | "0108";
     })
   | (InvocationBase & {
       readonly surface:
@@ -341,7 +351,8 @@ interface ParsedInvocation {
     | "0104"
     | "0105"
     | "0106"
-    | "0107";
+    | "0107"
+    | "0108";
   readonly freshLineage?:
     | "v2-artifacts-0075"
     | "v2-0088"
@@ -459,6 +470,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     | "0105"
     | "0106"
     | "0107"
+    | "0108"
     | null = null;
   let protectedReferenceEnvironment: "integration" | "production" | null = null;
   let organizationId: string | null = null;
@@ -717,7 +729,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
         value === "0104" ||
         value === "0105" ||
         value === "0106" ||
-        value === "0107"
+        value === "0107" ||
+        value === "0108"
       ) {
         throughMigration = value;
       } else {
@@ -1051,7 +1064,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       throughMigration === "0104" ||
       throughMigration === "0105" ||
       throughMigration === "0106" ||
-      throughMigration === "0107") &&
+      throughMigration === "0107" ||
+      throughMigration === "0108") &&
     (surfaceValue !== "takoserver-d1-schema" || environment !== "integration")
   ) {
     return null;
@@ -1437,7 +1451,8 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     invocation.throughMigration === "0104" ||
     invocation.throughMigration === "0105" ||
     invocation.throughMigration === "0106" ||
-    invocation.throughMigration === "0107"
+    invocation.throughMigration === "0107" ||
+    invocation.throughMigration === "0108"
   ) {
     if (invocation.environment !== "integration" || invocation.surface !== "takoserver-d1-schema")
       throw new DeployError("preflight", "post-Auth103 source registration is integration-only");

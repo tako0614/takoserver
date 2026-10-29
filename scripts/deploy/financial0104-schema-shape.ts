@@ -10,6 +10,7 @@ import {
 } from "../../src/money-cutover-sql.ts";
 import { ROOT_0105_OBJECTS } from "../../src/root-0105-org-capture-triggers.ts";
 import { SHARED_APP_STAGING_PHYSICAL_DDL } from "../../src/shared-app-staging-adoption.ts";
+import { SHARED_APP_STAGING_ORIGIN_HISTORY_DDL } from "../../src/shared-app-staging-origin-history.ts";
 import {
   forwardWorkerNativePredecessorReady,
   forwardWorkerNativeSchemaReady,
@@ -422,6 +423,114 @@ export function root0107PhysicalPredicate(): string {
       WHERE name COLLATE NOCASE IN (${names}) OR tbl_name COLLATE NOCASE IN (${tables}))`;
 }
 
+function history108Declarations(): readonly { readonly type: string; readonly name: string }[] {
+  const declarations = SHARED_APP_STAGING_ORIGIN_HISTORY_DDL.map((statement) => {
+    const parsed = /^CREATE (TABLE|TRIGGER) (shared_app_staging_[a-z0-9_]+)/u.exec(statement);
+    if (parsed?.[1] === undefined || parsed[2] === undefined)
+      throw preflightError("Root0108 physical declaration is malformed");
+    return { type: parsed[1].toLowerCase(), name: parsed[2] };
+  });
+  if (
+    declarations.length !== 10 ||
+    declarations.filter(({ type }) => type === "table").length !== 1 ||
+    declarations.filter(({ type }) => type === "trigger").length !== 9 ||
+    new Set(declarations.map(({ name }) => name)).size !== 10
+  )
+    throw preflightError("Root0108 physical declaration inventory changed");
+  return declarations;
+}
+
+/** The pinned 0107 source only adds one immutable history table and nine non-reuse guards. */
+export function compileRoot0108ImportShapes(
+  auth103: MigrationArtifact,
+  artifact104: MigrationArtifact,
+  artifact105: MigrationArtifact,
+  artifact106: MigrationArtifact,
+  artifact107: MigrationArtifact,
+  artifact108: MigrationArtifact,
+  profile: Financial0104Profile,
+) {
+  if (
+    artifact108.files.length !== 108 ||
+    artifact108.files
+      .slice(0, 107)
+      .some(
+        (file, index) =>
+          file.digest !== artifact107.files[index]?.digest ||
+          file.bytes !== artifact107.files[index]?.bytes,
+      )
+  )
+    throw preflightError("Root0108 shapes require the exact post-107 predecessor");
+  const at107 = compileRoot0107ImportShapes(
+    auth103,
+    artifact104,
+    artifact105,
+    artifact106,
+    artifact107,
+    profile,
+  );
+  const ordinary107 = compileAuth103NativeImportShapes(artifact107);
+  const ordinary108 = compileAuth103NativeImportShapes(artifact108);
+  if (canonicalJson(ordinary108.catalog) !== canonicalJson(at107.auth103Catalog))
+    throw preflightError("Root0108 changed the owned Auth103 catalog");
+  const before = new Map(rows(ordinary107.postShape).map((row) => [key(row), row]));
+  const added: ShapeRow[] = [];
+  for (const row of rows(ordinary108.postShape)) {
+    const prior = before.get(key(row));
+    if (prior === undefined) added.push(row);
+    else if (canonicalJson(prior) !== canonicalJson(row))
+      throw preflightError("Root0108 rewrote a post-107 object");
+    before.delete(key(row));
+  }
+  const declared = history108Declarations();
+  const actual = added.map(({ type, name }) => ({ type, name }));
+  const byDeclaration = (
+    left: { type: string; name: string },
+    right: { type: string; name: string },
+  ) => binary(left.type, right.type) || binary(left.name, right.name);
+  if (
+    before.size !== 0 ||
+    canonicalJson(actual.sort(byDeclaration)) !== canonicalJson([...declared].sort(byDeclaration))
+  )
+    throw preflightError("Root0108 delta differs from its physical source");
+  const prefix = rows(at107.postShape);
+  const names = new Set(prefix.map(key));
+  if (added.some((row) => names.has(key(row))))
+    throw preflightError("Root0108 collides with a post-107 object");
+  return Object.freeze({
+    prefixShape: at107.postShape,
+    postShape:
+      profile === "ordinary"
+        ? ordinary108.postShape
+        : project([...prefix, ...added].sort(byTypeName)),
+    auth103Catalog: at107.auth103Catalog,
+    financialCatalog: at107.financialCatalog,
+  });
+}
+
+export function root0108PredecessorPredicate(): string {
+  const names = history108Declarations()
+    .map(({ name }) => sqlLiteral(name))
+    .join(",");
+  return `NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE name COLLATE NOCASE IN (${names}))
+    AND NOT EXISTS (SELECT 1 FROM sqlite_temp_schema WHERE name COLLATE NOCASE IN (${names}))`;
+}
+
+export function root0108PhysicalPredicate(): string {
+  const declarations = history108Declarations();
+  const names = declarations.map(({ name }) => sqlLiteral(name)).join(",");
+  const tables = declarations
+    .filter(({ type }) => type === "table")
+    .map(({ name }) => sqlLiteral(name))
+    .join(",");
+  return `(SELECT foreign_keys FROM pragma_foreign_keys)=1
+    AND (SELECT ignore_check_constraints FROM pragma_ignore_check_constraints)=0
+    AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check)
+    AND (SELECT count(*) FROM main.sqlite_schema WHERE name IN (${names}))=10
+    AND NOT EXISTS (SELECT 1 FROM sqlite_temp_schema
+      WHERE name COLLATE NOCASE IN (${names}) OR tbl_name COLLATE NOCASE IN (${tables}))`;
+}
+
 /** Read-only SQL predicate: the Financial catalog is EXACTLY the recipe (plus
  * the Money guard's Stripe fences on the 0104 link table when Money-preserved). */
 export function financial0104CatalogPredicate(profile: Financial0104Profile = "ordinary"): string {
@@ -460,7 +569,7 @@ export function financial0104SourceSchemaReady(
   profile: Financial0104Profile = "ordinary",
 ): boolean {
   const count = input.applied.length;
-  if (count !== 104 && count !== 105 && count !== 106 && count !== 107)
+  if (count !== 104 && count !== 105 && count !== 106 && count !== 107 && count !== 108)
     return auth103SourceSchemaReady(input, sourceRoot, mode, profile);
   try {
     if (input.shape === undefined || input.shapeDigest === undefined) return false;
@@ -494,14 +603,24 @@ export function financial0104SourceSchemaReady(
                     source.artifact106,
                     profile,
                   )
-                : compileRoot0107ImportShapes(
-                    source.auth103,
-                    source.artifact,
-                    source.artifact105,
-                    source.artifact106,
-                    source.artifact107,
-                    profile,
-                  );
+                : count === 107
+                  ? compileRoot0107ImportShapes(
+                      source.auth103,
+                      source.artifact,
+                      source.artifact105,
+                      source.artifact106,
+                      source.artifact107,
+                      profile,
+                    )
+                  : compileRoot0108ImportShapes(
+                      source.auth103,
+                      source.artifact,
+                      source.artifact105,
+                      source.artifact106,
+                      source.artifact107,
+                      source.artifact108,
+                      profile,
+                    );
         if (compiledCache.size >= 4) compiledCache.clear();
         compiledCache.set(cacheKey, expected);
       }
@@ -518,7 +637,7 @@ export function financial0104SourceSchemaReady(
   }
 }
 
-/** Exact104–exact107 projection for pending selection: a physical checkout
+/** Exact104–exact108 projection for pending selection: a physical checkout
  * that stops before the applied chain has no pending migration once D1
  * carries that exact Root post-Auth103 ledger. */
 export function financial0104LedgerApplied(
@@ -528,12 +647,13 @@ export function financial0104LedgerApplied(
 ): boolean {
   const count = applied.length;
   if (
-    (count !== 104 && count !== 105 && count !== 106 && count !== 107) ||
+    (count !== 104 && count !== 105 && count !== 106 && count !== 107 && count !== 108) ||
     (local.length !== 100 &&
       local.length !== 103 &&
       local.length !== 104 &&
       local.length !== 105 &&
-      local.length !== 106) ||
+      local.length !== 106 &&
+      local.length !== 107) ||
     local.length >= count
   )
     return false;

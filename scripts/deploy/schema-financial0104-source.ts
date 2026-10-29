@@ -32,6 +32,7 @@ import {
   compileRoot0105ImportShapes,
   compileRoot0106ImportShapes,
   compileRoot0107ImportShapes,
+  compileRoot0108ImportShapes,
   type Financial0104Profile,
   financial0104CatalogPredicate,
   moneyStripeCustomerGuardInstallSql,
@@ -40,6 +41,8 @@ import {
   root0106PredecessorPredicate,
   root0107PhysicalPredicate,
   root0107PredecessorPredicate,
+  root0108PhysicalPredicate,
+  root0108PredecessorPredicate,
 } from "./financial0104-schema-shape.ts";
 import { type D1SchemaState, type MigrationArtifact, readD1SchemaState } from "./migrations.ts";
 import {
@@ -53,6 +56,7 @@ import { qualifySource } from "./qualification.ts";
 import { ROOT0105_MIGRATION_NAME, root0105Recipe } from "./root0105-recipe.ts";
 import { ROOT0106_MIGRATION_NAME, root0106Recipe } from "./root0106-recipe.ts";
 import { ROOT0107_MIGRATION_NAME, root0107Recipe } from "./root0107-recipe.ts";
+import { ROOT0108_MIGRATION_NAME, root0108Recipe } from "./root0108-recipe.ts";
 import {
   boundPredicate,
   ledgerPredicate,
@@ -84,7 +88,7 @@ export function financial0104MoneyThawedPredicate(writerEpoch: string): string {
 }
 
 export interface Financial0104ImportInput {
-  /** The exact target chain artifact through 0104–0107. */
+  /** The exact target chain artifact through 0104–0108. */
   readonly artifact: MigrationArtifact;
   readonly prefixShape: string;
   readonly postShape: string;
@@ -104,15 +108,17 @@ export function financial0104ImportPredicates(input: Financial0104ImportInput) {
   const file105 = input.artifact.files[104];
   const file106 = input.artifact.files[105];
   const file107 = input.artifact.files[106];
+  const file108 = input.artifact.files[107];
   const expectedNames = [
     ...AUTH103_NATIVE_MIGRATIONS,
     FINANCIAL0104_MIGRATION_NAME,
     ...(count >= 105 ? [ROOT0105_MIGRATION_NAME] : []),
     ...(count >= 106 ? [ROOT0106_MIGRATION_NAME] : []),
-    ...(count === 107 ? [ROOT0107_MIGRATION_NAME] : []),
+    ...(count >= 107 ? [ROOT0107_MIGRATION_NAME] : []),
+    ...(count === 108 ? [ROOT0108_MIGRATION_NAME] : []),
   ];
   if (
-    (count !== 104 && count !== 105 && count !== 106 && count !== 107) ||
+    (count !== 104 && count !== 105 && count !== 106 && count !== 107 && count !== 108) ||
     file104 === undefined ||
     JSON.stringify(input.artifact.names.slice(100)) !== JSON.stringify(expectedNames) ||
     file104.digest !== recipe.digest ||
@@ -125,19 +131,25 @@ export function financial0104ImportPredicates(input: Financial0104ImportInput) {
       (file106 === undefined ||
         file106.digest !== root0106Recipe().digest ||
         readFileSync(file106.path, "utf8") !== root0106Recipe().sql)) ||
-    (count === 107 &&
+    (count >= 107 &&
       (file107 === undefined ||
         file107.digest !== root0107Recipe().digest ||
-        readFileSync(file107.path, "utf8") !== root0107Recipe().sql))
+        readFileSync(file107.path, "utf8") !== root0107Recipe().sql)) ||
+    (count === 108 &&
+      (file108 === undefined ||
+        file108.digest !== root0108Recipe().digest ||
+        readFileSync(file108.path, "utf8") !== root0108Recipe().sql))
   )
     throw preflightError(
-      count === 107
-        ? "Root0107 import requires the exact Auth103 artifact plus 0104 through 0107"
-        : count === 106
-          ? "Root0106 import requires the exact Auth103 artifact plus 0104, 0105 and 0106"
-          : count === 105
-            ? "Root0105 import requires the exact Auth103 artifact plus 0104 and 0105"
-            : "Financial0104 import requires the exact Auth103 artifact plus 0104",
+      count === 108
+        ? "Root0108 import requires the exact Auth103 artifact plus0104 through0108"
+        : count === 107
+          ? "Root0107 import requires the exact Auth103 artifact plus 0104 through 0107"
+          : count === 106
+            ? "Root0106 import requires the exact Auth103 artifact plus 0104, 0105 and 0106"
+            : count === 105
+              ? "Root0105 import requires the exact Auth103 artifact plus 0104 and 0105"
+              : "Financial0104 import requires the exact Auth103 artifact plus 0104",
     );
   if (count === 106 && input.predecessorAuth103CatalogJson === undefined)
     throw preflightError("Root0106 requires the exact predecessor Auth103 catalog");
@@ -162,8 +174,8 @@ export function financial0104ImportPredicates(input: Financial0104ImportInput) {
   const root105 = ` AND ${root0105CatalogPredicate()}`;
   const root106 = ` AND (${root0106CatalogPredicate()})`;
   return Object.freeze({
-    before: `${ledgerPredicate(input.artifact.names.slice(0, count - 1))} AND ${auth103Before} AND ${originalShapePredicate(input.prefixShape)}${count >= 105 ? financial : ""}${count === 106 ? `${root105} AND (${root0106PredecessorPredicate()})` : ""}${count === 107 ? `${root105}${root106} AND (${root0107PredecessorPredicate()})` : ""}${money}`,
-    after: `${ledgerPredicate(input.artifact.names)} AND ${auth103After} AND ${originalShapePredicate(input.postShape)}${financial}${count >= 105 ? root105 : ""}${count >= 106 ? root106 : ""}${count === 107 ? ` AND (${root0107PhysicalPredicate()})` : ""}${money}`,
+    before: `${ledgerPredicate(input.artifact.names.slice(0, count - 1))} AND ${auth103Before} AND ${originalShapePredicate(input.prefixShape)}${count >= 105 ? financial : ""}${count === 106 ? `${root105} AND (${root0106PredecessorPredicate()})` : ""}${count === 107 ? `${root105}${root106} AND (${root0107PredecessorPredicate()})` : ""}${count === 108 ? `${root105}${root106} AND (${root0107PhysicalPredicate()}) AND (${root0108PredecessorPredicate()})` : ""}${money}`,
+    after: `${ledgerPredicate(input.artifact.names)} AND ${auth103After} AND ${originalShapePredicate(input.postShape)}${financial}${count >= 105 ? root105 : ""}${count >= 106 ? root106 : ""}${count >= 107 ? ` AND (${root0107PhysicalPredicate()})` : ""}${count === 108 ? ` AND (${root0108PhysicalPredicate()})` : ""}${money}`,
   });
 }
 
@@ -230,6 +242,8 @@ function writeD1Config(path: string, target: DeployTarget, migrationDirectory: s
  * exact106 ledger, post106 shape and native catalog.
  * 0107: exact106 -> pinned shared staging physical source + ledger insert ->
  * exact107 ledger, retained old-writer fences and post107 shape.
+ * 0108: exact107 -> additive predecessor-origin metadata/non-reuse schema only;
+ * no original import, drain, route transition or custody grant.
  * Each step's dispatch is recorded once; replay never.
  */
 export async function runD1SchemaFinancial0104(
@@ -237,7 +251,7 @@ export async function runD1SchemaFinancial0104(
     readonly action: "status" | "apply";
     readonly environment: "integration";
     readonly commit: string;
-    readonly throughMigration?: "0104" | "0105" | "0106" | "0107";
+    readonly throughMigration?: "0104" | "0105" | "0106" | "0107" | "0108";
   },
   target: DeployTarget,
   productionD1: { readonly databaseId: string; readonly databaseName: string },
@@ -259,7 +273,7 @@ export async function runD1SchemaFinancial0104(
     throw preflightError("Financial0104 Money profile is not the exact fenced writer policy");
   const profile: Financial0104Profile = moneyPreserved ? "money-preserved" : "ordinary";
   const step = invocation.throughMigration ?? "0104";
-  if (step !== "0104" && step !== "0105" && step !== "0106" && step !== "0107")
+  if (step !== "0104" && step !== "0105" && step !== "0106" && step !== "0107" && step !== "0108")
     throw preflightError("post-Auth103 chain step is not registered");
   const label =
     step === "0104"
@@ -268,7 +282,9 @@ export async function runD1SchemaFinancial0104(
         ? "root0105"
         : step === "0106"
           ? "root0106"
-          : "root0107";
+          : step === "0107"
+            ? "root0107"
+            : "root0108";
   const selectedTarget = canonicalJson(target);
   const custodyOwner = readAuth103OriginalCustodyDirectory();
   const custody = custodyOwner.path;
@@ -310,6 +326,7 @@ export async function runD1SchemaFinancial0104(
           "tests/deploy-root0105-canonical-source.test.ts",
           "tests/deploy-root0106-canonical-source.test.ts",
           "tests/deploy-root0107-canonical-source.test.ts",
+          ...(step === "0108" ? ["tests/deploy-root0108-canonical-source.test.ts"] : []),
         ],
         ["bun", "run", "check:migrations"],
       ]) {
@@ -336,14 +353,24 @@ export async function runD1SchemaFinancial0104(
                 registered.artifact106,
                 profile,
               )
-            : compileRoot0107ImportShapes(
-                registered.auth103,
-                registered.artifact,
-                registered.artifact105,
-                registered.artifact106,
-                registered.artifact107,
-                profile,
-              );
+            : step === "0107"
+              ? compileRoot0107ImportShapes(
+                  registered.auth103,
+                  registered.artifact,
+                  registered.artifact105,
+                  registered.artifact106,
+                  registered.artifact107,
+                  profile,
+                )
+              : compileRoot0108ImportShapes(
+                  registered.auth103,
+                  registered.artifact,
+                  registered.artifact105,
+                  registered.artifact106,
+                  registered.artifact107,
+                  registered.artifact108,
+                  profile,
+                );
     const targetArtifact =
       step === "0104"
         ? registered.artifact
@@ -351,7 +378,9 @@ export async function runD1SchemaFinancial0104(
           ? registered.artifact105
           : step === "0106"
             ? registered.artifact106
-            : registered.artifact107;
+            : step === "0107"
+              ? registered.artifact107
+              : registered.artifact108;
     const predecessorNames =
       step === "0104"
         ? registered.auth103.names
@@ -359,7 +388,9 @@ export async function runD1SchemaFinancial0104(
           ? registered.artifact.names
           : step === "0106"
             ? registered.artifact105.names
-            : registered.artifact106.names;
+            : step === "0107"
+              ? registered.artifact106.names
+              : registered.artifact107.names;
     const stepRecipe =
       step === "0104"
         ? registered.recipe
@@ -367,7 +398,9 @@ export async function runD1SchemaFinancial0104(
           ? registered.recipe105
           : step === "0106"
             ? registered.recipe106
-            : registered.recipe107;
+            : step === "0107"
+              ? registered.recipe107
+              : registered.recipe108;
     const recipes = registered.auth103Recipes;
     const input: Financial0104ImportInput = {
       artifact: targetArtifact,
@@ -444,7 +477,9 @@ export async function runD1SchemaFinancial0104(
                 ? "financial0104-awaiting-root0105"
                 : step === "0106"
                   ? "root0105-awaiting-root0106"
-                  : "root0106-awaiting-root0107"
+                  : step === "0107"
+                    ? "root0106-awaiting-root0107"
+                    : "root0107-awaiting-root0108"
             : "foreign-frozen-or-indeterminate",
         appliedCount: initial.applied.length,
         auth103SourceDigest: registered.auth103.digest,
@@ -462,7 +497,9 @@ export async function runD1SchemaFinancial0104(
             ? "Root0105 apply requires exact installed Financial0104 (thawed when Money-preserved); installed or foreign state is never replayed"
             : step === "0106"
               ? "Root0106 apply requires exact installed Root0105 (thawed when Money-preserved); installed or foreign state is never replayed"
-              : "Root0107 apply requires exact installed Root0106 (thawed when Money-preserved); installed or foreign state is never replayed",
+              : step === "0107"
+                ? "Root0107 apply requires exact installed Root0106 (thawed when Money-preserved); installed or foreign state is never replayed"
+                : "Root0108 apply requires exact installed Root0107 (thawed when Money-preserved); installed or foreign state is never replayed",
       );
     const final = await readD1SchemaState(database, "mutation");
     assertTarget();
@@ -560,7 +597,9 @@ export async function runD1SchemaFinancial0104(
             ? "Root0105 import was acknowledged but exact105 postconditions are unproved; repair forward"
             : step === "0106"
               ? "Root0106 import was acknowledged but exact106 postconditions are unproved; repair forward"
-              : "Root0107 import was acknowledged but exact107 postconditions are unproved; repair forward",
+              : step === "0107"
+                ? "Root0107 import was acknowledged but exact107 postconditions are unproved; repair forward"
+                : "Root0108 import was acknowledged but exact108 postconditions are unproved; repair forward",
       );
     const result = {
       kind: `takoserver.${label}-source-apply@v1`,

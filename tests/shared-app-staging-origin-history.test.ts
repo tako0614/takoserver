@@ -188,6 +188,61 @@ test("Root0107's original 18-statement recipe remains byte-pinned", () => {
   );
 });
 
+test("concurrent retention reads back the same original without rewriting or retrying", async () => {
+  const f = fixture();
+  try {
+    const retained = original("prior-app", "active");
+    const competing = createSharedAppStagingOriginHistory({
+      sql: f.sql,
+      clock: () => new Date(20),
+    });
+    let writes = 0;
+    const sql: Sql = {
+      query: (query, params) => f.sql.query(query, params),
+      batch: (statements) => f.sql.batch(statements),
+      async run(query, params) {
+        writes += 1;
+        await competing.retain(retained);
+        return f.sql.run(query, params);
+      },
+    };
+    const history = createSharedAppStagingOriginHistory({ sql, clock: () => new Date(10) });
+    await history.retain(retained);
+    expect(writes).toBe(1);
+    expect(
+      f.db
+        .query("SELECT retained_at,owner_ref,original_state FROM shared_app_staging_origin_history")
+        .get(),
+    ).toEqual({ retained_at: 20, owner_ref: "original-native-owner", original_state: "active" });
+  } finally {
+    f.db.close();
+  }
+});
+
+test("SQL REPLACE cannot overwrite or rename retained predecessor ownership", async () => {
+  const f = fixture();
+  try {
+    await f.history.retain(original("prior-app", "active"));
+    for (const selection of [
+      "name,predecessor,original_key,'replacement-owner',original_state,original_json,retained_at",
+      "'renamed-app',predecessor,original_key,owner_ref,original_state,original_json,retained_at",
+    ]) {
+      expect(() =>
+        f.db.exec(`INSERT OR REPLACE INTO shared_app_staging_origin_history
+        (name,predecessor,original_key,owner_ref,original_state,original_json,retained_at)
+        SELECT ${selection} FROM shared_app_staging_origin_history WHERE name='prior-app'`),
+      ).toThrow();
+    }
+    expect(
+      f.db
+        .query("SELECT name,owner_ref,original_state FROM shared_app_staging_origin_history")
+        .get(),
+    ).toEqual({ name: "prior-app", owner_ref: "original-native-owner", original_state: "active" });
+  } finally {
+    f.db.close();
+  }
+});
+
 test("additive history fences execute with native D1 and roll back a conflicting destination batch", async () => {
   const id = `origin-history-${crypto.randomUUID()}`;
   const runtime = new Miniflare({
@@ -233,6 +288,12 @@ test("additive history fences execute with native D1 and roll back a conflicting
       await sql.run(statement);
     const history = createSharedAppStagingOriginHistory({ sql });
     await history.retain(original("prior-app", "active"));
+    await expect(
+      sql.run(`INSERT OR REPLACE INTO shared_app_staging_origin_history
+        (name,predecessor,original_key,owner_ref,original_state,original_json,retained_at)
+        SELECT name,predecessor,original_key,'replacement-owner',original_state,original_json,retained_at
+        FROM shared_app_staging_origin_history WHERE name='prior-app'`),
+    ).rejects.toMatchObject({ code: "constraint" });
     const ledger = createSharedAppLedger({ environment: "staging", primary: () => sql });
     await expect(
       ledger

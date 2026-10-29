@@ -284,7 +284,8 @@ export function workerSchemaAllowsPending(
       migrations.local.length === 104 ||
       migrations.local.length === 105 ||
       migrations.local.length === 106 ||
-      migrations.local.length === 107)
+      migrations.local.length === 107 ||
+      migrations.local.length === 108)
   ) {
     return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }
@@ -299,7 +300,8 @@ export function workerSchemaAllowsPending(
       migrations.applied.length === 104 ||
       migrations.applied.length === 105 ||
       migrations.applied.length === 106 ||
-      migrations.applied.length === 107)
+      migrations.applied.length === 107 ||
+      migrations.applied.length === 108)
   ) {
     return financial0104SourceSchemaReady(
       migrations,
@@ -468,7 +470,8 @@ export function workerSelectedPendingMigrations(
     (migrations.applied.length === 104 ||
       migrations.applied.length === 105 ||
       migrations.applied.length === 106 ||
-      migrations.applied.length === 107) &&
+      migrations.applied.length === 107 ||
+      migrations.applied.length === 108) &&
     target.environment === "integration" &&
     target.artifactBlobIoMode === undefined &&
     (target.schemaMaintenanceMode === undefined ||
@@ -497,6 +500,7 @@ export function workerMoneyUnitSchemaReady(
     migrations.local.length === 105 ||
     migrations.local.length === 106 ||
     migrations.local.length === 107 ||
+    migrations.local.length === 108 ||
     (migrations.local.length === 100 && migrations.applied.length === 103) ||
     ((migrations.local.length === 100 || migrations.local.length === 103) &&
       migrations.applied.length === 104) ||
@@ -514,7 +518,14 @@ export function workerMoneyUnitSchemaReady(
       migrations.local.length === 104 ||
       migrations.local.length === 105 ||
       migrations.local.length === 106) &&
-      migrations.applied.length === 107)
+      migrations.applied.length === 107) ||
+    ((migrations.local.length === 100 ||
+      migrations.local.length === 103 ||
+      migrations.local.length === 104 ||
+      migrations.local.length === 105 ||
+      migrations.local.length === 106 ||
+      migrations.local.length === 107) &&
+      migrations.applied.length === 108)
   ) {
     // The ordinary and Money-preserved post-103 shapes, as 0094 and 0094-fenced
     // below; the publication profile itself is bound by workerSchemaAllowsPending.
