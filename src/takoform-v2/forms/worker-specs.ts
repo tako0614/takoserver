@@ -14,6 +14,9 @@ export {
 
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
+/** Shared cardinality for each Worker binding kind and bounded accepted-data reads. */
+export const MAX_WORKER_BINDINGS_PER_KIND = 64;
+
 const BINDING_NAME = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
 const SECRET_NAME = /^[A-Z][A-Z0-9_]{0,63}$/u;
 const HANDLERS = new Set<string>(["fetch", "scheduled", "queue"]);
@@ -359,7 +362,7 @@ function parseUniqueStringSet(
 }
 
 function parseBindings(value: unknown, allNames: Set<string>): WorkerVersionBinding[] {
-  const entries = arrayValues(value, 64);
+  const entries = arrayValues(value, MAX_WORKER_BINDINGS_PER_KIND);
   const localNames = new Set<string>();
   return entries.map((entry): WorkerVersionBinding => {
     const binding = record(entry);

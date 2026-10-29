@@ -1,4 +1,4 @@
-import type { Clock, Sql } from "../ports.ts";
+import type { Clock, Sql, SqlStatement } from "../ports.ts";
 import type {
   V2WorkerInvocationHandle,
   V2WorkerInvocationIngress,
@@ -87,6 +87,14 @@ export interface V2WorkerInvocationCustody {
   /** One physical Cron attempt for one durable match lease, atomically resolved from SQL. */
   admitCron(claim: V2WorkerCronInvocationClaim): Promise<V2WorkerInvocationAdmission>;
   read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null>;
+  /** Atomic row presence plus the same custody/schema validation. No execution grant. */
+  readPresence?(
+    handle: V2WorkerInvocationHandle,
+  ): Promise<
+    | { readonly kind: "missing" }
+    | { readonly kind: "invalid" }
+    | { readonly kind: "valid"; readonly record: V2WorkerInvocationRecord }
+  >;
   /** One authorization to initiate the native dispatch; no retry after uncertainty. */
   beginSend(handle: V2WorkerInvocationHandle): Promise<boolean>;
   /** Atomic exact-authority fence before the first external SQLite send. */
@@ -664,14 +672,61 @@ function createWorkerInvocationLifecycle(
     if (!Number.isSafeInteger(value) || value < 0) throw new TypeError("invalid invocation clock");
     return value;
   }
+  const readSql = `SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ? AND custody_token = ?
+        AND (${readReady}) LIMIT 2`;
+  const rawPresenceBatch: unknown = sql.batch;
+  const presenceBatch =
+    typeof rawPresenceBatch === "function" ? rawPresenceBatch.bind(sql) : undefined;
   async function read(handle: V2WorkerInvocationHandle): Promise<V2WorkerInvocationRecord | null> {
     const ownedHandle = ownHandle(handle);
-    const rows = await sql.query(
-      `SELECT * FROM tf_v2_worker_invocations WHERE invocation_id = ? AND custody_token = ?
-        AND (${readReady}) LIMIT 2`,
-      [ownedHandle.invocationId, ownedHandle.custodyToken],
-    );
+    const rows = await sql.query(readSql, [ownedHandle.invocationId, ownedHandle.custodyToken]);
     return rows.length === 1 ? record(rows[0], ownedHandle) : null;
+  }
+  async function readPresence(handle: V2WorkerInvocationHandle) {
+    const ownedHandle = ownHandle(handle);
+    const present: SqlStatement = {
+      sql: "SELECT invocation_id FROM tf_v2_worker_invocations WHERE invocation_id = ? LIMIT 2",
+      params: [ownedHandle.invocationId],
+    };
+    if (rawPresenceBatch !== undefined && !presenceBatch)
+      throw new TypeError("invocation presence batch unavailable");
+    // Preserve the original two SELECTs and all their predicates. One atomic
+    // read batch keeps proven absence separate from present-but-invalid rows.
+    if (!presenceBatch) {
+      const rows = await sql.query(present.sql, present.params);
+      if (rows.length === 0) return { kind: "missing" as const };
+      const value = rows.length === 1 ? await read(ownedHandle) : null;
+      return value ? { kind: "valid" as const, record: value } : { kind: "invalid" as const };
+    }
+    const results: unknown = await presenceBatch([
+      present,
+      { sql: readSql, params: [ownedHandle.invocationId, ownedHandle.custodyToken] },
+    ]);
+    if (!Array.isArray(results) || results.length !== 2)
+      throw new TypeError("incomplete invocation presence batch");
+    const reads: (readonly Row[])[] = [];
+    for (let index = 0; index < 2; index++) {
+      const result = results[index];
+      const resultRows: unknown = result?.rows;
+      if (!result || typeof result !== "object" || !Array.isArray(resultRows))
+        throw new TypeError("invalid invocation presence result");
+      for (let rowIndex = 0; rowIndex < resultRows.length; rowIndex++) {
+        const row = resultRows[rowIndex];
+        if (!row || typeof row !== "object" || Array.isArray(row))
+          throw new TypeError("invalid invocation presence row");
+      }
+      reads.push(resultRows);
+    }
+    const [presence, rows] = reads;
+    if (!presence || !rows) throw new TypeError("missing invocation presence result");
+    if (presence.length === 0 && rows.length === 0) return { kind: "missing" as const };
+    const value =
+      presence.length === 1 &&
+      presence[0]?.invocation_id === ownedHandle.invocationId &&
+      rows.length === 1
+        ? record(rows[0], ownedHandle)
+        : null;
+    return value ? { kind: "valid" as const, record: value } : { kind: "invalid" as const };
   }
   async function readSQLite(
     handle: V2WorkerInvocationHandle,
@@ -689,6 +744,7 @@ function createWorkerInvocationLifecycle(
     }
   }
   return {
+    readPresence,
     async admitCron(raw: V2WorkerCronInvocationClaim): Promise<V2WorkerInvocationAdmission> {
       const unavailable = { kind: "unavailable" } as const;
       const handle = raw?.handle;
