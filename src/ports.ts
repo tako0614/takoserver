@@ -60,7 +60,11 @@ export interface SqlAccess {
  *   external work outside any transaction, then settle with a guarded batch.
  */
 export interface Sql extends SqlAccess {
-  /** Commits all statements or none, in order. */
+  /**
+   * Commits all statements or none, in order; also accepts independent SELECTs.
+   * Read batches share one snapshot. SQLite uses BEGIN IMMEDIATE and rejects
+   * nested transactions; transports exposing only SqlAccess cannot batch.
+   */
   batch(statements: readonly SqlStatement[]): Promise<readonly SqlWrite[]>;
 }
 
