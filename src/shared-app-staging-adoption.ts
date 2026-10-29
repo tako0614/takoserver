@@ -38,7 +38,7 @@ const exactLegacy = (alias: "OLD" | "NEW", json: "before_json" | "after_json") =
 // 0035 v1 has no requested_subdomain. Match the exact staging Host authority,
 // including the web schemes, ASCII Host case, one root dot and a numeric port.
 // A longer hostname or a path is never an alias for this allocated DNS name.
-const legacyOriginForName = (origin: string, name: string): string => {
+export const legacyOriginForName = (origin: string, name: string): string => {
   const source = `lower(${origin})`;
   const host = `(${name} || '.app-staging.takos.jp')`;
   const bases = ["'http://'", "'https://'"].flatMap((scheme) => [

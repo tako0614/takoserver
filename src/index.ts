@@ -248,6 +248,12 @@ export {
   type SharedAppStagingAdoptionOriginal,
 } from "./shared-app-staging-adoption.ts";
 export {
+  createSharedAppStagingOriginHistory,
+  SHARED_APP_STAGING_ORIGIN_HISTORY_DDL,
+  SharedAppStagingOriginHistoryError,
+  type SharedAppStagingOriginHistoryRecord,
+} from "./shared-app-staging-origin-history.ts";
+export {
   createSponsorshipAuthority,
   type SponsorshipAuthority,
   SponsorshipAuthorityError,
