@@ -46,7 +46,12 @@ const BASE_URL = "https://host.example/apis/forms.takoform.com/v2";
 
 const hex = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-function harness() {
+function harness(
+  options: {
+    readonly assetReadDelayMs?: number;
+    readonly foundationLeaseMilliseconds?: number;
+  } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "v2-endpoint-order-"));
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
@@ -63,11 +68,19 @@ function harness() {
       files: [{ path: "index.html", url: fileUrl, sha256: hex(fileBytes), mediaType: "text/html" }],
     }),
   );
+  const assetSpec: JsonObject = {
+    artifact: { url: manifestUrl, sha256: hex(manifestBytes) },
+  };
+  let assetReadDelayed = false;
   const assets = createStaticAssetBundleHost({
     sql,
     targetKey: TARGET_KEY,
     source: {
       async read({ url }) {
+        if (!assetReadDelayed && options.assetReadDelayMs) {
+          assetReadDelayed = true;
+          await Bun.sleep(options.assetReadDelayMs);
+        }
         if (url === manifestUrl) return manifestBytes;
         if (url === fileUrl) return fileBytes;
         throw new Error("unknown fixture artifact");
@@ -176,23 +189,39 @@ function harness() {
     },
     [WORKER_DEPLOYMENT_FORM_URL]: deploymentForm,
   };
-  const engineWith = (endpoint: V2Form) =>
+  const engineWith = (
+    endpoint: V2Form,
+    lease: { readonly leaseMilliseconds?: number } = { leaseMilliseconds: 1_000 },
+  ) =>
     createTakoformV2Engine({
       sql,
       now,
-      leaseMilliseconds: 1_000,
+      ...(lease.leaseMilliseconds === undefined
+        ? {}
+        : { leaseMilliseconds: lease.leaseMilliseconds }),
       replayWindowSeconds: 3600,
       authorize: async () => true,
       forms: { ...baseForms, [WORKER_ENDPOINT_FORM_URL]: endpoint },
     });
   const engine = engineWith(endpointForm);
+  // Foundation Forms are identical on every Host modeled here. Bootstrap them
+  // through the real shared SQL queue with the normal Engine lease; keep the
+  // subject Engines' one-second leases and explicit retry advances unchanged.
+  const foundationEngine = engineWith(
+    endpointForm,
+    options.foundationLeaseMilliseconds === undefined
+      ? {}
+      : { leaseMilliseconds: options.foundationLeaseMilliseconds },
+  );
   return {
     db,
     sql,
     engine,
+    foundationEngine,
     endpointForm,
     engineWith,
     ownerCalls,
+    assetSpec,
     advance(ms: number) {
       clockOffsetMs += ms;
     },
@@ -203,13 +232,14 @@ function harness() {
           key: `create-${name}-key-0001`,
           input: { form, space: SPACE, name, spec },
         });
-        expect(await target.runNext()).toMatchObject({ id: accepted.id, status: "succeeded" });
+        expect(await foundationEngine.runNext()).toMatchObject({
+          id: accepted.id,
+          status: "succeeded",
+        });
         return accepted.resourceUid;
       };
       workerUid = await created(MODULE_WORKER_FORM_URL, "worker", {});
-      const asset = await created(STATIC_ASSET_BUNDLE_FORM_URL, "assets", {
-        artifact: { url: manifestUrl, sha256: hex(manifestBytes) },
-      });
+      const asset = await created(STATIC_ASSET_BUNDLE_FORM_URL, "assets", assetSpec);
       const versionUid = await created(WORKER_VERSION_FORM_URL, "version", {
         worker: { resourceUid: workerUid },
         handlers: [],
@@ -263,6 +293,42 @@ async function settleAll(h: Harness, engine: Engine, ids: readonly string[]) {
   }
   throw new Error("Operations did not settle");
 }
+
+test("Endpoint ordering foundations retain completion across bounded asset-read work", async () => {
+  const h = harness({ assetReadDelayMs: 2_100 });
+  try {
+    await h.foundations();
+    expect(h.ownerCalls).toEqual([]);
+  } finally {
+    h.close();
+  }
+});
+
+test("Endpoint ordering fixture still refuses completion after an explicit short asset lease expires", async () => {
+  const h = harness({ assetReadDelayMs: 2_100, foundationLeaseMilliseconds: 1_000 });
+  try {
+    const accepted = await accept(
+      h.foundationEngine,
+      STATIC_ASSET_BUNDLE_FORM_URL,
+      "expiring-assets",
+      h.assetSpec,
+    );
+    expect(await h.foundationEngine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+      effect: "unknown",
+      error: { code: "outcome_unconfirmed" },
+    });
+    const resource = await h.engine.getResource({
+      principal: PRINCIPAL,
+      uid: accepted.resourceUid,
+    });
+    expect(resource.observed.ready).not.toBe(true);
+    expect(h.ownerCalls).toEqual([]);
+  } finally {
+    h.close();
+  }
+});
 
 test("self-host admits only one live or pending WorkerDeployment per Worker", async () => {
   const h = harness();
