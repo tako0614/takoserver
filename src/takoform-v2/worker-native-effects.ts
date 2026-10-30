@@ -1,6 +1,11 @@
 import { canonicalJson } from "../json.ts";
 import type { Clock, Sql, SqlParam } from "../ports.ts";
-import { WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  isForwardFamilyWorkerVersionForm,
+} from "./forms/container-consumer-specs.ts";
+import { FORWARD_WORKER_VERSION_FORM_URL, WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
+import { forwardWorkerNativeSchemaReady } from "./forward-worker-native-schema.ts";
 import type { V2Execution } from "./types.ts";
 import { v2WorkerNativeIdentityDomainReady } from "./worker-native-identity-schema.ts";
 
@@ -68,9 +73,9 @@ const CLAIM = `op.id = ? AND op.resource_uid = ? AND op.principal = ?
   AND r.busy_operation = op.id AND r.deleted_at IS NULL
   AND r.spec_json = op.accepted_spec_json`;
 
-function validIdentity(value: V2NativeEffectIdentity): boolean {
+function validIdentity(value: V2NativeEffectIdentity, form: string): boolean {
   return (
-    value.execution.form === WORKER_VERSION_FORM_URL &&
+    value.execution.form === form &&
     (value.execution.action === "create" || value.execution.action === "update") &&
     typeof value.nativeIdentity === "string" &&
     value.nativeIdentity.length >= 1 &&
@@ -126,14 +131,67 @@ export function createV2NativeEffectCustody(options: {
   /** Source-selected physical domain seal, evaluated inside the existing send grant. */
   readonly requiredNativeIdentityDomain?: "opaque255";
 }): V2NativeEffectCustody {
-  const { sql, requiredNativeIdentityDomain } = options;
+  const { requiredNativeIdentityDomain } = options;
   if (requiredNativeIdentityDomain !== undefined && requiredNativeIdentityDomain !== "opaque255")
     throw new TypeError("unsupported required v2 Worker native identity domain");
   const requiredDomainSuffix =
     requiredNativeIdentityDomain === undefined
       ? ""
       : ` AND ${v2WorkerNativeIdentityDomainReady(requiredNativeIdentityDomain)}`;
+  return createNativeEffectCustody(options, WORKER_VERSION_FORM_URL, requiredDomainSuffix);
+}
+
+/** Retained WV0.5 sender after 106; the historical factory retains its exact SQL. */
+export function createRetainedV2NativeEffectCustody(options: {
+  readonly sql: Sql;
+  readonly now?: Clock;
+}): V2NativeEffectCustody {
+  return createNativeEffectCustody(
+    options,
+    WORKER_VERSION_FORM_URL,
+    ` AND ${forwardWorkerNativeSchemaReady()}`,
+  );
+}
+
+/** Source-selected Forward WV0.7 custody; grant SQL repeats the exact 106 physical seal. */
+export function createForwardV2NativeEffectCustody(options: {
+  readonly sql: Sql;
+  readonly now?: Clock;
+}): V2NativeEffectCustody {
+  return createNativeEffectCustody(
+    options,
+    FORWARD_WORKER_VERSION_FORM_URL,
+    ` AND ${forwardWorkerNativeSchemaReady()}`,
+  );
+}
+
+/**
+ * Source-selected WV0.8 custody: the 0.7 native identity/receipt ABI under its own Form.
+ *
+ * FAILS CLOSED against the installed 106 forward native schema: its insert guard admits only
+ * WorkerVersion 0.5.0 / 0.7.0, so a grant for a 0.8.0 Version throws at the insert guard until a
+ * successor schema widens those domains together with the readiness predicate every forward
+ * custody repeats. Deliberately not exported from the package barrel; a test pins the refusal.
+ */
+export function createContainerConsumerV2NativeEffectCustody(options: {
+  readonly sql: Sql;
+  readonly now?: Clock;
+}): V2NativeEffectCustody {
+  return createNativeEffectCustody(
+    options,
+    CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+    ` AND ${forwardWorkerNativeSchemaReady()}`,
+  );
+}
+
+function createNativeEffectCustody(
+  options: { readonly sql: Sql; readonly now?: Clock },
+  form: string,
+  requiredDomainSuffix: string,
+): V2NativeEffectCustody {
+  const { sql } = options;
   const now = options.now ?? (() => new Date());
+  const receiptReadySuffix = isForwardFamilyWorkerVersionForm(form) ? requiredDomainSuffix : "";
 
   function currentTime(): number | null {
     const value = now().getTime();
@@ -141,14 +199,14 @@ export function createV2NativeEffectCustody(options: {
   }
 
   async function currentClaim(identity: V2NativeEffectIdentity): Promise<boolean> {
-    if (!validIdentity(identity)) return false;
+    if (!validIdentity(identity, form)) return false;
     const nowMs = currentTime();
     if (nowMs === null) return false;
     return (
       (
         await sql.query(
           `SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
-         WHERE ${CLAIM} LIMIT 1`,
+         WHERE ${CLAIM}${receiptReadySuffix} LIMIT 1`,
           claimParams(identity.execution, nowMs),
         )
       ).length === 1
@@ -176,7 +234,7 @@ export function createV2NativeEffectCustody(options: {
            AND op.accepted_spec_json = ?
            AND r.principal = ? AND r.space = ? AND r.name = ?
            AND r.form_url = ? AND r.backend_id = ? AND r.target_key = ?
-         LIMIT 1`,
+         ${receiptReadySuffix} LIMIT 1`,
           [
             e.operationId,
             e.resourceUid,
@@ -203,7 +261,7 @@ export function createV2NativeEffectCustody(options: {
     identity: V2NativeEffectIdentity & { readonly receipt: string },
     column: "acknowledged_receipt" | "confirmed_receipt",
   ): Promise<boolean> {
-    if (!validIdentity(identity) || typeof identity.receipt !== "string") return false;
+    if (!validIdentity(identity, form) || typeof identity.receipt !== "string") return false;
     if (identity.receipt.length < 1 || identity.receipt.length > 255) return false;
     const other = column === "acknowledged_receipt" ? "confirmed_receipt" : "acknowledged_receipt";
     const e = identity.execution;
@@ -217,7 +275,7 @@ export function createV2NativeEffectCustody(options: {
            SELECT 1 FROM tf_v2_operations op
            WHERE op.id = tf_v2_worker_native_effects.operation_id
              AND op.accepted_spec_json = ? AND op.action = ?
-         )`,
+         )${receiptReadySuffix}`,
       [
         identity.receipt,
         e.operationId,
@@ -247,7 +305,7 @@ export function createV2NativeEffectCustody(options: {
 
   return {
     async grant(identity) {
-      if (!validIdentity(identity)) return "conflict";
+      if (!validIdentity(identity, form)) return "conflict";
       const nowMs = currentTime();
       if (nowMs === null) return "conflict";
       const e = identity.execution;

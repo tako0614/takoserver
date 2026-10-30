@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 // Ordinary bun test also uses a dedicated process: fixture mock.module calls
 // cannot replace real Root imports in unrelated product tests.
-test("request-owned R1 consumer runs all twenty-four external-origin scenarios in isolation", async () => {
+test("request-owned R1 consumer runs all twenty-five external-origin scenarios in isolation", async () => {
   const child = Bun.spawn({
     cmd: [
       process.execPath,
@@ -32,15 +32,15 @@ test("request-owned R1 consumer runs all twenty-four external-origin scenarios i
     exit: 0,
     diagnostics: "",
   });
-  expect(stderr).toMatch(/(?:^|\n)\s*24 pass\s*(?:\n|$)/u);
+  expect(stderr).toMatch(/(?:^|\n)\s*25 pass\s*(?:\n|$)/u);
   expect(stderr).toMatch(/(?:^|\n)\s*0 fail\s*(?:\n|$)/u);
-  expect(stderr.match(/^\(pass\) /gmu)).toHaveLength(24);
+  expect(stderr.match(/^\(pass\) /gmu)).toHaveLength(25);
   const childExpect = Number(/(\d+) expect\(\) calls/u.exec(stderr)?.[1]);
   expect(Number.isSafeInteger(childExpect) && childExpect > 0).toBe(true);
   console.info(
     JSON.stringify({
       scope: "isolated external-Root R1 fixture",
-      pass: 24,
+      pass: 25,
       fail: 0,
       expect: childExpect,
     }),

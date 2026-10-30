@@ -280,6 +280,29 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 There is no in-place route from an existing 0088/0089 D1 to this lineage. A
 new generation replaces it, and the old D1 stays protected history.
 
+#### Retaining predecessor shared staging origins (0108)
+
+The integration-only `--through-migration=0108` schema step accepts only an
+exact installed 0107 predecessor. Its pinned ten-statement recipe adds an
+immutable origin-history table and non-reuse triggers. Existing Auth103 and
+0104–0107 source artifacts keep their original bytes and digests. A foreign
+shape, temporary shadow, changed recipe or repeated application is refused.
+
+This schema step imports no predecessor records and creates no route authority.
+The trusted SQL `createSharedAppStagingOriginHistory` composition retains exact
+nonsecret ownership metadata before new names are allocated. An old active
+origin keeps its original active state and owner; tombstones remain permanently
+unavailable. The original JSON is stored byte-for-byte. Conflicting metadata,
+destination assignments and legacy origin aliases refuse instead of replacing
+either owner. A destination conflict needs its existing owner's disposition;
+this component has no reassignment or deletion operation.
+
+Retention only excludes new allocations. It does not create an Organization,
+reservation, incarnation or active route, and does not prove a complete census,
+old-writer drain or physical cutover. Those require the actual source originals
+and each physical/product owner's selection. Schema/source verification does
+not authorize applying this step to a protected database or switching a route.
+
 #### Money-preserved serving D1 through 0100 (staging-only `v2-0100-money-preserved`)
 
 `--fresh-lineage=v2-0100-money-preserved` creates a new staging D1 with the

@@ -1,5 +1,6 @@
 import { canonicalJson } from "../json.ts";
 import type { Clock, Sql } from "../ports.ts";
+import { CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL } from "./forms/container-consumer-specs.ts";
 import {
   parseWorkerCronTriggerSpec,
   validateWorkerCronTriggerUpdate,
@@ -82,9 +83,18 @@ export function createWorkerCronTriggerAdmissionReader(options: AdmissionReaderO
 export function createForwardWorkerCronTriggerAdmissionReader(options: AdmissionReaderOptions) {
   return createAdmissionReader(options, FORWARD_WORKER_DEPLOYMENT_FORM_URL);
 }
+/** Exact WorkerDeployment 0.7.0 claim reader; the same inventory and currentness code. */
+export function createContainerConsumerWorkerCronTriggerAdmissionReader(
+  options: AdmissionReaderOptions,
+) {
+  return createAdmissionReader(options, CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL);
+}
 function createAdmissionReader(
   options: AdmissionReaderOptions,
-  form: typeof WORKER_DEPLOYMENT_FORM_URL | typeof FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  form:
+    | typeof WORKER_DEPLOYMENT_FORM_URL
+    | typeof FORWARD_WORKER_DEPLOYMENT_FORM_URL
+    | typeof CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
 ) {
   const now = options.now ?? (() => new Date());
 

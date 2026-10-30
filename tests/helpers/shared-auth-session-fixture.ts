@@ -1,6 +1,7 @@
 import { Miniflare } from "miniflare";
 import { createSharedAuthSessionStore } from "../../src/shared-auth-session-store.ts";
 import { createD1Sql, type D1DatabaseLike } from "../../src/sql-d1.ts";
+import type { FixturePhase } from "./native-fixture-phase.ts";
 
 // TEST-ONLY proposed additive storage contract. These literals exercise real
 // D1 SQL/CAS without adopting a migration number, touching the schema owner, or
@@ -54,7 +55,17 @@ export const SHARED_AUTH_TEST_ONLY_DDL = [
    BEGIN SELECT RAISE(ABORT, 'shared auth revocation identity is immutable'); END`,
 ];
 
-export async function createSharedAuthSessionStoreD1Fixture() {
+export async function createSharedAuthSessionStoreD1Fixture(
+  recordPhase?: (phase: FixturePhase) => void,
+) {
+  const phase = (name: FixturePhase) => {
+    try {
+      recordPhase?.(name);
+    } catch {
+      // Diagnostic sinks cannot change fixture creation, SQL or cleanup results.
+    }
+  };
+  phase("d1_engine_begin");
   const runtime = new Miniflare({
     workers: [
       {
@@ -79,12 +90,21 @@ export async function createSharedAuthSessionStoreD1Fixture() {
   });
   try {
     const database = await runtime.getD1Database("AUTH_DB");
+    phase("d1_engine_ready");
     // Composition, rather than the vendor-neutral store, chooses primary reads.
     const sql = createD1Sql(database.withSession("first-primary") as unknown as D1DatabaseLike);
-    for (const statement of SHARED_AUTH_TEST_ONLY_DDL) await sql.run(statement);
+    phase("d1_schema_begin");
+    let completed = 0;
+    for (const statement of SHARED_AUTH_TEST_ONLY_DDL) {
+      await sql.run(statement);
+      if (++completed === 1) phase("d1_first_schema_ready");
+    }
+    phase("d1_schema_ready");
     return { runtime, sql, store: createSharedAuthSessionStore(sql) };
   } catch (error) {
+    phase("d1_failed_setup_dispose_begin");
     await runtime.dispose();
+    phase("d1_failed_setup_dispose_ready");
     throw error;
   }
 }

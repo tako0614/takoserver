@@ -4,11 +4,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import type { Sql } from "../src/ports.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2WorkerQueueSettlement } from "../src/takoform-v2/worker-queue-settlement.ts";
+import { writeMigratedDatabaseFile } from "./helpers/migrated-database.ts";
 
 const queue = { queueId: "queue-one", messageRetentionSeconds: 3600, deliveryDelaySeconds: 0 };
 const consumer = {
@@ -309,8 +309,8 @@ test("lost SQL acknowledgement is read back by exact call token and retained acr
   let database: Database | undefined;
   try {
     const path = join(directory, "state.sqlite");
+    writeMigratedDatabaseFile(path);
     database = new Database(path);
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const durableSql = createSqliteSql(database);
     let loseAck = false;
     const sql: Sql = {

@@ -7,6 +7,10 @@ import type {
 } from "../worker-module-inspection-contract.ts";
 import type { SqlArtifactCustodyRead } from "./forms/artifact-custody.ts";
 import {
+  type ForwardFamilyWorkerVersionFormUrl,
+  isForwardFamilyWorkerVersionForm,
+} from "./forms/container-consumer-specs.ts";
+import {
   type ObjectBucketBindingForm,
   snapshotObjectBucketBindingForms,
 } from "./forms/object-bucket-binding-profile.ts";
@@ -17,11 +21,7 @@ import {
   type WorkerBundleManifest,
   type WorkerBundleMediaType,
 } from "./forms/worker-bundle.ts";
-import {
-  FORWARD_WORKER_VERSION_FORM_URL,
-  parseForwardWorkerVersionSpec,
-  parseWorkerVersionSpec,
-} from "./forms/worker-specs.ts";
+import { parseForwardWorkerVersionSpec, parseWorkerVersionSpec } from "./forms/worker-specs.ts";
 import {
   type V2VerifiedAssetMaterials,
   verifyV2AssetMaterials,
@@ -123,8 +123,8 @@ export interface V2WorkerCodeEligibilityInput {
   readonly bundleResourceUid?: string;
   readonly assetResourceUid?: string;
   readonly spec: unknown;
-  /** Set only by the exact07 held-material resolver; this is compiler metadata. */
-  readonly sourceForm?: typeof FORWARD_WORKER_VERSION_FORM_URL;
+  /** Set only by the exact forward-family held-material resolver; this is compiler metadata. */
+  readonly sourceForm?: ForwardFamilyWorkerVersionFormUrl;
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: V2WorkerModuleInspector;
@@ -216,10 +216,10 @@ async function verifyV2WorkerCodeProjection(
   }
   let spec: ReturnType<typeof parseWorkerVersionSpec>;
   try {
-    if (input.sourceForm !== undefined && input.sourceForm !== FORWARD_WORKER_VERSION_FORM_URL)
+    if (input.sourceForm !== undefined && !isForwardFamilyWorkerVersionForm(input.sourceForm))
       throw versionUnavailable();
     spec =
-      input.sourceForm === FORWARD_WORKER_VERSION_FORM_URL
+      input.sourceForm !== undefined
         ? parseForwardWorkerVersionSpec(structuredClone(input.spec))
         : parseWorkerVersionSpec(structuredClone(input.spec));
     if (input.sourceForm && parseForwardWorkerVersionSpec(spec).containerBindings.length)
@@ -328,7 +328,7 @@ async function verifyV2WorkerCodeProjection(
   const sqliteBoot = snapshotSqliteBoot(input.sqliteBoot);
   const objectBucketBindings = snapshotResolvedObjectBucketBindings(
     input.resolvedObjectBucketBindings,
-    input.sourceForm === FORWARD_WORKER_VERSION_FORM_URL,
+    input.sourceForm !== undefined,
   );
   const objectBucketBoot = snapshotObjectBucketBoot(input.objectBucketBoot);
   const kvBindings = snapshotResolvedKvBindings(input.resolvedKvBindings);

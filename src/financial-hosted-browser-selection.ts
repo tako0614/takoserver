@@ -8,6 +8,7 @@ import {
   parseHostedBrowserBillingScope,
   sameHostedBrowserBillingScope,
 } from "./financial-hosted-browser-continuation.ts";
+import { MAX_JSON_REQUEST_BODY_BYTES, readBoundedRequestBody } from "./request-body.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import type { SharedAuthSession } from "./shared-auth-session.ts";
 import { parseStrictJson } from "./strict-json.ts";
@@ -340,8 +341,13 @@ export async function createFinancialHostedBrowserSelection(input: {
     };
     if (held.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin) unavailable();
     assertRequest(held);
-    const bytes = new Uint8Array(await request.clone().arrayBuffer());
-    const body = parseHostedBrowserBillingChoice(parseStrictJson(bytes, 64 * 1024));
+    // The re-read holds the JSON budget itself; it does not rely on the caller
+    // having bounded a sibling clone first.
+    const bytes = await readBoundedRequestBody(request.clone(), MAX_JSON_REQUEST_BODY_BYTES);
+    if (bytes === null) unavailable();
+    const body = parseHostedBrowserBillingChoice(
+      parseStrictJson(bytes, MAX_JSON_REQUEST_BODY_BYTES),
+    );
     assertRequest(held);
     if (JSON.stringify(body) !== JSON.stringify(choice)) unavailable();
     await readCurrent(held);

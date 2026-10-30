@@ -1039,6 +1039,117 @@ It refuses composition before restoration or after owner suspension; a closed
 boot cannot supply a positive TLS witness. This resolves the composition cycle
 without adding another frontend or Resource ledger.
 
+## Host-private parent-bound Container I/O originals
+
+The additive `takoserver.container-parent-io-binding@1` and
+`takoserver.container-parent-io-original@1` source contracts describe **one child
+HTTP I/O attempt** for WorkerVersion 0.7.0 / Container 0.1.0. They do not change
+those Forms, their frozen definitions, existing RPC methods or default dispatch.
+This first contract refuses WorkerVersion 0.8.0 and Container 0.2.0 by exact
+Form URL. It does not inspect or qualify native schema 0106; that source/apply
+work remains separate and on hold.
+
+The Core qualifier captures the exact accepted parent invocation/custody and full
+Worker selection, then compares the durable parent row and the source-selected
+accepted-binding/native-owner authorization before and after asynchronous hashing.
+The binding contains domain-separated custody and selection digests; plaintext
+custody tokens are not persisted in it. It also fixes the Host-issued one-use
+child producer ID, binding name, accepted target Form/UID/generation/operation,
+provider installation, physical incarnation, serving revision and owner identity.
+The qualified bytes are data, not a transferable admission grant. `authorize`
+must also verify Host issuance of the child producer ID; the private journal
+enforces one-use with durable CAS. The Host must issue unpredictable custody
+tokens with at least 128 bits of entropy: the unkeyed custody digest is not a
+password-hiding mechanism. The currentness closure retains plaintext custody in
+Host memory only and must never be logged, serialized or exposed through RPC.
+Body finished/canceled and independent SQLite drain states neither retire the
+parent nor authorize new Container I/O. Actual native caller currentness and
+closed-admission fencing belong to the source-selected owner authorization.
+The producer
+must recheck the captured currentness port after durable pending admission and
+before native dispatch. These checks do not make two owners' actions atomic.
+
+`decodeV2ContainerParentIoBinding` exposes the existing closed canonical/hash
+validation as a content-only decoder. It returns a detached, deeply immutable
+parent-digest/target scope or null, without contacting an owner or checking live
+currentness. A caller can self-hash arbitrary well-shaped content, so decoded
+owner/target fields must not select an authority from unverified input. The fixed
+Host composition must verify issuer, accepted parent, target and child issuance
+through its existing trusted source channels before admission. Retained bindings
+remain decodable after parent retirement; decoding does not grant a new send or
+prove an original. The original reader uses this same decoder before invoking
+its fixed trusted owner reader.
+
+The private owner must commit pending before physical entry, refuse replay of an
+existing attempt, and record a positive immutable original only after its owned
+raw fetch settles, upload reaches its defined terminal EOF and raw response
+reaches EOF or a genuine null body, with no abort, error or uncertain work.
+Outer response filtering, cancellation/disposal acknowledgements, borrow release,
+Tail, local counters and empty maps cannot establish this fact. The existing
+owner's durable storage must preserve a committed original across restart;
+unresolved prior-epoch attempts become unknown and stale callbacks cannot settle
+the successor epoch. Core supplies a closed version/shape, exact-binding and
+content-digest validator through a **fixed trusted owner readback port**. The
+hash authenticates neither issuer nor durability. Synthetic contract tests do
+not qualify the private journal, Container execution or a live provider.
+
+Readback distinguishes absent, pending, unknown and complete. Missing or malformed
+originals, wrong scope and unreadable acknowledgements remain nonpositive. A
+complete child original proves only that exact transport attempt. Parent
+retirement or Deployment DELETE additionally requires durable inventory of all
+children, a closed-admission seal, aggregation of every admitted attempt and the
+existing native retirement/currentness proofs. This source addition supplies no
+parent-complete verdict, retirement grant or physical qualification.
+
+`createV2ContainerParentIoInventory` supplies an additive Host-private durable
+child-set protocol through fixed custody/authorization/original-reader ports and
+the existing owner's transactional KV. It must open the parent before native
+dispatch and commit a distinct Host-issued child intent and exact binding before
+each physical invocation. It stores digest scopes and exact owner/revision
+locators, never plaintext custody or the currentness closure. Each issuance
+returns the same qualifier's Host-memory currentness check, which also refuses
+after the set is sealed or its physical owner's epoch changes. A dropped reply
+does not remove the admitted intent or authorize a resend.
+
+Sealing atomically closes new child admission. Reading a sealed set validates
+every retained binding and its own fixed-owner original; absent, pending,
+unknown, malformed, unreadable and unbound attempts remain nonpositive. Reads
+may report `absent` for a missing set or for a retained child's absent original;
+that state never means the set is empty or that no physical attempt occurred.
+Reads
+page the child rows without imposing a child-count admission limit. A successor
+epoch fences old callbacks and readers. Construct the inventory once per physical
+owner and retain that instance; even an extra reader construction advances the
+epoch and fences the live issuer. The original `open` and `seal` methods cannot
+reopen or seal an unsealed prior-epoch set. A previously sealed set can be read
+through its retained exact owner locators. These records do not share the
+independent SQLite external-use ledger or its alarm domain.
+
+The explicit `sealAfterNativeRetirement(parent)` recovery method can close an
+existing current- or prior-epoch set only when the fixed Core parent reader
+matches the full custody and selection and supplies the same valid native
+retirement before and after sealing. The current physical owner epoch must still
+match. Recovery preserves the set's original epoch, full child count and all
+unresolved intents; it cannot manufacture a missing set, replay a child or
+supply its I/O original. The caller cannot provide a retirement DTO. A `false`
+acknowledgement may still leave the durable set sealed, for example after a
+committed write whose acknowledgement was lost or a changed final parent read.
+Neither that side effect nor a positive closed-set read proves parent retirement:
+every consumer must independently reassert native retirement, complete source
+coverage and every child's fixed-owner original. The method closes admission
+only and does not release a process or authorize Deployment DELETE.
+
+`sealed_io_complete` reports only all registered children's transport I/O. Even
+a sealed zero-child set requires a durable pre-dispatch open. Before this can
+gate parent release, the private composition must prove that every possible
+Container entry path participates and must independently verify the genuine
+native parent retirement. This library neither mounts that composition nor
+issues a parent/process retirement or Deployment DELETE grant. Private actor
+gating, complete source-path coverage and the genuine Host-to-native currentness
+bridge remain separate source work; live/native physical qualification remains
+separate as well. In-memory storage-port tests do not qualify platform KV
+durability or native Container execution.
+
 ## Existing installations
 
 The additive v2 tables do not convert or delete existing v1 records. Keeping

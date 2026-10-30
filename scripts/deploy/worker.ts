@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { canonicalJson } from "../../src/json.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import {
   applicationSchemaMatches,
   deriveExpectedApplicationShape,
@@ -11,6 +12,7 @@ import {
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
 import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
+import { verifySelectedAuth103WorkerModules } from "./auth103-original-worker-modules.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -44,6 +46,7 @@ import {
   readMoneyUnitPolicy,
   stripeWebhookSchemaReady,
 } from "./migrations.ts";
+import { runOwnerGateWithTransientOutputs } from "./owner-gate-outputs.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -97,6 +100,7 @@ import {
   LEGACY_UNATTRIBUTED_PREDECESSOR,
   type WorkerState,
   type WorkerVersionAuthoritySelection,
+  workerVersionIdentity,
 } from "./worker-live.ts";
 
 export interface WorkerMigrationReader {
@@ -278,7 +282,10 @@ export function workerSchemaAllowsPending(
     (migrations.local.length === 100 ||
       migrations.local.length === 103 ||
       migrations.local.length === 104 ||
-      migrations.local.length === 105)
+      migrations.local.length === 105 ||
+      migrations.local.length === 106 ||
+      migrations.local.length === 107 ||
+      migrations.local.length === 108)
   ) {
     return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }
@@ -291,7 +298,10 @@ export function workerSchemaAllowsPending(
     workerMoneyPreservedTarget(target) &&
     (migrations.applied.length === 103 ||
       migrations.applied.length === 104 ||
-      migrations.applied.length === 105)
+      migrations.applied.length === 105 ||
+      migrations.applied.length === 106 ||
+      migrations.applied.length === 107 ||
+      migrations.applied.length === 108)
   ) {
     return financial0104SourceSchemaReady(
       migrations,
@@ -454,10 +464,14 @@ export function workerSelectedPendingMigrations(
       source.dispose();
     }
   }
-  // The separate Root post-Auth103 chain (Financial0104, then Root0105) of that
+  // The separate Root post-Auth103 chain (Financial0104 through Shared0107) of that
   // same exact103.
   if (
-    (migrations.applied.length === 104 || migrations.applied.length === 105) &&
+    (migrations.applied.length === 104 ||
+      migrations.applied.length === 105 ||
+      migrations.applied.length === 106 ||
+      migrations.applied.length === 107 ||
+      migrations.applied.length === 108) &&
     target.environment === "integration" &&
     target.artifactBlobIoMode === undefined &&
     (target.schemaMaintenanceMode === undefined ||
@@ -484,13 +498,34 @@ export function workerMoneyUnitSchemaReady(
     migrations.local.length === 103 ||
     migrations.local.length === 104 ||
     migrations.local.length === 105 ||
+    migrations.local.length === 106 ||
+    migrations.local.length === 107 ||
+    migrations.local.length === 108 ||
     (migrations.local.length === 100 && migrations.applied.length === 103) ||
     ((migrations.local.length === 100 || migrations.local.length === 103) &&
       migrations.applied.length === 104) ||
     ((migrations.local.length === 100 ||
       migrations.local.length === 103 ||
       migrations.local.length === 104) &&
-      migrations.applied.length === 105)
+      migrations.applied.length === 105) ||
+    ((migrations.local.length === 100 ||
+      migrations.local.length === 103 ||
+      migrations.local.length === 104 ||
+      migrations.local.length === 105) &&
+      migrations.applied.length === 106) ||
+    ((migrations.local.length === 100 ||
+      migrations.local.length === 103 ||
+      migrations.local.length === 104 ||
+      migrations.local.length === 105 ||
+      migrations.local.length === 106) &&
+      migrations.applied.length === 107) ||
+    ((migrations.local.length === 100 ||
+      migrations.local.length === 103 ||
+      migrations.local.length === 104 ||
+      migrations.local.length === 105 ||
+      migrations.local.length === 106 ||
+      migrations.local.length === 107) &&
+      migrations.applied.length === 108)
   ) {
     // The ordinary and Money-preserved post-103 shapes, as 0094 and 0094-fenced
     // below; the publication profile itself is bound by workerSchemaAllowsPending.
@@ -655,6 +690,29 @@ export async function runWorker(
   }
   if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
     throw preflightError("Worker maintenance selectors conflict");
+  }
+  const freshAuth103Source =
+    target.auth103NativeProfile === "root-shared-auth-staging-v1" &&
+    target.schemaMaintenanceMode === "pre-auth103-quiesced" &&
+    target.moneyCutoverWriterPolicy === undefined;
+  if (freshAuth103Source) {
+    const selectedHost = new URL(SHARED_AUTH_STAGING_PROFILE.publicOrigin).hostname;
+    if (
+      target.environment !== "integration" ||
+      target.takoformV2?.storageLineage !== "v2-0100" ||
+      target.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
+      target.workerName !== selectedHost.split(".")[0]
+    ) {
+      throw preflightError(
+        "fresh Auth103 Worker requires its exact selected Root origin and v2-0100 source",
+      );
+    }
+    if (
+      invocation.action === "apply" &&
+      invocation.surface !== "takoserver-worker-authority-cutover"
+    ) {
+      throw preflightError("fresh Auth103 Worker forward requires reviewed authority cutover");
+    }
   }
   if (invocation.legacyPredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
@@ -838,6 +896,20 @@ export async function runWorker(
     }
 
     if (invocation.action === "status") {
+      if (freshAuth103Source) {
+        await inspectSelectedAuth103WorkerModules("preflight", target, state, before);
+        const current = await inspectWorker("preflight", target, state, migrations, {
+          sourceRepositoryRoot,
+          ...(beforeAuthorityProfile === undefined
+            ? {}
+            : { authorityProfile: beforeAuthorityProfile }),
+        });
+        assertWorkerInspectionUnchanged(
+          before,
+          current,
+          "selected Auth103 Worker changed during historical module verification",
+        );
+      }
       const moneyServingProbe =
         target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
         target.schemaMaintenanceMode === undefined &&
@@ -973,12 +1045,38 @@ export async function runWorker(
       );
     }
 
-    await checked(run, "preflight", "scoped owner gate `bun run check`", ["bun", "run", "check"]);
+    const selectedTestWorkers = process.env.TAKOSERVER_TEST_WORKERS;
+    if (selectedTestWorkers !== undefined && !/^[1-9][0-9]?$/u.test(selectedTestWorkers)) {
+      throw preflightError("TAKOSERVER_TEST_WORKERS must be a worker count from 1 to 99");
+    }
+    const ownerGate = () =>
+      checked(
+        run,
+        "preflight",
+        "scoped owner gate `bun run check`",
+        ["bun", "run", "check"],
+        selectedTestWorkers === undefined
+          ? undefined
+          : { env: { TAKOSERVER_TEST_WORKERS: selectedTestWorkers } },
+      );
+    if (freshAuth103Source && run === runCommand) {
+      // Only this original process can enter the registered native build.
+      // Its full check must not leave generated bytes in that build's source.
+      await runOwnerGateWithTransientOutputs(REPOSITORY, root, ownerGate);
+    } else {
+      await ownerGate();
+    }
     // The owner gate can outlive a Wrangler OAuth access token (about one hour;
     // Wrangler refreshes only an already expired token). No Cloudflare read or
     // write after the gate reuses a bearer resolved before it.
     if (refreshStateAfterGate !== undefined) state = await refreshStateAfterGate();
 
+    const nativeAuth103Forward = freshAuth103Source;
+    if (nativeAuth103Forward) {
+      // Original replay can take minutes. Keep it before the existing sealed
+      // artifact and current-predecessor fence immediately ahead of upload.
+      await inspectSelectedAuth103WorkerModules("preflight", target, state, before);
+    }
     const prepared = await prepareWorkerArtifact({
       root,
       target,
@@ -988,31 +1086,35 @@ export async function runWorker(
       run,
       environment,
       ...(versionPublication ? { dryRunCommand: "versions-upload" as const } : {}),
-      writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
-        writeWorkerConfig(target, {
-          path,
-          main,
-          commit: source.commit,
-          sourceRepositoryRoot,
-          ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
-          ...(bundleDigestHex === undefined
-            ? {}
-            : { workerArtifactDigest: `sha256:${bundleDigestHex}` as const }),
-          ...(versionPublication ? { topology: "version-only" as const } : {}),
-          ...(target.integrationE2eCredentialAuthority === undefined
-            ? {}
-            : bundleDigestHex === undefined
-              ? { authorityProfile: { kind: "historical-pre-jit" as const } }
-              : {
-                  authorityProfile: {
-                    kind: "provenance-bound-jit" as const,
-                    provenance: {
-                      sourceCommit: source.commit,
-                      artifactDigest: `sha256:${bundleDigestHex}` as const,
-                    },
-                  },
-                }),
-        }),
+      ...(nativeAuth103Forward
+        ? {}
+        : {
+            writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
+              writeWorkerConfig(target, {
+                path,
+                main,
+                commit: source.commit,
+                sourceRepositoryRoot,
+                ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
+                ...(bundleDigestHex === undefined
+                  ? {}
+                  : { workerArtifactDigest: `sha256:${bundleDigestHex}` as const }),
+                ...(versionPublication ? { topology: "version-only" as const } : {}),
+                ...(target.integrationE2eCredentialAuthority === undefined
+                  ? {}
+                  : bundleDigestHex === undefined
+                    ? { authorityProfile: { kind: "historical-pre-jit" as const } }
+                    : {
+                        authorityProfile: {
+                          kind: "provenance-bound-jit" as const,
+                          provenance: {
+                            sourceCommit: source.commit,
+                            artifactDigest: `sha256:${bundleDigestHex}` as const,
+                          },
+                        },
+                      }),
+              }),
+          }),
     });
     const { bundlePath, configPath, bundleDigestHex } = prepared;
     const artifact = prepared.seal();
@@ -1159,6 +1261,10 @@ export async function runWorker(
             "deploy",
             bundlePath,
             "--no-bundle",
+            // Wrangler still allocates a build directory with --no-bundle.
+            // Keep it outside the closed source needed by post-upload replay.
+            "--outdir",
+            join(root, "upload"),
             "--config",
             configPath,
             "--strict",
@@ -1208,6 +1314,9 @@ export async function runWorker(
     }
     if (after.commit !== source.commit || after.bundleDigestHex !== bundleDigestHex) {
       throw verificationError("served Worker annotation does not identify the sealed upload");
+    }
+    if (freshAuth103Source) {
+      await inspectSelectedAuth103WorkerModules("verification", target, state, after);
     }
     if (!workerSchemaAllowsPending(target, after.migrations, sourceRepositoryRoot)) {
       throw verificationError("Worker publication left pending D1 migrations");
@@ -1260,6 +1369,13 @@ export async function runWorker(
                 target.publicOrigin,
                 options.fetcher ?? ((input, init) => fetch(input, init)),
               );
+    if (freshAuth103Source) {
+      const final = await inspectWorker("verification", target, state, migrations, {
+        sourceRepositoryRoot,
+        ...(afterAuthorityProfile === undefined ? {} : { authorityProfile: afterAuthorityProfile }),
+      });
+      assertAuth103PostUploadCurrent(after, final);
+    }
     return {
       kind: "takoserver.worker-apply@v2",
       surface: invocation.surface,
@@ -1461,6 +1577,21 @@ function assertWorkerInspectionUnchanged(
   }
 }
 
+export function assertAuth103PostUploadCurrent(
+  expected: Pick<WorkerInspection, "history" | "commit" | "bundleDigestHex">,
+  actual: Pick<WorkerInspection, "history" | "commit" | "bundleDigestHex">,
+): void {
+  if (
+    actual.history.deploymentId !== expected.history.deploymentId ||
+    actual.history.versionId !== expected.history.versionId ||
+    actual.history.previousVersionId !== expected.history.previousVersionId ||
+    actual.commit !== expected.commit ||
+    actual.bundleDigestHex !== expected.bundleDigestHex
+  ) {
+    throw verificationError("Auth103 Worker changed after module proof and serving probe");
+  }
+}
+
 async function requireDistinctIntegrationE2eSigningIdentity(
   target: DeployTarget,
   database: Pick<SigningDatabase, "readKey">,
@@ -1517,6 +1648,44 @@ async function inspectWorker(
     }
     throw verificationError("Worker post-mutation authoritative inspection failed");
   }
+}
+
+async function inspectSelectedAuth103WorkerModules(
+  phase: "preflight" | "verification",
+  target: DeployTarget,
+  state: WorkerState,
+  inspection: WorkerInspection,
+): Promise<void> {
+  if (
+    inspection.commit === null ||
+    inspection.bundleDigestHex === null ||
+    state.workerVersionWithModules === undefined
+  ) {
+    throw phase === "preflight"
+      ? preflightError("selected Auth103 Worker has no exact module readback")
+      : verificationError("selected Auth103 Worker has no exact module readback");
+  }
+  const version = await state.workerVersionWithModules(
+    target.workerName,
+    inspection.history.versionId,
+  );
+  const identity = workerVersionIdentity(phase, version);
+  if (
+    identity.commit !== inspection.commit ||
+    identity.bundleDigestHex !== inspection.bundleDigestHex
+  ) {
+    throw phase === "preflight"
+      ? preflightError("selected Auth103 module readback differs from its inspected Version")
+      : verificationError("selected Auth103 module readback differs from its inspected Version");
+  }
+  verifySelectedAuth103WorkerModules(
+    phase,
+    target,
+    identity.commit,
+    identity.bundleDigestHex,
+    version,
+    inspection.history,
+  );
 }
 
 async function inspectWorkerState(
@@ -1743,8 +1912,9 @@ async function checked(
   phase: DeployPhase,
   description: string,
   command: readonly string[],
+  options?: { readonly env: Readonly<Record<string, string>> },
 ): Promise<string> {
-  const result = await run(command);
+  const result = options === undefined ? await run(command) : await run(command, options);
   if (result.exitCode !== 0) {
     throw new DeployError(
       phase,

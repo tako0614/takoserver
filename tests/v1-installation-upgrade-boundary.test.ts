@@ -37,13 +37,18 @@ type Fixture = "empty" | "signed-in" | "used";
 function writeV1Database(path: string, fixture: Fixture, adjust?: (db: Database) => void): void {
   const database = new Database(path);
   try {
-    database.exec(readFileSync(join(FIXTURES, "schema.sql"), "utf8"));
-    database.exec(readFileSync(join(FIXTURES, `${fixture}.sql`), "utf8"));
-    // Bun's exec can stop at a failed statement without saying so; prove the
-    // fixture loaded completely before relying on it.
-    expect(recordedMigrations(database)).toEqual(V1_RELEASE_MIGRATIONS);
-    expect(count(database, "sqlite_schema")).toBe(88);
-    adjust?.(database);
+    // Install the committed fixture with one FULL durable commit. The migrator
+    // under test still runs separately on this real file with its old oracles.
+    // adjust shares this transaction; keep PRAGMAs and transaction control out.
+    database.transaction(() => {
+      database.exec(readFileSync(join(FIXTURES, "schema.sql"), "utf8"));
+      database.exec(readFileSync(join(FIXTURES, `${fixture}.sql`), "utf8"));
+      // Bun's exec can stop at a failed statement without saying so; prove the
+      // fixture loaded completely before relying on it.
+      expect(recordedMigrations(database)).toEqual(V1_RELEASE_MIGRATIONS);
+      expect(count(database, "sqlite_schema")).toBe(88);
+      adjust?.(database);
+    })();
   } finally {
     database.close();
   }

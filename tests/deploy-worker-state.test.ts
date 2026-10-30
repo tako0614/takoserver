@@ -260,6 +260,77 @@ describe("immutable Worker Version binding closure", () => {
     ).toThrow("exact selected target closure");
   });
 
+  test("Auth103 native Version binds both source provenance vars to selected commit and artifact", () => {
+    const target = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "integration-root-ga-9d9c84f4281649c884e0579d93e5c926",
+      d1: {
+        databaseName: "integration-takoserver-9d9c84f4281649c884e0579d93e5c926",
+        databaseId: "database-id",
+      },
+      r2: { bucketName: "integration-takoserver-9d9c84f4281649c884e0579d93e5c926" },
+      publicOrigin:
+        "https://integration-root-ga-9d9c84f4281649c884e0579d93e5c926.shoutatomiyama0614.workers.dev",
+      signing: { currentKeyId: "key-current" },
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+    } satisfies DeployTarget;
+    const commit = "5d4676649e30d38594d851616dc32a82b7496eb4";
+    const artifactDigest = `sha256:${"a".repeat(64)}` as const;
+    const base = expectedExactBindingClosure(target, { workerArtifactDigest: artifactDigest });
+    const actual = expectedExactVersionFromClosure(base);
+    const bindings = [
+      ...actual.resources.bindings,
+      { name: "TAKOSERVER_SOURCE_COMMIT", type: "plain_text", text: commit },
+      { name: "TAKOSERVER_WORKER_ARTIFACT_DIGEST", type: "plain_text", text: artifactDigest },
+    ];
+    const expected = expectedExactBindingClosure(target, {
+      workerArtifactDigest: artifactDigest,
+      nativeSourceCommit: commit,
+    });
+    expect(() => expectedExactBindingClosure(target, { nativeSourceCommit: commit })).toThrow(
+      "Auth103 native source provenance is not exact",
+    );
+    expect(() =>
+      expectedExactBindingClosure(target, {
+        workerArtifactDigest: artifactDigest,
+        nativeSourceCommit: "b".repeat(39),
+      }),
+    ).toThrow("Auth103 native source provenance is not exact");
+    expect(() =>
+      assertExactVersionBindingClosure(
+        "verification",
+        "version-1",
+        { resources: { bindings } },
+        expected,
+      ),
+    ).not.toThrow();
+    for (const drifted of [
+      bindings.filter((binding) => binding.name !== "TAKOSERVER_SOURCE_COMMIT"),
+      bindings.map((binding) =>
+        binding.name === "TAKOSERVER_SOURCE_COMMIT"
+          ? { ...binding, text: "b".repeat(40) }
+          : binding,
+      ),
+      bindings.map((binding) =>
+        binding.name === "TAKOSERVER_WORKER_ARTIFACT_DIGEST"
+          ? { ...binding, text: `sha256:${"b".repeat(64)}` }
+          : binding,
+      ),
+      [...bindings, { name: "STALE_PROVENANCE", type: "plain_text", text: "unexpected" }],
+    ]) {
+      expect(() =>
+        assertExactVersionBindingClosure(
+          "verification",
+          "version-1",
+          { resources: { bindings: drifted } },
+          expected,
+        ),
+      ).toThrow();
+    }
+  });
+
   test("binds the public Version to the exact private provider executor service", () => {
     const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();
     const target = {
@@ -431,6 +502,98 @@ describe("immutable Worker Version binding closure", () => {
         expectedExactBindingClosure(target, { authorityProfile: wrongProvenance }),
       ),
     ).toThrow("binds TAKOSERVER_SOURCE_COMMIT with unexpected text");
+  });
+
+  test("Hosted supplier uses the declared one-binding transition with strict predecessor and mounted closure", () => {
+    const root = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: "runtime-db", databaseId: "database-id" },
+      r2: { bucketName: "objects" },
+      publicOrigin: "https://api.integration.example.test",
+      signing: { currentKeyId: "key-current" },
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+      hostedBrowserBillingRpc: "hosted-staging-v1",
+    } satisfies DeployTarget;
+    const targetClosure = expectedExactBindingClosure(root);
+    expect(targetClosure.ACCOUNTS_FINANCIAL_PROOF).toEqual({
+      type: "service",
+      fields: { service: "takosumi-auth-staging", entrypoint: "AccountsFinancialProof" },
+    });
+    expect(targetClosure.HOSTED_BROWSER_BILLING_RPC).toEqual({
+      type: "service",
+      fields: { service: "takosumi-hosted-staging", entrypoint: "HostedBrowserBillingEntrypoint" },
+    });
+    const mounted = expectedExactVersionFromClosure(targetClosure);
+    const predecessor = {
+      resources: {
+        bindings: mounted.resources.bindings.filter(
+          (binding) => binding.name !== "HOSTED_BROWSER_BILLING_RPC",
+        ),
+      },
+    };
+    const delta = normalizedWorkerClosureDelta({
+      retiredVars: [],
+      addedVars: [],
+      refreshedVars: [],
+      addedBindings: ["HOSTED_BROWSER_BILLING_RPC"],
+      addedSecrets: [],
+      rotatedSecrets: [],
+    });
+    const admit = (version: unknown) =>
+      assertSurfaceTransitionPredecessor("preflight", "version-old", version, {
+        delta,
+        environment: "integration",
+        targetClosure,
+      });
+    expect(() => admit(predecessor)).not.toThrow();
+    expect(() => admit(mounted)).toThrow("outside the declared delta");
+    expect(() =>
+      assertExactVersionBindingClosure("verification", "version-new", predecessor, targetClosure),
+    ).toThrow("does not declare the HOSTED_BROWSER_BILLING_RPC binding");
+    expect(() =>
+      assertExactVersionBindingClosure("verification", "version-new", mounted, targetClosure),
+    ).not.toThrow();
+    const wrong = {
+      resources: {
+        bindings: mounted.resources.bindings.map((binding) =>
+          binding.name === "HOSTED_BROWSER_BILLING_RPC"
+            ? { ...binding, service: "wrong-hosted" }
+            : binding,
+        ),
+      },
+    };
+    expect(() =>
+      assertExactVersionBindingClosure("verification", "version-new", wrong, targetClosure),
+    ).toThrow("unexpected service");
+    expect(() =>
+      admit({
+        resources: {
+          bindings: predecessor.resources.bindings.filter((binding) => binding.name !== "STATE_DB"),
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      admit({
+        resources: {
+          bindings: predecessor.resources.bindings.filter(
+            (binding) => binding.name !== "ACCOUNTS_FINANCIAL_PROOF",
+          ),
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      admit({
+        resources: {
+          bindings: [
+            ...predecessor.resources.bindings,
+            { name: "FOREIGN", type: "plain_text", text: "1" },
+          ],
+        },
+      }),
+    ).toThrow("outside the declared delta");
   });
 
   test("legacy predecessor closure requires exactly the pre-version-metadata shape", () => {

@@ -32,7 +32,7 @@ const JOURNAL_KIND = "takoserver.hosted-billing-business-e2e-journal@v1";
 const INPUT_KIND = "takoserver.hosted-billing-business-e2e-input@v1";
 // Accounts issues shared-auth Workspace refs in this namespace; their billing
 // Organization is derived and created at the owner's first login, never here.
-const SHARED_WORKSPACE_REF = /^wrk_[0-9a-f]{32}$/u;
+const SHARED_WORKSPACE_REF = /^wrk_(?:[0-9a-f]{16}|[0-9a-f]{32})$/u;
 type ObjectValue = Record<string, unknown>;
 type Step = "personal" | "usage" | "subscription" | "topup";
 type Event =

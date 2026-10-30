@@ -18,6 +18,7 @@ const fakeContext = () =>
   ({
     sql: {},
     realm: {},
+    sourceProfile: "money-preserved",
     writerEpoch: `sha256:${"a".repeat(64)}`,
     authSchemaRef: "synthetic-unqualified-auth103",
     targetRef: "synthetic-unqualified-target",

@@ -603,10 +603,15 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         if (nativeId === null) throw new DockerHttpRevisionError("unavailable");
         return nativeId;
       },
-      async remove(_record, nativeId, signal) {
+      async stop(_record, nativeId, signal) {
+        // The custody inspects the exact ID again; this ACK is not an observation.
         const stopped = await engine("POST", `/containers/${nativeId}/stop?t=0`, undefined, signal);
         if (![204, 304, 404].includes(stopped.status))
           throw new DockerHttpRevisionError("unavailable");
+        return stopped.status === 404 ? "not-found" : "stopped";
+      },
+      async remove(_record, nativeId, signal) {
+        // Never stops: the custody records a positive exit observation before this call.
         const removed = await engine("DELETE", `/containers/${nativeId}?v=true`, undefined, signal);
         if (removed.status !== 204 && removed.status !== 404)
           throw new DockerHttpRevisionError("unavailable");

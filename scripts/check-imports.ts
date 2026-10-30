@@ -25,7 +25,10 @@ const manifest = JSON.parse(readFileSync("package.json", "utf8")) as {
   readonly dependencies?: Readonly<Record<string, string>>;
   readonly devDependencies?: Readonly<Record<string, string>>;
 };
-for (const name of Object.keys({ ...manifest.dependencies, ...manifest.devDependencies })) {
+for (const name of Object.keys({
+  ...manifest.dependencies,
+  ...manifest.devDependencies,
+})) {
   if (forbidden.test(name)) violations.push(`package.json: ${name}`);
 }
 
@@ -54,6 +57,16 @@ interface Layer {
 
 const LAYERS: readonly Layer[] = [
   {
+    name: "v2-container-parent-io",
+    match: /^src\/takoform-v2\/container-parent-completion\.ts$/u,
+    may: ["core"],
+  },
+  {
+    name: "v2-container-parent-io-inventory",
+    match: /^src\/takoform-v2\/container-parent-io-inventory\.ts$/u,
+    may: ["core", "v2-container-parent-io"],
+  },
+  {
     name: "v2-host-acceptance-contract",
     match: /^src\/takoform-v2\/host-acceptance\.ts$/u,
     may: ["core", "v2-private"],
@@ -75,6 +88,22 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/takoform-v2\/container-binding-authority\.ts$/u,
     may: ["core", "v2-form"],
   },
+  {
+    // Forward binding graph DATA is read-only and cannot reach native adapters.
+    name: "v2-forward-container-binding-authority",
+    match: /^src\/takoform-v2\/forward-container-binding-authority\.ts$/u,
+    may: ["core", "v2-form", "v2-operation-generation-index"],
+  },
+  {
+    name: "v2-operation-generation-index",
+    match: /^src\/takoform-v2\/operation-generation-index\.ts$/u,
+    may: ["core"],
+  },
+  {
+    name: "v2-forward-native-source",
+    match: /^src\/takoform-v2\/forward-worker-native-source\.ts$/u,
+    may: [],
+  },
   // v2 shares neutral primitives, not the v1 package/admission domain. The
   // Queue and Durable Workflow Resource/Operation managers are exposed as
   // source-extension factories, but this does not register them in the normal
@@ -85,6 +114,8 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/takoform-v2\/index\.ts$/u,
     may: [
       "core",
+      "v2-container-parent-io",
+      "v2-container-parent-io-inventory",
       "v2-contract",
       "v2-config",
       "v2-private",
@@ -93,6 +124,7 @@ const LAYERS: readonly Layer[] = [
       "v2-code-validation",
       "v2-runtime",
       "v2-service-binding-authority",
+      "v2-forward-container-binding-authority",
       "v2-queue-manager",
       "v2-actor-sql-graph",
       "v2-actor-physical-backend",
@@ -109,14 +141,15 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-contract",
-    match: /^src\/takoform-v2\/(?:types|identity|references|form-frontface)\.ts$/u,
+    match:
+      /^src\/takoform-v2\/(?:types|identity|references|form-frontface|worker-form-contract)\.ts$/u,
     may: ["core", "v2-contract", "v2-private"],
   },
   {
     name: "v2-state",
     match:
-      /^src\/takoform-v2\/(?:store|configured-update-inputs-schema|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema)\.ts$/u,
-    may: ["core", "v2-contract", "v2-private", "v2-state"],
+      /^src\/takoform-v2\/(?:store|configured-update-inputs-schema|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema|forward-worker-native-schema)\.ts$/u,
+    may: ["core", "v2-contract", "v2-private", "v2-state", "v2-operation-generation-index"],
   },
   {
     // Node's DatabaseSync and authorizer are the self-host-only realization.
@@ -522,7 +555,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|object-bucket-binding-profile|cron|selfhost-socket-layout|error-envelope|route-table|request-authorization|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|sqlite-migration-policy|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|object-bucket-binding-profile|cron|selfhost-socket-layout|error-envelope|route-table|request-authorization|request-body|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|sqlite-migration-policy|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -533,6 +566,12 @@ const LAYERS: readonly Layer[] = [
     match:
       /^src\/(?:sql-d1|sql-d1-http|sql-sqlite|money-cutover-sql|objects-r2|objects-r2-http|objects-mem|objects-fs|selfhost-object-store|selfhost-data-root|selfhost-listen-address|selfhost-socket-root|selfhost-endpoint-https-tls|selfhost-v2-worker-endpoint-upstream-websocket|selfhost-weighted-deployment|selfhost-actor-class-runtime|selfhost-actor-forward-worker-wrapper|selfhost-workflow-binding-worker-wrapper|workflow-transport-journal|vector-index-store)\.ts$|^src\/workerd-(?:artifact|execution-guard|linux-process|runtime|supervisor|version-graph|worker-execution-group|worker-module-inspector)\.ts$|^src\/generated\/(?:actor-native-bootstrap|selfhost-actor-forward-runtime-source|selfhost-workflow-binding-runtime-source)\.ts$|^src\/providers\//u,
     may: ["core", "adapter", "native-contract"],
+  },
+  {
+    // Private ordinary-only SQL fence; native/source/Financial authority is separate.
+    name: "adapter",
+    match: /^src\/ordinary-financial-public-sql\.ts$/u,
+    may: ["core", "domain"],
   },
   {
     name: "domain",
@@ -607,7 +646,8 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
-    name: "domain",
+    // Plain schema/build DATA and fixed predicates are shared below adapters/app.
+    name: "core",
     match: /^src\/auth103-native-source-contract\.ts$/u,
     may: ["core"],
   },
@@ -760,6 +800,18 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/shared-app-ledger-d1\.ts$/u,
     may: ["core", "adapter", "domain"],
   },
+  {
+    // Staging physical adoption uses SQL ports and the existing name policy.
+    name: "domain",
+    match: /^src\/shared-app-staging-adoption\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // Retained predecessor metadata uses only SQL ports and the staging predicate.
+    name: "domain",
+    match: /^src\/shared-app-staging-origin-history\.ts$/u,
+    may: ["core", "domain"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
@@ -816,6 +868,31 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   readonly typeOnly: boolean;
   readonly names: readonly string[];
 }[] = [
+  {
+    // The guarded discard factory consumes only its fixed schema and object names.
+    source: "src/takoform-v2/configured-private-inputs.ts",
+    target: "src/takoform-v2/configured-update-inputs-schema.ts",
+    typeOnly: false,
+    names: ["v2ConfiguredUpdateDiscardObjects", "v2ConfiguredUpdateDiscardSchema"],
+  },
+  {
+    source: "src/takoform-v2/worker-invocation-custody.ts",
+    target: "src/takoform-v2/forms/worker-specs.ts",
+    typeOnly: false,
+    names: ["FORWARD_WORKER_DEPLOYMENT_FORM_URL", "FORWARD_WORKER_VERSION_FORM_URL"],
+  },
+  {
+    source: "src/takoform-v2/forward-worker-native-schema.ts",
+    target: "src/takoform-v2/forward-worker-native-source.ts",
+    typeOnly: false,
+    names: ["FORWARD_NATIVE_BASE_OBJECTS"],
+  },
+  {
+    source: "src/takoform-v2/forward-container-binding-authority.ts",
+    target: "src/takoform-v2/worker-publication-state.ts",
+    typeOnly: false,
+    names: ["MAX_FAILED_TAIL"],
+  },
   {
     source: "src/providers/selfhost-container-entry-contract.ts",
     target: "src/takoform-v2/host-acceptance.ts",
@@ -992,6 +1069,25 @@ const EXACT_RP_FINANCIAL_ORIGIN_IMPORTS: Readonly<Record<string, readonly string
     "type WorkerRequestSql",
   ],
 };
+
+/** The operator barrel exposes this constructor, never the composition layer. */
+function exactSharedAppLedgerD1ExportEdge(path: string, target: string): boolean {
+  if (
+    (path !== "src/index.ts" && path !== "src/provider-extension.ts") ||
+    target !== "src/shared-app-ledger-d1.ts"
+  )
+    return false;
+  const source = readFileSync(path, "utf8");
+  const references = [...source.matchAll(/(["'`])(\.[^"'`]+)\1/gu)].filter(
+    (entry) => normalize(relative(resolve("."), resolve(dirname(path), entry[2] ?? ""))) === target,
+  );
+  return (
+    references.length === 1 &&
+    /^export\s+\{\s*createSharedAppLedgerD1\s*,?\s*\}\s+from\s+(["'])\.\/shared-app-ledger-d1\.ts\1;$/mu.test(
+      source,
+    )
+  );
+}
 
 function exactRpFinancialOriginImportEdge(path: string, target: string): boolean {
   if (target !== "src/financial-request-origin.ts") return false;
@@ -1183,6 +1279,7 @@ for (const path of walk("src")) {
       !exactContainerConstructionExportEdge &&
       !exactContainerAdapterImportEdge(path, target) &&
       !exactRpFinancialOriginImportEdge(path, target) &&
+      !exactSharedAppLedgerD1ExportEdge(path, target) &&
       !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
       !exactOriginPublicationExtensionEdge &&

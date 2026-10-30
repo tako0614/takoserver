@@ -263,17 +263,19 @@ export function createDockerContainerConfiguredInputs(options: {
     if (!Number.isSafeInteger(upperGeneration) || upperGeneration < 1) unavailable();
     const created = await readCreate(identity);
     if (upperGeneration === 1) return created;
+    // Accepted history selects the source even when its material is unavailable.
+    // The exact source is read separately; a missing map must never select an
+    // older accepted generation's values instead.
     const rows = await sql.query(
       `SELECT op.id AS source_id, op.generation AS source_generation,
         op.accepted_spec_json AS source_spec
        FROM tf_v2_resources resource JOIN tf_v2_operations op ON op.resource_uid = resource.uid
-       JOIN tf_v2_operation_configured_private_inputs material ON material.operation_id = op.id
        WHERE resource.uid = ? AND resource.principal = ? AND resource.space = ? AND resource.name = ?
          AND resource.form_url = ? AND resource.backend_id = ? AND resource.target_key = ?
          AND resource.deleted_at IS NULL AND op.principal = resource.principal
          AND op.backend_id = resource.backend_id AND op.target_key = resource.target_key
          AND op.action = 'update' AND op.private_inputs_present = 1
-         AND op.generation = material.generation AND op.generation <= ?
+         AND op.generation <= ?
        ORDER BY op.generation DESC LIMIT 2`,
       [
         identity.resourceUid,

@@ -33,7 +33,7 @@ import { createTakoformStore } from "../src/takoform/store.ts";
 import type { InstalledTakoformForm, TakoformHostPrincipal } from "../src/takoform/types.ts";
 import { createWorkerEndpointOriginReservationBindingHandle } from "../src/worker-endpoint-origin-reservations.ts";
 import { applyWithSelection } from "./helpers/apply-with-selection.ts";
-import { migratedDatabase } from "./helpers/migrated-database.ts";
+import { migratedDatabase, writeMigratedDatabaseFile } from "./helpers/migrated-database.ts";
 
 const FORM = (() => {
   const form = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
@@ -748,6 +748,7 @@ test("repairs a saved WorkerEndpoint receipt after same-process Host/SQLite reop
   let restarted: ReturnType<typeof openProcess> | undefined;
   let releaseCommitFailure: (() => void) | undefined;
   try {
+    writeMigratedDatabaseFile(databasePath);
     first = openProcess(new Database(databasePath));
     await seedWorker(first.sql, undefined, workerForm.identity);
     await first.sql.run(

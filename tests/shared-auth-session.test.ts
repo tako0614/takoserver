@@ -14,6 +14,7 @@ import {
   type SharedAuthSessionStore,
 } from "../src/shared-auth-session-store.ts";
 import { createD1Sql, type D1DatabaseLike } from "../src/sql-d1.ts";
+import { beginNativeFixturePhase } from "./helpers/native-fixture-phase.ts";
 import { createSharedAuthSessionStoreD1Fixture } from "./helpers/shared-auth-session-fixture.ts";
 import {
   createSharedSessionTestIssuer,
@@ -67,17 +68,24 @@ async function fixture(
     send?: (request: Request, send: (request: Request) => Promise<Response>) => Promise<Response>;
   } = {},
 ) {
-  const d1 = await createSharedAuthSessionStoreD1Fixture();
+  const recordPhase = beginNativeFixturePhase("shared-auth");
+  recordPhase("fixture_begin");
+  recordPhase("d1_fixture_begin");
+  const d1 = await createSharedAuthSessionStoreD1Fixture(recordPhase);
+  recordPhase("d1_fixture_ready");
   let stamp = INITIAL_TIME;
   try {
     // This source targets the owner's adopted strict-driver ABI. It must be
     // integrated and genuinely verified in native D1 before these tests run.
+    recordPhase("native_d1_begin");
     const database = await d1.runtime.getD1Database("AUTH_DB");
+    recordPhase("native_d1_ready");
     d1.sql = createD1Sql(database.withSession("first-primary") as unknown as D1DatabaseLike, {
       acknowledgement: "explicit-d1-result",
     });
     d1.store = createSharedAuthSessionStore(d1.sql);
     const issuer = await createSharedSessionTestIssuer(() => stamp);
+    recordPhase("issuer_ready");
     // The issuer helper has no personal billing Organization by default. This
     // fixture opts in to an explicit authenticated response for positive logins.
     issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
@@ -135,9 +143,11 @@ async function fixture(
       return { response, location: new URL(location), browserCookie, callbackUrl };
     }
     async function callback(input: { browserCookie: string; callbackUrl: string }) {
+      recordPhase("callback_begin");
       const response = await runtime.fetch(
         new Request(input.callbackUrl, { headers: { cookie: input.browserCookie } }),
       );
+      recordPhase("callback_ready");
       if (!response) throw new Error("unmounted test callback");
       return response;
     }
@@ -157,6 +167,7 @@ async function fixture(
         headers: { cookie: sessionCookie, origin: SESSION_TEST_CONSOLE },
       });
     }
+    recordPhase("fixture_ready");
     return {
       d1,
       issuer,
@@ -174,7 +185,11 @@ async function fixture(
         stamp = value;
       },
       now: () => stamp,
-      dispose: () => d1.runtime.dispose(),
+      dispose: async () => {
+        recordPhase("dispose_begin");
+        await d1.runtime.dispose();
+        recordPhase("dispose_ready");
+      },
     };
   } catch (error) {
     await d1.runtime.dispose();

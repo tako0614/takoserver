@@ -21,7 +21,8 @@ const sql: Sql = Object.freeze({
     return [];
   },
 });
-const inputs = Object.freeze({ sql, realm, writerEpoch: `sha256:${"a".repeat(64)}` });
+let inputs: object = Object.freeze({ sql, realm, writerEpoch: `sha256:${"a".repeat(64)}` });
+let consentReads = 0;
 const graph = Object.freeze({ sql, realm });
 const record = Object.freeze({});
 const currentSession = Object.freeze({});
@@ -85,13 +86,16 @@ mock.module("../../src/shared-financial-retained-r1.ts", () => ({
 }));
 mock.module("../../src/shared-auth-financial-consent.ts", () => ({
   ...originalConsent,
-  readSharedAuthFinancialConsentCurrentOriginalData: () => ({
-    original: {
-      originalBytes: new ArrayBuffer(0),
-      command: { key: { consentRef: heldConsentRef } },
-    },
-    sampledAt: 1,
-  }),
+  readSharedAuthFinancialConsentCurrentOriginalData: () => {
+    consentReads++;
+    return {
+      original: {
+        originalBytes: new ArrayBuffer(0),
+        command: { key: { consentRef: heldConsentRef } },
+      },
+      sampledAt: 1,
+    };
+  },
 }));
 mock.module("../../src/shared-auth-financial-consent-contract.ts", () => ({
   ...originalConsentContract,
@@ -143,5 +147,29 @@ test("selected consent proof mismatch mints no fixed read or batch operation", a
     expect(observed).toEqual({ queries: 0, batches: 0, parsed: 2, definitions: 2 });
   } finally {
     f.close();
+  }
+});
+
+test("an unselected Money epoch refuses the Customer executor before consent or SQL", () => {
+  const originalInputs = inputs;
+  const before = { ...observed, consentReads };
+  try {
+    for (const writerEpoch of [undefined, "not-an-epoch"]) {
+      inputs = Object.freeze({ sql, realm, writerEpoch });
+      expect(() =>
+        createFinancialCurrentConsentCustomerExecutor(
+          connection,
+          {},
+          new Request("https://fixture.invalid/ordinary"),
+          "held-workspace",
+          {},
+          {},
+          selected as never,
+        ),
+      ).toThrow("financial current consent customer unavailable");
+      expect({ ...observed, consentReads }).toEqual(before);
+    }
+  } finally {
+    inputs = originalInputs;
   }
 });

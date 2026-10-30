@@ -21,11 +21,13 @@ import {
   compileWorkerdVersionGraph,
   workerdVersionServiceBindingName,
 } from "../workerd-version-graph.ts";
+import {
+  isForwardFamilyWorkerDeploymentForm,
+  isForwardFamilyWorkerVersionForm,
+} from "./forms/container-consumer-specs.ts";
 import type { ObjectBucketWorkerBindingClaim } from "./forms/object-bucket-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./forms/sqlite-worker-binding-authority.ts";
 import {
-  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_VERSION_FORM_URL,
   parseForwardWorkerVersionSpec,
   parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -356,8 +358,10 @@ export function createV2WorkerPublication(options: {
         hostnames: [],
       };
       let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
+      if (version.form !== undefined && !isForwardFamilyWorkerVersionForm(version.form))
+        throw new Error("unsupported Worker Version Form");
       const versionSpec =
-        version.form === FORWARD_WORKER_VERSION_FORM_URL
+        version.form !== undefined
           ? parseForwardWorkerVersionSpec(version.spec)
           : parseWorkerVersionSpec(version.spec);
       if (
@@ -903,7 +907,7 @@ export function createV2WorkerPublication(options: {
     execution: V2Execution;
     incumbentSourceOperationId?: string;
   }): Promise<V2WorkerPublicationResolution> {
-    if (input.execution.form === FORWARD_WORKER_DEPLOYMENT_FORM_URL) {
+    if (isForwardFamilyWorkerDeploymentForm(input.execution.form)) {
       const resolve = options.publicationState.resolveForward;
       if (!resolve) throw new Error("forward publication resolver unavailable");
       return resolve.call(options.publicationState, input);
@@ -941,7 +945,7 @@ export function createV2WorkerPublication(options: {
       if (
         (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
           execution.form !== WORKER_ENDPOINT_FORM_URL &&
-          execution.form !== FORWARD_WORKER_DEPLOYMENT_FORM_URL) ||
+          !isForwardFamilyWorkerDeploymentForm(execution.form)) ||
         execution.targetKey !== options.targetKey
       ) {
         return notDispatched("worker_publication_target_mismatch");
@@ -1024,7 +1028,7 @@ export function createV2WorkerPublication(options: {
       if (
         (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
           execution.form !== WORKER_ENDPOINT_FORM_URL &&
-          execution.form !== FORWARD_WORKER_DEPLOYMENT_FORM_URL) ||
+          !isForwardFamilyWorkerDeploymentForm(execution.form)) ||
         execution.targetKey !== options.targetKey
       ) {
         return unknownResult();

@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { runInNewContext } from "node:vm";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import { type ActorAbiProfile, resolveActorAbiProfile } from "../src/actor-class-execution.ts";
 import {
@@ -9,6 +10,7 @@ import {
   createActorNativeSocketPort,
   signActorNativeUpgradeDecision,
 } from "../src/actor-native-owner-worker.ts";
+import { ACTOR_NATIVE_BOOTSTRAP_SOURCE } from "../src/generated/actor-native-bootstrap.ts";
 import { actorNativeBundleRealm } from "./helpers/actor-native-bundle-realm.ts";
 
 const v2Profile = resolveActorAbiProfile({
@@ -22,6 +24,7 @@ function inboundFixture(
   callback?: (request: Request) => Promise<Response>,
   admissionFetch?: (request: Request) => Promise<Response>,
   profile?: ActorAbiProfile,
+  admissionPlacement: "combined" | "socket-only" | "none" = "combined",
 ) {
   type Socket = Parameters<
     InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
@@ -53,6 +56,22 @@ function inboundFixture(
     undefined,
     selectedProfile,
   );
+  const admission = {
+    async fetch(request: Request) {
+      if (admissionFetch) return admissionFetch(request);
+      const body = (await request.json()) as Record<string, unknown>;
+      return body.action === "socket-complete"
+        ? new Response(null, { status: 204 })
+        : Response.json({
+            id: "inbound-owner",
+            attemptNonce: body.attemptNonce,
+            generationKey: "d".repeat(64),
+            epoch: "epoch-1",
+            variantKey: "default",
+            leaseId: "lease",
+          });
+    },
+  };
   const owner = new Owner(
     {
       facets: {
@@ -82,22 +101,8 @@ function inboundFixture(
     {
       CLASS: {},
       CLASS_0: {},
-      ADMISSION: {
-        async fetch(request) {
-          if (admissionFetch) return admissionFetch(request);
-          const body = (await request.json()) as Record<string, unknown>;
-          return body.action === "socket-complete"
-            ? new Response(null, { status: 204 })
-            : Response.json({
-                id: "inbound-owner",
-                attemptNonce: body.attemptNonce,
-                generationKey: "d".repeat(64),
-                epoch: "epoch-1",
-                variantKey: "default",
-                leaseId: "lease",
-              });
-        },
-      },
+      ...(admissionPlacement === "combined" ? { ADMISSION: admission } : {}),
+      ...(admissionPlacement === "socket-only" ? { SOCKET_ADMISSION: admission } : {}),
     },
   );
   return {
@@ -151,6 +156,42 @@ function inboundFixture(
     },
   };
 }
+
+test("socket-only admission completes a callback without an alarm binding", async () => {
+  const actions: string[] = [];
+  const f = inboundFixture(
+    undefined,
+    async (request) => {
+      expect(request.headers.get("x-takoserver-private-alarm-admission")).toBe("c".repeat(64));
+      const body = (await request.json()) as Record<string, unknown>;
+      actions.push(String(body.action));
+      return body.action === "socket-complete"
+        ? new Response(null, { status: 204 })
+        : Response.json({
+            id: "inbound-owner",
+            attemptNonce: body.attemptNonce,
+            generationKey: "d".repeat(64),
+            epoch: "epoch-1",
+            variantKey: "default",
+            leaseId: "socket-only-lease",
+          });
+    },
+    undefined,
+    "socket-only",
+  );
+  await f.owner.webSocketMessage(f.socket("socket-only"), "event");
+  expect(actions).toEqual(["socket", "socket-complete"]);
+  expect(f.delivered).toEqual(["socket-only"]);
+  expect(f.closes).toEqual([]);
+  await Promise.all(f.retained);
+  const denied = inboundFixture(undefined, undefined, undefined, "none");
+  await expect(
+    denied.owner.webSocketMessage(denied.socket("no-socket-admission"), "event"),
+  ).rejects.toThrow("Actor socket completion unavailable");
+  expect(denied.delivered).toEqual([]);
+  expect(denied.closes).toEqual([["no-socket-admission", 1011]]);
+  await Promise.all(denied.retained);
+});
 
 test("v2 socket error is a distinct terminal callback", async () => {
   const actions: string[] = [];
@@ -1070,6 +1111,129 @@ test("structural WfP owner omits admission and control bearers only in dynamic m
   await owner.webSocketMessage(socket, "event");
 });
 
+test("dynamic socket admission keeps both JSON actions headerless in a Workerd text-body model", async () => {
+  // Bun's Request does not add the text-body Content-Type seen in Workerd.
+  // Keep the model limited to that constructor difference; native direct-port
+  // qualification remains separate.
+  class WorkerdTextBodyRequest extends Request {
+    constructor(input: RequestInfo | URL, init?: RequestInit) {
+      const headers = new Headers(init?.headers);
+      if (typeof init?.body === "string" && !headers.has("content-type"))
+        headers.set("content-type", "text/plain;charset=UTF-8");
+      super(input, { ...init, headers });
+    }
+  }
+  class NativeWebSocket {
+    close() {}
+  }
+  const exportStatement = /\nexport \{\n(?: {2}[A-Za-z][A-Za-z0-9]*,?\n)+\};\n?$/u.exec(
+    ACTOR_NATIVE_BOOTSTRAP_SOURCE,
+  );
+  if (!exportStatement || exportStatement.index === undefined)
+    throw new Error("unexpected native bootstrap export syntax");
+  const realm = runInNewContext(
+    `${ACTOR_NATIVE_BOOTSTRAP_SOURCE.slice(0, exportStatement.index)}\n({ createActorNativeOwner });`,
+    {
+      WebSocket: NativeWebSocket,
+      Headers,
+      Request: WorkerdTextBodyRequest,
+      Response,
+      ReadableStream,
+      crypto,
+      TextEncoder,
+      TextDecoder,
+      Uint8Array,
+      ArrayBuffer,
+      AbortController,
+      AbortSignal,
+      DOMException,
+      setTimeout,
+      clearTimeout,
+      atob,
+      btoa,
+    },
+    { timeout: 1_000 },
+  ) as { createActorNativeOwner: typeof createActorNativeOwner };
+  const graph = { generationKey: "d".repeat(64), epoch: "epoch-1", variantKeys: ["selected"] };
+  const actorId = "structural-id";
+  const socket = Object.assign(new NativeWebSocket(), {
+    deserializeAttachment: () => ({ socketId: "socket-1", actorId, attachment: null }),
+    serializeAttachment() {},
+    send() {},
+  }) as unknown as Parameters<
+    InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
+  >[0];
+  const selectedClass = {};
+  const Owner = realm.createActorNativeOwner(
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    async () => selectedClass,
+    async () => graph,
+  );
+  const observed: { method: string; path: string; headerNames: string[]; action: unknown }[] = [];
+  let socketNonce: string | undefined;
+  let socketDeadline: number | undefined;
+  const owner = new Owner(
+    {
+      facets: {
+        get() {
+          return { fetch: async () => new Response(null, { status: 204 }) };
+        },
+        abort() {},
+      },
+      getWebSockets: () => [socket],
+      waitUntil() {},
+    },
+    {
+      CLASS: {},
+      SOCKET_ADMISSION: {
+        async fetch(request) {
+          const body = (await request.json()) as Record<string, unknown>;
+          const path = new URL(request.url).pathname;
+          const headerNames = [...request.headers.keys()];
+          observed.push({ method: request.method, path, headerNames, action: body.action });
+          if (request.method !== "POST" || path !== "/" || headerNames.length !== 0)
+            return new Response(null, { status: 404 });
+          if (body.action === "socket-complete")
+            return body.attemptNonce === socketNonce && body.deadlineAt === socketDeadline
+              ? new Response(null, { status: 204 })
+              : new Response(null, { status: 404 });
+          if (
+            body.action !== "socket" ||
+            body.id !== actorId ||
+            typeof body.attemptNonce !== "string" ||
+            !Number.isSafeInteger(body.deadlineAt)
+          )
+            return new Response(null, { status: 404 });
+          socketNonce = body.attemptNonce;
+          socketDeadline = body.deadlineAt as number;
+          return Response.json({
+            id: actorId,
+            attemptNonce: body.attemptNonce,
+            generationKey: graph.generationKey,
+            epoch: graph.epoch,
+            variantKey: "selected",
+            leaseId: "lease",
+          });
+        },
+      },
+    },
+  );
+  let callbackError: unknown;
+  try {
+    await owner.webSocketMessage(socket, "event");
+  } catch (error) {
+    callbackError = error;
+  }
+  expect(observed).toEqual([
+    { method: "POST", path: "/", headerNames: [], action: "socket" },
+    { method: "POST", path: "/", headerNames: [], action: "socket-complete" },
+  ]);
+  if (callbackError !== undefined) throw callbackError;
+});
+
 test("native owner refuses an unreserved WebSocket 101 and still admits the next turn", async () => {
   let calls = 0;
   const f = fixture(async () => {
@@ -1079,6 +1243,342 @@ test("native owner refuses an unreserved WebSocket 101 and still admits the next
   await expect(f.owner.fetch(f.request())).rejects.toThrow("Actor socket reservation unavailable");
   expect(await (await f.owner.fetch(f.request())).text()).toBe("ordinary");
   await Promise.all(f.retained);
+});
+
+test("private reservation offer never enters an application request even after Headers.delete poisoning", async () => {
+  const offer = "e".repeat(64);
+  let childSawOffer = false;
+  const f = fixture(async (request) => {
+    childSawOffer = request.headers.has("x-takoserver-private-actor-reservation-offer");
+    return new Response(null, { status: 204 });
+  });
+  const request = f.request();
+  request.headers.set("upgrade", "websocket");
+  request.headers.set("x-takoserver-private-actor-reservation-offer", offer);
+  const originalDelete = Headers.prototype.delete;
+  try {
+    Headers.prototype.delete = () => {};
+    expect((await f.owner.fetch(request)).status).toBe(204);
+  } finally {
+    Headers.prototype.delete = originalDelete;
+  }
+  expect(childSawOffer).toBe(false);
+  await Promise.all(f.retained);
+});
+
+test("self-host TOKEN ingress strips a caller-supplied private reservation offer", async () => {
+  const ingress = createActorNativeIngress("selfhost-token");
+  let forwardedOffer = false;
+  const response = await ingress.fetch(
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-token": "selfhost-token",
+        "x-takoserver-private-actor-id": "actor-one",
+        "x-takoserver-private-actor-reservation-offer": "f".repeat(64),
+      },
+    }),
+    {
+      NAMESPACE: {
+        idFromName: (name) => name,
+        get: () => ({
+          async fetch(request) {
+            forwardedOffer = request.headers.has("x-takoserver-private-actor-reservation-offer");
+            return new Response(null, { status: 204 });
+          },
+        }),
+      },
+    },
+  );
+  expect(response.status).toBe(204);
+  expect(forwardedOffer).toBe(false);
+});
+
+test("private offer rejects malformed, duplicated and non-upgrade requests before child dispatch", async () => {
+  let childCalls = 0;
+  const f = fixture(async () => {
+    childCalls++;
+    return new Response(null, { status: 204 });
+  });
+  for (const offer of ["f".repeat(63), "F".repeat(64), `${"f".repeat(64)}, ${"e".repeat(64)}`]) {
+    const request = f.request();
+    request.headers.set("upgrade", "websocket");
+    request.headers.set("x-takoserver-private-actor-reservation-offer", offer);
+    expect(() => f.owner.fetch(request)).toThrow("Actor socket reservation unavailable");
+  }
+  const ordinary = f.request();
+  ordinary.headers.set("x-takoserver-private-actor-reservation-offer", "f".repeat(64));
+  expect(() => f.owner.fetch(ordinary)).toThrow("Actor socket reservation unavailable");
+  expect(childCalls).toBe(0);
+  await Promise.all(f.retained);
+});
+
+test("private offer validation never dispatches its value to tenant RegExp.exec", async () => {
+  const offer = "e".repeat(64);
+  let seenByTenantExec = false;
+  const f = fixture(async () => new Response(null, { status: 204 }));
+  const request = f.request();
+  request.headers.set("upgrade", "websocket");
+  request.headers.set("x-takoserver-private-actor-reservation-offer", offer);
+  const originalExec = RegExp.prototype.exec;
+  try {
+    RegExp.prototype.exec = function (value) {
+      if (value === offer) {
+        seenByTenantExec = true;
+        throw new Error("offer reached tenant RegExp.exec");
+      }
+      return originalExec.call(this, value);
+    };
+    expect((await f.owner.fetch(request)).status).toBe(204);
+  } finally {
+    RegExp.prototype.exec = originalExec;
+  }
+  expect(seenByTenantExec).toBe(false);
+  await Promise.all(f.retained);
+});
+
+test("Host offer is the one pending private bearer, with no bearer on its native 101", async () => {
+  const exported = /\nexport \{\n(?: {2}[A-Za-z][A-Za-z0-9]*,?\n)+\};\n?$/u.exec(
+    ACTOR_NATIVE_BOOTSTRAP_SOURCE,
+  );
+  if (!exported || exported.index === undefined) throw new Error("native artifact export missing");
+  class NativeSocket {
+    private attachment: unknown;
+    close() {}
+    send() {}
+    serializeAttachment(value: unknown) {
+      this.attachment = value;
+    }
+    deserializeAttachment() {
+      return this.attachment;
+    }
+  }
+  class NativePair {
+    readonly 0 = new NativeSocket();
+    readonly 1 = new NativeSocket();
+  }
+  class NativeResponse extends Response {
+    readonly webSocket: NativeSocket | undefined;
+    private readonly nativeStatus: number | undefined;
+    constructor(body?: BodyInit | null, init?: ResponseInit & { webSocket?: NativeSocket }) {
+      super(body, init?.status === 101 ? { ...init, status: 200 } : init);
+      this.nativeStatus = init?.status === 101 ? 101 : undefined;
+      this.webSocket = init?.webSocket;
+    }
+    override get status() {
+      return this.nativeStatus ?? super.status;
+    }
+    override get headers() {
+      return super.headers;
+    }
+    override get ok() {
+      return this.status >= 200 && this.status < 300;
+    }
+  }
+  const realm = runInNewContext(
+    `${ACTOR_NATIVE_BOOTSTRAP_SOURCE.slice(0, exported.index)}\n({ createActorNativeOwner, createActorNativeSocketPort, signActorNativeUpgradeDecision });`,
+    {
+      WebSocket: NativeSocket,
+      WebSocketPair: NativePair,
+      Headers,
+      Request,
+      Response: NativeResponse,
+      ReadableStream,
+      crypto,
+      TextEncoder,
+      TextDecoder,
+      Uint8Array,
+      ArrayBuffer,
+      AbortController,
+      AbortSignal,
+      DOMException,
+      setTimeout,
+      clearTimeout,
+      atob,
+      btoa,
+    },
+    { timeout: 1_000 },
+  ) as {
+    createActorNativeOwner: typeof createActorNativeOwner;
+    createActorNativeSocketPort: typeof createActorNativeSocketPort;
+    signActorNativeUpgradeDecision: typeof signActorNativeUpgradeDecision;
+  };
+  const database = new Database(":memory:");
+  const sql = {
+    exec(statement: string, ...params: (string | number | null)[]) {
+      if (statement.startsWith("SELECT"))
+        return database.query(statement).all(...params) as Record<string, unknown>[];
+      database.query(statement).run(...params);
+      return [];
+    },
+  };
+  const actorId = "private-offer-actor";
+  const offer = "e".repeat(64);
+  const delivery = "a".repeat(64);
+  const secret = "b".repeat(64);
+  const retained: Promise<unknown>[] = [];
+  const sockets: NativeSocket[] = [];
+  let childSawOffer = false;
+  let owner!: InstanceType<ReturnType<typeof realm.createActorNativeOwner>>;
+  const service = { fetch: (request: Request) => owner.fetch(request) };
+  const Owner = realm.createActorNativeOwner(delivery, "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  owner = new Owner(
+    {
+      facets: {
+        get: () => ({
+          async fetch(request) {
+            childSawOffer = request.headers.has("x-takoserver-private-actor-reservation-offer");
+            const nonce = request.headers.get("x-takoserver-private-actor-upgrade-nonce");
+            if (!nonce) throw new Error("missing trusted upgrade nonce");
+            const port = realm.createActorNativeSocketPort(service, secret, actorId, nonce);
+            const socketId = await port.accept();
+            const decision = await realm.signActorNativeUpgradeDecision(
+              delivery,
+              nonce,
+              encodeURIComponent(actorId),
+              socketId,
+            );
+            return new NativeResponse(null, {
+              status: 204,
+              headers: {
+                "x-takoserver-private-actor-upgrade-decision": decision,
+                "x-takoserver-private-actor-upgrade-socket-id": socketId,
+                "x-takoserver-private-actor-reservation": "f".repeat(64),
+                "x-takoserver-private-actor-reservation-offer": "f".repeat(64),
+              },
+            });
+          },
+        }),
+        abort() {},
+      },
+      storage: { sql, setAlarm() {}, deleteAlarm() {} },
+      getWebSockets: () => sockets as never[],
+      acceptWebSocket(socket) {
+        sockets.push(socket as unknown as NativeSocket);
+      },
+      waitUntil(promise) {
+        retained.push(promise);
+      },
+    },
+    {
+      CLASS: {},
+      CLASS_0: {},
+      SOCKET_ADMISSION: {
+        async fetch() {
+          return new NativeResponse(null, { status: 204 });
+        },
+      },
+    },
+  );
+  const request = () =>
+    new Request("http://actor.invalid/", {
+      headers: {
+        "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+        "x-takoserver-private-actor-variant": "default",
+        "x-takoserver-private-actor-reservation-offer": offer,
+        upgrade: "websocket",
+        connection: "Upgrade",
+        "sec-websocket-key": "dGhlIHNhbXBsZSBub25jZQ==",
+        "sec-websocket-version": "13",
+      },
+    });
+  try {
+    const originalDelete = Headers.prototype.delete;
+    let upgraded: NativeResponse;
+    try {
+      Headers.prototype.delete = () => {};
+      upgraded = (await owner.fetch(request())) as NativeResponse;
+    } finally {
+      Headers.prototype.delete = originalDelete;
+    }
+    expect(upgraded.status).toBe(101);
+    expect(upgraded.headers.has("x-takoserver-private-actor-reservation")).toBe(false);
+    expect(upgraded.headers.has("x-takoserver-private-actor-reservation-offer")).toBe(false);
+    expect(upgraded.headers.has("x-takoserver-private-actor-upgrade-decision")).toBe(false);
+    expect(upgraded.headers.has("x-takoserver-private-actor-upgrade-socket-id")).toBe(false);
+    expect(childSawOffer).toBe(false);
+    expect(sql.exec("SELECT bearer FROM actor_socket_reservations")).toEqual([{ bearer: offer }]);
+    const receipts = sql.exec("SELECT offer_digest FROM actor_socket_offer_receipts");
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]?.offer_digest).not.toBe(offer);
+    expect(receipts[0]?.offer_digest).toMatch(/^[a-f0-9]{64}$/u);
+    await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 1 }]);
+    const wrongActor = request();
+    wrongActor.headers.set("x-takoserver-private-actor-id", "other-actor");
+    await expect(owner.fetch(wrongActor)).rejects.toThrow("Actor identity changed");
+    const forgedSettlement = await owner.fetch(
+      new Request("http://actor.invalid/", {
+        method: "POST",
+        headers: {
+          "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+          "x-takoserver-private-actor-reservation": "f".repeat(64),
+          "x-takoserver-private-actor-reservation-action": "commit",
+        },
+      }),
+    );
+    expect(forgedSettlement.status).toBe(404);
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 1 }]);
+    const committed = await owner.fetch(
+      new Request("http://actor.invalid/", {
+        method: "POST",
+        headers: {
+          "x-takoserver-private-actor-id": encodeURIComponent(actorId),
+          "x-takoserver-private-actor-reservation": offer,
+          "x-takoserver-private-actor-reservation-action": "commit",
+        },
+      }),
+    );
+    expect(committed.status).toBe(204);
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 0 }]);
+    await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
+    const knownDigest = new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(`actor-socket-offer-v1\n${offer}`),
+      ),
+    );
+    const originalIterator = Object.getOwnPropertyDescriptor(Uint8Array.prototype, Symbol.iterator);
+    let alteredDigestReads = 0;
+    let replayError: unknown;
+    try {
+      Object.defineProperty(Uint8Array.prototype, Symbol.iterator, {
+        configurable: true,
+        value: function* (this: Uint8Array) {
+          let isOfferDigest = this.length === knownDigest.length;
+          for (let index = 0; isOfferDigest && index < knownDigest.length; index += 1)
+            if (this[index] !== knownDigest[index]) isOfferDigest = false;
+          if (isOfferDigest) alteredDigestReads += 1;
+          for (let index = 0; index < this.length; index += 1)
+            yield (this[index] as number) ^ (isOfferDigest ? alteredDigestReads & 1 : 0);
+        },
+      });
+      try {
+        await owner.fetch(request());
+      } catch (error) {
+        replayError = error;
+      }
+    } finally {
+      if (originalIterator)
+        Object.defineProperty(Uint8Array.prototype, Symbol.iterator, originalIterator);
+      else Reflect.deleteProperty(Uint8Array.prototype, Symbol.iterator);
+    }
+    expect(alteredDigestReads).toBe(0);
+    expect((replayError as { message?: unknown } | undefined)?.message).toBe(
+      "Actor socket reservation unavailable",
+    );
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 0 }]);
+    sql.exec("UPDATE actor_socket_offer_receipts SET expires_at = ?", Date.now() - 1);
+    await owner.alarm();
+    expect(sql.exec("SELECT COUNT(*) AS n FROM actor_socket_offer_receipts")).toEqual([{ n: 1 }]);
+    await expect(owner.fetch(request())).rejects.toThrow("Actor socket reservation unavailable");
+    await Promise.all(retained);
+  } finally {
+    database.close();
+  }
 });
 
 test("native socket decision is invocation-bound and retires the child before attempting transport", async () => {
@@ -1716,6 +2216,77 @@ test("native alarm defaults to deny before facet construction and retains its du
         .get(),
     ).toEqual({ obligation: 1, pending: null, retryAt: expect.any(Number) });
     expect(nativeWake).toBeGreaterThan(Date.now());
+  } finally {
+    database.close();
+  }
+});
+
+test("socket-only admission never handles alarm attempts or poisons a retry", async () => {
+  const database = new Database(":memory:");
+  let facetGets = 0;
+  const socketActions: string[] = [];
+  const Owner = createActorNativeOwner("a".repeat(64), "c".repeat(64), {
+    generationKey: "d".repeat(64),
+    epoch: "epoch-1",
+    variantKeys: ["default"],
+  });
+  try {
+    const owner = new Owner(
+      {
+        facets: {
+          get() {
+            facetGets++;
+            return { fetch: async () => new Response(null, { status: 204 }) };
+          },
+          abort() {},
+        },
+        storage: {
+          sql: {
+            exec(sql: string, ...params: (string | number | null)[]) {
+              const statement = database.query(sql);
+              if (sql.startsWith("SELECT"))
+                return statement.all(...params) as Record<string, unknown>[];
+              statement.run(...params);
+              return [];
+            },
+          },
+          setAlarm() {},
+          deleteAlarm() {},
+        },
+        waitUntil() {},
+      },
+      {
+        CLASS: {},
+        CLASS_0: {},
+        SOCKET_ADMISSION: {
+          async fetch(request) {
+            const body = (await request.json()) as Record<string, unknown>;
+            socketActions.push(String(body.action));
+            return body.action === "complete"
+              ? new Response(null, { status: 503 })
+              : Response.json({
+                  id: body.id,
+                  attemptNonce: body.attemptNonce,
+                  variantKey: "default",
+                  generationKey: "d".repeat(64),
+                  epoch: "epoch-1",
+                  leaseId: "wrong-alarm-lease",
+                });
+          },
+        },
+      },
+    );
+    database
+      .query("UPDATE actor_alarm_state SET actor_id = ?, pending_at = ? WHERE id = 1")
+      .run("same-id", Date.now() - 1);
+    await expect(owner.alarm()).rejects.toThrow("Actor alarm completion unavailable");
+    database.query("UPDATE actor_alarm_state SET retry_at = ? WHERE id = 1").run(Date.now() - 1);
+    await expect(owner.alarm()).rejects.toThrow("Actor alarm completion unavailable");
+    expect(socketActions).toEqual([]);
+    expect(facetGets).toBe(0);
+    expect(database.query("SELECT obligation FROM actor_alarm_state WHERE id = 1").get()).toEqual({
+      obligation: 1,
+    });
   } finally {
     database.close();
   }

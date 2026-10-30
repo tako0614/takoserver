@@ -4,7 +4,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
-import { createAuth103CanonicalSourceArtifacts } from "../scripts/deploy/auth103-native-source.ts";
+import {
+  createAuth103CanonicalSourceArtifacts,
+  readAuth103NativeTargetSourceProfile,
+} from "../scripts/deploy/auth103-native-source.ts";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
@@ -15,7 +18,10 @@ import {
   compileAuth103NativeImportShapes,
   composeAuth103NativeImportData,
 } from "../scripts/deploy/schema-auth103-native-source.ts";
-import { AUTH103_NATIVE_MIGRATIONS } from "../src/auth103-native-source-contract.ts";
+import {
+  AUTH103_NATIVE_MIGRATIONS,
+  AUTH103_NATIVE_PROFILE,
+} from "../src/auth103-native-source-contract.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { canonicalJson } from "../src/json.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
@@ -27,6 +33,62 @@ import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 const hash = (value: string): `sha256:${string}` =>
   `sha256:${createHash("sha256").update(value).digest("hex")}`;
 const literal = (value: string) => `'${value.replaceAll("'", "''")}'`;
+
+test("selected native storage profile follows the declared v2 lineage and refuses Money downgrades", () => {
+  const target = {
+    kind: "takoserver.deploy-target@v2",
+    environment: "integration",
+    accountId: "a".repeat(32),
+    workerName: "auth103-profile-component",
+    d1: {
+      databaseName: "auth103-profile-component",
+      databaseId: "00000000-0000-4000-8000-000000000000",
+    },
+    r2: { bucketName: "auth103-profile-component" },
+    publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+    signing: { currentKeyId: "component-key" },
+    auth103NativeProfile: AUTH103_NATIVE_PROFILE,
+    takoformV2: { config: "{}", storageLineage: "v2-0100" },
+  } as const;
+  expect(readAuth103NativeTargetSourceProfile(target)).toBe("ordinary");
+  expect(
+    readAuth103NativeTargetSourceProfile({
+      ...target,
+      takoformV2: { config: "{}", storageLineage: "v2-0092" },
+    }),
+  ).toBeNull();
+  expect(
+    readAuth103NativeTargetSourceProfile({
+      ...target,
+      takoformV2: { config: "{}", storageLineage: "v2-0100-money-preserved" },
+    }),
+  ).toBeNull();
+  expect(
+    readAuth103NativeTargetSourceProfile({
+      ...target,
+      takoformV2: {
+        config: "{}",
+        storageLineage: "v2-0088",
+        appliedSchemaLineage: "v2-0092",
+      },
+    }),
+  ).toBeNull();
+  expect(
+    readAuth103NativeTargetSourceProfile({
+      ...target,
+      takoformV2: { config: "{}", storageLineage: "v2-0100-money-preserved" },
+      moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+      moneyCutoverWriterEpoch: `sha256:${"b".repeat(64)}`,
+    }),
+  ).toBe("money-preserved");
+  expect(
+    readAuth103NativeTargetSourceProfile({
+      ...target,
+      moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+      moneyCutoverWriterEpoch: `sha256:${"b".repeat(64)}`,
+    }),
+  ).toBeNull();
+});
 
 function fixture() {
   const root = mkdtempSync(resolve(tmpdir(), "auth103-one-import-"));

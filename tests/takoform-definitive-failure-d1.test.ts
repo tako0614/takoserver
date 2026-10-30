@@ -103,41 +103,119 @@ const QUERY =
   `space=${SPACE}&definitionVersion=${FORM_REF.definitionVersion}` +
   `&schemaDigest=${encodeURIComponent(FORM_REF.schemaDigest)}`;
 
+type AbortD1Stage =
+  | "runtime"
+  | "database"
+  | "schema"
+  | "app"
+  | "tenant-session"
+  | "tenant-organization"
+  | "tenant-funding"
+  | "tenant-key"
+  | "apply"
+  | "held-wallet"
+  | "abort-tick"
+  | "refusal-oracles"
+  | "dispose";
+
+function createAbortD1StageReport() {
+  const started = performance.now();
+  let since = started;
+  let stage: AbortD1Stage = "runtime";
+  let releaseConstraint = false;
+  let closed = false;
+  let emitted = false;
+  const print = (reason: "pre-timeout" | "failure") => {
+    if (closed || emitted) return;
+    emitted = true;
+    const now = performance.now();
+    try {
+      console.error(
+        JSON.stringify({
+          abortD1StageReport: true,
+          reason,
+          releaseConstraint,
+          stage,
+          elapsedMs: Math.round(now - started),
+          stageMs: Math.round(now - since),
+        }),
+      );
+    } catch {
+      // Diagnostics must not replace the original assertion or cleanup error.
+    }
+  };
+  // The original case still owns its unchanged 30s deadline. This only observes.
+  const warning = setTimeout(() => print("pre-timeout"), 29_000);
+  return {
+    mode(constraint: boolean) {
+      releaseConstraint = constraint;
+    },
+    next(value: AbortD1Stage) {
+      stage = value;
+      since = performance.now();
+    },
+    failed() {
+      print("failure");
+      clearTimeout(warning);
+    },
+    done() {
+      closed = true;
+      clearTimeout(warning);
+    },
+  };
+}
+
+type AbortD1StageReport = ReturnType<typeof createAbortD1StageReport>;
+
 test("native D1 settles whole-operation apply abort with an atomic exact hold release", async () => {
-  for (const injectReleaseConstraint of [false, true]) {
-    await withNativeD1(
-      { failOn: [], recoveryAbort: true, injectReleaseConstraint },
-      async ({ app, sql, observe }) => {
-        const tenant = await createTenant(app.fetch);
-        const initial = await applyResource(app.fetch, tenant.provider, "d1-recovery-abort");
-        expect(initial.status).toBe(202);
-        const operationId = operationIdFrom(initial.body);
-        expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
-          heldMicros: "5000000",
-        });
-        const recovered = (await app.tick()).providerRepairs;
-        expect(recovered).toMatchObject(
-          injectReleaseConstraint ? { settled: 0, pending: 1 } : { settled: 1, pending: 0 },
-        );
-        expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
-          settledMicros: "20000000",
-          heldMicros: injectReleaseConstraint ? "5000000" : "0",
-        });
-        expect(
-          await sql.query(
-            "SELECT provider_outcome FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
-            [operationId],
-          ),
-        ).toEqual(injectReleaseConstraint ? [{ provider_outcome: "indeterminate" }] : []);
-        expect(
-          await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
-            operationId,
-          ]),
-        ).toEqual([{ phase: injectReleaseConstraint ? "committing" : "failed" }]);
-        expect(observe.releaseIntercepts).toBe(1);
-        expect(observe.maxBindParams).toBeLessThanOrEqual(100);
-      },
-    );
+  const report = createAbortD1StageReport();
+  try {
+    for (const injectReleaseConstraint of [false, true]) {
+      report.mode(injectReleaseConstraint);
+      await withNativeD1(
+        { failOn: [], recoveryAbort: true, injectReleaseConstraint },
+        async ({ app, sql, observe }) => {
+          const tenant = await createTenant(app.fetch, report);
+          report.next("apply");
+          const initial = await applyResource(app.fetch, tenant.provider, "d1-recovery-abort");
+          expect(initial.status).toBe(202);
+          const operationId = operationIdFrom(initial.body);
+          report.next("held-wallet");
+          expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
+            heldMicros: "5000000",
+          });
+          report.next("abort-tick");
+          const recovered = (await app.tick()).providerRepairs;
+          report.next("refusal-oracles");
+          expect(recovered).toMatchObject(
+            injectReleaseConstraint ? { settled: 0, pending: 1 } : { settled: 1, pending: 0 },
+          );
+          expect(await walletAt(app.fetch, tenant.organizationId, tenant.owner)).toMatchObject({
+            settledMicros: "20000000",
+            heldMicros: injectReleaseConstraint ? "5000000" : "0",
+          });
+          expect(
+            await sql.query(
+              "SELECT provider_outcome FROM tf_provider_mutation_sagas_selection_v1 WHERE operation_id = ?",
+              [operationId],
+            ),
+          ).toEqual(injectReleaseConstraint ? [{ provider_outcome: "indeterminate" }] : []);
+          expect(
+            await sql.query("SELECT phase FROM tf_deferred_operations_selection_v1 WHERE id = ?", [
+              operationId,
+            ]),
+          ).toEqual([{ phase: injectReleaseConstraint ? "committing" : "failed" }]);
+          expect(observe.releaseIntercepts).toBe(1);
+          expect(observe.maxBindParams).toBeLessThanOrEqual(100);
+        },
+        report,
+      );
+    }
+  } catch (error) {
+    report.failed();
+    throw error;
+  } finally {
+    report.done();
   }
 }, 30_000);
 
@@ -459,7 +537,9 @@ interface NativeD1Fixture {
 async function withNativeD1(
   options: NativeD1Options,
   callback: (fixture: NativeD1Fixture) => Promise<void>,
+  report?: AbortD1StageReport,
 ): Promise<void> {
+  report?.next("runtime");
   const runtime = new Miniflare({
     workers: [
       {
@@ -483,10 +563,16 @@ async function withNativeD1(
     ],
   });
   try {
+    report?.next("database");
     const database = await runtime.getD1Database("STATE_DB");
+    report?.next("schema");
     await applyMigrations(database);
+    report?.next("app");
     const base = createD1Sql(database);
-    const observe: NativeD1Observation = { releaseIntercepts: 0, maxBindParams: 0 };
+    const observe: NativeD1Observation = {
+      releaseIntercepts: 0,
+      maxBindParams: 0,
+    };
     const sql = observeSql(base, observe, options.injectReleaseConstraint === true);
     class AbortProvider extends FakeProvider {
       override async apply(_input: ApplyInput) {
@@ -520,7 +606,11 @@ async function withNativeD1(
       clock: () => new Date(NOW),
     });
     await callback({ app, sql, observe });
+  } catch (error) {
+    report?.failed();
+    throw error;
   } finally {
+    report?.next("dispose");
     await runtime.dispose();
   }
 }
@@ -576,8 +666,10 @@ interface TenantFixture {
 
 async function createTenant(
   fetch: (request: Request) => Promise<Response>,
+  report?: AbortD1StageReport,
 ): Promise<TenantFixture> {
   const suffix = TENANT_PREFIX;
+  report?.next("tenant-session");
   const session = await call(fetch, "POST", "/v1/sessions", {
     provider: "google",
     assertion: "verified",
@@ -585,6 +677,7 @@ async function createTenant(
   const sessionToken = session.body.sessionToken;
   if (typeof sessionToken !== "string") throw new Error("test session was not issued");
   const owner = { authorization: `Bearer ${sessionToken}` };
+  report?.next("tenant-organization");
   const organization = await call(
     fetch,
     "POST",
@@ -598,6 +691,7 @@ async function createTenant(
   }
   const organizationId = (organizationValue as { id?: unknown }).id;
   if (typeof organizationId !== "string") throw new Error("test organization has no id");
+  report?.next("tenant-funding");
   await call(
     fetch,
     "POST",
@@ -605,6 +699,7 @@ async function createTenant(
     { settlementProof: `proof-${suffix}` },
     owner,
   );
+  report?.next("tenant-key");
   const key = await call(
     fetch,
     "POST",

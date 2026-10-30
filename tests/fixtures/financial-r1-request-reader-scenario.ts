@@ -1,4 +1,5 @@
 import { expect, mock, test } from "bun:test";
+import type { Sql } from "../../src/ports.ts";
 import type { SharedFinancialAction } from "../../src/shared-financial-action.ts";
 import type { WorkerRequestSql } from "../../src/worker-request-composition.ts";
 
@@ -266,6 +267,53 @@ async function setup(action: SharedFinancialAction = topupAction(), terms?: stri
   const reader = createFinancialActionConsentR1Reader(connection, request, SCOPE.workspaceId);
   return { command, install, reader };
 }
+
+test("unselected Money epoch refuses request R1 before final touch, Clock or SQL", async () => {
+  await setup();
+  const inputs = state.inputs;
+  const context = state.context;
+  let queries = 0;
+  const query: Sql["query"] = (...args) => {
+    queries++;
+    return f.sql.query(...args);
+  };
+  const sql = Object.freeze({ ...f.sql, query });
+  const before = {
+    writes: f.writes,
+    queries,
+    provider: f.providerRequests,
+    clocks: f.clocks,
+    captures: state.captures,
+  };
+  try {
+    for (const writerEpoch of [undefined, "not-an-epoch"]) {
+      state.inputs = { ...inputs, sql, writerEpoch };
+      state.context = { ...context, sql, writerEpoch };
+      expectUnavailable(() =>
+        createFinancialActionConsentR1Reader(connection, request, SCOPE.workspaceId),
+      );
+      await expect(
+        readFinancialRequestBoundR1History(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          "challenge:ordinary-refusal",
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect({
+        writes: f.writes,
+        queries,
+        provider: f.providerRequests,
+        clocks: f.clocks,
+        captures: state.captures,
+      }).toEqual(before);
+    }
+  } finally {
+    state.inputs = inputs;
+    state.context = context;
+    f.close();
+  }
+});
 
 test("request-owned R1 consumer returns exact five-action originals, both receipts and separate credential-row/selected scopes", async () => {
   for (const action of ACTIONS) {

@@ -163,11 +163,25 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
     )`);
     // A real pre-0077 database has only the prefix. Later migrations depend on
     // 0077/0078 and must run through the normal migrator after the old row exists.
-    for (const migration of MIGRATIONS.slice(0, historicalMigrationCount)) {
-      db.exec(migration.sql);
-      db.query("INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))").run(
-        migration.name,
-      );
+    // The prefix is replayed in one transaction: autocommit made it the dominant
+    // cost (about 2,700 syncs), so a slow journal alone could time the case out.
+    // The resulting file is identical and FULL still syncs the one commit.
+    db.exec("BEGIN");
+    try {
+      for (const migration of MIGRATIONS.slice(0, historicalMigrationCount)) {
+        db.exec(migration.sql);
+        db.query(
+          "INSERT INTO applied_migrations (name, applied_at) VALUES (?, datetime('now'))",
+        ).run(migration.name);
+      }
+      db.exec("COMMIT");
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Keep the replay's own failure.
+      }
+      throw error;
     }
   }
   const sql = createSqliteSql(db);
@@ -1580,6 +1594,43 @@ test("graph read and stillCurrent refuse a claim whose lease expires during the 
       kind: "unresolved",
       code: "stale_claim",
     });
+  } finally {
+    f.close();
+  }
+});
+
+test("publication graph reads remain available while another SQLite connection holds the writer lock", async () => {
+  const f = fixture();
+  try {
+    const { worker, version } = await f.basics();
+    const deployment = await f.create(
+      WORKER_DEPLOYMENT_FORM_URL,
+      "deployment",
+      {
+        worker: { resourceUid: worker.resourceUid },
+        versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+      },
+      false,
+    );
+    const execution = await f.claim(deployment.id);
+    const writer = new Database(f.path);
+    try {
+      writer.exec("BEGIN IMMEDIATE");
+      try {
+        const reader = createV2WorkerPublicationState({
+          sql: f.sql,
+          now: () => new Date(f.currentClock()),
+        });
+        const current = await reader.resolve({ execution });
+        expect(current.kind).toBe("ready");
+        if (current.kind !== "ready") throw new Error("read-only graph became unavailable");
+        expect(await current.stillCurrent()).toBe(true);
+      } finally {
+        writer.exec("ROLLBACK");
+      }
+    } finally {
+      writer.close();
+    }
   } finally {
     f.close();
   }

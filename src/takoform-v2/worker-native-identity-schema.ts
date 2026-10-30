@@ -97,6 +97,9 @@ const OPAQUE_TABLE = `CREATE TABLE tf_v2_worker_native_deletions (
   CHECK (acknowledged_receipt IS NULL OR granted_at_ms IS NOT NULL)
 )`;
 
+/** Exact 0102 source-owned successor table, reused by the later Forward recipe. */
+export const v2WorkerOpaqueDeletionTableSql = OPAQUE_TABLE;
+
 const INDEX = `CREATE INDEX tf_v2_worker_native_deletions_next
   ON tf_v2_worker_native_deletions(delete_operation_id, source_generation DESC, source_operation_id)`;
 

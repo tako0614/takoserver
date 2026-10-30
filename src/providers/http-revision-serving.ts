@@ -133,6 +133,12 @@ export interface HttpRevisionServingHandle<Revision extends HttpRevisionServingR
   observe(identity: HttpRevisionServingIdentity): Promise<HttpRevisionServingObservation>;
   sweep(identity: HttpRevisionServingIdentity): Promise<HttpRevisionServingObservation>;
   invoke(identity: HttpRevisionServingIdentity, request: Request): Promise<Response>;
+  /** Select the exact currently serving native revision in the invocation lease interval. */
+  invokePinned(
+    identity: HttpRevisionServingIdentity,
+    expectedRevision: string,
+    request: Request,
+  ): Promise<Response>;
   remove(identity: HttpRevisionServingIdentity): Promise<HttpRevisionServingObservation>;
   close(): Promise<void>;
 }
@@ -231,6 +237,67 @@ export function createHttpRevisionServing<
         }
       })();
       return closing;
+    }
+
+    function invokeSelected(
+      identity: HttpRevisionServingIdentity,
+      request: Request,
+      pin: { readonly expectedRevision: string } | null,
+    ): Promise<Response> {
+      return run(async () => {
+        const current = await serviceFor(options, services, identity, () => stopping);
+        if (closed.signal.aborted) fail(options, "closed");
+        const state = current.state;
+        if (!state || state.deleting || state.serving === null) fail(options, "unavailable");
+        const selected = structuredCloneSafe(revisionOf(options, state, state.serving));
+        // The selected revision and its lease are acquired without an await.
+        // A pin mismatch cannot reach backend readback or dispatch.
+        if (pin !== null && selected.input.revision !== pin.expectedRevision)
+          fail(options, "unavailable");
+        const abort = new AbortController();
+        const abortRequest = () => abort.abort();
+        const call: Call = {
+          owner,
+          generation: selected.input.generation,
+          abort,
+          finish() {
+            current.calls.delete(call);
+            request.signal.removeEventListener("abort", abortRequest);
+          },
+        };
+        // Lifecycle awaits never block admission to the still-serving revision.
+        current.calls.add(call);
+        request.signal.addEventListener("abort", abortRequest, { once: true });
+        if (request.signal.aborted) abort.abort();
+        try {
+          const native = await options.backend.observe(selected.input);
+          if (native.state !== "ready") fail(options, "unavailable");
+          const nativeId = requireNative(options, native);
+          checkNative(options, selected, nativeId);
+          // Delete/drain/close may have fenced this call during readback.
+          if (
+            abort.signal.aborted ||
+            closed.signal.aborted ||
+            current.failed ||
+            current.state?.deleting
+          )
+            fail(options, "unavailable");
+          const response = await options.backend.invoke(selected.input, request, {
+            nativeId,
+            context: native.context,
+            signal: abort.signal,
+          });
+          if (abort.signal.aborted) {
+            await response.body?.cancel();
+            fail(options, "unavailable");
+          }
+          return leasedResponse(options, response, call);
+        } catch (error) {
+          abort.abort();
+          call.finish();
+          throw error;
+        }
+      });
     }
 
     return {
@@ -373,57 +440,11 @@ export function createHttpRevisionServing<
       },
 
       invoke(identity, request) {
-        return run(async () => {
-          const current = await serviceFor(options, services, identity, () => stopping);
-          if (closed.signal.aborted) fail(options, "closed");
-          const state = current.state;
-          if (!state || state.deleting || state.serving === null) fail(options, "unavailable");
-          const selected = structuredCloneSafe(revisionOf(options, state, state.serving));
-          const abort = new AbortController();
-          const abortRequest = () => abort.abort();
-          const call: Call = {
-            owner,
-            generation: selected.input.generation,
-            abort,
-            finish() {
-              current.calls.delete(call);
-              request.signal.removeEventListener("abort", abortRequest);
-            },
-          };
-          // Selection and lease acquisition contain no await. Lifecycle awaits
-          // never block admission to the still-serving revision.
-          current.calls.add(call);
-          request.signal.addEventListener("abort", abortRequest, { once: true });
-          if (request.signal.aborted) abort.abort();
-          try {
-            const native = await options.backend.observe(selected.input);
-            if (native.state !== "ready") fail(options, "unavailable");
-            const nativeId = requireNative(options, native);
-            checkNative(options, selected, nativeId);
-            // Delete/drain/close may have fenced this call during readback.
-            if (
-              abort.signal.aborted ||
-              closed.signal.aborted ||
-              current.failed ||
-              current.state?.deleting
-            )
-              fail(options, "unavailable");
-            const response = await options.backend.invoke(selected.input, request, {
-              nativeId,
-              context: native.context,
-              signal: abort.signal,
-            });
-            if (abort.signal.aborted) {
-              await response.body?.cancel();
-              fail(options, "unavailable");
-            }
-            return leasedResponse(options, response, call);
-          } catch (error) {
-            abort.abort();
-            call.finish();
-            throw error;
-          }
-        });
+        return invokeSelected(identity, request, null);
+      },
+
+      invokePinned(identity, expectedRevision, request) {
+        return invokeSelected(identity, request, { expectedRevision });
       },
 
       remove(identity) {

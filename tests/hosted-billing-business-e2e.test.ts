@@ -1097,10 +1097,10 @@ test("real route sequence retains exact commands, permits GET reentry, and never
   expect(calls.filter((call) => call.startsWith("POST"))).toEqual([]);
 });
 
-test("a shared-auth Workspace selects its derived Organization and never creates a personal one", async () => {
+async function sharedWorkspaceCase(length: 16 | 32) {
   const f = fixture();
   const authority = "takoserver.hosted.staging-test.v1";
-  const workspaceRef = `wrk_${"c".repeat(32)}`;
+  const workspaceRef = `wrk_${"c".repeat(length)}`;
   const inputRaw = f.inputRaw.replace('"workspace-original"', `"${workspaceRef}"`);
   const input = parseBusinessInput(inputRaw);
   const org = await workspaceBillingOrganizationRef(authority, workspaceRef);
@@ -1179,7 +1179,11 @@ test("a shared-auth Workspace selects its derived Organization and never creates
     usagePublicFieldsMatch: true,
     webhookProven: false,
   });
-});
+}
+
+for (const length of [16, 32] as const)
+  test(`a ${length}-hex shared-auth Workspace selects its derived Organization and never creates a personal one`, () =>
+    sharedWorkspaceCase(length));
 
 for (const outcome of ["lost-ack", "conflict"] as const)
   test(`uncertain top-up ${outcome} stays GET-only and withholds URL`, async () => {

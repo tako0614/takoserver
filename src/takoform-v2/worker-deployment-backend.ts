@@ -2,14 +2,23 @@ import { bytesDigest, canonicalJson } from "../json.ts";
 import type { WorkerdPublicationIdentity } from "../workerd-runtime.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../workerd-worker-runtime-owner.ts";
 import {
+  fixedReferencesForContainerConsumerWorkerDeployment,
+  prepareContainerConsumerWorkerDeploymentReferences,
+} from "./forms/container-consumer-references.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  isForwardFamilyWorkerVersionForm,
+  parseContainerConsumerWorkerDeploymentSpec,
+  validateContainerConsumerWorkerDeploymentUpdate,
+  WORKER_DEPLOYMENT_SLOT_FORM_URLS,
+} from "./forms/container-consumer-specs.ts";
+import {
   fixedReferencesForForwardWorkerDeployment,
   prepareForwardWorkerDeploymentReferences,
   referencesForWorkerDeployment,
 } from "./forms/worker-references.ts";
 import {
-  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
   FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-  FORWARD_WORKER_VERSION_FORM_URL,
   parseForwardWorkerDeploymentSpec,
   parseForwardWorkerVersionSpec,
   parseWorkerDeploymentSpec,
@@ -60,7 +69,11 @@ const unknown = (): V2BackendResult => ({
   message: "The Worker publication or retirement is not yet confirmed",
 });
 
-/** One self-host runtime owner can serve only one Deployment UID per Worker. */
+/**
+ * One self-host runtime owner can serve only one Deployment UID per Worker, across every
+ * Deployment Form that can own it (WORKER_DEPLOYMENT_SLOT_FORM_URLS), whichever order they
+ * were created in. A Form missing from that list would let a second UID in unnoticed.
+ */
 function deploymentAdmission(input: {
   readonly principal: string;
   readonly space: string;
@@ -73,13 +86,12 @@ function deploymentAdmission(input: {
     // A deleting or failed Resource still owns its UID until DELETE settles;
     // a same-UID update excludes itself, while a deleted UID can be replaced.
     sql: `NOT EXISTS (SELECT 1 FROM tf_v2_resources other
-      WHERE other.form_url IN (?, ?, ?) AND other.principal = ? AND other.space = ?
+      WHERE other.form_url IN (${WORKER_DEPLOYMENT_SLOT_FORM_URLS.map(() => "?").join(", ")})
+        AND other.principal = ? AND other.space = ?
         AND other.deleted_at IS NULL AND other.uid <> ?
         AND json_extract(other.spec_json, '$.worker.resourceUid') = ?)`,
     params: [
-      WORKER_DEPLOYMENT_FORM_URL,
-      CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
-      FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+      ...WORKER_DEPLOYMENT_SLOT_FORM_URLS,
       input.principal,
       input.space,
       input.resourceUid,
@@ -95,23 +107,40 @@ function deploymentAdmission(input: {
  * No other native sender may be installed for the same Worker UID/target.
  * The caller owns that mapping, durable owner lock, and runtime lifecycle.
  */
+type DeploymentFormOptions = {
+  readonly targetKey: string;
+  readonly publicationState: PublicationState;
+  readonly ownerForWorker: (workerUid: string) => Promise<RuntimeOwner> | RuntimeOwner;
+  /** A missing reader is refusal, never evidence that no Cron attachment exists. */
+  readonly scheduledAttachments: V2ScheduledAttachmentRequirementReader;
+};
+type DeploymentFormUrl =
+  | typeof WORKER_DEPLOYMENT_FORM_URL
+  | typeof FORWARD_WORKER_DEPLOYMENT_FORM_URL
+  | typeof CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL;
+
 export function createWorkerDeploymentForm(
-  options: {
-    readonly targetKey: string;
-    readonly publicationState: PublicationState;
-    readonly ownerForWorker: (workerUid: string) => Promise<RuntimeOwner> | RuntimeOwner;
-    /** A missing reader is refusal, never evidence that no Cron attachment exists. */
-    readonly scheduledAttachments: V2ScheduledAttachmentRequirementReader;
-  },
+  options: DeploymentFormOptions,
   forward = false,
 ): V2Form {
+  return deploymentForm(
+    options,
+    forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL,
+  );
+}
+
+/**
+ * Each factory serves exactly one Deployment Form, so the Operation's own Form is compared
+ * for exact equality; the Version Forms it may select are decided where the graph is read.
+ */
+function deploymentForm(options: DeploymentFormOptions, formUrl: DeploymentFormUrl): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   if (!options.scheduledAttachments) throw new TypeError("scheduledAttachments is required");
+  const forward = formUrl !== WORKER_DEPLOYMENT_FORM_URL;
 
   async function run(execution: V2Execution): Promise<V2BackendResult> {
     if (
-      execution.form !==
-        (forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL) ||
+      execution.form !== formUrl ||
       execution.backendId !== WORKER_DEPLOYMENT_BACKEND_ID ||
       execution.targetKey !== options.targetKey ||
       (execution.action !== "create" &&
@@ -174,7 +203,7 @@ export function createWorkerDeploymentForm(
           (before.snapshot.deployment?.versions.some(
             (version) =>
               !(
-                version.form === FORWARD_WORKER_VERSION_FORM_URL
+                isForwardFamilyWorkerVersionForm(version.form)
                   ? parseForwardWorkerVersionSpec(version.spec)
                   : parseWorkerVersionSpec(version.spec)
               ).handlers.includes("scheduled"),
@@ -311,9 +340,12 @@ export function createWorkerDeploymentForm(
     },
     async prepareAdmission(input) {
       try {
+        const admission = deploymentAdmission(input);
+        if (formUrl === CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL)
+          return await prepareContainerConsumerWorkerDeploymentReferences(input, admission);
         return forward
-          ? await prepareForwardWorkerDeploymentReferences(input, deploymentAdmission(input))
-          : deploymentAdmission(input);
+          ? await prepareForwardWorkerDeploymentReferences(input, admission)
+          : admission;
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;
@@ -321,6 +353,10 @@ export function createWorkerDeploymentForm(
     },
     references(spec) {
       try {
+        if (formUrl === CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL)
+          return fixedReferencesForContainerConsumerWorkerDeployment(
+            parseContainerConsumerWorkerDeploymentSpec(spec),
+          );
         return forward
           ? fixedReferencesForForwardWorkerDeployment(parseForwardWorkerDeploymentSpec(spec))
           : referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec));
@@ -395,34 +431,54 @@ export async function exactV2WorkerPublicationIdentity(
   return canonicalJson(identity) === canonicalJson(expected);
 }
 
+type FamilyDeploymentOptions =
+  | { readonly targetKey: string }
+  | (Omit<Parameters<typeof createWorkerDeploymentForm>[0], "publicationState"> & {
+      readonly publicationState: PublicationState & {
+        resolveForward(input: {
+          execution: V2Execution;
+          incumbentSourceOperationId?: string;
+        }): Promise<V2WorkerPublicationResolution>;
+      };
+    });
+
 /** Exact forward admission; no legacy runtime fallback or default registration. */
-export function createForwardWorkerDeploymentForm(
-  options:
-    | { readonly targetKey: string }
-    | (Omit<Parameters<typeof createWorkerDeploymentForm>[0], "publicationState"> & {
-        readonly publicationState: PublicationState & {
-          resolveForward(input: {
-            execution: V2Execution;
-            incumbentSourceOperationId?: string;
-          }): Promise<V2WorkerPublicationResolution>;
-        };
-      }),
+export function createForwardWorkerDeploymentForm(options: FamilyDeploymentOptions): V2Form {
+  return familyDeploymentForm(options, FORWARD_WORKER_DEPLOYMENT_FORM_URL);
+}
+
+/**
+ * WorkerDeployment 0.7.0: the 0.6.0 execution ABI over the closed 0.5.0 / 0.7.0 / 0.8.0
+ * Version set. A separate identity, so an accepted 0.6.0 Deployment is never reinterpreted.
+ */
+export function createContainerConsumerWorkerDeploymentForm(
+  options: FamilyDeploymentOptions,
+): V2Form {
+  return familyDeploymentForm(options, CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL);
+}
+
+function familyDeploymentForm(
+  options: FamilyDeploymentOptions,
+  formUrl:
+    | typeof FORWARD_WORKER_DEPLOYMENT_FORM_URL
+    | typeof CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
 ): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   if ("publicationState" in options)
-    return createWorkerDeploymentForm(
+    return deploymentForm(
       {
         ...options,
         publicationState: {
           resolve: options.publicationState.resolveForward.bind(options.publicationState),
         },
       },
-      true,
+      formUrl,
     );
+  const consumer = formUrl === CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL;
   const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => ({
     kind: "unknown",
     code:
-      execution.form === FORWARD_WORKER_DEPLOYMENT_FORM_URL &&
+      execution.form === formUrl &&
       execution.targetKey === options.targetKey &&
       execution.backendId === WORKER_DEPLOYMENT_BACKEND_ID
         ? "worker_forward_materializer_unavailable"
@@ -432,7 +488,9 @@ export function createForwardWorkerDeploymentForm(
   return {
     validateCreate(spec) {
       try {
-        parseForwardWorkerDeploymentSpec(spec);
+        (consumer ? parseContainerConsumerWorkerDeploymentSpec : parseForwardWorkerDeploymentSpec)(
+          spec,
+        );
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;
@@ -440,17 +498,26 @@ export function createForwardWorkerDeploymentForm(
     },
     validateUpdate(previous, spec) {
       try {
-        validateForwardWorkerDeploymentUpdate(previous, spec);
+        (consumer
+          ? validateContainerConsumerWorkerDeploymentUpdate
+          : validateForwardWorkerDeploymentUpdate)(previous, spec);
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;
       }
     },
     references(spec) {
-      return fixedReferencesForForwardWorkerDeployment(parseForwardWorkerDeploymentSpec(spec));
+      return consumer
+        ? fixedReferencesForContainerConsumerWorkerDeployment(
+            parseContainerConsumerWorkerDeploymentSpec(spec),
+          )
+        : fixedReferencesForForwardWorkerDeployment(parseForwardWorkerDeploymentSpec(spec));
     },
     prepareAdmission(input) {
-      return prepareForwardWorkerDeploymentReferences(input, deploymentAdmission(input));
+      const admission = deploymentAdmission(input);
+      return consumer
+        ? prepareContainerConsumerWorkerDeploymentReferences(input, admission)
+        : prepareForwardWorkerDeploymentReferences(input, admission);
     },
     rejectDeleteWhileReferenced: true,
     backend: {

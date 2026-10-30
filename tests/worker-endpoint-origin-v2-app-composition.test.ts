@@ -14,6 +14,7 @@ import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createSharedAppLedger } from "../src/shared-app-ledger.ts";
+import { SHARED_APP_STAGING_PHYSICAL_DDL } from "../src/shared-app-staging-adoption.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
@@ -94,11 +95,19 @@ function sharedSchema(db: Database, includeBindings: boolean, typed = false): vo
 }
 
 async function fixture(
-  options: { shared?: boolean; bindings?: boolean; typed?: boolean; carrier?: boolean } = {},
+  options: {
+    shared?: boolean;
+    bindings?: boolean;
+    typed?: boolean;
+    carrier?: boolean;
+    physical?: boolean;
+  } = {},
 ) {
   const db = migrateSqliteDatabase();
   const raw = createSqliteSql(db);
-  if (options.shared !== false)
+  if (options.physical) {
+    for (const statement of SHARED_APP_STAGING_PHYSICAL_DDL) db.exec(statement);
+  } else if (options.shared !== false)
     sharedSchema(db, options.bindings !== false, options.typed === true);
   const statements: SqlStatement[] = [];
   const batches: (readonly SqlStatement[])[] = [];
@@ -907,6 +916,72 @@ test("actual public carrier PUT creates the original consumed by real App Engine
     );
   } finally {
     f.close();
+  }
+});
+
+test("physical 0107 candidate admits a fresh typed carrier original and untouched cancellation", async () => {
+  const f = await fixture({ physical: true, carrier: true });
+  try {
+    const app = f.makeApp({ ...f.selection, kind: "form-v2@1" });
+    const name = "physical-carrier-app";
+    const reservationId = "physical-carrier-original";
+    expect((await f.control(app, "PUT", reservationId, name)).status).toBe(201);
+    expect(() =>
+      f.db
+        .query("UPDATE worker_endpoint_origin_reservations SET revision=2 WHERE reservation_id=?")
+        .run(reservationId),
+    ).toThrow();
+    expect((await f.control(app, "DELETE", reservationId, name)).status).toBe(204);
+    expect(
+      f.db.query("SELECT state FROM shared_app_staging_names WHERE normalized_name=?").get(name),
+    ).toEqual({ state: "released" });
+    expect(
+      f.db.query("SELECT count(*) AS n FROM shared_app_staging_carrier_witnesses").get(),
+    ).toEqual({ n: 0 });
+    expect(
+      f.db.query("SELECT count(*) AS n FROM shared_app_staging_batch_assertions").get(),
+    ).toEqual({ n: 0 });
+  } finally {
+    f.db.close();
+  }
+});
+
+test("physical carrier witness cleanup is a terminal condition for prepare and cancel", async () => {
+  const f = await fixture({ physical: true, carrier: true });
+  try {
+    const app = f.makeApp({ ...f.selection, kind: "form-v2@1" });
+    const name = "closed-carrier-app";
+    const reservationId = "closed-carrier-original";
+    f.db.exec(`CREATE TRIGGER fixture_skip_carrier_witness_cleanup
+      BEFORE DELETE ON shared_app_staging_carrier_witnesses BEGIN SELECT RAISE(IGNORE); END`);
+    expect((await f.control(app, "PUT", reservationId, name)).status).toBe(503);
+    expect(f.db.query("SELECT count(*) AS n FROM shared_app_staging_assignments").get()).toEqual({
+      n: 0,
+    });
+    expect(
+      f.db.query("SELECT count(*) AS n FROM worker_endpoint_origin_reservations").get(),
+    ).toEqual({ n: 0 });
+    expect(
+      f.db.query("SELECT count(*) AS n FROM shared_app_staging_carrier_witnesses").get(),
+    ).toEqual({ n: 0 });
+    f.db.exec("DROP TRIGGER fixture_skip_carrier_witness_cleanup");
+    expect((await f.control(app, "PUT", reservationId, name)).status).toBe(201);
+    f.db.exec(`CREATE TRIGGER fixture_skip_carrier_witness_cleanup
+      BEFORE DELETE ON shared_app_staging_carrier_witnesses BEGIN SELECT RAISE(IGNORE); END`);
+    expect((await f.control(app, "DELETE", reservationId, name)).status).toBe(503);
+    expect(
+      f.db.query("SELECT state FROM shared_app_staging_names WHERE normalized_name=?").get(name),
+    ).toEqual({ state: "reserved" });
+    expect(
+      f.db
+        .query("SELECT state FROM worker_endpoint_origin_reservations WHERE reservation_id=?")
+        .get(reservationId),
+    ).toEqual({ state: "prepared" });
+    expect(
+      f.db.query("SELECT count(*) AS n FROM shared_app_staging_carrier_witnesses").get(),
+    ).toEqual({ n: 0 });
+  } finally {
+    f.db.close();
   }
 });
 

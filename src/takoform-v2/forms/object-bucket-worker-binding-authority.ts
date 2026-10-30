@@ -1,15 +1,17 @@
 import { bytesDigest, canonicalJson } from "../../json.ts";
 import type { Sql } from "../../ports.ts";
+import { referencesForForwardFamilyWorkerVersion } from "./container-consumer-references.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  isForwardFamilyWorkerVersionForm,
+} from "./container-consumer-specs.ts";
 import { OBJECT_BUCKET_LIMITS, parseObjectBucketSpec } from "./object-bucket.ts";
 import { resolveObjectBucketBackendId } from "./object-bucket-backend.ts";
 import {
   type ObjectBucketBindingFormUrl,
   snapshotObjectBucketBindingForms,
 } from "./object-bucket-binding-profile.ts";
-import {
-  referencesForForwardWorkerVersion,
-  referencesForWorkerVersion,
-} from "./worker-references.ts";
+import { referencesForWorkerVersion } from "./worker-references.ts";
 import {
   FORWARD_WORKER_VERSION_FORM_URL,
   parseForwardWorkerVersionSpec,
@@ -77,7 +79,7 @@ export function createObjectBucketWorkerBindingAuthority(options: {
               op.action, op.status, op.effect, op.generation AS operation_generation,
               op.accepted_spec_json
        FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
-       WHERE r.uid = ? AND r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
+       WHERE r.uid = ? AND r.form_url IN (?, ?, ?) AND r.principal = ? AND r.space = ?
          AND r.target_key = ? AND r.deleted_at IS NULL AND r.busy_operation IS NULL
          AND r.phase = 'idle' AND r.observed_generation = r.generation
          AND op.resource_uid = r.uid AND op.principal = r.principal
@@ -89,6 +91,7 @@ export function createObjectBucketWorkerBindingAuthority(options: {
         grant.workerVersionUid,
         WORKER_VERSION_FORM_URL,
         FORWARD_WORKER_VERSION_FORM_URL,
+        CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
         grant.principal,
         grant.space,
         grant.targetKey,
@@ -106,10 +109,9 @@ export function createObjectBucketWorkerBindingAuthority(options: {
 
     let spec: ReturnType<typeof parseWorkerVersionSpec>;
     try {
-      spec =
-        version.form_url === FORWARD_WORKER_VERSION_FORM_URL
-          ? parseForwardWorkerVersionSpec(JSON.parse(version.spec_json))
-          : parseWorkerVersionSpec(JSON.parse(version.spec_json));
+      spec = isForwardFamilyWorkerVersionForm(version.form_url)
+        ? parseForwardWorkerVersionSpec(JSON.parse(version.spec_json))
+        : parseWorkerVersionSpec(JSON.parse(version.spec_json));
       if (!isReadyWorkerVersionObservation(JSON.parse(version.observed_json), true)) return null;
     } catch {
       return null;
@@ -167,15 +169,32 @@ export function createObjectBucketWorkerBindingAuthority(options: {
       return null;
     }
 
-    const refSet = await options.sql.query(
-      "SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id = ?",
-      [version.operation_id as string],
+    // Keep this observation read-only on SQLite; batch() takes a writer lock.
+    const [refSet, ...referenceRows] = await options.sql.query(
+      `SELECT 0 AS record_kind, sealed, NULL AS target_uid, NULL AS form_url,
+              NULL AS readiness, NULL AS target_spec_path, NULL AS target_spec_equals
+       FROM tf_v2_operation_reference_sets WHERE operation_id = ?
+       UNION ALL
+       SELECT 1 AS record_kind, NULL AS sealed, target_uid, form_url,
+              readiness, target_spec_path, target_spec_equals
+       FROM tf_v2_operation_references WHERE operation_id = ?
+       ORDER BY record_kind, target_uid`,
+      [version.operation_id as string, version.operation_id as string],
     );
-    if (refSet.length !== 1 || refSet[0]?.sealed !== 1) return null;
-    const references = await options.sql.query(
-      `SELECT target_uid, form_url, readiness, target_spec_path, target_spec_equals
-       FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
-      [version.operation_id as string],
+    if (
+      refSet?.record_kind !== 0 ||
+      refSet.sealed !== 1 ||
+      referenceRows.some((row) => row.record_kind !== 1)
+    )
+      return null;
+    const references = referenceRows.map(
+      ({ target_uid, form_url, readiness, target_spec_path, target_spec_equals }) => ({
+        target_uid,
+        form_url,
+        readiness,
+        target_spec_path,
+        target_spec_equals,
+      }),
     );
     let expected: ReturnType<typeof referencesForWorkerVersion>;
     try {
@@ -184,13 +203,13 @@ export function createObjectBucketWorkerBindingAuthority(options: {
           throw new TypeError("invalid sealed target");
         return { resourceUid: row.target_uid, formUrl: row.form_url };
       });
-      expected =
-        version.form_url === FORWARD_WORKER_VERSION_FORM_URL
-          ? referencesForForwardWorkerVersion(
-              parseForwardWorkerVersionSpec(JSON.parse(version.spec_json)),
-              sealedTargets,
-            )
-          : referencesForWorkerVersion(spec);
+      expected = isForwardFamilyWorkerVersionForm(version.form_url)
+        ? referencesForForwardFamilyWorkerVersion(
+            version.form_url,
+            parseForwardWorkerVersionSpec(JSON.parse(version.spec_json)),
+            sealedTargets,
+          )
+        : referencesForWorkerVersion(spec);
     } catch {
       return null;
     }
@@ -280,17 +299,16 @@ export function createObjectBucketWorkerBindingAuthority(options: {
       }
     }
 
-    const selectedForm =
-      version.form_url === FORWARD_WORKER_VERSION_FORM_URL
-        ? snapshotObjectBucketBindingForms([
-            {
-              publicName: binding,
-              resourceUid: selected.resourceUid,
-              formUrl: expected.find((item) => item.resourceUid === selected.resourceUid)?.formUrl,
-            },
-          ])[0]?.formUrl
-        : undefined;
-    if (version.form_url === FORWARD_WORKER_VERSION_FORM_URL && !selectedForm) return null;
+    const selectedForm = isForwardFamilyWorkerVersionForm(version.form_url)
+      ? snapshotObjectBucketBindingForms([
+          {
+            publicName: binding,
+            resourceUid: selected.resourceUid,
+            formUrl: expected.find((item) => item.resourceUid === selected.resourceUid)?.formUrl,
+          },
+        ])[0]?.formUrl
+      : undefined;
+    if (isForwardFamilyWorkerVersionForm(version.form_url) && !selectedForm) return null;
     const legacyVector = [
       version.uid,
       version.generation,

@@ -620,8 +620,9 @@ export function createInternalV2CodeWorkerVersionForm(options: CodeWorkerVersion
 function codeWorkerVersionForm(
   options: CodeWorkerVersionOptions,
   backendId: string,
-  forward = false,
+  versionForm: WorkerVersionFormUrl = WORKER_VERSION_FORM_URL,
 ): V2Form {
+  const forward = versionForm !== WORKER_VERSION_FORM_URL;
   const parseSpec = forward
     ? (value: unknown) => {
         const spec = parseForwardWorkerVersionSpec(value);
@@ -698,7 +699,7 @@ function codeWorkerVersionForm(
 
   async function manage(execution: V2Execution): Promise<V2BackendResult> {
     if (
-      execution.form !== (forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL) ||
+      execution.form !== versionForm ||
       execution.targetKey !== targetKey ||
       execution.backendId !== backendId
     ) {
@@ -857,7 +858,7 @@ function codeWorkerVersionForm(
         ...(spec.bundle ? { bundleResourceUid: spec.bundle.resourceUid } : {}),
         ...(spec.assets ? { assetResourceUid: spec.assets.bundle.resourceUid } : {}),
         spec: snapshot.version.spec,
-        ...(forward ? { sourceForm: FORWARD_WORKER_VERSION_FORM_URL } : {}),
+        ...(isForwardFamilyWorkerVersionForm(versionForm) ? { sourceForm: versionForm } : {}),
         bundle: materials.bundle,
         assets: materials.assets,
         inspectModule,
@@ -945,7 +946,10 @@ function codeWorkerVersionForm(
     references(spec) {
       const refs = forward
         ? (spec: WorkerVersionSpec) =>
-            fixedReferencesForForwardWorkerVersion(parseForwardWorkerVersionSpec(spec))
+            fixedReferencesForForwardFamilyWorkerVersion(
+              versionForm,
+              parseForwardWorkerVersionSpec(spec),
+            )
         : referencesForWorkerVersion;
       return refs(
         codeOnly(
@@ -1069,7 +1073,7 @@ function codeWorkerVersionForm(
           },
         }
       : {}),
-    ...(forward ? { prepareAdmission: prepareForwardWorkerVersionReferences } : {}),
+    ...(forward ? { prepareAdmission: prepareVersionReferences(versionForm) } : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: backendId,
@@ -1101,8 +1105,9 @@ export function createInternalV2StaticWorkerVersionForm(
 function staticWorkerVersionForm(
   options: StaticWorkerVersionOptions,
   backendId: string,
-  forward = false,
+  versionForm: WorkerVersionFormUrl = WORKER_VERSION_FORM_URL,
 ): V2Form {
+  const forward = versionForm !== WORKER_VERSION_FORM_URL;
   const parseSpec = forward ? parseForwardWorkerVersionSpec : parseWorkerVersionSpec;
   if (
     !options.targetKey ||
@@ -1119,7 +1124,7 @@ function staticWorkerVersionForm(
 
   async function manage(execution: V2Execution): Promise<V2BackendResult> {
     if (
-      execution.form !== (forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL) ||
+      execution.form !== versionForm ||
       execution.targetKey !== targetKey ||
       execution.backendId !== backendId
     ) {
@@ -1193,12 +1198,13 @@ function staticWorkerVersionForm(
     },
     references(spec) {
       return forward
-        ? fixedReferencesForForwardWorkerVersion(
+        ? fixedReferencesForForwardFamilyWorkerVersion(
+            versionForm,
             parseForwardWorkerVersionSpec(staticOnly(validated(() => parseSpec(spec)))),
           )
         : referencesForWorkerVersion(staticOnly(validated(() => parseSpec(spec))));
     },
-    ...(forward ? { prepareAdmission: prepareForwardWorkerVersionReferences } : {}),
+    ...(forward ? { prepareAdmission: prepareVersionReferences(versionForm) } : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: backendId,
@@ -1211,11 +1217,19 @@ function staticWorkerVersionForm(
 
 /** One internal Form identity for static, code, and code-plus-assets Versions. */
 export function createInternalV2WorkerVersionForm(options: CodeWorkerVersionOptions): V2Form {
-  return unifiedWorkerVersionForm(options, false);
+  return unifiedWorkerVersionForm(options, WORKER_VERSION_FORM_URL);
 }
-function unifiedWorkerVersionForm(options: CodeWorkerVersionOptions, forward: boolean): V2Form {
-  const staticForm = staticWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID, forward);
-  const codeForm = codeWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID, forward);
+function unifiedWorkerVersionForm(
+  options: CodeWorkerVersionOptions,
+  versionForm: WorkerVersionFormUrl,
+): V2Form {
+  const forward = versionForm !== WORKER_VERSION_FORM_URL;
+  const staticForm = staticWorkerVersionForm(
+    options,
+    WORKER_VERSION_UNIFIED_BACKEND_ID,
+    versionForm,
+  );
+  const codeForm = codeWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID, versionForm);
   const selected = (spec: JsonObject): V2Form =>
     Object.hasOwn(spec, "bundle") ? codeForm : staticForm;
   return {
@@ -1231,7 +1245,7 @@ function unifiedWorkerVersionForm(options: CodeWorkerVersionOptions, forward: bo
       return form.references(spec);
     },
     ...(codeForm.privateInputs ? { privateInputs: codeForm.privateInputs } : {}),
-    ...(forward ? { prepareAdmission: prepareForwardWorkerVersionReferences } : {}),
+    ...(forward ? { prepareAdmission: prepareVersionReferences(versionForm) } : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: WORKER_VERSION_UNIFIED_BACKEND_ID,
@@ -1247,26 +1261,67 @@ function unifiedWorkerVersionForm(options: CodeWorkerVersionOptions, forward: bo
 }
 
 import {
-  fixedReferencesForForwardWorkerVersion,
-  prepareForwardWorkerVersionReferences,
-} from "./forms/worker-references.ts";
+  fixedReferencesForForwardFamilyWorkerVersion,
+  prepareContainerConsumerWorkerVersionReferences,
+} from "./forms/container-consumer-references.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+  isForwardFamilyWorkerVersionForm,
+  parseContainerConsumerWorkerVersionSpec,
+  validateContainerConsumerWorkerVersionUpdate,
+} from "./forms/container-consumer-specs.ts";
+import { prepareForwardWorkerVersionReferences } from "./forms/worker-references.ts";
 import {
   FORWARD_WORKER_VERSION_FORM_URL,
   parseForwardWorkerVersionSpec,
   validateForwardWorkerVersionUpdate,
 } from "./forms/worker-specs.ts";
 
+/** The exact WorkerVersion Form one factory serves; compared for equality, never as a set. */
+type WorkerVersionFormUrl =
+  | typeof WORKER_VERSION_FORM_URL
+  | typeof FORWARD_WORKER_VERSION_FORM_URL
+  | typeof CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL;
+
+/** The reference sealer matching one Form: 0.8.0 alone may seal a Container 0.2.0 target. */
+function prepareVersionReferences(versionForm: WorkerVersionFormUrl) {
+  return versionForm === CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL
+    ? prepareContainerConsumerWorkerVersionReferences
+    : prepareForwardWorkerVersionReferences;
+}
+
+type FamilyVersionOptions =
+  | { readonly targetKey: string }
+  | (Omit<CodeWorkerVersionOptions, "publicationState"> & {
+      readonly publicationState: VersionState & {
+        resolveForwardVersion(input: {
+          execution: V2Execution;
+        }): Promise<V2WorkerVersionResolution>;
+      };
+    });
+
 /** Named07 factory. Actual ports select held materialization; target-only preparation remains refused. */
-export function createInternalV2ForwardWorkerVersionForm(
-  options:
-    | { readonly targetKey: string }
-    | (Omit<CodeWorkerVersionOptions, "publicationState"> & {
-        readonly publicationState: VersionState & {
-          resolveForwardVersion(input: {
-            execution: V2Execution;
-          }): Promise<V2WorkerVersionResolution>;
-        };
-      }),
+export function createInternalV2ForwardWorkerVersionForm(options: FamilyVersionOptions): V2Form {
+  return familyVersionForm(options, FORWARD_WORKER_VERSION_FORM_URL);
+}
+
+/**
+ * WorkerVersion 0.8.0: the 0.7.0 spec grammar and execution ABI with containerBindings
+ * sealed against Container 0.1.0 or 0.2.0 per binding. A separate identity and sealer, so
+ * an accepted 0.7.0 Version is never reinterpreted. Self-host still has no Container
+ * runtime, so a code Version naming a containerBinding is refused exactly as 0.7.0's is.
+ */
+export function createInternalV2ContainerConsumerWorkerVersionForm(
+  options: FamilyVersionOptions,
+): V2Form {
+  return familyVersionForm(options, CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL);
+}
+
+function familyVersionForm(
+  options: FamilyVersionOptions,
+  versionForm:
+    | typeof FORWARD_WORKER_VERSION_FORM_URL
+    | typeof CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
 ): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   if ("sql" in options) {
@@ -1275,13 +1330,15 @@ export function createInternalV2ForwardWorkerVersionForm(
     );
     return unifiedWorkerVersionForm(
       { ...options, publicationState: { resolveVersion: resolveForwardVersion } },
-      true,
+      versionForm,
     );
   }
+  const consumer = versionForm === CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL;
+  const parse = consumer ? parseContainerConsumerWorkerVersionSpec : parseForwardWorkerVersionSpec;
   const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => ({
     kind: "unknown",
     code:
-      execution.form === FORWARD_WORKER_VERSION_FORM_URL &&
+      execution.form === versionForm &&
       execution.targetKey === options.targetKey &&
       execution.backendId === WORKER_VERSION_UNIFIED_BACKEND_ID
         ? "worker_forward_materializer_unavailable"
@@ -1290,22 +1347,27 @@ export function createInternalV2ForwardWorkerVersionForm(
   });
   return {
     validateCreate(spec) {
-      const parsed = validated(() => parseForwardWorkerVersionSpec(spec));
+      const parsed = validated(() => parse(spec));
       // This source-only adapter has no new private-input custody port.
       if (parsed.requiredSensitiveVars.length !== 0)
         throw new TakoformV2Error("capability_required", 422);
     },
     validateUpdate(previous, spec) {
-      const parsed = validated(() => validateForwardWorkerVersionUpdate(previous, spec));
+      const parsed = validated(() =>
+        consumer
+          ? validateContainerConsumerWorkerVersionUpdate(previous, spec)
+          : validateForwardWorkerVersionUpdate(previous, spec),
+      );
       if (parsed.requiredSensitiveVars.length !== 0)
         throw new TakoformV2Error("capability_required", 422);
     },
     references(spec) {
-      return fixedReferencesForForwardWorkerVersion(
-        validated(() => parseForwardWorkerVersionSpec(spec)),
+      return fixedReferencesForForwardFamilyWorkerVersion(
+        versionForm,
+        validated(() => parse(spec)),
       );
     },
-    prepareAdmission: prepareForwardWorkerVersionReferences,
+    prepareAdmission: prepareVersionReferences(versionForm),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: WORKER_VERSION_UNIFIED_BACKEND_ID,

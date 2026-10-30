@@ -275,6 +275,7 @@ export {
   type SharedAppRouteSelection,
   type SharedAppSelection,
 } from "./shared-app-ledger.ts";
+export { createSharedAppLedgerD1 } from "./shared-app-ledger-d1.ts";
 export {
   SHARED_APP_STAGING_SUFFIX,
   sharedAppStagingNameFromHost,

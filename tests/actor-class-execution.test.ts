@@ -45,6 +45,81 @@ function completePrototype(Actor: { readonly prototype: object }): void {
   }
 }
 
+/** Start the inspection deadline only after the child has imported and prepared its candidate. */
+async function runCandidateInspectionChild(script: string): Promise<{
+  readonly timedOut: boolean;
+  readonly exitCode: number;
+  readonly output: string;
+}> {
+  const child = Bun.spawn([process.execPath, "-e", script], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stderr = new Response(child.stderr).text();
+  const reader = child.stdout.getReader();
+  const reap = async () => {
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+    try {
+      await child.exited;
+    } catch {}
+    try {
+      await stderr;
+    } catch {}
+    try {
+      reader.releaseLock();
+    } catch {}
+  };
+  let setupTimedOut = false;
+  const setupTimeout = setTimeout(() => {
+    setupTimedOut = true;
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+  }, 10_000);
+  let setupReady = false;
+  try {
+    const ready = await reader.read();
+    if (setupTimedOut || ready.done || new TextDecoder().decode(ready.value) !== "R") {
+      throw new Error("candidate inspection child setup did not complete");
+    }
+    setupReady = true;
+  } finally {
+    clearTimeout(setupTimeout);
+    if (!setupReady) await reap();
+  }
+
+  let timedOut = false;
+  const inspectionTimeout = setTimeout(() => {
+    timedOut = true;
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+  }, 1_000);
+  let exitCode: number;
+  try {
+    child.stdin.write("G");
+    await child.stdin.end();
+    exitCode = await child.exited;
+  } catch (error) {
+    await reap();
+    throw error;
+  } finally {
+    clearTimeout(inspectionTimeout);
+  }
+  let output = "";
+  for (;;) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    output += new TextDecoder().decode(chunk.value);
+  }
+  reader.releaseLock();
+  await stderr;
+  return { timedOut, exitCode, output };
+}
+
 describe("private Actor ordinary-class execution seam", () => {
   test("accepts inherited prototype methods and uses one receiver for every handler", async () => {
     const receivers: unknown[] = [];
@@ -318,8 +393,10 @@ describe("private Actor ordinary-class execution seam", () => {
 
   test("candidate inspection refuses cyclic and changing prototype chains", async () => {
     const moduleUrl = new URL("../src/actor-class-candidate-inspection.ts", import.meta.url).href;
+    // The child may take longer than the inspection deadline just to become ready.
     const script = `
       import { inspectActorClassV2Candidate } from ${JSON.stringify(moduleUrl)};
+      await new Promise((resolve) => setTimeout(resolve, 1200));
       let failures = 0;
       let cycle;
       cycle = new Proxy({}, { getPrototypeOf() { return cycle; } });
@@ -331,13 +408,6 @@ describe("private Actor ordinary-class execution seam", () => {
         socketError() {}
       }
       Object.setPrototypeOf(Actor.prototype, cycle);
-      try {
-        inspectActorClassV2Candidate({ Actor }, "Actor");
-        failures += 1;
-      } catch (error) {
-        if (error?.code !== "backend_unavailable") failures += 1;
-      }
-
       let chainReads = 0;
       const changing = {
         getPrototypeOf() {
@@ -352,6 +422,14 @@ describe("private Actor ordinary-class execution seam", () => {
         socketClose() {}
       }
       Object.setPrototypeOf(ChangingActor.prototype, new Proxy({}, changing));
+      process.stdout.write("R");
+      await new Promise((resolve) => process.stdin.once("data", resolve));
+      try {
+        inspectActorClassV2Candidate({ Actor }, "Actor");
+        failures += 1;
+      } catch (error) {
+        if (error?.code !== "backend_unavailable") failures += 1;
+      }
       try {
         inspectActorClassV2Candidate({ ChangingActor }, "ChangingActor");
         failures += 1;
@@ -361,20 +439,10 @@ describe("private Actor ordinary-class execution seam", () => {
       if (chainReads !== 1) failures += 1;
       process.exitCode = failures === 0 ? 0 : 2;
     `;
-    const child = Bun.spawn([process.execPath, "-e", script], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, 1_000);
-    const exitCode = await child.exited;
-    clearTimeout(timeout);
-
-    expect(timedOut).toBe(false);
-    expect(exitCode).toBe(0);
+    const result = await runCandidateInspectionChild(script);
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toBe("");
   });
 
   test("an unbounded candidate inspection is killable outside the Host process", async () => {
@@ -390,25 +458,15 @@ describe("private Actor ordinary-class execution seam", () => {
         socketError() {}
       }
       Object.setPrototypeOf(Actor.prototype, new Proxy({}, chain));
+      process.stdout.write("R");
+      await new Promise((resolve) => process.stdin.once("data", resolve));
       process.stdout.write("started\\n");
       inspectActorClassV2Candidate({ Actor }, "Actor");
     `;
-    const child = Bun.spawn([process.execPath, "-e", script], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const output = new Response(child.stdout).text();
-    let timedOut = false;
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGKILL");
-    }, 1_000);
-    const exitCode = await child.exited;
-    clearTimeout(timeout);
-
-    expect(timedOut).toBe(true);
-    expect(exitCode).not.toBe(0);
-    expect(await output).toBe("started\n");
+    const result = await runCandidateInspectionChild(script);
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).not.toBe(0);
+    expect(result.output).toBe("started\n");
   });
 
   test("refuses a class missing any one of the four required handlers", () => {

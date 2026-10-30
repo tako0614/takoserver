@@ -9,6 +9,7 @@ import { parseHostedBrowserBillingOriginal } from "../../src/financial-hosted-br
 import type {
   HostedBrowserBillingLookup,
   HostedBrowserLiveAuthorizationTarget,
+  HostedBrowserLiveReadTarget,
   HostedBrowserLiveSelectionTarget,
 } from "../../src/financial-hosted-browser-rpc.ts";
 import { createOrgTopUps, type TopUpSession } from "../../src/org-top-up.ts";
@@ -99,7 +100,10 @@ interface Env {
       input: HostedBrowserBillingLookup,
       selection: HostedBrowserLiveSelectionTarget,
     ): Promise<unknown>;
-    readBrowserBillingContinuation(input: HostedBrowserBillingLookup): Promise<unknown>;
+    readBrowserBillingContinuation(
+      input: HostedBrowserBillingLookup,
+      liveRead?: HostedBrowserLiveReadTarget,
+    ): Promise<unknown>;
     claimBrowserBillingContinuation(
       input: HostedBrowserBillingLookup,
       authorization: HostedBrowserLiveAuthorizationTarget,
@@ -113,7 +117,10 @@ interface Env {
 const dispatched = new Set<string>();
 const sessions = new Map<string, TopUpSession>();
 const processor = { create: 0, read: 0, recover: 0 };
+let financialGetReads = 0;
 const prepared = new Map<string, ReturnType<typeof originalFor>>();
+const TOP_UP_COMMAND_READBACK_SQL =
+  "SELECT org_id, reference, state, command_json, dispatched_at FROM stripe_top_up_commands";
 const hostedFixtureState: {
   callback: { continuationRef: string; scope: HostedBrowserBillingScope; choice: unknown } | null;
   callbackAttempted: boolean;
@@ -123,6 +130,11 @@ const hostedFixtureState: {
   callbackAttempted: false,
   callbackRejected: false,
 };
+const hostedReadFixtureState: {
+  callbackCount: number;
+  callbackRejected: boolean;
+  scope: HostedBrowserBillingScope | null;
+} = { callbackCount: 0, callbackRejected: false, scope: null };
 
 /** Named native Hosted counterpart with closed DATA, not a product implementation. */
 export class Hosted extends WorkerEntrypoint<Env> {
@@ -164,33 +176,60 @@ export class Hosted extends WorkerEntrypoint<Env> {
   async fixtureState() {
     return {
       ...hostedFixtureState,
+      readCallback: hostedReadFixtureState,
       preparedOriginal: prepared.get("0".repeat(64)) ?? null,
     };
   }
 
-  async readBrowserBillingContinuation(input: HostedBrowserBillingLookup) {
+  async readBrowserBillingContinuation(
+    input: HostedBrowserBillingLookup,
+    liveRead?: HostedBrowserLiveReadTarget,
+  ) {
     const kind = input.continuationRef[0] ?? "";
     const saved = prepared.get(input.continuationRef);
-    if (saved)
-      return {
+    let result: unknown;
+    let selectedScope: HostedBrowserBillingScope;
+    if (saved) {
+      selectedScope = saved.scope;
+      result = {
         kind: "payment",
         original: saved,
         custody: dispatched.has(input.continuationRef)
           ? { phase: "dispatch-started", accepted: acceptedFor(kind, saved) }
           : { phase: "prepared" },
       };
-    if (kind === "0" || kind === "1")
-      return { kind: "view", contractVersion: "hosted-browser-v1", scope: scopeFor(kind) };
-    const original = originalFor(kind);
-    if (kind === "d")
-      return { kind: "view", contractVersion: "hosted-browser-v1", scope: original.scope };
-    return {
-      kind: "payment",
-      original,
-      custody: dispatched.has(input.continuationRef)
-        ? { phase: "dispatch-started", accepted: acceptedFor(kind) }
-        : { phase: "prepared" },
-    };
+    } else if (kind === "0" || kind === "1") {
+      selectedScope = scopeFor(kind);
+      result = { kind: "view", contractVersion: "hosted-browser-v1", scope: selectedScope };
+    } else {
+      const original = originalFor(kind);
+      selectedScope = original.scope;
+      result =
+        kind === "d"
+          ? { kind: "view", contractVersion: "hosted-browser-v1", scope: selectedScope }
+          : {
+              kind: "payment",
+              original,
+              custody: dispatched.has(input.continuationRef)
+                ? { phase: "dispatch-started", accepted: acceptedFor(kind) }
+                : { phase: "prepared" },
+            };
+    }
+    if (liveRead) {
+      const callbackScope =
+        kind === "1"
+          ? { ...selectedScope, organizationId: "different-native-organization" }
+          : selectedScope;
+      hostedReadFixtureState.callbackCount++;
+      hostedReadFixtureState.scope = callbackScope;
+      try {
+        await liveRead.assertReadCurrent(callbackScope);
+      } catch {
+        hostedReadFixtureState.callbackRejected = true;
+        throw new Error("fixture live Owner read callback rejected");
+      }
+    }
+    return result;
   }
 
   async claimBrowserBillingContinuation(
@@ -240,6 +279,11 @@ export class Hosted extends WorkerEntrypoint<Env> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    if (request.method === "POST" && url.pathname === "/test/topup-command-readback") {
+      return Response.json(
+        await env.AUTH_DB.withSession("first-primary").prepare(TOP_UP_COMMAND_READBACK_SQL).all(),
+      );
+    }
     if (url.pathname === "/test/processor") return Response.json(processor);
     if (url.pathname === "/test/hosted") return Response.json(await env.HOSTED.fixtureState());
     const testOrigin = request.headers.get("x-test-origin");
@@ -331,7 +375,28 @@ export default {
       sharedAuth,
       accounts,
       hostedBrowserBillingRpc: env.HOSTED,
-      checkout: topups,
+      checkout: {
+        ...topups,
+        async receipt(...args: Parameters<typeof topups.receipt>) {
+          const receipt = await topups.receipt(...args);
+          if (request.method === "GET") {
+            financialGetReads++;
+            const interleave = request.headers.get("x-test-financial-get-interleave");
+            if (interleave === "revoke-owner" || interleave === "revoke-and-reject") {
+              const revoked = await env.REVOKER.fetch(
+                new Request("https://fixture.invalid/revoke"),
+              );
+              if (revoked.status !== 204)
+                throw new Error("local Owner revocation did not complete");
+            }
+            if (interleave === "mutate-request")
+              request.headers.set("x-test-financial-get-drift", "changed");
+            if (interleave === "revoke-and-reject")
+              throw new Error("fixture financial GET refused");
+          }
+          return receipt;
+        },
+      },
       inventory: {} as never,
       deployments: {} as never,
       attachments: {} as never,
@@ -345,8 +410,13 @@ export default {
       settlement: {} as never,
       clock: () => new Date(NOW),
     });
-    const response =
+    let response =
       (await control(request, new URL(request.url))) ?? new Response(null, { status: 404 });
+    if (request.method === "GET" && url.pathname.includes("/wallet/checkout/")) {
+      const headers = new Headers(response.headers);
+      headers.set("x-fixture-financial-get-count", String(financialGetReads));
+      response = new Response(response.body, { status: response.status, headers });
+    }
     if (url.pathname.endsWith("/wallet/checkout")) {
       // Same-request diagnostics read the actual owning command table before
       // the local platform proxy can close on a denied RPC response.

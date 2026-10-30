@@ -4,6 +4,7 @@ import { runChecked, runCommand, wranglerCommand } from "./process.ts";
 import {
   deploymentVariables,
   expectedWorkerSecrets,
+  HOSTED_BROWSER_BILLING_STAGING_RPC,
   SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF,
   type WorkerVersionAuthorityProfile,
 } from "./realized-config.ts";
@@ -231,14 +232,42 @@ export function expectedExactBindingClosure(
     readonly authorityProfile?: WorkerVersionAuthorityProfile;
     /** Canonical outer artifact annotation for current Form-authority Hosts. */
     readonly workerArtifactDigest?: `sha256:${string}`;
+    /** Exact source-owned provenance emitted by the registered Auth103 native build. */
+    readonly nativeSourceCommit?: string;
   } = {},
 ): ExpectedBindingClosure {
+  if (
+    input.nativeSourceCommit !== undefined &&
+    (target.auth103NativeProfile !== "root-shared-auth-staging-v1" ||
+      !/^[0-9a-f]{40}$/u.test(input.nativeSourceCommit) ||
+      !/^sha256:[0-9a-f]{64}$/u.test(input.workerArtifactDigest ?? ""))
+  ) {
+    throw new DeployError("preflight", "Auth103 native source provenance is not exact");
+  }
   const vars = deploymentVariables(target, input.signingKeyId, input.authorityProfile, {
     ...(input.workerArtifactDigest === undefined
       ? {}
       : { workerArtifactDigest: input.workerArtifactDigest }),
   });
-  const entries = (vars.vars ?? {}) as Readonly<Record<string, string>>;
+  const emitted = (vars.vars ?? {}) as Readonly<Record<string, string>>;
+  if (
+    input.nativeSourceCommit !== undefined &&
+    ((emitted.TAKOSERVER_SOURCE_COMMIT !== undefined &&
+      emitted.TAKOSERVER_SOURCE_COMMIT !== input.nativeSourceCommit) ||
+      (emitted.TAKOSERVER_WORKER_ARTIFACT_DIGEST !== undefined &&
+        emitted.TAKOSERVER_WORKER_ARTIFACT_DIGEST !== input.workerArtifactDigest))
+  ) {
+    throw new DeployError("preflight", "Auth103 native source provenance conflicts with target");
+  }
+  const entries = {
+    ...emitted,
+    ...(input.nativeSourceCommit === undefined
+      ? {}
+      : {
+          TAKOSERVER_SOURCE_COMMIT: input.nativeSourceCommit,
+          TAKOSERVER_WORKER_ARTIFACT_DIGEST: input.workerArtifactDigest ?? "",
+        }),
+  } as Readonly<Record<string, string>>;
   return {
     AI: { type: "ai", fields: {} },
     WORKER_VERSION: { type: "version_metadata", fields: {} },
@@ -249,6 +278,14 @@ export function expectedExactBindingClosure(
           ACCOUNTS_FINANCIAL_PROOF: {
             type: "service",
             fields: SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF,
+          },
+        }),
+    ...(target.hostedBrowserBillingRpc === undefined
+      ? {}
+      : {
+          HOSTED_BROWSER_BILLING_RPC: {
+            type: "service",
+            fields: HOSTED_BROWSER_BILLING_STAGING_RPC,
           },
         }),
     ...(target.cloudflareProviderExecutor === undefined || isArtifactBlobIoQuiescedTarget(target)
@@ -289,6 +326,7 @@ export function expectedLegacyPreVersionMetadataBindingClosure(
     readonly expectedSecrets?: readonly string[];
     readonly authorityProfile?: WorkerVersionAuthorityProfile;
     readonly workerArtifactDigest?: `sha256:${string}`;
+    readonly nativeSourceCommit?: string;
   } = {},
 ): ExpectedBindingClosure {
   return {
@@ -404,6 +442,7 @@ export function expectedTransitionBindingClosure(
     readonly metadataProfile?: WorkerVersionMetadataBindingProfile;
     readonly authorityProfile?: WorkerVersionAuthorityProfile;
     readonly workerArtifactDigest?: `sha256:${string}`;
+    readonly nativeSourceCommit?: string;
   },
 ): ExpectedBindingClosure {
   const exact = expectedExactBindingClosure(target, {
@@ -413,6 +452,9 @@ export function expectedTransitionBindingClosure(
     ...(input.workerArtifactDigest === undefined
       ? {}
       : { workerArtifactDigest: input.workerArtifactDigest }),
+    ...(input.nativeSourceCommit === undefined
+      ? {}
+      : { nativeSourceCommit: input.nativeSourceCommit }),
   });
   return {
     ...exact,

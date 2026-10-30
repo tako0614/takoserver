@@ -17,6 +17,16 @@ const identity: HttpRevisionServingIdentity = {
   incarnationId: "incarnation-one",
 };
 
+function deferred() {
+  let release: () => void = () => {
+    throw new Error("uninitialized gate");
+  };
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
 function revision(generation: number): Revision {
   return {
     ...identity,
@@ -33,11 +43,14 @@ function makeFixture() {
   const snapshots = new Map<string, Snapshot>();
   const native = new Map<number, string>();
   const retired: number[] = [];
+  const observed: number[] = [];
+  const invoked: number[] = [];
   let failRetire = false;
   let failPersist = false;
 
   const backend: HttpRevisionServingBackend<Revision, string> = {
     async observe(input) {
+      observed.push(input.generation);
       const nativeId = native.get(input.generation);
       return nativeId === undefined ? { state: "absent" } : { state: "ready", nativeId };
     },
@@ -46,8 +59,12 @@ function makeFixture() {
       native.set(input.generation, nativeId);
       return { state: "ready", nativeId };
     },
-    async invoke(_input, _request) {
-      return new Response(new ReadableStream<Uint8Array>({ start() {} }), { status: 200 });
+    async invoke(input, _request) {
+      invoked.push(input.generation);
+      return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+        status: 200,
+        headers: { "X-Fixture-Revision": input.revision },
+      });
     },
     async retire(input) {
       if (failRetire) throw new Error("backend retirement failed");
@@ -92,6 +109,8 @@ function makeFixture() {
     snapshots,
     native,
     retired,
+    observed,
+    invoked,
     backend,
     state,
     options,
@@ -200,4 +219,113 @@ test("sweep aborts an old revision body at the same drain deadline", async () =>
   });
   expect(await pendingRead).toMatchObject({ code: "unavailable" });
   await handle.close();
+});
+
+test("pinned invocation rejects N after serving switches to N+1 without a native call", async () => {
+  const fixture = makeFixture();
+  const handle = createHttpRevisionServing(fixture.options()).open();
+  await handle.reconcile(revision(1));
+  expect(await handle.observe(identity)).toMatchObject({
+    servingGeneration: 1,
+  });
+  await handle.reconcile(revision(2));
+  const observed = fixture.observed.length;
+  await expect(
+    handle.invokePinned(identity, revision(1).revision, new Request("https://example.test/")),
+  ).rejects.toMatchObject({ code: "unavailable" });
+  await expect(
+    handle.invokePinned(
+      identity,
+      undefined as unknown as string,
+      new Request("https://example.test/"),
+    ),
+  ).rejects.toMatchObject({ code: "unavailable" });
+  expect(fixture.observed).toHaveLength(observed);
+  expect(fixture.invoked).toEqual([]);
+  await handle.close();
+});
+
+test("exact pin invokes its revision and legacy invocation retains current selection", async () => {
+  const fixture = makeFixture();
+  const handle = createHttpRevisionServing(fixture.options()).open();
+  await handle.reconcile(revision(1));
+  const pinned = await handle.invokePinned(
+    identity,
+    revision(1).revision,
+    new Request("https://example.test/"),
+  );
+  expect(pinned.headers.get("X-Fixture-Revision")).toBe(revision(1).revision);
+  await pinned.body?.cancel();
+  await handle.reconcile(revision(2));
+  const legacy = await handle.invoke(identity, new Request("https://example.test/"));
+  expect(legacy.headers.get("X-Fixture-Revision")).toBe(revision(2).revision);
+  expect(fixture.invoked).toEqual([1, 2]);
+  await legacy.body?.cancel();
+  await handle.close();
+});
+
+test("pin is checked after asynchronous service load and before the invocation lease", async () => {
+  const fixture = makeFixture();
+  const seed = createHttpRevisionServing(fixture.options()).open();
+  await seed.reconcile(revision(1));
+  await seed.close();
+
+  const entered = deferred();
+  const release = deferred();
+  const state: HttpRevisionServingStatePort<Revision, string> = {
+    ...fixture.state,
+    async load(value) {
+      entered.release();
+      await release.promise;
+      return fixture.state.load(value);
+    },
+  };
+  const handle = createHttpRevisionServing(fixture.options({ state })).open();
+  const pending = handle.invokePinned(
+    identity,
+    revision(1).revision,
+    new Request("https://example.test/"),
+  );
+  await entered.promise;
+  const replacement = createHttpRevisionServing(fixture.options()).open();
+  await replacement.reconcile(revision(2));
+  await replacement.close();
+  const observed = fixture.observed.length;
+  release.release();
+  await expect(pending).rejects.toMatchObject({ code: "unavailable" });
+  expect(fixture.observed).toHaveLength(observed);
+  expect(fixture.invoked).toEqual([]);
+  await handle.close();
+});
+
+test("closing during pinned service load never acquires a lease or dispatches", async () => {
+  const fixture = makeFixture();
+  const seed = createHttpRevisionServing(fixture.options()).open();
+  await seed.reconcile(revision(1));
+  await seed.close();
+
+  const entered = deferred();
+  const release = deferred();
+  const state: HttpRevisionServingStatePort<Revision, string> = {
+    ...fixture.state,
+    async load(value) {
+      entered.release();
+      await release.promise;
+      return fixture.state.load(value);
+    },
+  };
+  const handle = createHttpRevisionServing(fixture.options({ state })).open();
+  const pending = handle.invokePinned(
+    identity,
+    revision(1).revision,
+    new Request("https://example.test/"),
+  );
+  await entered.promise;
+  const observed = fixture.observed.length;
+  const closing = handle.close();
+  release.release();
+  await expect(pending).rejects.toMatchObject({ code: "closed" });
+  await closing;
+  expect(fixture.observed).toHaveLength(observed);
+  expect(fixture.invoked).toEqual([]);
 });

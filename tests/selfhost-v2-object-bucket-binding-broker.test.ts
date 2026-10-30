@@ -1362,6 +1362,19 @@ async function proveCoreBucketBinding(backendId: string | undefined) {
         resourceUid: bucket.resourceUid,
       },
     });
+    // Binding authority is a reader: another connection's reserved writer lock
+    // must not block the committed graph or force an unavailable result.
+    const writer = new Database(join(root, "control.sqlite"));
+    try {
+      writer.exec("BEGIN IMMEDIATE");
+      try {
+        expect(await authority.resolveCurrentBucketBinding(grant, "MEDIA")).toEqual(first);
+      } finally {
+        writer.exec("ROLLBACK");
+      }
+    } finally {
+      writer.close();
+    }
     const wrongAuthority = createObjectBucketWorkerBindingAuthority({
       sql,
       targetKey: TARGET,

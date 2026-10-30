@@ -1,6 +1,7 @@
 import { errorEnvelope } from "../error-envelope.ts";
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { JsonObject } from "../ports.ts";
+import { readBoundedRequestBody } from "../request-body.ts";
 import { parseStrictJson, StrictJsonError } from "../strict-json.ts";
 import { DIGEST, isFormGroup, isFormVersion, isKind, validateFormRef } from "./forms.ts";
 import { MAXIMUM_REQUEST_BODY_BYTES } from "./limits.ts";
@@ -203,9 +204,7 @@ export function mutationFingerprint(request: Request, rawBodyDigest: `sha256:${s
 }
 
 export async function requestBodyDigest(request: Request): Promise<`sha256:${string}`> {
-  const bytes = await request.clone().arrayBuffer();
-  if (bytes.byteLength > MAXIMUM_REQUEST_BODY_BYTES) throw new TakoformHostError();
-  return await bytesDigest(bytes);
+  return await bytesDigest(await hostBudgetBody(request.clone()));
 }
 
 /**
@@ -217,8 +216,7 @@ export async function requestBodyDigest(request: Request): Promise<`sha256:${str
  * substituting U+FFFD would make this Host claim bytes nobody sent.
  */
 export async function requestBodyText(request: Request): Promise<string> {
-  const bytes = await request.clone().arrayBuffer();
-  if (bytes.byteLength > MAXIMUM_REQUEST_BODY_BYTES) throw new TakoformHostError();
+  const bytes = await hostBudgetBody(request.clone());
   try {
     return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
   } catch {
@@ -265,18 +263,49 @@ export function increment(value: string): string {
 
 // --- bodies, queries, and identifiers -------------------------------------
 
+/**
+ * The request bytes, at most the Host request budget. A longer body is refused
+ * with the budget's own error as soon as a chunk would pass it; nothing past
+ * the budget is buffered.
+ */
+export async function hostBudgetBody(request: Request): Promise<Uint8Array> {
+  const bytes = await readBoundedRequestBody(request, MAXIMUM_REQUEST_BODY_BYTES);
+  if (bytes === null) throw new TakoformHostError();
+  return bytes;
+}
+
+/**
+ * A scope probe's view of the body: decoded the way `Body.json()` decodes it,
+ * read from a clone so the engine still parses the original. `undefined` means
+ * the body could not be read as JSON — malformed, or a stream that failed or
+ * was already used — which each probe answers in its own words. A body past
+ * the budget is refused with the budget's error instead of the probe's.
+ */
+export async function requestJsonProbe(request: Request): Promise<unknown> {
+  let bytes: Uint8Array | null;
+  try {
+    bytes = await readBoundedRequestBody(request.clone(), MAXIMUM_REQUEST_BODY_BYTES);
+  } catch {
+    return undefined;
+  }
+  if (bytes === null) throw new TakoformHostError();
+  try {
+    return JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return undefined;
+  }
+}
+
 export async function jsonBody(request: Request): Promise<unknown> {
   if (!request.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
     throw new TakoformHostError();
   }
   const declared = Number(request.headers.get("content-length") ?? 0);
   if (declared > MAXIMUM_REQUEST_BODY_BYTES) throw new TakoformHostError();
-  const bytes = await request.arrayBuffer();
-  if (bytes.byteLength === 0 || bytes.byteLength > MAXIMUM_REQUEST_BODY_BYTES) {
-    throw new TakoformHostError();
-  }
+  const bytes = await hostBudgetBody(request);
+  if (bytes.byteLength === 0) throw new TakoformHostError();
   try {
-    return parseStrictJson(new Uint8Array(bytes), MAXIMUM_REQUEST_BODY_BYTES);
+    return parseStrictJson(bytes, MAXIMUM_REQUEST_BODY_BYTES);
   } catch (error) {
     if (!(error instanceof StrictJsonError)) throw error;
     throw new TakoformHostError();

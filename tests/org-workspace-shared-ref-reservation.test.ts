@@ -17,6 +17,7 @@ import type { Sql } from "../src/ports.ts";
 import { workspaceBillingOrganizationRef } from "../src/workspace-billing-organization.ts";
 
 const AUTHORITY = "takoserver-staging-billing";
+const SHARED_REF_16 = `wrk_${"0123456789abcdef"}`;
 const SHARED_REF = `wrk_${"0123456789abcdef".repeat(2)}`;
 const OTHER_SHARED_REF = `wrk_${"fedcba9876543210".repeat(2)}`;
 const PERSONAL_ORG = "org_personal_squatter";
@@ -104,11 +105,15 @@ async function refused(operation: Promise<unknown>, code: string) {
 }
 
 describe("shared-auth Workspace reference reservation", () => {
-  test("the reserved namespace is exactly wrk_ plus 32 lowercase hex", () => {
+  test("the reserved namespace is exactly wrk_ plus 16 or 32 lowercase hex", () => {
+    expect(SHARED_WORKSPACE_REF.test(SHARED_REF_16)).toBe(true);
     expect(SHARED_WORKSPACE_REF.test(SHARED_REF)).toBe(true);
     for (const ref of [
+      `wrk_${"0".repeat(15)}`,
+      `wrk_${"0".repeat(17)}`,
       `wrk_${"0".repeat(31)}`,
       `wrk_${"0".repeat(33)}`,
+      `wrk_${"A".repeat(16)}`,
       `wrk_${"A".repeat(32)}`,
       `WRK_${"0".repeat(32)}`,
       `xwrk_${"0".repeat(32)}`,
@@ -137,6 +142,27 @@ describe("shared-auth Workspace reference reservation", () => {
     );
     expect(await f.rows()).toEqual(empty);
     expect(empty.bindings).toEqual([]);
+  });
+
+  test("a 16-hex shared ref reserves first hold and usage for its derived Org", async () => {
+    const f = fixture(AUTHORITY);
+    const empty = await f.rows();
+    await refused(
+      f.billing.hold(f.hold(PERSONAL_ORG, "short_squat_hold", SHARED_REF_16)),
+      "workspace_ref_reserved",
+    );
+    await refused(
+      f.billing.usage(f.usage(PERSONAL_ORG, "short_squat_usage", SHARED_REF_16)),
+      "workspace_ref_reserved",
+    );
+    expect(await f.rows()).toEqual(empty);
+    const derived = await workspaceBillingOrganizationRef(AUTHORITY, SHARED_REF_16);
+    await f.billing.hold(f.hold(derived, "short_owner_hold", SHARED_REF_16));
+    expect((await f.rows()).bindings).toEqual([{ workspace_ref: SHARED_REF_16, org_id: derived }]);
+    await refused(
+      f.billing.usage(f.usage(PERSONAL_ORG, "short_late_usage", SHARED_REF_16)),
+      "workspace_ref_conflict",
+    );
   });
 
   test("the derived Org binds normally, and the binding then excludes every other Org", async () => {
@@ -181,6 +207,22 @@ describe("shared-auth Workspace reference reservation", () => {
       "workspace_ref_conflict",
     );
     expect((await f.rows()).holds).toEqual([{ org_id: PERSONAL_ORG, ref: "legacy_hold" }]);
+  });
+
+  test("an existing foreign 16-hex binding is not reassigned to the derived Org", async () => {
+    const f = fixture(AUTHORITY);
+    await f.sql.run(
+      "INSERT INTO org_wallet_workspace_bindings (workspace_ref, org_id, created_at) VALUES (?, ?, ?)",
+      [SHARED_REF_16, PERSONAL_ORG, "2026-10-01T00:00:00.000Z"],
+    );
+    const derived = await workspaceBillingOrganizationRef(AUTHORITY, SHARED_REF_16);
+    await refused(
+      f.billing.hold(f.hold(derived, "short_derived_hold", SHARED_REF_16)),
+      "workspace_ref_conflict",
+    );
+    expect((await f.rows()).bindings).toEqual([
+      { workspace_ref: SHARED_REF_16, org_id: PERSONAL_ORG },
+    ]);
   });
 
   test("without a shared Workspace authority (self-host) wrk_ references bind lazily as before", async () => {
