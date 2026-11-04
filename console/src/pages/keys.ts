@@ -321,20 +321,33 @@ function createKey(
 function openScopedKeyModal(options: ModalOptions, isScopeCurrent: () => boolean) {
   let open = true;
   let stop = (): void => {};
+  const lifetime: KeyModalLifetime = { close: null };
   const close = openModal({
     ...options,
     onClose: () => {
       open = false;
+      lifetime.close = null;
       stop();
       options.onClose?.();
     },
   });
-  stop = effect(() => {
-    if (!isScopeCurrent()) close();
-  });
+  lifetime.close = close;
+  stop = watchKeyModalScope(isScopeCurrent, lifetime);
   // An already-retired page may open a dialog before the first effect runs.
   if (!open) stop();
   return { close, isCurrent: () => open && isScopeCurrent() };
+}
+
+interface KeyModalLifetime {
+  close: (() => void) | null;
+}
+
+// A disposed effect stays registered in this reactive core. Keep its closure
+// outside the modal's lexical scope and sever its only modal reference on close.
+function watchKeyModalScope(isScopeCurrent: () => boolean, lifetime: KeyModalLifetime): () => void {
+  return effect(() => {
+    if (!isScopeCurrent()) lifetime.close?.();
+  });
 }
 
 const INSTALL_GUIDE_STEPS =
