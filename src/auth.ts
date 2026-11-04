@@ -164,7 +164,7 @@ export interface ApiKeyAdministration {
     /** Atomically refuses while any unrevoked key has this exact name. */
     readonly exclusiveUnrevokedName?: string;
   }): Promise<ApiKeyAdministrationIssue>;
-  /** Idempotent internally: null means the exact id was never present. */
+  /** Idempotent internally; null means absent or owner-fenced revocation was not confirmed. */
   revoke(input: {
     readonly organizationId: string;
     readonly apiKeyId: string;
