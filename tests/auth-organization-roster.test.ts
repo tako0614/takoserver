@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
 import { createAccounts } from "../src/auth.ts";
 import { createEphemeralSql } from "../src/compat.ts";
-import { controlErrorResponse } from "../src/control.ts";
+import { SqlError } from "../src/ports.ts";
 import { createD1Sql, type D1DatabaseLike } from "../src/sql-d1.ts";
 
 async function fixture(count: number) {
@@ -50,21 +50,13 @@ test("the complete identity roster includes the 201st create ACK and excludes fo
   expect(await accounts.organizations("unknown-principal")).toEqual([]);
 });
 
-test("an oversized identity roster refuses partial success and recovers after membership removal", async () => {
+test("the identity roster includes more than 1000 memberships and observes removal", async () => {
   const { sql, accounts, owner, actor, created } = await fixture(1_000);
   expect(await accounts.organizations(owner.principal.id)).toEqual(created);
   const extra = await accounts.createOrganization({ actor, name: "One more Organization" });
-  const failure = await accounts.organizations(owner.principal.id).then(
-    () => null,
-    (error: unknown) => error,
-  );
-  expect(failure).toBeInstanceOf(Error);
-  const response = controlErrorResponse(failure);
-  expect(response.status).toBe(503);
-  const body = await response.json();
-  expect(body).toMatchObject({ error: { code: "backend_unavailable" } });
-  expect(JSON.stringify(body)).not.toContain(owner.principal.id);
-  expect(JSON.stringify(body)).not.toContain(extra.name);
+  const complete = await accounts.organizations(owner.principal.id);
+  expect(complete).toHaveLength(1_001);
+  expect(complete).toContainEqual(extra);
 
   await sql.run("DELETE FROM org_memberships WHERE org_id = ? AND principal_id = ?", [
     created[0]!.id,
@@ -76,7 +68,7 @@ test("an oversized identity roster refuses partial success and recovers after me
   expect(recovered).not.toContainEqual(created[0]!);
 });
 
-test("the complete roster query preserves its bound and principal filter in local native D1", async () => {
+test("the complete roster query preserves every membership and principal filter in local native D1", async () => {
   const runtime = new Miniflare({
     workers: [
       {
@@ -101,7 +93,9 @@ test("the complete roster query preserves its bound and principal filter in loca
   });
   try {
     const database = await runtime.getD1Database("AUTH_DB");
-    const sql = createD1Sql(database.withSession("first-primary") as unknown as D1DatabaseLike);
+    const sql = createD1Sql(database.withSession("first-primary") as unknown as D1DatabaseLike, {
+      acknowledgement: "explicit-d1-result",
+    });
     // Only the read-model columns are needed: this fixture is not an installed
     // Auth schema, a credential issuer, or proof of native session admission.
     await sql.run(
@@ -116,9 +110,7 @@ test("the complete roster query preserves its bound and principal filter in loca
     await sql.run("INSERT INTO orgs VALUES ('org_foreign', 'Foreign', 'stranger', '0000')");
     await sql.run("INSERT INTO org_memberships VALUES ('org_foreign', 'stranger')");
     const accounts = createAccounts({ sql, identity });
-    await expect(accounts.organizations("roster-owner")).rejects.toMatchObject({
-      name: "OrganizationRosterUnavailableError",
-    });
+    expect(await accounts.organizations("roster-owner")).toHaveLength(1_001);
     await sql.run("DELETE FROM org_memberships WHERE org_id = 'org_1001'");
     const complete = await accounts.organizations("roster-owner");
     expect(complete.map((organization) => organization.id)).toEqual(
@@ -134,6 +126,20 @@ test("the complete roster query preserves its bound and principal filter in loca
     await runtime.dispose();
   }
 }, 60_000);
+
+test("an unavailable roster query is not returned as a successful empty roster", async () => {
+  const failure = new SqlError("unavailable", "synthetic roster read failure");
+  const accounts = createAccounts({
+    identity,
+    sql: {
+      ...createEphemeralSql(),
+      async query() {
+        throw failure;
+      },
+    },
+  });
+  await expect(accounts.organizations("roster-owner")).rejects.toBe(failure);
+});
 
 const identity = {
   async verify() {

@@ -421,17 +421,6 @@ export class AuthError extends Error {
   }
 }
 
-/** A complete identity roster could not fit the bounded response-row budget. */
-export class OrganizationRosterUnavailableError extends Error {
-  constructor() {
-    super("The complete Organization roster is unavailable");
-    this.name = "OrganizationRosterUnavailableError";
-  }
-}
-
-// This bounds response materialization, not SQL scan work or creation/join permission.
-const COMPLETE_ORGANIZATION_ROSTER_LIMIT = 1_000;
-
 /** Unmapped historical ownership and damaged personal tuples require owner resolution. */
 export class PersonalOrganizationError extends Error {
   readonly code = "personal_organization_unavailable";
@@ -1923,13 +1912,9 @@ function createAccountsInternal(
       const rows = await sql.query(
         `SELECT o.id, o.name, o.owner_principal_id, o.created_at FROM orgs o
          JOIN org_memberships m ON m.org_id = o.id
-         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC LIMIT ?`,
-        [principalId, COMPLETE_ORGANIZATION_ROSTER_LIMIT + 1],
+         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC`,
+        [principalId],
       );
-      // One query keeps this success roster in one snapshot. Reading the extra
-      // row distinguishes a complete result from a silently truncated page.
-      if (rows.length > COMPLETE_ORGANIZATION_ROSTER_LIMIT)
-        throw new OrganizationRosterUnavailableError();
       return rows.map((row) => ({
         id: String(row.id),
         name: String(row.name),
