@@ -10,7 +10,13 @@
 
 type Subscriber = () => void;
 
-let listening: Subscriber | null = null;
+interface Listener {
+  readonly wake: Subscriber;
+  readonly dependencies: Set<Set<Subscriber>>;
+  active: boolean;
+}
+
+let listening: Listener | null = null;
 
 export interface Signal<Value> {
   (): Value;
@@ -23,7 +29,10 @@ export function signal<Value>(initial: Value): Signal<Value> {
   const readers = new Set<Subscriber>();
 
   const read = (() => {
-    if (listening) readers.add(listening);
+    if (listening?.active) {
+      readers.add(listening.wake);
+      listening.dependencies.add(readers);
+    }
     return current;
   }) as Signal<Value>;
 
@@ -45,25 +54,35 @@ export function signal<Value>(initial: Value): Signal<Value> {
  *
  * Re-runs are batched onto a microtask so a handler that moves three values
  * repaints once. Each run re-registers its reads from scratch, so a branch that
- * stops being taken stops waking the effect.
+ * stops being taken stops waking the effect. Disposal or a thrown body releases
+ * its subscriptions; a failed body is not retried automatically.
  */
 export function effect(body: () => void): () => void {
-  let disposed = false;
   let queued = false;
+  const dependencies = new Set<Set<Subscriber>>();
+  const detach = (): void => {
+    for (const readers of dependencies) readers.delete(wake);
+    dependencies.clear();
+  };
 
   const run = (): void => {
-    if (disposed) return;
+    if (!listener.active) return;
+    detach();
     const previous = listening;
-    listening = wake;
+    listening = listener;
     try {
       body();
+    } catch (error) {
+      listener.active = false;
+      detach();
+      throw error;
     } finally {
       listening = previous;
     }
   };
 
   const wake = (): void => {
-    if (queued || disposed) return;
+    if (queued || !listener.active) return;
     queued = true;
     queueMicrotask(() => {
       queued = false;
@@ -71,9 +90,11 @@ export function effect(body: () => void): () => void {
     });
   };
 
+  const listener: Listener = { wake, dependencies, active: true };
   run();
   return () => {
-    disposed = true;
+    listener.active = false;
+    detach();
   };
 }
 

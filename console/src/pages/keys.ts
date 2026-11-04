@@ -346,8 +346,8 @@ interface KeyModalLifetime {
   close: (() => void) | null;
 }
 
-// A disposed effect stays registered in this reactive core. Keep its closure
-// outside the modal's lexical scope and sever its only modal reference on close.
+// Keep the watcher outside the modal's lexical scope. Closing clears its modal
+// reference and disposes the signal subscriptions.
 function watchKeyModalScope(isScopeCurrent: () => boolean, lifetime: KeyModalLifetime): () => void {
   return effect(() => {
     if (!isScopeCurrent()) lifetime.close?.();
