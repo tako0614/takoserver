@@ -1235,6 +1235,57 @@ const billingToasts = (page: BillingPageFixture) =>
 const walletReadCount = (page: BillingPageFixture) =>
   page.calls().filter((call) => call === `GET /v1/organizations/${organizationId}/wallet`).length;
 
+describe("Workspace usage original page scope", () => {
+  for (const change of ["roundtrip", "session", "origin-roundtrip"] as const) {
+    const retire = async (page: BillingPageFixture) => {
+      if (change !== "origin-roundtrip") return retireBillingScope(change, page);
+      const state = await import("../console/src/state.ts");
+      state.setApiOrigin("https://other.example.test");
+      state.setApiOrigin("https://api.example.test");
+      page.signIn();
+    };
+
+    test(`a delayed first page cannot restore usage after ${change}`, async () => {
+      let release: (response: Response) => void = () => {
+        throw new Error("Workspace usage request did not start");
+      };
+      const page = await billingPageFor({
+        subscription: "legacy",
+        workspaceUsage: () =>
+          new Promise<Response>((resolve) => {
+            release = resolve;
+          }),
+      });
+      await retire(page);
+      release(Response.json(workspaceUsageBody(["ws_retired_scope"], null)));
+      await flush();
+      expect(page.root.textContent).not.toContain("ws_retired_scope");
+    });
+
+    test(`an expired old cursor cannot reload usage after ${change}`, async () => {
+      let release: (response: Response) => void = () => {
+        throw new Error("Workspace continuation request did not start");
+      };
+      const page = await billingPageFor({
+        subscription: "legacy",
+        workspaceUsage: (url) =>
+          url.searchParams.has("cursor")
+            ? new Promise<Response>((resolve) => {
+                release = resolve;
+              })
+            : Response.json(workspaceUsageBody(["ws_original"], "old_cursor")),
+      });
+      await page.click("Load more");
+      await retire(page);
+      release(Response.json({ error: { code: "expired" } }, { status: 409 }));
+      await flush();
+      expect(
+        page.calls().filter((call) => call.endsWith("/wallet/usage-summary/workspaces")),
+      ).toHaveLength(2);
+    });
+  }
+});
+
 describe("rendered legacy billing completion scope", () => {
   for (const change of ["org", "roundtrip", "session", "origin", "dismiss"] as const) {
     test(`a retired checkout dialog cannot submit (${change})`, async () => {

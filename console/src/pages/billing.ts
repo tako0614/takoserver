@@ -64,7 +64,7 @@ export function billingPage(organizationId: string): Child {
   const workspaceUsage = createWorkspaceUsageController({
     organizationId,
     api,
-    isCurrent: () => currentOrganization()?.id === organizationId,
+    isCurrent: isPageCurrent,
   });
   workspaceUsage.reload();
   const reloadWallet = () => {

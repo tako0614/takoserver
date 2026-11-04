@@ -27,6 +27,7 @@ import {
   observeSessionIdentity,
   organizations,
   principal,
+  recordCreatedOrganization,
   resolveSharedSessionReturnPath,
   selectOrganization,
   session,
@@ -326,7 +327,7 @@ function createOrganization(): void {
           close();
           return;
         }
-        organizations.update((all) => [...all, organization]);
+        recordCreatedOrganization(organization);
         selectOrganization(organization.id);
         toast(tr("組織を作成しました", "Organization created"), "ok");
         close();

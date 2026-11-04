@@ -717,7 +717,7 @@ export interface Accounts {
   organization(id: string): Promise<Organization | null>;
   /** The person behind a session, for a console to greet and to audit against. */
   principal(id: string): Promise<Principal | null>;
-  /** Every organization this principal owns, oldest first. */
+  /** Every organization this principal belongs to, oldest first; never a partial roster. */
   organizations(principalId: string): Promise<readonly Organization[]>;
   /**
    * The organization's live keys. Secrets are never stored, so they cannot be
@@ -1912,7 +1912,7 @@ function createAccountsInternal(
       const rows = await sql.query(
         `SELECT o.id, o.name, o.owner_principal_id, o.created_at FROM orgs o
          JOIN org_memberships m ON m.org_id = o.id
-         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC LIMIT 200`,
+         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC`,
         [principalId],
       );
       return rows.map((row) => ({
