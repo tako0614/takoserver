@@ -421,8 +421,7 @@ export class AuthError extends Error {
   }
 }
 
-/** Unmapped historical ownership and damaged personal tuples require owner resolution. */
-/** A complete identity roster could not fit the bounded response work budget. */
+/** A complete identity roster could not fit the bounded response-row budget. */
 export class OrganizationRosterUnavailableError extends Error {
   constructor() {
     super("The complete Organization roster is unavailable");
@@ -430,9 +429,10 @@ export class OrganizationRosterUnavailableError extends Error {
   }
 }
 
-// This is a read-work budget, not permission to create or join Organizations.
+// This bounds response materialization, not SQL scan work or creation/join permission.
 const COMPLETE_ORGANIZATION_ROSTER_LIMIT = 1_000;
 
+/** Unmapped historical ownership and damaged personal tuples require owner resolution. */
 export class PersonalOrganizationError extends Error {
   readonly code = "personal_organization_unavailable";
   readonly status = 503;
