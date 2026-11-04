@@ -12,7 +12,7 @@ import {
 } from "../resource-intent.ts";
 import { health, matchingResources, phaseLabel } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
-import { api, currentOrganization } from "../state.ts";
+import { api, captureSelectedOrganizationScope, currentOrganization } from "../state.ts";
 import { ago, badge, card, copyable, empty, explain, ICON, icon, whenReady } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
@@ -54,6 +54,10 @@ function operationSettled(operation: { readonly status: string }): boolean {
  * overview can link to one Form's Resources; the text filter still applies.
  */
 export function resourcesPage(organizationId: string): Child {
+  const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
+  const pageRoute = route();
+  const isCurrentPage = (): boolean =>
+    isOrganizationCurrent() && route() === pageRoute && followToken === followGeneration;
   // Made on the first empty render and reused, so a re-render does not ask the
   // Host again.
   const note = once(() => firstRunNote(organizationId));
@@ -80,19 +84,20 @@ export function resourcesPage(organizationId: string): Child {
   const recovering = signal(false);
   const recoveryError = signal<Error | null>(null);
   const retryExact = async (id: string): Promise<void> => {
-    if (recovering() || currentOrganization()?.id !== organizationId) return;
+    if (recovering() || !isCurrentPage()) return;
     recovering.set(true);
     recoveryError.set(null);
     try {
       const accepted = await sendResourceIntent(id);
-      if (currentOrganization()?.id === organizationId)
+      if (isCurrentPage())
         navigate(
           `/resources?operation=${encodeURIComponent(accepted.id)}&intent=${encodeURIComponent(id)}`,
         );
     } catch (error) {
-      recoveryError.set(error instanceof Error ? error : new Error(String(error)));
+      if (isCurrentPage())
+        recoveryError.set(error instanceof Error ? error : new Error(String(error)));
     } finally {
-      recovering.set(false);
+      if (isCurrentPage()) recovering.set(false);
     }
   };
   // Keep the accepted handle in the URL across refreshes. Checking status only
@@ -310,8 +315,8 @@ export function resourcesPage(organizationId: string): Child {
                   "div",
                   { class: "notice notice--warn" },
                   tr(
-                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。「同じ要求を再送」を使ってください。同じキーで同じ要求を送るので、Hostはすでに受け付けていれば同じOperationを返し、まだなら今受け付けます。どちらでも変更は一度だけです。同じ変更を新しいキーで送り直さないでください。",
-                    "The Console could not tell whether the Host accepted this request. Use “Retry exact request”: it sends the same request under the same key. If the Host already accepted it, it returns that same Operation; if not, it accepts it now. Either way only one change is made. Never send the same change again under a new key.",
+                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。「同じ要求を再送」は同じキーで同じ要求を送ります。Hostがすでに受け付けていれば同じOperationを返し、まだなら今受け付けます。どちらでも同じ論理Operationを追跡します。同じ変更を新しいキーで送り直さないでください。",
+                    "The Console could not tell whether the Host accepted this request. Use “Retry exact request”: it sends the same request under the same key. If the Host already accepted it, it returns that same Operation; if not, it accepts it now. Either way it tracks the same logical Operation. Never send the same change again under a new key.",
                   ),
                 )
               : null,
@@ -321,8 +326,8 @@ export function resourcesPage(organizationId: string): Child {
                   "div",
                   { class: "notice notice--warn" },
                   tr(
-                    "Hostが要求を受け付けたかどうか分からず、ページの再読み込みか再送期限のために、同じ要求はもう再送できません。新しく送る前に、リソース一覧と対象のリソースを確認してください（リソースが多い場合は「さらに読み込む」で続きを読み込み、絞り込みで探します）。作成が受け付けられていれば、そのリソースはすぐ一覧に出ます。少し待っても出ないなら受け付けられておらず、作り直せます。同じ名前の作成は、最初の作成が届いていれば拒否されます。更新と削除は読み取った世代を指定します。最初のものが反映済みなら、リソースにはすでにその変更が表示されており、古い読み取りに基づく再送は拒否されます。それでも分からず、Hostを運用しているのが別の人なら、その人に確認してください。",
-                    "The Console could not tell whether the Host accepted a request, and it can no longer resend it exactly: the page was reloaded, or the replay window has passed. Check the Resources list and the Resource before sending anything new (with many Resources, use Load more, then the filter). An accepted create is listed at once, so a create still missing after a moment was not accepted and can be made again; a create of the same name is refused if the first one did land. An update or a delete names the generation it read: if the first one applied, the Resource already shows the change, and a resend based on the old read is refused. If that does not settle it and someone else runs this Host, ask them.",
+                    "Hostが要求を受け付けたかどうか分からず、ページの再読み込みか再送期限のために、同じ要求はもう再送できません。現在の権限でリソース一覧と対象を確認してください（リソースが多い場合は「さらに読み込む」で続きを読み込み、絞り込みで探します）。一覧に見つからないことや403・404・410だけでは、元の要求が未受理だったとは判断できません。結果が不明なまま同じ変更を新しいキーで送らず、Hostの運用者と元の要求・Operationを照合してください。",
+                    "The Console could not tell whether the Host accepted a request, and it can no longer resend it exactly: the page was reloaded, or the replay window has passed. Check the Resources list and the Resource with your current access (with many Resources, use Load more, then the filter). A missing Resource or a 403, 404 or 410 response does not prove the original request was never accepted. Do not send the same change under a new key while its outcome remains unknown; reconcile the original request and Operation with the Host operator.",
                   ),
                 )
               : null,
