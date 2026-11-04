@@ -154,6 +154,11 @@ export interface ApiKeyAdministration {
     readonly name: string;
     readonly scopes: readonly ApiKeyScope[];
     readonly expiresInSeconds: number;
+    /**
+     * Owner-route fence: require this owner and membership in the key INSERT.
+     * Custom implementations must honor the fence or refuse the request.
+     */
+    readonly expectedOwnerPrincipalId?: string;
     /** Optional stable id for an operation whose response may be lost. */
     readonly apiKeyId?: string;
     /** Atomically refuses while any unrevoked key has this exact name. */
@@ -822,8 +827,12 @@ export function createApiKeyAdministration(
     status,
 
     async issue(input) {
-      const ownerPrincipalId = await organizationOwnerPrincipalId(input.organizationId);
+      const organizationId = input.organizationId;
+      const expectedOwnerPrincipalId = input.expectedOwnerPrincipalId;
+      const ownerPrincipalId = await organizationOwnerPrincipalId(organizationId);
       if (!ownerPrincipalId) throw new AuthError("not_found");
+      if (expectedOwnerPrincipalId !== undefined && expectedOwnerPrincipalId !== ownerPrincipalId)
+        throw new AuthError("not_found");
       const scopes = validScopes(input.scopes);
       if (input.name.length === 0 || input.name.length > 128) throw new AuthError("invalid");
       if (!Number.isSafeInteger(input.expiresInSeconds) || input.expiresInSeconds <= 0) {
@@ -848,20 +857,35 @@ export function createApiKeyAdministration(
         secretDigest,
         id,
         ownerPrincipalId,
-        input.organizationId,
+        organizationId,
         input.name,
         JSON.stringify([...scopes]),
         createdAt,
         expiresAt,
       ] as const;
+      const ownerGuard = `EXISTS (
+        SELECT 1 FROM orgs o
+        JOIN org_memberships m
+          ON m.org_id = o.id AND m.principal_id = o.owner_principal_id
+        WHERE o.id = ? AND o.owner_principal_id = ? AND m.role = 'owner'
+      )`;
+      const ownerParams =
+        expectedOwnerPrincipalId === undefined ? [] : [organizationId, expectedOwnerPrincipalId];
       const write =
         input.exclusiveUnrevokedName === undefined
-          ? await sql.run(
-              `INSERT INTO auth_tokens
+          ? expectedOwnerPrincipalId === undefined
+            ? await sql.run(
+                `INSERT INTO auth_tokens
                  (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
                VALUES (?, ?, 'api_key', ?, ?, ?, ?, ?, ?)`,
-              params,
-            )
+                params,
+              )
+            : await sql.run(
+                `INSERT INTO auth_tokens
+                 (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+               SELECT ?, ?, 'api_key', ?, ?, ?, ?, ?, ? WHERE ${ownerGuard}`,
+                [...params, ...ownerParams],
+              )
           : await sql.run(
               `INSERT INTO auth_tokens
                  (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
@@ -870,15 +894,16 @@ export function createApiKeyAdministration(
                  SELECT 1 FROM auth_tokens
                  WHERE org_id = ? AND kind = 'api_key' AND name = ? AND revoked_at IS NULL
                )
+               ${expectedOwnerPrincipalId === undefined ? "" : `AND ${ownerGuard}`}
                ON CONFLICT(id) DO NOTHING`,
-              [...params, input.organizationId, input.exclusiveUnrevokedName],
+              [...params, organizationId, input.exclusiveUnrevokedName, ...ownerParams],
             );
       if (write.changes === 1) {
         return {
           kind: "issued",
           apiKey: {
             id,
-            organizationId: input.organizationId,
+            organizationId,
             name: input.name,
             scopes,
             createdAt,
@@ -887,9 +912,18 @@ export function createApiKeyAdministration(
           secret,
         };
       }
+      if (expectedOwnerPrincipalId !== undefined && write.changes === 0) {
+        // This read only classifies a refused INSERT. It cannot authorize or
+        // retry a write that lost its same-statement owner fence.
+        const currentOwner = await sql.query(
+          `SELECT 1 AS owner_current WHERE ${ownerGuard}`,
+          ownerParams,
+        );
+        if (!currentOwner[0]) throw new AuthError("not_found");
+      }
       if (input.apiKeyId !== undefined) {
         const existing = await status({
-          organizationId: input.organizationId,
+          organizationId,
           apiKeyId: input.apiKeyId,
         });
         if (existing) return { kind: "existing", status: existing };
@@ -1929,9 +1963,11 @@ function createAccountsInternal(
     },
 
     async createApiKey({ actor, organizationId, name, scopes, expiresInSeconds }) {
+      const expectedOwnerPrincipalId = actor.principalId;
       await accounts.requireOwner(actor, organizationId);
       const issued = await apiKeyAdministration.issue({
         organizationId,
+        expectedOwnerPrincipalId,
         name,
         scopes,
         expiresInSeconds,
