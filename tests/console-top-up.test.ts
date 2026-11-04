@@ -803,6 +803,9 @@ async function billingPageFor(input: {
   readonly signedIn?: boolean;
   readonly receiptState?: TopUpReceipt["state"];
   readonly workspaceUsage?: (url: URL) => Response | Promise<Response>;
+  readonly checkoutResponse?: () => Response | Promise<Response>;
+  readonly fundingResponse?: () => Response | Promise<Response>;
+  readonly subscriptionResponse?: () => Response | Promise<Response>;
 }) {
   const values = input.storage ?? new Map<string, string>();
   const storage = {
@@ -861,6 +864,7 @@ async function billingPageFor(input: {
         body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
       });
       if (url.pathname === `${base}/payments/subscription`) {
+        if (input.subscriptionResponse) return input.subscriptionResponse();
         if (input.subscription === "loading") return new Promise<Response>(() => undefined);
         if (input.subscription === "failing")
           return Response.json({ error: { code: "unavailable" } }, { status: 503 });
@@ -889,10 +893,14 @@ async function billingPageFor(input: {
           checkout: null,
         });
       if (method === "POST" && url.pathname === `${base}/wallet/checkout`)
-        return input.subscription === "hosted"
-          ? Response.json({ checkout: { url: checkoutUrl } }, { status: 201 })
-          : Response.json({ error: { code: "not_found" } }, { status: 404 });
-      if (url.pathname === `${base}/wallet/funding`) return Response.json({ wallet: {} });
+        return (
+          input.checkoutResponse?.() ??
+          (input.subscription === "hosted"
+            ? Response.json({ checkout: { url: checkoutUrl } }, { status: 201 })
+            : Response.json({ error: { code: "not_found" } }, { status: 404 }))
+        );
+      if (url.pathname === `${base}/wallet/funding`)
+        return input.fundingResponse?.() ?? Response.json({ wallet: {} });
       if (url.pathname === `${base}/wallet/usage-summary/workspaces` && input.workspaceUsage)
         return input.workspaceUsage(url);
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
@@ -902,6 +910,7 @@ async function billingPageFor(input: {
   const state = await import("../console/src/state.ts");
   const { consoleLocale } = await import("../console/src/i18n.ts");
   const { billingPage } = await import("../console/src/pages/billing.ts");
+  const { mountToasts } = await import("../console/src/ui.ts");
   consoleLocale.set("en");
   state.setApiOrigin("https://api.example.test");
   const signIn = () => {
@@ -920,6 +929,9 @@ async function billingPageFor(input: {
     state.principal.set(null);
     state.organizations.set([]);
   } else signIn();
+  const toastHost = mountToasts();
+  if (!(toastHost instanceof TestNode)) throw new Error("toast host did not render a test node");
+  body.append(toastHost);
   const root = billingPage(organizationId) as unknown as TestNode;
   await flush();
   const button = (label: string) =>
@@ -1182,4 +1194,198 @@ describe("billing page Workspace usage", () => {
     expect(reads).toBe(2);
     expect(failing.root.textContent).toContain("No Workspace-attributed usage in this period.");
   });
+});
+
+function deferredBillingResponse() {
+  let resolve!: (response: Response) => void;
+  const promise = new Promise<Response>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+type BillingPageFixture = Awaited<ReturnType<typeof billingPageFor>>;
+type BillingScopeChange = "org" | "roundtrip" | "session" | "origin" | "dismiss";
+
+async function retireBillingScope(kind: BillingScopeChange, page: BillingPageFixture) {
+  const state = await import("../console/src/state.ts");
+  if (kind === "org" || kind === "roundtrip") {
+    state.organizations.update((all) => [
+      ...all,
+      {
+        id: "org-other",
+        name: "Other",
+        ownerPrincipalId,
+        createdAt: "2026-11-04T00:00:00Z",
+      },
+    ]);
+    state.selectOrganization("org-other");
+  }
+  if (kind === "roundtrip") state.selectOrganization(organizationId);
+  if (kind === "session") {
+    state.adoptSession();
+    page.signIn();
+  }
+  if (kind === "origin") state.setApiOrigin("https://other.example.test");
+  if (kind === "dismiss") await page.click("Cancel");
+}
+
+const billingToasts = (page: BillingPageFixture) =>
+  page.body.all().filter((node) => node.className.startsWith("toast toast--"));
+const walletReadCount = (page: BillingPageFixture) =>
+  page.calls().filter((call) => call === `GET /v1/organizations/${organizationId}/wallet`).length;
+
+describe("rendered legacy billing completion scope", () => {
+  for (const change of ["org", "roundtrip", "session", "origin", "dismiss"] as const) {
+    test(`a retired checkout dialog cannot submit (${change})`, async () => {
+      const page = await billingPageFor({ subscription: "legacy" });
+      await page.click("Add funds");
+      const confirm = page.body
+        .all()
+        .find((node) => node.tag === "button" && node.textContent === "Continue to payment");
+      expect(confirm).toBeDefined();
+      await retireBillingScope(change, page);
+      confirm?.click();
+      await flush();
+      expect(page.calls()).not.toContain(checkoutCall);
+    });
+
+    for (const status of [201, 404, 503]) {
+      test(`retired checkout completion cannot redirect, fallback or toast (${change}, ${status})`, async () => {
+        const answer = deferredBillingResponse();
+        const page = await billingPageFor({
+          subscription: "legacy",
+          checkoutResponse: () => answer.promise,
+        });
+        await page.click("Add funds");
+        await page.click("Continue to payment");
+        expect(page.sent.filter((request) => request.call === checkoutCall)).toEqual([
+          { call: checkoutCall, body: { amountMinor: 5000 } },
+        ]);
+        await retireBillingScope(change, page);
+        answer.resolve(
+          Response.json(
+            status === 201
+              ? { checkout: { url: checkoutUrl } }
+              : { error: { code: status === 404 ? "not_found" : "unavailable" } },
+            { status },
+          ),
+        );
+        await flush();
+        expect(page.assigned).toEqual([]);
+        expect(page.body.textContent).not.toContain("Settlement proof");
+        expect(billingToasts(page)).toHaveLength(0);
+      });
+    }
+
+    for (const status of [200, 503]) {
+      test(`retired proof completion cannot toast or reload (${change}, ${status})`, async () => {
+        const answer = deferredBillingResponse();
+        const page = await billingPageFor({
+          subscription: "legacy",
+          fundingResponse: () => answer.promise,
+        });
+        await page.click("Add funds");
+        await page.click("Continue to payment");
+        const proof = page.body.all().find((node) => node.tag === "textarea");
+        expect(proof).toBeDefined();
+        if (proof) proof.value = "synthetic-settlement-proof";
+        await page.click("Credit wallet");
+        expect(page.sent.filter((request) => request.call === fundingCall)).toEqual([
+          { call: fundingCall, body: { settlementProof: "synthetic-settlement-proof" } },
+        ]);
+        const before = walletReadCount(page);
+        await retireBillingScope(change, page);
+        answer.resolve(
+          Response.json(status === 200 ? { wallet: {} } : { error: { code: "unavailable" } }, {
+            status,
+          }),
+        );
+        await flush();
+        expect(billingToasts(page)).toHaveLength(0);
+        expect(walletReadCount(page)).toBe(before);
+      });
+    }
+
+    if (change !== "dismiss") {
+      test(`a retired proof dialog cannot submit (${change})`, async () => {
+        const page = await billingPageFor({ subscription: "legacy" });
+        await page.click("Add funds");
+        await page.click("Continue to payment");
+        const proof = page.body.all().find((node) => node.tag === "textarea");
+        if (proof) proof.value = "synthetic-settlement-proof";
+        await retireBillingScope(change, page);
+        await page.click("Credit wallet");
+        expect(page.calls()).not.toContain(fundingCall);
+      });
+
+      test(`a retired legacy return cannot publish its funding result (${change})`, async () => {
+        const answer = deferredBillingResponse();
+        const page = await billingPageFor({
+          subscription: "legacy",
+          search: "?checkout=cs_test_original&keep=1",
+          fundingResponse: () => answer.promise,
+        });
+        expect(page.calls().filter((call) => call === fundingCall)).toHaveLength(1);
+        const before = walletReadCount(page);
+        await retireBillingScope(change, page);
+        answer.resolve(Response.json({ wallet: {} }));
+        await flush();
+        expect(billingToasts(page)).toHaveLength(0);
+        expect(walletReadCount(page)).toBe(before);
+        expect(page.replaced).toEqual(["/billing?keep=1"]);
+      });
+
+      test(`a retired page cannot consume a return when its lane arrives late (${change})`, async () => {
+        const lane = deferredBillingResponse();
+        const page = await billingPageFor({
+          subscription: "legacy",
+          search: "?checkout=cs_test_original&keep=1",
+          subscriptionResponse: () => lane.promise,
+        });
+        await retireBillingScope(change, page);
+        lane.resolve(Response.json({ error: { code: "not_found" } }, { status: 404 }));
+        await flush();
+        expect(page.replaced).toEqual([]);
+        expect(page.calls()).not.toContain(fundingCall);
+        expect(page.location.search).toBe("?checkout=cs_test_original&keep=1");
+      });
+    }
+  }
+
+  test("a current legacy checkout still redirects once with its original amount", async () => {
+    const page = await billingPageFor({
+      subscription: "legacy",
+      checkoutResponse: () => Response.json({ checkout: { url: checkoutUrl } }, { status: 201 }),
+    });
+    await page.click("Add funds");
+    await page.click("Continue to payment");
+    expect(page.assigned).toEqual([checkoutUrl]);
+    expect(page.sent.filter((request) => request.call === checkoutCall)).toEqual([
+      { call: checkoutCall, body: { amountMinor: 5000 } },
+    ]);
+  });
+
+  for (const status of [200, 503]) {
+    test(`a current proof result still reports its actual outcome (${status})`, async () => {
+      const page = await billingPageFor({
+        subscription: "legacy",
+        fundingResponse: () =>
+          Response.json(status === 200 ? { wallet: {} } : { error: { code: "unavailable" } }, {
+            status,
+          }),
+      });
+      await page.click("Add funds");
+      await page.click("Continue to payment");
+      const proof = page.body.all().find((node) => node.tag === "textarea");
+      expect(proof).toBeDefined();
+      if (proof) proof.value = "synthetic-settlement-proof";
+      const before = walletReadCount(page);
+      await page.click("Credit wallet");
+      expect(page.calls().filter((call) => call === fundingCall)).toHaveLength(1);
+      expect(billingToasts(page)).toHaveLength(1);
+      expect(walletReadCount(page)).toBe(before + (status === 200 ? 1 : 0));
+      expect(page.body.textContent.includes("Settlement proof")).toBe(status !== 200);
+    });
+  }
 });
