@@ -31,6 +31,7 @@ import {
   resolveSharedSessionReturnPath,
   selectOrganization,
   session,
+  sessionKind,
   signInSession,
   signOut,
   theme,
@@ -241,10 +242,17 @@ function topbar(): Child {
   );
 }
 
+/** Presentation only; local creation waits for the resolved sign-in identity. */
+function canCreateLocalOrganization(): boolean {
+  const identity = principal();
+  return sessionKind() === "legacy" && identity !== null && identity.provider !== "takos-id";
+}
+
 function organizationPicker(): Child {
   const all = organizations();
   const current = currentOrganization();
   if (all.length === 0) {
+    if (!canCreateLocalOrganization()) return null;
     return h(
       "button",
       { class: "btn btn--sm btn--primary", type: "button", onClick: createOrganization },
@@ -274,21 +282,24 @@ function organizationPicker(): Child {
         ),
       ),
     ),
-    h(
-      "button",
-      {
-        class: "btn btn--ghost btn--sm",
-        type: "button",
-        title: tr("組織を作成", "Create organization"),
-        "aria-label": tr("組織を作成", "Create organization"),
-        onClick: createOrganization,
-      },
-      icon(ICON.plus, 15),
-    ),
+    canCreateLocalOrganization()
+      ? h(
+          "button",
+          {
+            class: "btn btn--ghost btn--sm",
+            type: "button",
+            title: tr("組織を作成", "Create organization"),
+            "aria-label": tr("組織を作成", "Create organization"),
+            onClick: createOrganization,
+          },
+          icon(ICON.plus, 15),
+        )
+      : null,
   );
 }
 
 function createOrganization(): void {
+  if (!canCreateLocalOrganization()) return;
   const isCurrent = captureSessionScope();
   let open = true;
   const name = h("input", { class: "input", placeholder: tr("本番環境", "Acme production") });
@@ -313,7 +324,7 @@ function createOrganization(): void {
       ),
     ),
     onConfirm: async () => {
-      if (!open || !isCurrent()) {
+      if (!open || !isCurrent() || !canCreateLocalOrganization()) {
         close();
         return;
       }
@@ -363,19 +374,37 @@ function page(): Child {
   const organization = currentOrganization();
 
   if (!organization) {
+    const knownIdentity = principal() !== null;
+    const canCreate = canCreateLocalOrganization();
     return card(
       null,
       empty(
-        tr("組織がありません", "No organization yet"),
-        tr(
-          "リソース、APIキー、残高は組織ごとに管理されます。最初の組織を作成してください。",
-          "Everything in this console belongs to an organization: the resources it declares, its API keys and its wallet. Create one to begin.",
-        ),
-        h(
-          "button",
-          { class: "btn btn--primary", type: "button", onClick: createOrganization },
-          tr("組織を作成", "Create organization"),
-        ),
+        !knownIdentity
+          ? tr("アカウント情報をまだ確認できていません", "Account details are not available yet")
+          : canCreate
+            ? tr("組織がありません", "No organization yet")
+            : tr("利用できる組織がありません", "No organization available"),
+        !knownIdentity
+          ? tr(
+              "アカウント情報の読込完了後に操作できます。エラーが表示されている場合は、ページを再読み込みしてください。",
+              "Wait for your account details before continuing. If an error is shown, reload this page.",
+            )
+          : !canCreate
+            ? tr(
+                "このログインで利用できる組織がありません。ログイン先の管理者に、組織へのアクセス権とアカウント連携を確認してください。",
+                "No organization is available for this sign-in. Ask your sign-in administrator to check your organization access and account linkage.",
+              )
+            : tr(
+                "リソース、APIキー、残高は組織ごとに管理されます。最初の組織を作成してください。",
+                "Everything in this console belongs to an organization: the resources it declares, its API keys and its wallet. Create one to begin.",
+              ),
+        canCreate
+          ? h(
+              "button",
+              { class: "btn btn--primary", type: "button", onClick: createOrganization },
+              tr("組織を作成", "Create organization"),
+            )
+          : null,
       ),
     );
   }
