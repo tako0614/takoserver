@@ -1,6 +1,6 @@
 import { ApiError, type ResourceOperation } from "./api.ts";
 import { effect } from "./reactive.ts";
-import { api, currentOrganization, principal } from "./state.ts";
+import { api, captureSessionScope, currentOrganization, principal } from "./state.ts";
 
 type IntentBody =
   | {
@@ -31,7 +31,10 @@ export interface ResourceIntent {
 }
 
 /** Browser-memory only: never write spec, key, token, or private input to storage or URL. */
-const intents = new Map<string, ResourceIntent>();
+const intents = new Map<
+  string,
+  { readonly intent: ResourceIntent; readonly isSessionCurrent: () => boolean }
+>();
 let activePrincipalId = principal()?.id ?? null;
 effect(() => {
   const next = principal()?.id ?? null;
@@ -61,17 +64,20 @@ export function prepareResourceIntent(
     uncertain: false,
     inFlight: false,
   };
-  intents.set(intent.id, intent);
+  intents.set(intent.id, { intent, isSessionCurrent: captureSessionScope() });
   return intent;
 }
 
 export function uncertainResourceIntents(organizationId: string): readonly ResourceIntent[] {
-  return [...intents.values()].filter(
-    (intent) =>
-      intent.organizationId === organizationId &&
-      intent.principalId === (principal()?.id ?? null) &&
-      intent.uncertain,
-  );
+  return [...intents.values()]
+    .filter(
+      ({ intent, isSessionCurrent }) =>
+        isSessionCurrent() &&
+        intent.organizationId === organizationId &&
+        intent.principalId === (principal()?.id ?? null) &&
+        intent.uncertain,
+    )
+    .map(({ intent }) => intent);
 }
 
 export function canReplayResourceIntent(intent: ResourceIntent, now = performance.now()): boolean {
@@ -99,8 +105,10 @@ export async function sendResourceIntent(
   id: string,
   now = performance.now(),
 ): Promise<ResourceOperation> {
-  const intent = intents.get(id);
-  if (!intent) throw new ApiError("intent_missing", 0, "resource-intent");
+  const stored = intents.get(id);
+  if (!stored) throw new ApiError("intent_missing", 0, "resource-intent");
+  if (!stored.isSessionCurrent()) throw new ApiError("session_changed", 0, "resource-intent");
+  const { intent } = stored;
   if (currentOrganization()?.id !== intent.organizationId)
     throw new ApiError("organization_changed", 0, "resource-intent");
   if (intent.principalId !== (principal()?.id ?? null))
@@ -140,7 +148,7 @@ export async function sendResourceIntent(
  * and send it anew under a new key. Anything uncertain or accepted is kept.
  */
 export function discardRefusedResourceIntent(id: string, error: unknown): boolean {
-  const intent = intents.get(id);
+  const intent = intents.get(id)?.intent;
   if (!intent || intent.uncertain || intent.operationId !== null || intent.inFlight) return false;
   if (!(error instanceof ApiError) || isUnknownAcceptance(error)) return false;
   if (error.status < 400 || error.status >= 500) return false;
@@ -151,7 +159,7 @@ export function discardRefusedResourceIntent(id: string, error: unknown): boolea
 }
 
 export function settleResourceIntent(id: string, operation: ResourceOperation): void {
-  const intent = intents.get(id);
+  const intent = intents.get(id)?.intent;
   if (
     intent?.operationId === operation.id &&
     (operation.status === "succeeded" || operation.status === "failed")

@@ -14,7 +14,7 @@ import {
 } from "../form-specs.ts";
 import { formLabel, KNOWN_FORM_GROUPS } from "../forms.ts";
 import { tr } from "../i18n.ts";
-import { resource, signal } from "../reactive.ts";
+import { effect, resource, signal } from "../reactive.ts";
 import { findReferrers } from "../referrers.ts";
 import {
   discardRefusedResourceIntent,
@@ -26,8 +26,8 @@ import {
 } from "../resource-intent.ts";
 import { health } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath } from "../router.ts";
-import { api, currentOrganization } from "../state.ts";
-import { copyable, explain, openModal, toast } from "../ui.ts";
+import { api, captureSelectedOrganizationScope } from "../state.ts";
+import { copyable, explain, type ModalOptions, openModal, toast } from "../ui.ts";
 
 function jsonSpec(text: string): Record<string, unknown> | null {
   try {
@@ -40,16 +40,41 @@ function jsonSpec(text: string): Record<string, unknown> | null {
   }
 }
 
-function sameOrganization(organizationId: string): boolean {
-  if (currentOrganization()?.id === organizationId) return true;
-  toast(
-    tr(
-      "組織が変更されました。操作は送信していません。",
-      "Organization changed. No operation was sent.",
-    ),
-    "bad",
-  );
-  return false;
+interface ResourceModal {
+  close(): void;
+  isCurrent(): boolean;
+}
+
+function openScopedResourceModal(
+  options: ModalOptions,
+  isScopeCurrent: () => boolean,
+): ResourceModal {
+  let open = true;
+  let stop = (): void => {};
+  const lifetime: { close: (() => void) | null } = { close: null };
+  const close = openModal({
+    ...options,
+    onClose: () => {
+      open = false;
+      lifetime.close = null;
+      stop();
+      options.onClose?.();
+    },
+  });
+  lifetime.close = close;
+  stop = watchResourceModalScope(isScopeCurrent, lifetime);
+  if (!open) stop();
+  return { close, isCurrent: () => open && isScopeCurrent() };
+}
+
+/** Do not retain the dialog after its scope watcher has been disposed. */
+function watchResourceModalScope(
+  isScopeCurrent: () => boolean,
+  lifetime: { close: (() => void) | null },
+): () => void {
+  return effect(() => {
+    if (!isScopeCurrent()) lifetime.close?.();
+  });
 }
 
 function recoveryDetails(
@@ -163,24 +188,30 @@ function refusalNotice(): {
 
 async function submit(
   intent: ResourceIntent,
-  close: () => void,
+  modal: ResourceModal,
   refused: (error: unknown) => void = (error) => toast(explain(error as Error), "bad"),
 ): Promise<void> {
+  if (!modal.isCurrent()) return;
   try {
     const accepted = await sendResourceIntent(intent.id);
-    close();
-    if (currentOrganization()?.id === intent.organizationId)
-      navigate(
-        `/resources?operation=${encodeURIComponent(accepted.id)}&intent=${encodeURIComponent(intent.id)}`,
-      );
+    if (!modal.isCurrent()) return;
+    modal.close();
+    navigate(
+      `/resources?operation=${encodeURIComponent(accepted.id)}&intent=${encodeURIComponent(intent.id)}`,
+    );
   } catch (error) {
+    if (!modal.isCurrent()) {
+      // Retire a definitely refused record without showing old-scope feedback.
+      // Unknown, accepted and conflicting originals remain protected by this helper.
+      discardRefusedResourceIntent(intent.id, error);
+      return;
+    }
     if (
       isUnknownAcceptance(error) ||
       (error instanceof ApiError && error.code === "replay_window_expired")
     ) {
-      close();
-      if (currentOrganization()?.id === intent.organizationId)
-        navigate(`/resources?acceptance=unknown&intent=${encodeURIComponent(intent.id)}`);
+      modal.close();
+      navigate(`/resources?acceptance=unknown&intent=${encodeURIComponent(intent.id)}`);
       return;
     }
     refused(error);
@@ -527,6 +558,8 @@ export interface CreatePreset {
 const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
 export function createResource(organizationId: string, preset?: CreatePreset): void {
+  const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
+  if (!isScopeCurrent()) return;
   let key = `console-create-${crypto.randomUUID()}`;
   const name = h("input", {
     class: "input",
@@ -751,147 +784,155 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   showDetails();
   let intent: ResourceIntent | null = null;
   const refusal = refusalNotice();
-  const close = openModal({
-    title: tr("リソースを作成", "New resource"),
-    confirmLabel: tr("作成する", "Create"),
-    body: h(
-      "div",
-      { style: { display: "grid", gap: "14px" } },
-      preset?.note ? h("div", { class: "notice", id: "create-resource-note" }, preset.note) : null,
-      form.element,
-      h(
+  const modal = openScopedResourceModal(
+    {
+      title: tr("リソースを作成", "New resource"),
+      confirmLabel: tr("作成する", "Create"),
+      body: h(
         "div",
-        { class: "field" },
-        h("label", { for: "create-resource-name" }, tr("名前", "Name")),
-        name,
+        { style: { display: "grid", gap: "14px" } },
+        preset?.note
+          ? h("div", { class: "notice", id: "create-resource-note" }, preset.note)
+          : null,
+        form.element,
         h(
-          "small",
-          { id: "create-resource-name-rule" },
-          tr(
-            "英数字と「.」「_」「-」で128文字まで。先頭は英数字です。この組織の中で、Formを問わず重複できません。",
-            "Up to 128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit. Unique in this organization, whatever the Form.",
+          "div",
+          { class: "field" },
+          h("label", { for: "create-resource-name" }, tr("名前", "Name")),
+          name,
+          h(
+            "small",
+            { id: "create-resource-name-rule" },
+            tr(
+              "英数字と「.」「_」「-」で128文字まで。先頭は英数字です。この組織の中で、Formを問わず重複できません。",
+              "Up to 128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit. Unique in this organization, whatever the Form.",
+            ),
           ),
         ),
+        h(
+          "div",
+          { class: "field" },
+          h("label", null, tr("スペース", "Space")),
+          h("span", { class: "field__value" }, organizationId),
+        ),
+        references,
+        h(
+          "div",
+          { class: "field" },
+          h("label", { for: "create-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
+          spec,
+          specHint,
+          artifactHint,
+        ),
+        requestDisclosure(details),
+        refusal.element,
       ),
-      h(
-        "div",
-        { class: "field" },
-        h("label", null, tr("スペース", "Space")),
-        h("span", { class: "field__value" }, organizationId),
-      ),
-      references,
-      h(
-        "div",
-        { class: "field" },
-        h("label", { for: "create-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
-        spec,
-        specHint,
-        artifactHint,
-      ),
-      requestDisclosure(details),
-      refusal.element,
-    ),
-    onConfirm: async () => {
-      if (!sameOrganization(organizationId)) return;
-      refusal.clear();
-      if (!intent) {
-        const selectedForm = form.value();
-        const selectedName = name.value.trim();
-        const parsed = jsonSpec(spec.value);
-        if (!selectedForm || !selectedName || !parsed) {
-          toast(
-            tr(
-              "Formを選び、名前とJSONオブジェクトを入力してください",
-              "Choose a Form, then enter a name and a JSON object",
-            ),
-            "bad",
-          );
-          return;
-        }
-        // The Host's own name rule, so a refused name costs no round trip.
-        if (!RESOURCE_NAME.test(selectedName)) {
-          refusal.say(
-            tr(
-              "名前は、英数字と「.」「_」「-」で128文字までにし、先頭を英数字にしてください。",
-              "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
-            ),
-          );
-          return;
-        }
-        // A starter's empty values are the ones the Host would refuse; say which.
-        const blanks = remainingBlanks(parsed);
-        if (blanks.length > 0) {
-          toast(
-            tr(
-              `まだ空の値があります：${blanks.map(pathLabel).join("、")}`,
-              `Still empty: ${blanks.map(pathLabel).join(", ")}`,
-            ),
-            "bad",
-          );
-          return;
-        }
-        form.setDisabled(true);
-        name.disabled = true;
-        spec.disabled = true;
-        picker?.setDisabled(true);
-        showDetails();
-        try {
-          if (!(await api.formSupport(organizationId, selectedForm))) {
+      onConfirm: async () => {
+        if (!modal.isCurrent()) return;
+        refusal.clear();
+        if (!intent) {
+          const selectedForm = form.value();
+          const selectedName = name.value.trim();
+          const parsed = jsonSpec(spec.value);
+          if (!selectedForm || !selectedName || !parsed) {
             toast(
               tr(
-                "このHostはそのFormの作成をサポートしていません",
-                "This Host does not support create for that exact Form",
+                "Formを選び、名前とJSONオブジェクトを入力してください",
+                "Choose a Form, then enter a name and a JSON object",
               ),
               "bad",
             );
+            return;
+          }
+          // The Host's own name rule, so a refused name costs no round trip.
+          if (!RESOURCE_NAME.test(selectedName)) {
+            refusal.say(
+              tr(
+                "名前は、英数字と「.」「_」「-」で128文字までにし、先頭を英数字にしてください。",
+                "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
+              ),
+            );
+            return;
+          }
+          // A starter's empty values are the ones the Host would refuse; say which.
+          const blanks = remainingBlanks(parsed);
+          if (blanks.length > 0) {
+            toast(
+              tr(
+                `まだ空の値があります：${blanks.map(pathLabel).join("、")}`,
+                `Still empty: ${blanks.map(pathLabel).join(", ")}`,
+              ),
+              "bad",
+            );
+            return;
+          }
+          form.setDisabled(true);
+          name.disabled = true;
+          spec.disabled = true;
+          picker?.setDisabled(true);
+          showDetails();
+          try {
+            const supported = await api.formSupport(organizationId, selectedForm);
+            if (!modal.isCurrent()) return;
+            if (!supported) {
+              toast(
+                tr(
+                  "このHostはそのFormの作成をサポートしていません",
+                  "This Host does not support create for that exact Form",
+                ),
+                "bad",
+              );
+              form.setDisabled(false);
+              name.disabled = false;
+              spec.disabled = false;
+              picker?.setDisabled(false);
+              return;
+            }
+            if (!modal.isCurrent()) return;
+            const replayWindowSeconds = await api.replayWindowSeconds();
+            if (!modal.isCurrent()) return;
+            intent = prepareResourceIntent(
+              organizationId,
+              { action: "create", form: selectedForm, name: selectedName, spec: parsed },
+              replayWindowSeconds,
+              key,
+            );
+            details.replaceChildren(
+              recoveryDetails(
+                key,
+                "POST",
+                "/apis/forms.takoform.com/v2/resources",
+                resourceIntentRequestBody(intent),
+              ),
+            );
+          } catch (error) {
+            if (!modal.isCurrent()) return;
             form.setDisabled(false);
             name.disabled = false;
             spec.disabled = false;
             picker?.setDisabled(false);
+            refusal.show(error, "unsent");
             return;
           }
-          if (!sameOrganization(organizationId)) return;
-          const replayWindowSeconds = await api.replayWindowSeconds();
-          if (!sameOrganization(organizationId)) return;
-          intent = prepareResourceIntent(
-            organizationId,
-            { action: "create", form: selectedForm, name: selectedName, spec: parsed },
-            replayWindowSeconds,
-            key,
-          );
-          details.replaceChildren(
-            recoveryDetails(
-              key,
-              "POST",
-              "/apis/forms.takoform.com/v2/resources",
-              resourceIntentRequestBody(intent),
-            ),
-          );
-        } catch (error) {
-          form.setDisabled(false);
-          name.disabled = false;
-          spec.disabled = false;
-          picker?.setDisabled(false);
-          refusal.show(error, "unsent");
-          return;
         }
-      }
-      await submit(intent, close, (error) => {
-        // Definitely refused: nothing was stored, so unlock it for a corrected,
-        // new request under a new key. Otherwise only the exact retry remains.
-        if (intent && discardRefusedResourceIntent(intent.id, error)) {
-          intent = null;
-          key = `console-create-${crypto.randomUUID()}`;
-          form.setDisabled(false);
-          name.disabled = false;
-          spec.disabled = false;
-          picker?.setDisabled(false);
-          showDetails();
-          refusal.show(error, "editable");
-        } else refusal.show(error, "fixed");
-      });
+        await submit(intent, modal, (error) => {
+          // Definitely refused: nothing was stored, so unlock it for a corrected,
+          // new request under a new key. Otherwise only the exact retry remains.
+          if (intent && discardRefusedResourceIntent(intent.id, error)) {
+            intent = null;
+            key = `console-create-${crypto.randomUUID()}`;
+            form.setDisabled(false);
+            name.disabled = false;
+            spec.disabled = false;
+            picker?.setDisabled(false);
+            showDetails();
+            refusal.show(error, "editable");
+          } else refusal.show(error, "fixed");
+        });
+      },
     },
-  });
+    isScopeCurrent,
+  );
 }
 
 /**
@@ -910,6 +951,8 @@ export function updateResource(
     readonly confirmLabel?: string;
   },
 ): void {
+  const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
+  if (!isScopeCurrent()) return;
   let key = `console-update-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
   const spec = h("textarea", {
@@ -938,64 +981,73 @@ export function updateResource(
   showDetails();
   let intent: ResourceIntent | null = null;
   const refusal = refusalNotice();
-  const close = openModal({
-    title: proposal?.title ?? tr(`${resource.name}を更新`, `Update ${resource.name}`),
-    confirmLabel: proposal?.confirmLabel ?? tr("更新する", "Update"),
-    body: h(
-      "div",
-      { class: "field" },
-      proposal ? h("div", { class: "notice", id: "update-resource-note" }, proposal.note) : null,
-      h("label", { for: "update-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
-      spec,
-      requestDisclosure(details),
-      refusal.element,
-    ),
-    onConfirm: async () => {
-      if (!sameOrganization(organizationId)) return;
-      refusal.clear();
-      if (!intent) {
-        const parsed = jsonSpec(spec.value);
-        if (!parsed) {
-          toast(tr("JSONオブジェクトを入力してください", "Enter a JSON object"), "bad");
-          return;
-        }
-        spec.disabled = true;
-        showDetails();
-        try {
-          const replayWindowSeconds = await api.replayWindowSeconds();
-          if (!sameOrganization(organizationId)) return;
-          intent = prepareResourceIntent(
-            organizationId,
-            { action: "update", uid: resource.uid, generation: resource.generation, spec: parsed },
-            replayWindowSeconds,
-            key,
-          );
-          details.replaceChildren(
-            recoveryDetails(
-              key,
-              "PUT",
-              path,
-              resourceIntentRequestBody(intent),
-              resource.generation,
-            ),
-          );
-        } catch (error) {
-          spec.disabled = false;
-          refusal.show(error, "unsent");
-          return;
-        }
-      }
-      await submit(intent, close, (error) => {
-        if (intent && discardRefusedResourceIntent(intent.id, error)) {
-          intent = null;
-          key = `console-update-${crypto.randomUUID()}`;
-          spec.disabled = false;
+  const modal = openScopedResourceModal(
+    {
+      title: proposal?.title ?? tr(`${resource.name}を更新`, `Update ${resource.name}`),
+      confirmLabel: proposal?.confirmLabel ?? tr("更新する", "Update"),
+      body: h(
+        "div",
+        { class: "field" },
+        proposal ? h("div", { class: "notice", id: "update-resource-note" }, proposal.note) : null,
+        h("label", { for: "update-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
+        spec,
+        requestDisclosure(details),
+        refusal.element,
+      ),
+      onConfirm: async () => {
+        if (!modal.isCurrent()) return;
+        refusal.clear();
+        if (!intent) {
+          const parsed = jsonSpec(spec.value);
+          if (!parsed) {
+            toast(tr("JSONオブジェクトを入力してください", "Enter a JSON object"), "bad");
+            return;
+          }
+          spec.disabled = true;
           showDetails();
-          refusal.show(error, "editable");
-        } else refusal.show(error, "fixed");
-      });
+          try {
+            const replayWindowSeconds = await api.replayWindowSeconds();
+            if (!modal.isCurrent()) return;
+            intent = prepareResourceIntent(
+              organizationId,
+              {
+                action: "update",
+                uid: resource.uid,
+                generation: resource.generation,
+                spec: parsed,
+              },
+              replayWindowSeconds,
+              key,
+            );
+            details.replaceChildren(
+              recoveryDetails(
+                key,
+                "PUT",
+                path,
+                resourceIntentRequestBody(intent),
+                resource.generation,
+              ),
+            );
+          } catch (error) {
+            if (!modal.isCurrent()) return;
+            spec.disabled = false;
+            refusal.show(error, "unsent");
+            return;
+          }
+        }
+        await submit(intent, modal, (error) => {
+          if (intent && discardRefusedResourceIntent(intent.id, error)) {
+            intent = null;
+            key = `console-update-${crypto.randomUUID()}`;
+            spec.disabled = false;
+            showDetails();
+            refusal.show(error, "editable");
+          } else refusal.show(error, "fixed");
+        });
+      },
     },
-  });
+    isScopeCurrent,
+  );
 }
 
 /** The kind of an exact Form URL, such as "WorkerDeployment". */
@@ -1090,6 +1142,8 @@ function openFromDialog(href: string, close: () => void): Record<string, unknown
  * offered.
  */
 export function deleteResource(organizationId: string, target: ResourceSummary): void {
+  const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
+  if (!isScopeCurrent()) return;
   const key = `console-delete-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(target.uid)}`;
   const naming = resource(() => findReferrers(organizationId, target.uid));
@@ -1098,118 +1152,125 @@ export function deleteResource(organizationId: string, target: ResourceSummary):
     return state.state === "ready" ? state.value.referrers.map((entry) => entry.resource) : [];
   };
   let intent: ResourceIntent | null = null;
-  const close = openModal({
-    title: tr(`${target.name}を削除しますか？`, `Delete ${target.name}?`),
-    confirmLabel: tr("リソースを削除", "Delete resource"),
-    confirmTone: "danger",
-    confirmBlocked: () => naming.get().state === "loading" || blocking().length > 0,
-    body: h(
-      "div",
-      { style: { display: "grid", gap: "14px" } },
-      h(
+  const modal = openScopedResourceModal(
+    {
+      title: tr(`${target.name}を削除しますか？`, `Delete ${target.name}?`),
+      confirmLabel: tr("リソースを削除", "Delete resource"),
+      confirmTone: "danger",
+      confirmBlocked: () => naming.get().state === "loading" || blocking().length > 0,
+      body: h(
         "div",
-        { class: "notice notice--bad" },
-        tr("Hostはこのリソースを削除します。", "The Host deletes this Resource. "),
-        deleteConsequence(target.form),
-        tr("この操作は元に戻せません。", "This cannot be undone."),
-      ),
-      live(() => {
-        const state = naming.get();
-        if (state.state === "loading")
-          return h(
-            "small",
-            null,
-            tr(
-              "このリソースを参照しているものを確認しています…",
-              "Checking what names this Resource…",
-            ),
-          );
-        if (state.state === "error")
-          return h(
-            "small",
-            null,
-            tr(
-              "このリソースを参照しているものを確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
-              "Couldn't check what names this Resource. If another still names it, the Host refuses the delete.",
-            ),
-          );
-        const { referrers, complete } = state.value;
-        if (referrers.length === 0)
-          return complete
-            ? null
-            : h(
-                "small",
-                null,
-                tr(
-                  "参照しているリソースをすべては確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
-                  "Not everything that might name this Resource could be checked. If another still names it, the Host refuses the delete.",
-                ),
-              );
-        return h(
+        { style: { display: "grid", gap: "14px" } },
+        h(
           "div",
-          { class: "notice notice--warn", style: { display: "grid", gap: "8px" } },
-          h(
-            "span",
-            null,
-            tr(
-              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。",
-              "The Host refuses this delete while these still name it.",
-            ),
-          ),
-          h(
-            "ul",
-            { style: { margin: "0", paddingLeft: "18px" } },
-            ...referrers.map(({ resource: referrer }) =>
-              h(
-                "li",
-                null,
-                h(
-                  "a",
-                  { class: "mono", ...openFromDialog(resourcePath(referrer.uid), () => close()) },
-                  referrer.name,
-                ),
-                ` ${formLabel(referrer.form)}`,
-                health(referrer).phase === "Deleting"
-                  ? tr("（削除中）", " (being deleted)")
-                  : tr(
-                      `：${referrerStep(referrer, target)}`,
-                      `: ${referrerStep(referrer, target)}`,
-                    ),
+          { class: "notice notice--bad" },
+          tr("Hostはこのリソースを削除します。", "The Host deletes this Resource. "),
+          deleteConsequence(target.form),
+          tr("この操作は元に戻せません。", "This cannot be undone."),
+        ),
+        live(() => {
+          const state = naming.get();
+          if (state.state === "loading")
+            return h(
+              "small",
+              null,
+              tr(
+                "このリソースを参照しているものを確認しています…",
+                "Checking what names this Resource…",
+              ),
+            );
+          if (state.state === "error")
+            return h(
+              "small",
+              null,
+              tr(
+                "このリソースを参照しているものを確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+                "Couldn't check what names this Resource. If another still names it, the Host refuses the delete.",
+              ),
+            );
+          const { referrers, complete } = state.value;
+          if (referrers.length === 0)
+            return complete
+              ? null
+              : h(
+                  "small",
+                  null,
+                  tr(
+                    "参照しているリソースをすべては確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+                    "Not everything that might name this Resource could be checked. If another still names it, the Host refuses the delete.",
+                  ),
+                );
+          return h(
+            "div",
+            { class: "notice notice--warn", style: { display: "grid", gap: "8px" } },
+            h(
+              "span",
+              null,
+              tr(
+                "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。",
+                "The Host refuses this delete while these still name it.",
               ),
             ),
-          ),
-          // The dialog does not watch them, so a change made meanwhile is read on request.
-          h(
-            "div",
-            null,
             h(
-              "button",
-              { class: "btn", type: "button", onClick: () => naming.reload() },
-              tr("もう一度確認する", "Check again"),
+              "ul",
+              { style: { margin: "0", paddingLeft: "18px" } },
+              ...referrers.map(({ resource: referrer }) =>
+                h(
+                  "li",
+                  null,
+                  h(
+                    "a",
+                    {
+                      class: "mono",
+                      ...openFromDialog(resourcePath(referrer.uid), () => modal.close()),
+                    },
+                    referrer.name,
+                  ),
+                  ` ${formLabel(referrer.form)}`,
+                  health(referrer).phase === "Deleting"
+                    ? tr("（削除中）", " (being deleted)")
+                    : tr(
+                        `：${referrerStep(referrer, target)}`,
+                        `: ${referrerStep(referrer, target)}`,
+                      ),
+                ),
+              ),
             ),
-          ),
-        );
-      }),
-      requestDisclosure(recoveryDetails(key, "DELETE", path, null, target.generation)),
-    ),
-    onConfirm: async () => {
-      if (!sameOrganization(organizationId)) return;
-      if (!intent) {
-        try {
-          const replayWindowSeconds = await api.replayWindowSeconds();
-          if (!sameOrganization(organizationId)) return;
-          intent = prepareResourceIntent(
-            organizationId,
-            { action: "delete", uid: target.uid, generation: target.generation },
-            replayWindowSeconds,
-            key,
+            // The dialog does not watch them, so a change made meanwhile is read on request.
+            h(
+              "div",
+              null,
+              h(
+                "button",
+                { class: "btn", type: "button", onClick: () => naming.reload() },
+                tr("もう一度確認する", "Check again"),
+              ),
+            ),
           );
-        } catch (error) {
-          toast(explain(error as Error), "bad");
-          return;
+        }),
+        requestDisclosure(recoveryDetails(key, "DELETE", path, null, target.generation)),
+      ),
+      onConfirm: async () => {
+        if (!modal.isCurrent()) return;
+        if (!intent) {
+          try {
+            const replayWindowSeconds = await api.replayWindowSeconds();
+            if (!modal.isCurrent()) return;
+            intent = prepareResourceIntent(
+              organizationId,
+              { action: "delete", uid: target.uid, generation: target.generation },
+              replayWindowSeconds,
+              key,
+            );
+          } catch (error) {
+            if (!modal.isCurrent()) return;
+            toast(explain(error as Error), "bad");
+            return;
+          }
         }
-      }
-      await submit(intent, close);
+        await submit(intent, modal);
+      },
     },
-  });
+    isScopeCurrent,
+  );
 }
