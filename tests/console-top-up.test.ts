@@ -1440,3 +1440,46 @@ describe("rendered legacy billing completion scope", () => {
     });
   }
 });
+
+test("operator funding exposes a unique control for its visible settlement-proof label", async () => {
+  const page = await billingPageFor({ subscription: "legacy" });
+  await page.click("Add funds");
+  await page.click("Continue to payment");
+
+  const label = page.body
+    .all()
+    .find((node) => node.tag === "label" && node.textContent === "Settlement proof");
+  expect(label).toBeDefined();
+  const target = label?.attributes.get("for");
+  expect(target).toBeString();
+  expect(target).not.toBe("");
+  const controls = page.body.all().filter((node) => node.attributes.get("id") === target);
+  expect(controls).toHaveLength(1);
+  expect(controls[0]?.tag).toBe("textarea");
+  expect(page.calls()).not.toContain(fundingCall);
+});
+
+for (const subscription of ["legacy", "hosted"] as const) {
+  test(`funding amount labels target their own controls (${subscription})`, async () => {
+    const page = await billingPageFor({ subscription });
+    await page.click("Add funds");
+    await page.click("Add funds");
+
+    const labels = page.body
+      .all()
+      .filter((node) => node.tag === "label" && node.textContent === "Amount (USD)");
+    expect(labels).toHaveLength(2);
+    const targets = labels.map((label) => label.attributes.get("for"));
+    expect(new Set(targets).size).toBe(2);
+    for (const target of targets) {
+      expect(target).toBeString();
+      expect(target).not.toBe("");
+      const controls = page.body.all().filter((node) => node.attributes.get("id") === target);
+      expect(controls).toHaveLength(1);
+      expect(controls[0]?.tag).toBe("input");
+      expect(controls[0]?.value).toBe("50");
+    }
+    expect(page.calls()).not.toContain(checkoutCall);
+    expect(page.calls()).not.toContain(fundingCall);
+  });
+}
