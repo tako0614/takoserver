@@ -222,102 +222,100 @@ function createKey(
     ),
   );
 
-  const modal = openScopedKeyModal(
-    {
-      title: tr("APIキーを作成", "Create API key"),
-      confirmLabel: tr("キーを作成", "Create key"),
-      body: h(
+  const options: ModalOptions = {
+    title: tr("APIキーを作成", "Create API key"),
+    confirmLabel: tr("キーを作成", "Create key"),
+    body: h(
+      "div",
+      { style: { display: "grid", gap: "16px" } },
+      h(
         "div",
-        { style: { display: "grid", gap: "16px" } },
+        { class: "field" },
+        h("label", { for: "create-key-name" }, tr("名前", "Name")),
+        name,
         h(
-          "div",
-          { class: "field" },
-          h("label", { for: "create-key-name" }, tr("名前", "Name")),
-          name,
-          h(
-            "small",
-            null,
-            tr(
-              "キーの用途を入力します。この名前は一覧だけに表示されます。",
-              "What this key is for. It appears in the list and nowhere else.",
-            ),
+          "small",
+          null,
+          tr(
+            "キーの用途を入力します。この名前は一覧だけに表示されます。",
+            "What this key is for. It appears in the list and nowhere else.",
           ),
-        ),
-        h(
-          "div",
-          { class: "field" },
-          h("span", { class: "field__label" }, tr("スコープ", "Scopes")),
-          ...keyScopeGroups(aiAvailable).map((group) =>
-            h(
-              "fieldset",
-              { class: "checks" },
-              h("legend", null, group.label()),
-              ...group.scopes.map((scope) => {
-                const box = h("input", {
-                  type: "checkbox",
-                  ...(chosen.has(scope.id) ? { checked: true } : {}),
-                  onChange: (event: Event) => {
-                    if ((event.target as HTMLInputElement).checked) chosen.add(scope.id);
-                    else chosen.delete(scope.id);
-                  },
-                });
-                return h(
-                  "label",
-                  { class: "check" },
-                  box,
-                  h(
-                    "span",
-                    { class: "check__text" },
-                    h("span", { class: "mono check__id" }, scope.id),
-                    h("small", null, scope.blurb()),
-                  ),
-                );
-              }),
-            ),
-          ),
-          h(
-            "small",
-            null,
-            tr(
-              "必要なスコープだけを付与してください。後から権限を拡張することはできません。",
-              "Grant only what the caller needs. Scopes cannot be widened later.",
-            ),
-          ),
-        ),
-        h(
-          "div",
-          { class: "field" },
-          h("label", { for: "create-key-lifetime" }, tr("有効期間", "Expires in")),
-          lifetime,
         ),
       ),
-      onConfirm: async () => {
+      h(
+        "div",
+        { class: "field" },
+        h("span", { class: "field__label" }, tr("スコープ", "Scopes")),
+        ...keyScopeGroups(aiAvailable).map((group) =>
+          h(
+            "fieldset",
+            { class: "checks" },
+            h("legend", null, group.label()),
+            ...group.scopes.map((scope) => {
+              const box = h("input", {
+                type: "checkbox",
+                ...(chosen.has(scope.id) ? { checked: true } : {}),
+                onChange: (event: Event) => {
+                  if ((event.target as HTMLInputElement).checked) chosen.add(scope.id);
+                  else chosen.delete(scope.id);
+                },
+              });
+              return h(
+                "label",
+                { class: "check" },
+                box,
+                h(
+                  "span",
+                  { class: "check__text" },
+                  h("span", { class: "mono check__id" }, scope.id),
+                  h("small", null, scope.blurb()),
+                ),
+              );
+            }),
+          ),
+        ),
+        h(
+          "small",
+          null,
+          tr(
+            "必要なスコープだけを付与してください。後から権限を拡張することはできません。",
+            "Grant only what the caller needs. Scopes cannot be widened later.",
+          ),
+        ),
+      ),
+      h(
+        "div",
+        { class: "field" },
+        h("label", { for: "create-key-lifetime" }, tr("有効期間", "Expires in")),
+        lifetime,
+      ),
+    ),
+    onConfirm: async () => {
+      if (!modal.isCurrent()) return;
+      if (name.value.trim() === "") {
+        toast(tr("キー名を入力してください", "Give the key a name"), "bad");
+        return;
+      }
+      if (chosen.size === 0) {
+        toast(tr("スコープを1つ以上選択してください", "Choose at least one scope"), "bad");
+        return;
+      }
+      try {
+        const created = await api.createApiKey(organizationId, {
+          name: name.value.trim(),
+          scopes: [...chosen],
+          expiresInSeconds: Number(lifetime.value),
+        });
         if (!modal.isCurrent()) return;
-        if (name.value.trim() === "") {
-          toast(tr("キー名を入力してください", "Give the key a name"), "bad");
-          return;
-        }
-        if (chosen.size === 0) {
-          toast(tr("スコープを1つ以上選択してください", "Choose at least one scope"), "bad");
-          return;
-        }
-        try {
-          const created = await api.createApiKey(organizationId, {
-            name: name.value.trim(),
-            scopes: [...chosen],
-            expiresInSeconds: Number(lifetime.value),
-          });
-          if (!modal.isCurrent()) return;
-          modal.close();
-          reload();
-          revealSecret(organizationId, created.apiKey, created.secret, v2Endpoint, isScopeCurrent);
-        } catch (error) {
-          if (modal.isCurrent()) toast(explain(error as Error), "bad");
-        }
-      },
+        modal.close();
+        reload();
+        revealSecret(organizationId, created.apiKey, created.secret, v2Endpoint, isScopeCurrent);
+      } catch (error) {
+        if (modal.isCurrent()) toast(explain(error as Error), "bad");
+      }
     },
-    isScopeCurrent,
-  );
+  };
+  const modal = openScopedKeyModal(options, isScopeCurrent);
 }
 
 function openScopedKeyModal(options: ModalOptions, isScopeCurrent: () => boolean) {
@@ -350,99 +348,97 @@ function revealSecret(
   isScopeCurrent: () => boolean,
 ): void {
   const usage = keyUsage(v2Endpoint, organizationId, key.scopes);
-  openScopedKeyModal(
-    {
-      title: tr("今すぐキーをコピーしてください", "Copy this key now"),
-      dismissLabel: tr("完了", "Done"),
-      body: h(
+  const options: ModalOptions = {
+    title: tr("今すぐキーをコピーしてください", "Copy this key now"),
+    dismissLabel: tr("完了", "Done"),
+    body: h(
+      "div",
+      { style: { display: "grid", gap: "14px" } },
+      h(
         "div",
-        { style: { display: "grid", gap: "14px" } },
+        { class: "notice notice--warn" },
+        icon(ICON.alert, 15),
         h(
           "div",
-          { class: "notice notice--warn" },
-          icon(ICON.alert, 15),
-          h(
-            "div",
-            null,
-            tr(
-              "Takoserverはこのシークレットのダイジェストだけを保存します。再表示できないため、紛失した場合は失効して新しいキーを作成してください。",
-              "Takoserver stores only a digest of this secret. It cannot be shown again — if it is lost, revoke the key and create another.",
-            ),
+          null,
+          tr(
+            "Takoserverはこのシークレットのダイジェストだけを保存します。再表示できないため、紛失した場合は失効して新しいキーを作成してください。",
+            "Takoserver stores only a digest of this secret. It cannot be shown again — if it is lost, revoke the key and create another.",
           ),
         ),
-        h(
-          "div",
-          { class: "field" },
-          h("label", null, key.name),
-          h(
-            "div",
-            {
-              class: "json",
-              style: {
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                gap: "10px",
-              },
-            },
-            // A zero basis lets the secret wrap before the copy button gives up any width.
-            h(
-              "span",
-              { class: "mono", style: { wordBreak: "break-all", flex: "1", minWidth: "0" } },
-              secret,
-            ),
-            copyable(secret, tr("キーをコピー", "copy key")),
-          ),
-        ),
-        usage === null
-          ? null
-          : h(
-              "div",
-              { class: "field" },
-              h(
-                "div",
-                {
-                  style: {
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: "10px",
-                  },
-                },
-                h("span", { class: "field__label" }, tr("使い方", "Use it")),
-                copyable(usage, tr("コマンドをコピー", "copy commands")),
-              ),
-              // One command per line, as the shell reads it: scroll rather than wrap.
-              h(
-                "pre",
-                { class: "json", style: { whiteSpace: "pre", overflowWrap: "normal" } },
-                usage,
-              ),
-              h(
-                "small",
-                null,
-                tr(
-                  "実行すると「API key:」と表示されるので、キーを貼り付けてEnterを押します。キーは画面に表示されず、シェルの履歴にも残りません。このコマンドは組織のリソースを一覧表示します。",
-                  "Run it, paste the key at the API key: prompt and press Enter. The key is not shown and stays out of shell history. The command lists the organization's Resources.",
-                ),
-              ),
-              h(
-                "small",
-                null,
-                tr("作成と削除は", ""),
-                h(
-                  "a",
-                  { href: INSTALL_GUIDE_STEPS, target: "_blank", rel: "noopener noreferrer" },
-                  tr("導入手順書（英語）の手順8〜13", "Steps 8 to 13 of the install guide"),
-                ),
-                tr(
-                  "にあります。手順5の変数Fと、手順6で用意した成果物も使います。",
-                  " create and delete them, using F from step 5 and the artifacts seeded in step 6.",
-                ),
-              ),
-            ),
       ),
-    },
-    isScopeCurrent,
-  );
+      h(
+        "div",
+        { class: "field" },
+        h("label", null, key.name),
+        h(
+          "div",
+          {
+            class: "json",
+            style: {
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "10px",
+            },
+          },
+          // A zero basis lets the secret wrap before the copy button gives up any width.
+          h(
+            "span",
+            { class: "mono", style: { wordBreak: "break-all", flex: "1", minWidth: "0" } },
+            secret,
+          ),
+          copyable(secret, tr("キーをコピー", "copy key")),
+        ),
+      ),
+      usage === null
+        ? null
+        : h(
+            "div",
+            { class: "field" },
+            h(
+              "div",
+              {
+                style: {
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "10px",
+                },
+              },
+              h("span", { class: "field__label" }, tr("使い方", "Use it")),
+              copyable(usage, tr("コマンドをコピー", "copy commands")),
+            ),
+            // One command per line, as the shell reads it: scroll rather than wrap.
+            h(
+              "pre",
+              { class: "json", style: { whiteSpace: "pre", overflowWrap: "normal" } },
+              usage,
+            ),
+            h(
+              "small",
+              null,
+              tr(
+                "実行すると「API key:」と表示されるので、キーを貼り付けてEnterを押します。キーは画面に表示されず、シェルの履歴にも残りません。このコマンドは組織のリソースを一覧表示します。",
+                "Run it, paste the key at the API key: prompt and press Enter. The key is not shown and stays out of shell history. The command lists the organization's Resources.",
+              ),
+            ),
+            h(
+              "small",
+              null,
+              tr("作成と削除は", ""),
+              h(
+                "a",
+                { href: INSTALL_GUIDE_STEPS, target: "_blank", rel: "noopener noreferrer" },
+                tr("導入手順書（英語）の手順8〜13", "Steps 8 to 13 of the install guide"),
+              ),
+              tr(
+                "にあります。手順5の変数Fと、手順6で用意した成果物も使います。",
+                " create and delete them, using F from step 5 and the artifacts seeded in step 6.",
+              ),
+            ),
+          ),
+    ),
+  };
+  openScopedKeyModal(options, isScopeCurrent);
 }
