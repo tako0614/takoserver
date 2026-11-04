@@ -24,6 +24,7 @@ import {
   applyTheme,
   bootstrapSharedSession,
   currentOrganization,
+  observeSessionIdentity,
   organizations,
   principal,
   resolveSharedSessionReturnPath,
@@ -61,28 +62,10 @@ function boot(): void {
   const view = h("div");
   root.append(view);
 
-  // Whoever is signed in is loaded once per session token, not per page: the
+  // Whoever is signed in is loaded once per local session, not per page: the
   // navigation needs it, and re-asking on every route change would make the
   // organization picker flicker on a screen that never changed.
-  effect(() => {
-    const token = session();
-    if (!token) {
-      principal.set(null);
-      organizations.set([]);
-      return;
-    }
-    api.me().then(
-      (me) => {
-        principal.set(me.principal);
-        organizations.set(me.organizations);
-      },
-      (error: unknown) => {
-        if ((error as { isExpiredSession?: boolean }).isExpiredSession !== true) {
-          toast(explain(error as Error), "bad");
-        }
-      },
-    );
-  });
+  observeSessionIdentity((error) => toast(explain(error as Error), "bad"));
 
   effect(() => {
     const screen = !sessionReady()

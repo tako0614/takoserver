@@ -6,7 +6,7 @@ import {
   type Principal,
   type SharedAuthSessionStatus,
 } from "./api.ts";
-import { signal } from "./reactive.ts";
+import { effect, signal } from "./reactive.ts";
 
 /**
  * What the console remembers between page loads.
@@ -29,6 +29,8 @@ export type Theme = "system" | "light" | "dark";
 export type SessionKind = "shared-auth" | "legacy";
 
 export const session = signal<string | null>(localStorage.getItem(SESSION_KEY));
+// The cookie marker is constant across logins; it cannot identify an async request's session.
+const sessionRevision = signal(0);
 export const sessionKind = signal<SessionKind | null>(
   session() === null
     ? null
@@ -75,50 +77,74 @@ export function hostV2Base(discovery: HostDiscovery | null): string {
 
 export function setApiOrigin(origin: string): void {
   const trimmed = origin.replace(/\/+$/u, "");
+  if (trimmed === apiOrigin()) return;
   localStorage.setItem(ORIGIN_KEY, trimmed);
   latestSharedAuthAvailabilityProbe += 1;
+  clearSession();
+  sharedAuthAvailable.set(null);
   apiOrigin.set(trimmed);
+}
+
+function captureSessionScope(): () => boolean {
+  const revision = sessionRevision();
+  const origin = apiOrigin();
+  const marker = session();
+  return () => sessionRevision() === revision && apiOrigin() === origin && session() === marker;
 }
 
 /** Only the latest request for the selected API origin may update the sign-in choice. */
 export async function refreshSharedAuthAvailability(clearImmediately = false): Promise<void> {
   const probe = ++latestSharedAuthAvailabilityProbe;
   const origin = apiOrigin();
+  const isCurrent = captureSessionScope();
   if (clearImmediately) sharedAuthAvailable.set(null);
   try {
     const available = (await api.sharedAuthSession()).available;
-    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin)
+    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin && isCurrent())
       sharedAuthAvailable.set(available);
   } catch {
-    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin)
+    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin && isCurrent())
       sharedAuthAvailable.set(null);
   }
 }
 
 function clearSession(): void {
+  sessionRevision.update((revision) => revision + 1);
   localStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(SESSION_KIND_KEY);
+  localStorage.removeItem(ORG_KEY);
   session.set(null);
   sessionKind.set(null);
   principal.set(null);
   organizations.set([]);
+  currentOrganizationId.set(null);
 }
 
 export async function signOut(): Promise<void> {
+  const isCurrent = captureSessionScope();
+  let cleared = false;
+  const clearCurrent = (): void => {
+    if (!isCurrent()) return;
+    clearSession();
+    cleared = true;
+  };
   if (sessionKind() === "shared-auth") {
     await api.sharedAuthSignOut();
-    clearSession();
+    clearCurrent();
   } else {
     try {
       await api.signOut();
     } finally {
-      clearSession();
+      clearCurrent();
     }
   }
-  await refreshSharedAuthAvailability();
+  if (cleared) await refreshSharedAuthAvailability();
 }
 
 export function adoptSession(kind: SessionKind = "legacy"): void {
+  sessionRevision.update((revision) => revision + 1);
+  principal.set(null);
+  organizations.set([]);
   localStorage.setItem(SESSION_KEY, "cookie");
   localStorage.setItem(SESSION_KIND_KEY, kind);
   sessionKind.set(kind);
@@ -131,14 +157,49 @@ export function adoptSession(kind: SessionKind = "legacy"): void {
  * the Console identity and organizations.
  */
 export async function bootstrapSharedSession(): Promise<boolean> {
+  const isCurrent = captureSessionScope();
   const status: SharedAuthSessionStatus = await api.sharedAuthSession();
+  if (!isCurrent()) return false;
   sharedAuthAvailable.set(status.available);
   if (!status.available || !status.authenticated) return false;
   const me = await api.me();
+  if (!isCurrent()) return false;
+  adoptSession("shared-auth");
   principal.set(me.principal);
   organizations.set(me.organizations);
-  adoptSession("shared-auth");
   return true;
+}
+
+/** Load identity once per local session/origin, ignoring completions from a retired scope. */
+export function observeSessionIdentity(onError: (error: unknown) => void): () => void {
+  let disposed = false;
+  const stop = effect(() => {
+    const isCurrent = captureSessionScope();
+    if (!session()) {
+      principal.set(null);
+      organizations.set([]);
+      return;
+    }
+    void api.me().then(
+      (me) => {
+        if (disposed || !isCurrent()) return;
+        principal.set(me.principal);
+        organizations.set(me.organizations);
+      },
+      (error: unknown) => {
+        if (
+          !disposed &&
+          isCurrent() &&
+          (error as { isExpiredSession?: boolean }).isExpiredSession !== true
+        )
+          onError(error);
+      },
+    );
+  });
+  return () => {
+    disposed = true;
+    stop();
+  };
 }
 
 /** Retain only closed, same-tab destinations across the fixed-root SSO callback. */
@@ -204,6 +265,7 @@ export const api: Api = createApi({
     return apiOrigin();
   },
   token: () => null,
+  sessionRevision,
   onSessionLost: clearSession,
 });
 
