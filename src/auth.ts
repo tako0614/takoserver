@@ -168,6 +168,8 @@ export interface ApiKeyAdministration {
   revoke(input: {
     readonly organizationId: string;
     readonly apiKeyId: string;
+    /** Custom implementations must honor the owner/member fence or refuse. */
+    readonly expectedOwnerPrincipalId?: string;
   }): Promise<ApiKeyAdministrationStatus | null>;
 }
 
@@ -789,14 +791,29 @@ export function createApiKeyAdministration(
     return typeof value === "string" ? value : null;
   };
 
+  const ownerGuard = `EXISTS (
+    SELECT 1 FROM orgs o
+    JOIN org_memberships m
+      ON m.org_id = o.id AND m.principal_id = o.owner_principal_id
+    WHERE o.id = ? AND o.owner_principal_id = ? AND m.role = 'owner'
+  )`;
   const status = async (input: {
     readonly organizationId: string;
     readonly apiKeyId: string;
+    readonly expectedOwnerPrincipalId?: string | undefined;
   }): Promise<ApiKeyAdministrationStatus | null> => {
+    const expectedOwnerPrincipalId = input.expectedOwnerPrincipalId;
     const rows = await sql.query(
       `SELECT id, org_id, name, scopes_json, created_at, expires_at, revoked_at
-       FROM auth_tokens WHERE id = ? AND org_id = ? AND kind = 'api_key'`,
-      [input.apiKeyId, input.organizationId],
+       FROM auth_tokens WHERE id = ? AND org_id = ? AND kind = 'api_key'
+       ${expectedOwnerPrincipalId === undefined ? "" : `AND ${ownerGuard}`}`,
+      [
+        input.apiKeyId,
+        input.organizationId,
+        ...(expectedOwnerPrincipalId === undefined
+          ? []
+          : [input.organizationId, expectedOwnerPrincipalId]),
+      ],
     );
     const row = rows[0];
     if (!row) return null;
@@ -863,12 +880,6 @@ export function createApiKeyAdministration(
         createdAt,
         expiresAt,
       ] as const;
-      const ownerGuard = `EXISTS (
-        SELECT 1 FROM orgs o
-        JOIN org_memberships m
-          ON m.org_id = o.id AND m.principal_id = o.owner_principal_id
-        WHERE o.id = ? AND o.owner_principal_id = ? AND m.role = 'owner'
-      )`;
       const ownerParams =
         expectedOwnerPrincipalId === undefined ? [] : [organizationId, expectedOwnerPrincipalId];
       const write =
@@ -932,16 +943,39 @@ export function createApiKeyAdministration(
     },
 
     async revoke(input) {
-      const existing = await status(input);
+      const original = {
+        organizationId: input.organizationId,
+        apiKeyId: input.apiKeyId,
+        expectedOwnerPrincipalId: input.expectedOwnerPrincipalId,
+      };
+      const existing = await status(original);
       if (!existing) return null;
       if (existing.present) {
-        await sql.run(
-          `UPDATE auth_tokens SET revoked_at = ?
+        if (original.expectedOwnerPrincipalId === undefined) {
+          await sql.run(
+            `UPDATE auth_tokens SET revoked_at = ?
            WHERE id = ? AND org_id = ? AND kind = 'api_key' AND revoked_at IS NULL`,
-          [clock().toISOString(), input.apiKeyId, input.organizationId],
-        );
+            [clock().toISOString(), original.apiKeyId, original.organizationId],
+          );
+        } else {
+          await sql.run(
+            `UPDATE auth_tokens SET revoked_at = ?
+             WHERE id = ? AND org_id = ? AND kind = 'api_key' AND revoked_at IS NULL
+             AND ${ownerGuard}`,
+            [
+              clock().toISOString(),
+              original.apiKeyId,
+              original.organizationId,
+              original.organizationId,
+              original.expectedOwnerPrincipalId,
+            ],
+          );
+        }
       }
-      return await status(input);
+      const current = await status(original);
+      // A zero-row owner-fenced UPDATE cannot be reported as a successful
+      // revoke just because ownership was restored before this final read.
+      return original.expectedOwnerPrincipalId !== undefined && current?.present ? null : current;
     },
   };
 }
@@ -1977,8 +2011,13 @@ function createAccountsInternal(
     },
 
     async revokeApiKey({ actor, organizationId, apiKeyId }) {
+      const expectedOwnerPrincipalId = actor.principalId;
       await accounts.requireOwner(actor, organizationId);
-      const revoked = await apiKeyAdministration.revoke({ organizationId, apiKeyId });
+      const revoked = await apiKeyAdministration.revoke({
+        organizationId,
+        apiKeyId,
+        expectedOwnerPrincipalId,
+      });
       if (!revoked) throw new AuthError("not_found");
       return revoked.apiKey;
     },

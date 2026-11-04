@@ -9,6 +9,9 @@ async function ownerFixture() {
   const original = createEphemeralSql();
   let beforeOwnerRead: (() => Promise<void>) | undefined;
   let beforeInsert: (() => Promise<void>) | undefined;
+  let beforeRevoke: (() => Promise<void>) | undefined;
+  let afterRevoke: (() => Promise<void>) | undefined;
+  let revokeAttempts = 0;
   const sql: Sql = {
     async query(text, params) {
       if (text === "SELECT owner_principal_id FROM orgs WHERE id = ?" && beforeOwnerRead) {
@@ -24,7 +27,22 @@ async function ownerFixture() {
         beforeInsert = undefined;
         await change();
       }
-      return await original.run(text, params);
+      const revoke = text.includes("UPDATE auth_tokens SET revoked_at");
+      if (revoke) {
+        revokeAttempts++;
+        if (beforeRevoke) {
+          const change = beforeRevoke;
+          beforeRevoke = undefined;
+          await change();
+        }
+      }
+      const write = await original.run(text, params);
+      if (revoke && afterRevoke) {
+        const change = afterRevoke;
+        afterRevoke = undefined;
+        await change();
+      }
+      return write;
     },
     async batch(statements) {
       return await original.batch(statements);
@@ -80,6 +98,33 @@ async function ownerFixture() {
       beforeInsert = async () => {
         await original.run("DELETE FROM org_memberships WHERE org_id = ?", [organization.id]);
       };
+    },
+    transferBeforeRevoke() {
+      beforeRevoke = transfer;
+    },
+    transferAfterRevoke() {
+      afterRevoke = transfer;
+    },
+    removeMembershipBeforeRevoke(restoreAfter = false) {
+      beforeRevoke = async () => {
+        await original.run("DELETE FROM org_memberships WHERE org_id = ?", [organization.id]);
+      };
+      if (restoreAfter) {
+        afterRevoke = async () => {
+          await original.run(
+            "INSERT INTO org_memberships (org_id, principal_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+            [organization.id, actor.principalId, organization.createdAt],
+          );
+        };
+      }
+    },
+    loseRevokeAcknowledgement() {
+      afterRevoke = async () => {
+        throw new Error("synthetic_lost_revoke_ack");
+      };
+    },
+    get revokeAttempts() {
+      return revokeAttempts;
     },
     administration: createApiKeyAdministration({ sql }),
   };
@@ -227,6 +272,28 @@ test("the owner INSERT fence and unfenced operator exclusivity execute in local 
       (await administration.issue({ ...operatorInput, apiKeyId: "key_native_conflict" })).kind,
     ).toBe("exclusive_conflict");
     expect(await administration.list("org_native")).toHaveLength(2);
+    const revokeInput = {
+      organizationId: "org_native",
+      apiKeyId: "key_native_operator",
+      expectedOwnerPrincipalId: "next-owner",
+    };
+    expect(
+      await administration.revoke({ ...revokeInput, expectedOwnerPrincipalId: "first-owner" }),
+    ).toBeNull();
+    expect((await administration.status(revokeInput))?.present).toBe(true);
+    expect((await administration.revoke(revokeInput))?.present).toBe(false);
+    expect((await administration.revoke(revokeInput))?.present).toBe(false);
+    expect(
+      (
+        await administration.revoke({
+          organizationId: "org_native",
+          apiKeyId: first.kind === "issued" ? first.apiKey.id : "unreachable",
+        })
+      )?.present,
+    ).toBe(false);
+    expect(
+      await administration.revoke({ organizationId: "org_native", apiKeyId: "missing" }),
+    ).toBeNull();
   } finally {
     await runtime.dispose();
   }
@@ -258,4 +325,82 @@ test("the final key INSERT refuses an owner handoff after the administration rea
       organizationId: fixture.organization.id,
     }),
   ).toEqual([]);
+});
+
+async function revocationFixture() {
+  const fixture = await ownerFixture();
+  const key = await fixture.accounts.createApiKey({
+    actor: fixture.actor,
+    organizationId: fixture.organization.id,
+    name: "revocation-owner-fence",
+    scopes: ["resources:read"],
+    expiresInSeconds: 60,
+  });
+  const input = {
+    actor: fixture.actor,
+    organizationId: fixture.organization.id,
+    apiKeyId: key.apiKey.id,
+  };
+  return {
+    ...fixture,
+    input,
+    get revokeAttempts() {
+      return fixture.revokeAttempts;
+    },
+  };
+}
+
+test("owner-fenced revoke refuses a handoff before UPDATE without revoking the key", async () => {
+  const fixture = await revocationFixture();
+  fixture.transferBeforeRevoke();
+  await expect(fixture.accounts.revokeApiKey(fixture.input)).rejects.toMatchObject({
+    code: "not_found",
+  });
+  expect((await fixture.administration.status(fixture.input))?.present).toBe(true);
+});
+
+test("owner-fenced revoke refuses a removed membership before UPDATE", async () => {
+  const fixture = await revocationFixture();
+  fixture.removeMembershipBeforeRevoke();
+  await expect(fixture.accounts.revokeApiKey(fixture.input)).rejects.toMatchObject({
+    code: "not_found",
+  });
+  expect((await fixture.administration.status(fixture.input))?.present).toBe(true);
+});
+
+test("owner-fenced revoke does not report success when the owner returns after a refused UPDATE", async () => {
+  const fixture = await revocationFixture();
+  fixture.removeMembershipBeforeRevoke(true);
+  await expect(fixture.accounts.revokeApiKey(fixture.input)).rejects.toMatchObject({
+    code: "not_found",
+  });
+  expect((await fixture.administration.status(fixture.input))?.present).toBe(true);
+});
+
+test("owner-fenced revoke with a handoff after UPDATE refuses metadata while preserving the committed effect", async () => {
+  const fixture = await revocationFixture();
+  fixture.transferAfterRevoke();
+  await expect(fixture.accounts.revokeApiKey(fixture.input)).rejects.toMatchObject({
+    code: "not_found",
+  });
+  // Refusal after the write is not evidence of no effect.
+  expect((await fixture.administration.status(fixture.input))?.present).toBe(false);
+});
+
+test("owner-fenced revoke remains idempotent for the same current owner", async () => {
+  const fixture = await revocationFixture();
+  const first = await fixture.accounts.revokeApiKey(fixture.input);
+  expect(await fixture.accounts.revokeApiKey(fixture.input)).toEqual(first);
+  expect(fixture.revokeAttempts).toBe(1);
+  expect((await fixture.administration.status(fixture.input))?.present).toBe(false);
+});
+
+test("owner-fenced revoke propagates a lost ACK without a second mutation", async () => {
+  const fixture = await revocationFixture();
+  fixture.loseRevokeAcknowledgement();
+  await expect(fixture.accounts.revokeApiKey(fixture.input)).rejects.toThrow(
+    "synthetic_lost_revoke_ack",
+  );
+  expect(fixture.revokeAttempts).toBe(1);
+  expect((await fixture.administration.status(fixture.input))?.present).toBe(false);
 });
