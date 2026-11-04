@@ -136,6 +136,14 @@ const organizations = ["a", "b"].map((id) => ({
   ownerPrincipalId: "owner",
   createdAt: "2026-11-04T00:00:00Z",
 }));
+const existingKey = {
+  id: "synthetic-key",
+  name: "fixture-key",
+  scopes: ["resources:write"],
+  organizationId: "org-a",
+  createdAt: "2026-11-04T00:00:00Z",
+  expiresAt: "2099-01-01T00:00:00Z",
+};
 const created = {
   apiKey: { id: "synthetic-key", name: "fixture-key", scopes: ["resources:write"] },
   secret: "synthetic-key-secret",
@@ -205,9 +213,11 @@ beforeEach(async () => {
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       requests.push(request);
-      if (request.method === "POST") return reply(request);
+      if (request.method === "POST" || request.method === "DELETE") return reply(request);
       return Response.json(
-        new URL(request.url).pathname.endsWith("/api-keys") ? { apiKeys: [] } : { endpoints: {} },
+        new URL(request.url).pathname.endsWith("/api-keys")
+          ? { apiKeys: [existingKey] }
+          : { endpoints: {} },
       );
     },
     { preconnect: originalFetch.preconnect },
@@ -331,4 +341,91 @@ test("modal close notifies its lifetime once and removes the Escape listener", (
   dismiss();
   expect(closed).toBe(1);
   expect(documentEvents.listeners.get("keydown") ?? []).toHaveLength(0);
+});
+
+const deletions = () => requests.filter((request) => request.method === "DELETE");
+function openRevoke(): TestNode {
+  find((node) => node.tag === "button" && node.textContent === "Revoke").click();
+  return find((node) => node.tag === "button" && node.textContent === "Revoke key");
+}
+
+test("current revocation sends the original DELETE once and refreshes", async () => {
+  openRevoke().click();
+  await tick();
+  expect(deletions()).toHaveLength(1);
+  expect(deletions()[0]?.url).toBe(
+    "https://api.example.test/v1/organizations/org-a/api-keys/synthetic-key",
+  );
+  expect(reads()).toHaveLength(2);
+  expect(toasts()).toHaveLength(1);
+  expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(0);
+});
+
+test("current revocation failure reports the refusal without refresh or retry", async () => {
+  reply = () => Response.json({ error: { code: "unavailable" } }, { status: 503 });
+  openRevoke().click();
+  await tick();
+  expect(deletions()).toHaveLength(1);
+  expect(reads()).toHaveLength(1);
+  expect(toasts()).toHaveLength(1);
+  expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(1);
+});
+
+for (const kind of ["org", "roundtrip", "session", "origin"] as const) {
+  test(`a retired revoke dialog cannot dispatch (${kind})`, async () => {
+    const confirm = openRevoke();
+    changeScope(kind);
+    confirm.click();
+    await tick();
+    expect(deletions()).toHaveLength(0);
+  });
+
+  for (const status of [200, 404, 503]) {
+    test(`retired revoke completion cannot reload or toast (${kind}, ${status})`, async () => {
+      const answer = deferred();
+      reply = () => answer.promise;
+      openRevoke().click();
+      expect(deletions()).toHaveLength(1);
+      changeScope(kind);
+      answer.resolve(
+        Response.json(status === 200 ? created : { error: { code: "unavailable" } }, { status }),
+      );
+      await tick();
+      expect(reads()).toHaveLength(1);
+      expect(toasts()).toHaveLength(0);
+    });
+  }
+}
+
+for (const status of [200, 503]) {
+  test(`a dismissed revoke cannot update the next dialog (${status})`, async () => {
+    const answer = deferred();
+    reply = () => answer.promise;
+    openRevoke().click();
+    dismiss();
+    openCreate();
+    answer.resolve(
+      Response.json(status === 200 ? created : { error: { code: "unavailable" } }, { status }),
+    );
+    await tick();
+    expect(deletions()).toHaveLength(1);
+    expect(reads()).toHaveLength(1);
+    expect(toasts()).toHaveLength(0);
+    expect(
+      body.all().filter((node) => node.attributes.get("aria-label") === "Create API key"),
+    ).toHaveLength(1);
+  });
+}
+
+test("pending revocation rejects local reentry", async () => {
+  const answer = deferred();
+  reply = () => answer.promise;
+  const confirm = openRevoke();
+  confirm.click();
+  confirm.click();
+  expect(deletions()).toHaveLength(1);
+  answer.resolve(Response.json(created));
+  await tick();
+  expect(deletions()).toHaveLength(1);
+  expect(reads()).toHaveLength(2);
 });
