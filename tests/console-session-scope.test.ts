@@ -163,7 +163,7 @@ test("a current 401 still invalidates the current identity", async () => {
 
 for (const kind of ["legacy", "shared-auth"] as const) {
   for (const status of [204, 503]) {
-    test(`an old ${kind} logout (${status}) does not clear a newly adopted session`, async () => {
+    test(`an old ${kind} logout (${status}) agrees with same-host cookie expiry`, async () => {
       state.adoptSession(kind);
       const response = deferred<Response>();
       const seen = transport((request) =>
@@ -180,13 +180,42 @@ for (const kind of ["legacy", "shared-auth"] as const) {
       );
       const result = await logout;
       if (status === 503) expect(result).toMatchObject({ status });
-      expect(state.session()).toBe("cookie");
-      expect(state.principal()?.id).toBe("new");
-      expect(state.currentOrganization()?.id).toBe("org-new");
-      expect(seen).toHaveLength(1);
+      expect(state.session()).toBe(status === 204 ? null : "cookie");
+      expect(state.principal()?.id).toBe(status === 204 ? undefined : "new");
+      expect(state.currentOrganization()?.id).toBe(status === 204 ? undefined : "org-new");
+      expect(seen).toHaveLength(status === 204 ? 2 : 1);
     });
   }
 }
+
+test("a successful old logout on a different cookie host does not clear the selected host", async () => {
+  adopt("old");
+  const response = deferred<Response>();
+  const seen = transport(() => response.promise);
+  const logout = state.signOut();
+  state.setApiOrigin("https://b.example.test");
+  adopt("new");
+  response.resolve(new Response(null, { status: 204 }));
+  await logout;
+  expect(state.principal()?.id).toBe("new");
+  expect(seen).toHaveLength(1);
+});
+
+test("a successful old logout still expires the same cookie host after a port change", async () => {
+  adopt("old");
+  const response = deferred<Response>();
+  transport((request) =>
+    new URL(request.url).pathname === "/auth/oidc/session"
+      ? Response.json({ authenticated: false }, { status: 401 })
+      : response.promise,
+  );
+  const logout = state.signOut();
+  state.setApiOrigin("https://a.example.test:9443");
+  adopt("new");
+  response.resolve(new Response(null, { status: 204 }));
+  await logout;
+  expect(state.session()).toBe(null);
+});
 
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 

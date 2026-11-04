@@ -23,6 +23,7 @@ import {
   api,
   applyTheme,
   bootstrapSharedSession,
+  captureSessionScope,
   currentOrganization,
   observeSessionIdentity,
   organizations,
@@ -94,22 +95,28 @@ export async function resolveInitialSession(
 
     if (returned.kind === "error") toast(returned.message, "bad");
     if (returned.kind === "ok") {
+      const isCurrent = captureSessionScope();
       try {
         await api.signIn("google", returned.value.idToken, "oidc", returned.value.nonce);
-        adoptSession();
-        navigate(returned.value.from, { replace: true });
+        if (isCurrent()) {
+          adoptSession();
+          navigate(returned.value.from, { replace: true });
+        }
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (isCurrent()) toast(explain(error as Error), "bad");
       }
     }
     if (takosIdReturn.kind === "error") toast(takosIdReturn.message, "bad");
     if (takosIdReturn.kind === "ok") {
+      const isCurrent = captureSessionScope();
       try {
         await api.signIn("takos-id", takosIdReturn.idToken, "oidc");
-        adoptSession();
-        navigate(takosIdReturn.from, { replace: true });
+        if (isCurrent()) {
+          adoptSession();
+          navigate(takosIdReturn.from, { replace: true });
+        }
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (isCurrent()) toast(explain(error as Error), "bad");
       }
     }
 

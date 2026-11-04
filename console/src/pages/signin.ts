@@ -10,6 +10,7 @@ import {
   api,
   apiOrigin,
   applyTheme,
+  captureSessionScope,
   refreshSharedAuthAvailability,
   setApiOrigin,
   sharedAuthAvailable,
@@ -346,11 +347,12 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
       return;
     }
     busy.set(true);
+    const isCurrent = captureSessionScope();
     try {
       await signInWithOperatorAssertion(api, providers, assertion.value.trim());
-      adoptSession();
+      if (isCurrent()) adoptSession();
     } catch (error) {
-      toast(explain(error as Error), "bad");
+      if (isCurrent()) toast(explain(error as Error), "bad");
     } finally {
       busy.set(false);
     }

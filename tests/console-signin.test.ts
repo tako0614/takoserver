@@ -69,6 +69,11 @@ class SignInNode {
     for (const listener of this.listeners.get("click") ?? []) listener({} as Event);
   }
 
+  async submit(): Promise<void> {
+    for (const listener of this.listeners.get("submit") ?? [])
+      await listener({ preventDefault: () => undefined } as Event);
+  }
+
   all(): SignInNode[] {
     return [this, ...this.children.flatMap((child) => child.all())];
   }
@@ -126,6 +131,62 @@ function assertionFor(provider: string): string {
 }
 
 describe("Takoserver Console operator sign-in", () => {
+  for (const changeOrigin of [false, true]) {
+    test(`operator sign-in adoption is bound to its endpoint (changed: ${changeOrigin})`, async () => {
+      installSignInDom();
+      const originalFetch = globalThis.fetch;
+      const state = await import("../console/src/state.ts");
+      const { signInPage } = await import("../console/src/pages/signin.ts");
+      state.setApiOrigin("https://old.example.test");
+      state.sharedAuthAvailable.set(false);
+      let answerSignIn!: (response: Response) => void;
+      const response = new Promise<Response>((resolve) => {
+        answerSignIn = resolve;
+      });
+      const requests: Request[] = [];
+      globalThis.fetch = Object.assign(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const request = new Request(input, init);
+          requests.push(request);
+          return new URL(request.url).pathname === "/v1/identity/providers"
+            ? Response.json({
+                providers: [{ id: "local", displayName: "Operator", method: "operator-assertion" }],
+              })
+            : response;
+        },
+        { preconnect: originalFetch.preconnect },
+      );
+      try {
+        const page = requireSignInNode(signInPage());
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        const textarea = page.all().find((node) => node.tag === "textarea");
+        const form = page.all().find((node) => node.tag === "form");
+        if (!textarea || !form) throw new Error("operator sign-in form missing");
+        textarea.value = assertionFor("local");
+        const signingIn = form.submit();
+        expect(requests.at(-1)?.url).toBe("https://old.example.test/v1/sessions");
+        if (changeOrigin) state.setApiOrigin("https://new.example.test");
+        answerSignIn(
+          Response.json({
+            principal: {
+              id: "old-principal",
+              provider: "local",
+              email: "old@example.test",
+              displayName: "Old",
+            },
+          }),
+        );
+        await signingIn;
+        expect(state.session()).toBe(changeOrigin ? null : "cookie");
+        expect(state.principal()).toBe(null);
+        expect(state.apiOrigin()).toBe(
+          changeOrigin ? "https://new.example.test" : "https://old.example.test",
+        );
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+    });
+  }
   test("endpoint Save keeps a completed logout's older availability reply from changing the new host", async () => {
     installSignInDom();
     const originalFetch = globalThis.fetch;

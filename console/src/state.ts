@@ -85,11 +85,19 @@ export function setApiOrigin(origin: string): void {
   apiOrigin.set(trimmed);
 }
 
-function captureSessionScope(): () => boolean {
+export function captureSessionScope(): () => boolean {
   const revision = sessionRevision();
   const origin = apiOrigin();
   const marker = session();
   return () => sessionRevision() === revision && apiOrigin() === origin && session() === marker;
+}
+
+function sessionCookieHost(origin: string): string | null {
+  try {
+    return new URL(origin).hostname;
+  } catch {
+    return null;
+  }
 }
 
 /** Only the latest request for the selected API origin may update the sign-in choice. */
@@ -122,20 +130,25 @@ function clearSession(): void {
 
 export async function signOut(): Promise<void> {
   const isCurrent = captureSessionScope();
+  const cookieHost = sessionCookieHost(apiOrigin());
+  const legacy = sessionKind() !== "shared-auth";
   let cleared = false;
-  const clearCurrent = (): void => {
-    if (!isCurrent()) return;
-    clearSession();
-    cleared = true;
-  };
-  if (sessionKind() === "shared-auth") {
-    await api.sharedAuthSignOut();
-    clearCurrent();
-  } else {
-    try {
-      await api.signOut();
-    } finally {
-      clearCurrent();
+  let succeeded = false;
+  try {
+    if (legacy) await api.signOut();
+    else await api.sharedAuthSignOut();
+    succeeded = true;
+  } finally {
+    // A successful logout expires host-only cookies before this JS callback.
+    // Ports are not cookie boundaries: even a newer local adoption on that
+    // host is no longer evidence of a signed-in browser after that response.
+    if (
+      (legacy || succeeded) &&
+      (isCurrent() ||
+        (succeeded && cookieHost !== null && cookieHost === sessionCookieHost(apiOrigin())))
+    ) {
+      clearSession();
+      cleared = true;
     }
   }
   if (cleared) await refreshSharedAuthAvailability();
