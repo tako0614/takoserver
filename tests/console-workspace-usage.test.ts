@@ -218,3 +218,20 @@ test("a refresh supersedes an in-flight continuation, and a left Organization ig
   await settle();
   expect(left.controller.state()).toEqual({ status: "loading" });
 });
+
+test("a retired usage controller cannot dispatch a reload or replace its current state", async () => {
+  let current = true;
+  const { controller, calls } = harness(
+    () => page([row("ws_original")], null),
+    () => current,
+  );
+  controller.reload();
+  await settle();
+  const shown = controller.state();
+  expect(shown).toMatchObject({ status: "ready" });
+  current = false;
+  controller.reload();
+  await settle();
+  expect(calls).toHaveLength(1);
+  expect(controller.state()).toBe(shown);
+});

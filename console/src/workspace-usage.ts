@@ -61,6 +61,7 @@ export function createWorkspaceUsageController(options: WorkspaceUsageController
   let generation = 0;
 
   const load = async (restarted: boolean): Promise<void> => {
+    if (!isCurrent()) return;
     const mine = ++generation;
     current.set({ status: "loading" });
     try {
