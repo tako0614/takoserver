@@ -144,7 +144,8 @@ export type ApiKeyAdministrationIssue =
  */
 export interface ApiKeyAdministration {
   organizationOwnerPrincipalId(organizationId: string): Promise<string | null>;
-  list(organizationId: string): Promise<readonly ApiKey[]>;
+  /** Expected-owner calls must enforce the owner/member fence or refuse. */
+  list(organizationId: string, expectedOwnerPrincipalId?: string): Promise<readonly ApiKey[]>;
   status(input: {
     readonly organizationId: string;
     readonly apiKeyId: string;
@@ -831,7 +832,25 @@ export function createApiKeyAdministration(
   return {
     organizationOwnerPrincipalId,
 
-    async list(organizationId) {
+    async list(organizationId, expectedOwnerPrincipalId) {
+      if (expectedOwnerPrincipalId !== undefined) {
+        const rows = await sql.query(
+          `SELECT k.id, k.org_id, k.name, k.scopes_json, k.created_at, k.expires_at
+           FROM orgs o
+           JOIN org_memberships m
+             ON m.org_id = o.id AND m.principal_id = o.owner_principal_id AND m.role = 'owner'
+           LEFT JOIN auth_tokens k
+             ON k.org_id = o.id AND k.kind = 'api_key' AND k.revoked_at IS NULL
+           WHERE o.id = ? AND o.owner_principal_id = ?
+           ORDER BY k.created_at DESC, k.id DESC LIMIT 200`,
+          [organizationId, expectedOwnerPrincipalId],
+        );
+        if (!rows[0]) throw new AuthError("not_found");
+        // A current owner with no live keys has one LEFT JOIN null-key row.
+        // Lost ownership has no rows and must never be shown as an empty list.
+        if (rows.length === 1 && rows[0].id === null) return [];
+        return rows.map(apiKeyFromRow);
+      }
       const rows = await sql.query(
         `SELECT id, org_id, name, scopes_json, created_at, expires_at FROM auth_tokens
          WHERE org_id = ? AND kind = 'api_key' AND revoked_at IS NULL
@@ -1992,8 +2011,9 @@ function createAccountsInternal(
     },
 
     async apiKeys({ actor, organizationId }) {
+      const expectedOwnerPrincipalId = actor.principalId;
       await accounts.requireOwner(actor, organizationId);
-      return await apiKeyAdministration.list(organizationId);
+      return await apiKeyAdministration.list(organizationId, expectedOwnerPrincipalId);
     },
 
     async createApiKey({ actor, organizationId, name, scopes, expiresInSeconds }) {
