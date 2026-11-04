@@ -164,6 +164,22 @@ export function adoptSession(kind: SessionKind = "legacy"): void {
   session.set("cookie");
 }
 
+/** Adopt only this sign-in, clearing ambiguous same-host UI after a retired Cookie write. */
+export async function signInSession(...args: Parameters<Api["signIn"]>): Promise<boolean> {
+  const isCurrent = captureSessionScope();
+  const cookieHost = sessionCookieHost(apiOrigin());
+  await api.signIn(...args);
+  if (!isCurrent()) {
+    // The browser applied the successful response's Set-Cookie before this
+    // callback. It may have replaced a newer same-host cookie, even on a
+    // different port; the newer UI identity may no longer describe that cookie.
+    if (cookieHost !== null && cookieHost === sessionCookieHost(apiOrigin())) clearSession();
+    return false;
+  }
+  adoptSession();
+  return true;
+}
+
 /**
  * Adopts the shared-auth browser session only after both the RP oracle and
  * this Host's own principal lookup succeed. The latter remains the source of

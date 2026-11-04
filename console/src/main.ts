@@ -19,7 +19,6 @@ import { signInPage } from "./pages/signin.ts";
 import { effect, signal } from "./reactive.ts";
 import { linkProps, navigate, route } from "./router.ts";
 import {
-  adoptSession,
   api,
   applyTheme,
   bootstrapSharedSession,
@@ -31,6 +30,7 @@ import {
   resolveSharedSessionReturnPath,
   selectOrganization,
   session,
+  signInSession,
   signOut,
   theme,
 } from "./state.ts";
@@ -89,17 +89,17 @@ export async function resolveInitialSession(
   returned: GoogleReturnResult,
   sessionReady: { set(value: boolean): void },
 ): Promise<void> {
+  const isInitialScopeCurrent = captureSessionScope();
   try {
     const takosIdReturn = await readTakosIdReturn();
+    if (!isInitialScopeCurrent()) return;
     const hasProviderReturn = returned.kind !== "none" || takosIdReturn.kind !== "none";
 
     if (returned.kind === "error") toast(returned.message, "bad");
     if (returned.kind === "ok") {
       const isCurrent = captureSessionScope();
       try {
-        await api.signIn("google", returned.value.idToken, "oidc", returned.value.nonce);
-        if (isCurrent()) {
-          adoptSession();
+        if (await signInSession("google", returned.value.idToken, "oidc", returned.value.nonce)) {
           navigate(returned.value.from, { replace: true });
         }
       } catch (error) {
@@ -110,9 +110,7 @@ export async function resolveInitialSession(
     if (takosIdReturn.kind === "ok") {
       const isCurrent = captureSessionScope();
       try {
-        await api.signIn("takos-id", takosIdReturn.idToken, "oidc");
-        if (isCurrent()) {
-          adoptSession();
+        if (await signInSession("takos-id", takosIdReturn.idToken, "oidc")) {
           navigate(takosIdReturn.from, { replace: true });
         }
       } catch (error) {

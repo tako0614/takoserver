@@ -1,11 +1,15 @@
 import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 
 const originalFetch = globalThis.fetch;
-const globals = ["localStorage", "document", "window"] as const;
+const globals = ["localStorage", "sessionStorage", "document", "window"] as const;
 const descriptors = globals.map(
   (name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const,
 );
 const values = new Map<string, string>();
+const location = new URL("https://console.example.test/");
+const updatePath = (_state: unknown, _title: string, path: string) => {
+  location.href = new URL(path, location.origin).href;
+};
 Object.assign(globalThis, {
   localStorage: {
     getItem: (key: string): string | null => values.get(key) ?? null,
@@ -16,8 +20,25 @@ Object.assign(globalThis, {
       values.delete(key);
     },
   },
-  document: { documentElement: { dataset: { apiOrigin: "https://a.example.test" } } },
-  window: { location: new URL("https://console.example.test/") },
+  sessionStorage: {
+    getItem: (key: string): string | null => values.get(key) ?? null,
+    setItem: (key: string, value: string): void => {
+      values.set(key, value);
+    },
+    removeItem: (key: string): void => {
+      values.delete(key);
+    },
+  },
+  document: {
+    documentElement: { dataset: { apiOrigin: "https://a.example.test" } },
+    getElementById: () => null,
+  },
+  window: {
+    location,
+    addEventListener: () => undefined,
+    scrollTo: () => undefined,
+    history: { replaceState: updatePath, pushState: updatePath },
+  },
 });
 const state = await import("../console/src/state.ts");
 let stopObserver: (() => void) | undefined;
@@ -62,6 +83,7 @@ function adopt(id: string): void {
 
 beforeEach(() => {
   values.clear();
+  location.href = "https://console.example.test/";
   state.setApiOrigin("https://a.example.test");
   state.session.set(null);
   state.sessionKind.set(null);
@@ -299,3 +321,106 @@ test("the identity observer still reports a current failure and can be disposed 
   await flush();
   expect(state.principal()?.id).toBe("new");
 });
+
+for (const provider of ["google", "takos-id"] as const) {
+  for (const change of ["none", "other-host", "same-host-port"] as const) {
+    test(`${provider} actual callback finishes only in its request scope (${change})`, async () => {
+      const main = await import("../console/src/main.ts");
+      if (provider === "takos-id") {
+        location.href = "https://console.example.test/auth/takos-id?state=synthetic&code=one";
+        values.set(
+          "takoserver.takos-id.pending",
+          JSON.stringify({
+            issuer: "https://issuer.example.test",
+            clientId: "synthetic-client",
+            state: "synthetic",
+            verifier: "synthetic-verifier",
+            from: "/resources",
+          }),
+        );
+      }
+      const response = deferred<Response>();
+      const dispatched = deferred<void>();
+      const seen = transport((request) => {
+        if (request.url === "https://issuer.example.test/oauth/token")
+          return Response.json({ id_token: "synthetic-id-token" });
+        if (request.url !== "https://a.example.test/v1/sessions")
+          throw new Error(`unexpected synthetic callback route: ${request.url}`);
+        dispatched.resolve();
+        return response.promise;
+      });
+      let ready = false;
+      const callback = main.resolveInitialSession(
+        provider === "google"
+          ? {
+              kind: "ok",
+              value: {
+                idToken: "synthetic-id-token",
+                nonce: "synthetic-nonce",
+                from: "/resources",
+              },
+            }
+          : { kind: "none" },
+        {
+          set: (value) => {
+            ready = value;
+          },
+        },
+      );
+      await dispatched.promise;
+      if (change === "other-host") state.setApiOrigin("https://b.example.test");
+      if (change === "same-host-port") state.setApiOrigin("https://a.example.test:9443");
+      if (change !== "none") adopt("new");
+      response.resolve(Response.json(identity("old")));
+      await callback;
+      expect(ready).toBe(true);
+      expect(state.session()).toBe(change === "same-host-port" ? null : "cookie");
+      expect(state.principal()?.id).toBe(change === "other-host" ? "new" : undefined);
+      expect(location.pathname).toBe(change === "none" ? "/resources" : "/");
+      expect(
+        seen.filter((request) => new URL(request.url).pathname === "/v1/sessions"),
+      ).toHaveLength(1);
+    });
+  }
+}
+
+for (const provider of ["google", "takos-id"] as const) {
+  test(`${provider} callback never sends old credentials to an endpoint selected during return processing`, async () => {
+    const main = await import("../console/src/main.ts");
+    const token = deferred<Response>();
+    if (provider === "takos-id") {
+      location.href = "https://console.example.test/auth/takos-id?state=synthetic&code=one";
+      values.set(
+        "takoserver.takos-id.pending",
+        JSON.stringify({
+          issuer: "https://issuer.example.test",
+          clientId: "synthetic-client",
+          state: "synthetic",
+          verifier: "synthetic-verifier",
+          from: "/resources",
+        }),
+      );
+    }
+    const seen = transport((request) =>
+      request.url === "https://issuer.example.test/oauth/token"
+        ? token.promise
+        : Response.json(identity("old")),
+    );
+    const callback = main.resolveInitialSession(
+      provider === "google"
+        ? {
+            kind: "ok",
+            value: { idToken: "synthetic-id-token", nonce: "synthetic-nonce", from: "/resources" },
+          }
+        : { kind: "none" },
+      { set: () => undefined },
+    );
+    state.setApiOrigin("https://b.example.test");
+    token.resolve(Response.json({ id_token: "synthetic-id-token" }));
+    await callback;
+    expect(seen.map((request) => request.url)).toEqual(
+      provider === "google" ? [] : ["https://issuer.example.test/oauth/token"],
+    );
+    expect(state.session()).toBe(null);
+  });
+}

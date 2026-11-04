@@ -131,8 +131,8 @@ function assertionFor(provider: string): string {
 }
 
 describe("Takoserver Console operator sign-in", () => {
-  for (const changeOrigin of [false, true]) {
-    test(`operator sign-in adoption is bound to its endpoint (changed: ${changeOrigin})`, async () => {
+  for (const change of ["none", "other-host", "same-host-port", "same-host-login"] as const) {
+    test(`operator sign-in adoption handles the Cookie response scope (${change})`, async () => {
       installSignInDom();
       const originalFetch = globalThis.fetch;
       const state = await import("../console/src/state.ts");
@@ -165,7 +165,17 @@ describe("Takoserver Console operator sign-in", () => {
         textarea.value = assertionFor("local");
         const signingIn = form.submit();
         expect(requests.at(-1)?.url).toBe("https://old.example.test/v1/sessions");
-        if (changeOrigin) state.setApiOrigin("https://new.example.test");
+        if (change === "other-host") state.setApiOrigin("https://new.example.test");
+        if (change === "same-host-port") state.setApiOrigin("https://old.example.test:9443");
+        if (change !== "none") {
+          state.adoptSession();
+          state.principal.set({
+            id: "new",
+            provider: "local",
+            email: "new@example.test",
+            displayName: "New",
+          });
+        }
         answerSignIn(
           Response.json({
             principal: {
@@ -177,10 +187,16 @@ describe("Takoserver Console operator sign-in", () => {
           }),
         );
         await signingIn;
-        expect(state.session()).toBe(changeOrigin ? null : "cookie");
-        expect(state.principal()).toBe(null);
+        expect(state.session()).toBe(
+          change === "same-host-port" || change === "same-host-login" ? null : "cookie",
+        );
+        expect(state.principal()?.id).toBe(change === "other-host" ? "new" : undefined);
         expect(state.apiOrigin()).toBe(
-          changeOrigin ? "https://new.example.test" : "https://old.example.test",
+          change === "other-host"
+            ? "https://new.example.test"
+            : change === "same-host-port"
+              ? "https://old.example.test:9443"
+              : "https://old.example.test",
         );
       } finally {
         globalThis.fetch = originalFetch;
