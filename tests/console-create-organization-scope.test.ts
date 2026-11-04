@@ -358,11 +358,20 @@ function identityResponse(rows = organizations): Response {
   });
 }
 
+/** A second read of this known session, rather than adoption of a new unknown one. */
+function refreshKnownIdentity(): void {
+  stopObservers.push(
+    state.observeSessionIdentity((error) => {
+      throw error;
+    }),
+  );
+}
+
 for (const returned of ["old-list", "includes-created", "removes-old-org"] as const) {
   test(`same-session pending identity preserves only new create ACKs (${returned})`, async () => {
     const identity = deferred();
     identityReply = () => identity.promise;
-    state.adoptSession();
+    refreshKnownIdentity();
     state.organizations.set(organizations);
     await tick();
     openCreate().click();
@@ -396,7 +405,7 @@ test("later identity success can remove a created Org and cannot be overwritten 
   const older = deferred();
   const newer = deferred();
   identityReply = () => older.promise;
-  state.adoptSession();
+  refreshKnownIdentity();
   await tick();
   openCreate().click();
   await tick();
@@ -419,7 +428,7 @@ test("a newer failed identity read does not discard a still-current older succes
   const older = deferred();
   const newer = deferred();
   identityReply = () => older.promise;
-  state.adoptSession();
+  refreshKnownIdentity();
   await tick();
   openCreate().click();
   await tick();
@@ -437,7 +446,7 @@ test("a newer failed identity read does not discard a still-current older succes
 test("two acknowledged creates during one identity read are retained once each", async () => {
   const identity = deferred();
   identityReply = () => identity.promise;
-  state.adoptSession();
+  refreshKnownIdentity();
   await tick();
   openCreate().click();
   await tick();
@@ -460,7 +469,7 @@ for (const kind of ["session", "origin"] as const) {
   test(`a new ${kind} cannot inherit old create ACKs or identity responses`, async () => {
     const older = deferred();
     identityReply = () => older.promise;
-    state.adoptSession();
+    refreshKnownIdentity();
     await tick();
     openCreate().click();
     await tick();
@@ -475,3 +484,117 @@ for (const kind of ["session", "origin"] as const) {
     expect(state.currentOrganization()).toBeNull();
   });
 }
+
+const createOrganizationButtons = () =>
+  body
+    .all()
+    .filter(
+      (node) =>
+        node.tag === "button" &&
+        (node.attributes.get("aria-label") === "Create organization" ||
+          node.textContent === "Create organization"),
+    );
+
+for (const kind of ["shared-auth", "takos-id"] as const) {
+  test(`managed Organization session keeps selection without offering local create (${kind})`, async () => {
+    if (kind === "shared-auth") state.adoptSession("shared-auth");
+    await tick();
+    if (kind === "takos-id") {
+      const current = state.principal();
+      if (!current) throw new Error("fixture principal missing");
+      state.principal.set({ ...current, provider: "takos-id" });
+    }
+    await tick();
+    expect(createOrganizationButtons()).toHaveLength(0);
+    const picker = body.all().find((node) => node.attributes.get("aria-label") === "Organization");
+    if (!picker) throw new Error("managed Organization picker missing");
+    picker.value = "org-b";
+    for (const listener of picker.listeners.get("change") ?? [])
+      listener({ target: picker } as unknown as Event);
+    await tick();
+    expect(state.currentOrganization()?.id).toBe("org-b");
+    expect(state.organizations().map((item) => item.id)).toEqual(["org-a", "org-b"]);
+    expect(posts()).toHaveLength(0);
+  });
+
+  test(`managed session without an Organization gives guidance rather than a refused create (${kind})`, async () => {
+    if (kind === "shared-auth") state.adoptSession("shared-auth");
+    await tick();
+    if (kind === "takos-id") {
+      const current = state.principal();
+      if (!current) throw new Error("fixture principal missing");
+      state.principal.set({ ...current, provider: "takos-id" });
+    }
+    state.organizations.set([]);
+    await tick();
+    expect(createOrganizationButtons()).toHaveLength(0);
+    expect(body.textContent).toContain("No organization available");
+    expect(body.textContent).toContain("sign-in administrator");
+    expect(posts()).toHaveLength(0);
+  });
+}
+
+test("an old local create button cannot open a dialog after switching to shared login", async () => {
+  const oldButton = createOrganizationButtons()[0];
+  if (!oldButton) throw new Error("fixture local create button missing");
+  state.adoptSession("shared-auth");
+  await tick();
+  oldButton.click();
+  expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(0);
+  expect(posts()).toHaveLength(0);
+});
+
+test("a projected sign-in cannot confirm a previously opened local create dialog", async () => {
+  const confirm = openCreate();
+  const current = state.principal();
+  if (!current) throw new Error("fixture principal missing");
+  state.principal.set({ ...current, provider: "takos-id" });
+  confirm.click();
+  await tick();
+  expect(posts()).toHaveLength(0);
+  expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(0);
+});
+
+test("switching back to local login restores the original create action", async () => {
+  state.adoptSession("shared-auth");
+  await tick();
+  expect(createOrganizationButtons()).toHaveLength(0);
+  state.adoptSession();
+  await tick();
+  openCreate().click();
+  await tick();
+  expect(posts()).toHaveLength(1);
+  expect(posts()[0]?.url).toBe("https://api.example.test/v1/organizations");
+  expect(await posts()[0]?.json()).toEqual({ name: "Fixture Org" });
+});
+
+for (const provider of ["local", "takos-id"] as const) {
+  test(`pending identity lookup does not affirm local Organization creation (${provider})`, async () => {
+    const oldButton = createOrganizationButtons()[0];
+    if (!oldButton) throw new Error("fixture local create button missing");
+    const me = await identityResponse().json();
+    const answer = deferred();
+    identityReply = () => answer.promise;
+    state.adoptSession();
+    await tick();
+    expect(state.principal()).toBe(null);
+    expect(createOrganizationButtons()).toHaveLength(0);
+    oldButton.click();
+    expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(0);
+    expect(posts()).toHaveLength(0);
+    answer.resolve(Response.json({ ...me, principal: { ...me.principal, provider } }));
+    await tick();
+    expect(createOrganizationButtons().length > 0).toBe(provider === "local");
+  });
+}
+
+test("failed identity lookup gives unavailable guidance without a create action", async () => {
+  identityReply = () => Response.json({ error: { code: "backend_unavailable" } }, { status: 503 });
+  state.adoptSession();
+  await tick();
+  expect(state.principal()).toBe(null);
+  expect(createOrganizationButtons()).toHaveLength(0);
+  expect(body.textContent).toContain("Account details are not available yet");
+  expect(body.textContent).not.toContain("No organization yet");
+  expect(posts()).toHaveLength(0);
+});

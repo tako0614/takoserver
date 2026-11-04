@@ -166,7 +166,8 @@ function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () =>
 }
 
 function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
-  const close = openModal({
+  const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
+  const options: ModalOptions = {
     title: tr(`${key.name}を失効しますか？`, `Revoke ${key.name}?`),
     confirmLabel: tr("キーを失効", "Revoke key"),
     confirmTone: "danger",
@@ -184,16 +185,19 @@ function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
       ),
     ),
     onConfirm: async () => {
+      if (!modal.isCurrent()) return;
       try {
         await api.revokeApiKey(organizationId, key.id);
+        if (!modal.isCurrent()) return;
         toast(tr("キーを失効しました", "Key revoked"), "ok");
         reload();
-        close();
+        modal.close();
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (modal.isCurrent()) toast(explain(error as Error), "bad");
       }
     },
-  });
+  };
+  const modal = openScopedKeyModal(options, isScopeCurrent);
 }
 
 function createKey(
@@ -342,8 +346,8 @@ interface KeyModalLifetime {
   close: (() => void) | null;
 }
 
-// A disposed effect stays registered in this reactive core. Keep its closure
-// outside the modal's lexical scope and sever its only modal reference on close.
+// Keep the watcher outside the modal's lexical scope. Closing clears its modal
+// reference and disposes the signal subscriptions.
 function watchKeyModalScope(isScopeCurrent: () => boolean, lifetime: KeyModalLifetime): () => void {
   return effect(() => {
     if (!isScopeCurrent()) lifetime.close?.();
