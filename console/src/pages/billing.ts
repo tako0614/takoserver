@@ -48,6 +48,8 @@ import {
 } from "../ui.ts";
 import { createWorkspaceUsageController, type WorkspaceUsageState } from "../workspace-usage.ts";
 
+let nextFundingInputId = 0;
+
 /**
  * The wallet, and the ledger it is derived from.
  *
@@ -586,7 +588,15 @@ function uiLocale(): "en-US" | "ja-JP" {
  * a credit.
  */
 function addFunds(organizationId: string, reload: () => void, isScopeCurrent: () => boolean): void {
-  const amount = h("input", { class: "input", type: "number", value: "50", min: "5", step: "5" });
+  const amountId = `funding-amount-${++nextFundingInputId}`;
+  const amount = h("input", {
+    id: amountId,
+    class: "input",
+    type: "number",
+    value: "50",
+    min: "5",
+    step: "5",
+  });
   const busy = signal(false);
   let open = true;
   const isCurrent = () => open && isScopeCurrent();
@@ -603,7 +613,7 @@ function addFunds(organizationId: string, reload: () => void, isScopeCurrent: ()
       h(
         "div",
         { class: "field" },
-        h("label", null, tr("金額（USD）", "Amount (USD)")),
+        h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
         amount,
         h(
           "small",
@@ -686,7 +696,9 @@ function hostedAddFunds(
   const state = topUp.state();
   const pending =
     state.status === "unresolved" || state.status === "amount_conflict" ? state.amountMinor : null;
+  const amountId = `top-up-amount-${++nextFundingInputId}`;
   const amount = h("input", {
+    id: amountId,
     class: "input",
     type: "number",
     value: String(pending === null ? 50 : pending / 100),
@@ -704,7 +716,7 @@ function hostedAddFunds(
       h(
         "div",
         { class: "field" },
-        h("label", null, tr("金額（USD）", "Amount (USD)")),
+        h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
         amount,
         h(
           "small",
@@ -901,7 +913,9 @@ function operatorFunding(
 ): void {
   let open = true;
   const isCurrent = () => open && isScopeCurrent();
+  const inputId = `operator-funding-${++nextFundingInputId}`;
   const input = h("textarea", {
+    id: inputId,
     class: "textarea",
     placeholder: tr(
       "この組織に発行された入金証明を貼り付けてください",
@@ -934,7 +948,7 @@ function operatorFunding(
       h(
         "div",
         { class: "field" },
-        h("label", null, tr("入金証明", "Settlement proof")),
+        h("label", { for: inputId }, tr("入金証明", "Settlement proof")),
         input,
         h(
           "small",
