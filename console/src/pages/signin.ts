@@ -6,13 +6,14 @@ import { mark } from "../mark.ts";
 import { type Resource, resource, signal } from "../reactive.ts";
 import { route } from "../router.ts";
 import {
-  adoptSession,
   api,
   apiOrigin,
   applyTheme,
+  captureSessionScope,
   refreshSharedAuthAvailability,
   setApiOrigin,
   sharedAuthAvailable,
+  signInSession,
   storeSharedSessionReturnPath,
   theme,
 } from "../state.ts";
@@ -341,16 +342,21 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
 
   const submit = async (event: Event): Promise<void> => {
     event.preventDefault();
+    if (busy()) return;
     if (assertion.value.trim() === "") {
       toast(tr("assertionを貼り付けてください", "Paste an assertion first"), "bad");
       return;
     }
     busy.set(true);
+    const isCurrent = captureSessionScope();
     try {
-      await signInWithOperatorAssertion(api, providers, assertion.value.trim());
-      adoptSession();
+      await signInWithOperatorAssertion(
+        { signIn: signInSession },
+        providers,
+        assertion.value.trim(),
+      );
     } catch (error) {
-      toast(explain(error as Error), "bad");
+      if (isCurrent()) toast(explain(error as Error), "bad");
     } finally {
       busy.set(false);
     }

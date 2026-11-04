@@ -381,6 +381,8 @@ export interface ResourceDeclaration {
 export interface ApiOptions {
   readonly origin: string;
   readonly token: () => string | null;
+  /** Local cookie adoption/invalidation generation; never an authentication credential. */
+  readonly sessionRevision?: () => number;
   readonly onSessionLost: () => void;
 }
 
@@ -943,10 +945,12 @@ export function createApi(options: ApiOptions) {
     includeAuthorization = true,
     cache?: RequestCache,
   ): Promise<{ readonly status: number; readonly payload: Result }> => {
+    const origin = options.origin;
+    const sessionRevision = options.sessionRevision?.();
     const token = includeAuthorization ? options.token() : null;
     let response: Response;
     try {
-      response = await fetch(`${options.origin}${path}`, {
+      response = await fetch(`${origin}${path}`, {
         method,
         credentials: "include",
         ...(cache === undefined ? {} : { cache }),
@@ -983,7 +987,14 @@ export function createApi(options: ApiOptions) {
         path,
         typeof detail === "string" && detail.length > 0 && detail.length <= 1024 ? detail : null,
       );
-      if (failure.isExpiredSession && clearSessionOnUnauthorized) options.onSessionLost();
+      if (
+        failure.isExpiredSession &&
+        clearSessionOnUnauthorized &&
+        origin === options.origin &&
+        sessionRevision === options.sessionRevision?.() &&
+        token === (includeAuthorization ? options.token() : null)
+      )
+        options.onSessionLost();
       throw failure;
     }
     return { status: response.status, payload: payload as Result };

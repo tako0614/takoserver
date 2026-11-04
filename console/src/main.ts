@@ -19,16 +19,18 @@ import { signInPage } from "./pages/signin.ts";
 import { effect, signal } from "./reactive.ts";
 import { linkProps, navigate, route } from "./router.ts";
 import {
-  adoptSession,
   api,
   applyTheme,
   bootstrapSharedSession,
+  captureSessionScope,
   currentOrganization,
+  observeSessionIdentity,
   organizations,
   principal,
   resolveSharedSessionReturnPath,
   selectOrganization,
   session,
+  signInSession,
   signOut,
   theme,
 } from "./state.ts";
@@ -61,28 +63,10 @@ function boot(): void {
   const view = h("div");
   root.append(view);
 
-  // Whoever is signed in is loaded once per session token, not per page: the
+  // Whoever is signed in is loaded once per local session, not per page: the
   // navigation needs it, and re-asking on every route change would make the
   // organization picker flicker on a screen that never changed.
-  effect(() => {
-    const token = session();
-    if (!token) {
-      principal.set(null);
-      organizations.set([]);
-      return;
-    }
-    api.me().then(
-      (me) => {
-        principal.set(me.principal);
-        organizations.set(me.organizations);
-      },
-      (error: unknown) => {
-        if ((error as { isExpiredSession?: boolean }).isExpiredSession !== true) {
-          toast(explain(error as Error), "bad");
-        }
-      },
-    );
-  });
+  observeSessionIdentity((error) => toast(explain(error as Error), "bad"));
 
   effect(() => {
     const screen = !sessionReady()
@@ -105,28 +89,32 @@ export async function resolveInitialSession(
   returned: GoogleReturnResult,
   sessionReady: { set(value: boolean): void },
 ): Promise<void> {
+  const isInitialScopeCurrent = captureSessionScope();
   try {
     const takosIdReturn = await readTakosIdReturn();
+    if (!isInitialScopeCurrent()) return;
     const hasProviderReturn = returned.kind !== "none" || takosIdReturn.kind !== "none";
 
     if (returned.kind === "error") toast(returned.message, "bad");
     if (returned.kind === "ok") {
+      const isCurrent = captureSessionScope();
       try {
-        await api.signIn("google", returned.value.idToken, "oidc", returned.value.nonce);
-        adoptSession();
-        navigate(returned.value.from, { replace: true });
+        if (await signInSession("google", returned.value.idToken, "oidc", returned.value.nonce)) {
+          navigate(returned.value.from, { replace: true });
+        }
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (isCurrent()) toast(explain(error as Error), "bad");
       }
     }
     if (takosIdReturn.kind === "error") toast(takosIdReturn.message, "bad");
     if (takosIdReturn.kind === "ok") {
+      const isCurrent = captureSessionScope();
       try {
-        await api.signIn("takos-id", takosIdReturn.idToken, "oidc");
-        adoptSession();
-        navigate(takosIdReturn.from, { replace: true });
+        if (await signInSession("takos-id", takosIdReturn.idToken, "oidc")) {
+          navigate(takosIdReturn.from, { replace: true });
+        }
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (isCurrent()) toast(explain(error as Error), "bad");
       }
     }
 
