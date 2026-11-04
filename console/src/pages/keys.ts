@@ -34,8 +34,8 @@ const LIFETIMES: readonly { readonly label: () => string; readonly seconds: numb
  */
 export function keysPage(organizationId: string): Child {
   const keys = resource(() => api.apiKeys(organizationId));
-  // Asked once per page, so the dialog opens at once; until the answer comes
-  // back, or if it never does, ai:invoke is simply not offered.
+  // Asked once per page. An already-open dialog follows the answer without
+  // replacing the person's inputs; an unreadable document never offers AI.
   const discovery = resource(() => api.hostDiscovery());
   const aiAvailable = (): boolean => {
     const state = discovery.get();
@@ -70,7 +70,7 @@ export function keysPage(organizationId: string): Child {
         {
           class: "btn btn--primary",
           type: "button",
-          onClick: () => createKey(organizationId, keys.reload, aiAvailable(), v2Endpoint()),
+          onClick: () => createKey(organizationId, keys.reload, aiAvailable, v2Endpoint()),
         },
         icon(ICON.plus, 14),
         text(tr("キーを作成", "Create key")),
@@ -203,7 +203,7 @@ function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
 function createKey(
   organizationId: string,
   reload: () => void,
-  aiAvailable: boolean,
+  aiAvailable: () => boolean,
   v2Endpoint: string,
 ): void {
   const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
@@ -214,6 +214,8 @@ function createKey(
     autocomplete: "off",
   });
   const chosen = new Set<string>(DEFAULT_KEY_SCOPES);
+  const aiFields: HTMLFieldSetElement[] = [];
+  const aiBoxes: HTMLInputElement[] = [];
   const lifetime = h(
     "select",
     { class: "select", id: "create-key-lifetime" },
@@ -250,8 +252,8 @@ function createKey(
         "div",
         { class: "field" },
         h("span", { class: "field__label" }, tr("スコープ", "Scopes")),
-        ...keyScopeGroups(aiAvailable).map((group) =>
-          h(
+        ...keyScopeGroups(true).map((group) => {
+          const field = h(
             "fieldset",
             { class: "checks" },
             h("legend", null, group.label()),
@@ -264,6 +266,7 @@ function createKey(
                   else chosen.delete(scope.id);
                 },
               });
+              if (scope.id === "ai:invoke") aiBoxes.push(box);
               return h(
                 "label",
                 { class: "check" },
@@ -276,8 +279,10 @@ function createKey(
                 ),
               );
             }),
-          ),
-        ),
+          );
+          if (group.scopes.some((scope) => scope.id === "ai:invoke")) aiFields.push(field);
+          return field;
+        }),
         h(
           "small",
           null,
@@ -319,7 +324,19 @@ function createKey(
       }
     },
   };
-  const modal = openScopedKeyModal(options, isScopeCurrent);
+  const stopDiscovery = effect(() => {
+    const available = aiAvailable();
+    for (const field of aiFields) {
+      field.hidden = !available;
+      field.disabled = !available;
+      field.style.display = available ? "" : "none";
+    }
+    if (!available) {
+      chosen.delete("ai:invoke");
+      for (const box of aiBoxes) box.checked = false;
+    }
+  });
+  const modal = openScopedKeyModal({ ...options, onClose: stopDiscovery }, isScopeCurrent);
 }
 
 function openScopedKeyModal(options: ModalOptions, isScopeCurrent: () => boolean) {

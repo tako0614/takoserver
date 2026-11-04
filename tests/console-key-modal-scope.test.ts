@@ -16,13 +16,15 @@ const originalFetch = globalThis.fetch;
 class TestNode {
   readonly children: TestNode[] = [];
   readonly attributes = new Map<string, string>();
-  readonly style = {};
+  readonly style: Record<string, string> = {};
   readonly dataset = {};
   readonly listeners = new Map<string, EventListener[]>();
   parent: TestNode | null = null;
   className = "";
   value = "";
   disabled = false;
+  checked = false;
+  hidden = false;
 
   constructor(
     readonly tag = "text",
@@ -71,6 +73,7 @@ class TestNode {
   setAttribute(name: string, value: string): void {
     this.attributes.set(name, value);
     if (name === "disabled") this.disabled = true;
+    if (name === "checked") this.checked = true;
   }
 
   addEventListener(type: string, listener: EventListener): void {
@@ -150,6 +153,7 @@ const created = {
 };
 let requests: Request[];
 let reply: (request: Request) => Response | Promise<Response>;
+let discoveryReply: () => Response | Promise<Response>;
 
 function find(predicate: (node: TestNode) => boolean): TestNode {
   const result = body.all().find(predicate);
@@ -209,11 +213,13 @@ beforeEach(async () => {
   await tick();
   requests = [];
   reply = () => Response.json(created);
+  discoveryReply = () => Response.json({ endpoints: {} });
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       requests.push(request);
       if (request.method === "POST" || request.method === "DELETE") return reply(request);
+      if (new URL(request.url).pathname === "/.well-known/takoserver") return discoveryReply();
       return Response.json(
         new URL(request.url).pathname.endsWith("/api-keys")
           ? { apiKeys: [existingKey] }
@@ -253,6 +259,96 @@ test("current create issues one original request and reveals its one-time secret
   expect(secretVisible()).toBe(true);
   expect(reads()).toHaveLength(2);
 });
+
+function scopeInput(id: string): TestNode | undefined {
+  const label = body
+    .all()
+    .find(
+      (node) =>
+        node.tag === "label" &&
+        node
+          .all()
+          .some((child) => child.className.includes("check__id") && child.textContent === id),
+    );
+  return label?.all().find((node) => node.tag === "input");
+}
+
+function scopeOffered(id: string): boolean {
+  const input = scopeInput(id);
+  if (!input) return false;
+  for (let node: TestNode | null = input; node; node = node.parent) {
+    if (node.hidden || node.disabled || node.style.display === "none") return false;
+  }
+  return true;
+}
+
+function chooseScope(id: string, checked: boolean): TestNode {
+  const input = scopeInput(id);
+  if (!input) throw new Error(`scope ${id} is not rendered`);
+  input.checked = checked;
+  for (const listener of input.listeners.get("change") ?? [])
+    listener({ target: input } as unknown as Event);
+  return input;
+}
+
+async function renderPendingDiscovery() {
+  const answer = deferred();
+  discoveryReply = () => answer.promise;
+  body.replaceChildren();
+  render();
+  await tick();
+  return answer;
+}
+
+test("an open create dialog receives late AI discovery without replacing entered controls", async () => {
+  const answer = await renderPendingDiscovery();
+  const confirm = openCreate();
+  const name = find((node) => node.attributes.get("id") === "create-key-name");
+  const writer = chooseScope("resources:write", false);
+  const reader = chooseScope("resources:read", true);
+  expect(scopeOffered("ai:invoke")).toBe(false);
+  expect(posts()).toHaveLength(0);
+
+  answer.resolve(Response.json({ endpoints: { ai: "https://api.example.test/v1/ai" } }));
+  await tick();
+
+  expect(scopeOffered("ai:invoke")).toBe(true);
+  expect(find((node) => node.attributes.get("id") === "create-key-name")).toBe(name);
+  expect(name.value).toBe("fixture-key");
+  expect(scopeInput("resources:write")).toBe(writer);
+  expect(scopeInput("resources:read")).toBe(reader);
+  expect(writer.checked).toBe(false);
+  expect(reader.checked).toBe(true);
+  expect(posts()).toHaveLength(0);
+  chooseScope("ai:invoke", true);
+  confirm.click();
+  await tick();
+  expect(posts()).toHaveLength(1);
+  expect(await posts()[0]?.json()).toEqual({
+    name: "fixture-key",
+    scopes: ["resources:read", "ai:invoke"],
+    expiresInSeconds: 7776000,
+  });
+});
+
+for (const [label, payload, status] of [
+  ["absent", { endpoints: {} }, 200],
+  ["malformed", { endpoints: { ai: true } }, 200],
+  ["failed", { endpoints: { ai: "https://api.example.test/v1/ai" } }, 503],
+] as const) {
+  test(`late ${label} discovery keeps AI unavailable and ordinary key creation usable`, async () => {
+    const answer = await renderPendingDiscovery();
+    const confirm = openCreate();
+    answer.resolve(Response.json(payload, { status }));
+    await tick();
+    expect(scopeOffered("ai:invoke")).toBe(false);
+    expect(scopeOffered("resources:write")).toBe(true);
+    confirm.click();
+    await tick();
+    expect(posts()).toHaveLength(1);
+    expect((await posts()[0]?.json())?.scopes).toEqual(["resources:write"]);
+  });
+}
 
 for (const kind of ["org", "roundtrip", "session", "origin"] as const) {
   test(`a retired create dialog cannot dispatch (${kind})`, async () => {
