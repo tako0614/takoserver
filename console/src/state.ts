@@ -43,6 +43,7 @@ let latestSharedAuthAvailabilityProbe = 0;
 export const principal = signal<Principal | null>(null);
 export const organizations = signal<readonly Organization[]>([]);
 export const currentOrganizationId = signal<string | null>(localStorage.getItem(ORG_KEY));
+const organizationSelectionRevision = signal(0);
 
 /**
  * Where the API lives.
@@ -285,8 +286,22 @@ export function resolveSharedSessionReturnPath(currentPath: string): string {
 }
 
 export function selectOrganization(id: string): void {
+  if (id !== currentOrganizationId())
+    organizationSelectionRevision.update((revision) => revision + 1);
   localStorage.setItem(ORG_KEY, id);
   currentOrganizationId.set(id);
+}
+
+/** Presentation custody only; the Host still authorizes every organization request. */
+export function captureSelectedOrganizationScope(organizationId: string): () => boolean {
+  const isSessionCurrent = captureSessionScope();
+  const revision = organizationSelectionRevision();
+  const organization = currentOrganization();
+  return () =>
+    isSessionCurrent() &&
+    organizationSelectionRevision() === revision &&
+    organization?.id === organizationId &&
+    currentOrganization() === organization;
 }
 
 export const api: Api = createApi({

@@ -2,8 +2,8 @@ import type { ApiKey } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../key-scopes.ts";
-import { resource } from "../reactive.ts";
-import { api, hostV2Base } from "../state.ts";
+import { effect, resource } from "../reactive.ts";
+import { api, captureSelectedOrganizationScope, hostV2Base } from "../state.ts";
 import {
   badge,
   card,
@@ -12,6 +12,7 @@ import {
   explain,
   ICON,
   icon,
+  type ModalOptions,
   openModal,
   toast,
   when,
@@ -201,6 +202,7 @@ function createKey(
   aiAvailable: boolean,
   v2Endpoint: string,
 ): void {
+  const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
   const name = h("input", {
     class: "input",
     id: "create-key-name",
@@ -220,7 +222,7 @@ function createKey(
     ),
   );
 
-  const close = openModal({
+  const options: ModalOptions = {
     title: tr("APIキーを作成", "Create API key"),
     confirmLabel: tr("キーを作成", "Create key"),
     body: h(
@@ -289,6 +291,7 @@ function createKey(
       ),
     ),
     onConfirm: async () => {
+      if (!modal.isCurrent()) return;
       if (name.value.trim() === "") {
         toast(tr("キー名を入力してください", "Give the key a name"), "bad");
         return;
@@ -303,13 +306,47 @@ function createKey(
           scopes: [...chosen],
           expiresInSeconds: Number(lifetime.value),
         });
-        close();
+        if (!modal.isCurrent()) return;
+        modal.close();
         reload();
-        revealSecret(organizationId, created.apiKey, created.secret, v2Endpoint);
+        revealSecret(organizationId, created.apiKey, created.secret, v2Endpoint, isScopeCurrent);
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (modal.isCurrent()) toast(explain(error as Error), "bad");
       }
     },
+  };
+  const modal = openScopedKeyModal(options, isScopeCurrent);
+}
+
+function openScopedKeyModal(options: ModalOptions, isScopeCurrent: () => boolean) {
+  let open = true;
+  let stop = (): void => {};
+  const lifetime: KeyModalLifetime = { close: null };
+  const close = openModal({
+    ...options,
+    onClose: () => {
+      open = false;
+      lifetime.close = null;
+      stop();
+      options.onClose?.();
+    },
+  });
+  lifetime.close = close;
+  stop = watchKeyModalScope(isScopeCurrent, lifetime);
+  // An already-retired page may open a dialog before the first effect runs.
+  if (!open) stop();
+  return { close, isCurrent: () => open && isScopeCurrent() };
+}
+
+interface KeyModalLifetime {
+  close: (() => void) | null;
+}
+
+// A disposed effect stays registered in this reactive core. Keep its closure
+// outside the modal's lexical scope and sever its only modal reference on close.
+function watchKeyModalScope(isScopeCurrent: () => boolean, lifetime: KeyModalLifetime): () => void {
+  return effect(() => {
+    if (!isScopeCurrent()) lifetime.close?.();
   });
 }
 
@@ -321,9 +358,10 @@ function revealSecret(
   key: ApiKey,
   secret: string,
   v2Endpoint: string,
+  isScopeCurrent: () => boolean,
 ): void {
   const usage = keyUsage(v2Endpoint, organizationId, key.scopes);
-  openModal({
+  const options: ModalOptions = {
     title: tr("今すぐキーをコピーしてください", "Copy this key now"),
     dismissLabel: tr("完了", "Done"),
     body: h(
@@ -414,5 +452,6 @@ function revealSecret(
             ),
           ),
     ),
-  });
+  };
+  openScopedKeyModal(options, isScopeCurrent);
 }
