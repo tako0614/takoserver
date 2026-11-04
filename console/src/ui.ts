@@ -355,14 +355,19 @@ export interface ModalOptions {
   /** While true, the confirm is disabled: the request would only be refused. */
   readonly confirmBlocked?: () => boolean;
   readonly dismissLabel?: string;
+  readonly onClose?: () => void;
 }
 
 export function openModal(options: ModalOptions): () => void {
   let stopBlocking: (() => void) | null = null;
+  let closed = false;
   const close = (): void => {
+    if (closed) return;
+    closed = true;
     stopBlocking?.();
     scrim.remove();
     document.removeEventListener("keydown", onKey);
+    options.onClose?.();
   };
   const onKey = (event: KeyboardEvent): void => {
     if (event.key === "Escape") close();
