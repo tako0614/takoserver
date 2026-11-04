@@ -1148,6 +1148,7 @@ tbody tr.is-clickable:hover {
 /* --------------------------------------------------------------- toasts -- */
 
 .toasts {
+  pointer-events: none;
   position: fixed;
   right: 16px;
   bottom: 16px;
