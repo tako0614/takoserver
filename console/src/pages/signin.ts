@@ -331,6 +331,7 @@ function googleGlyph(): SVGSVGElement {
 function operatorForm(providers: readonly IdentityProvider[]): Child {
   const busy = signal(false);
   const assertion = h("textarea", {
+    id: "assertion",
     class: "textarea",
     placeholder: tr(
       "運営者が署名したassertionを貼り付けてください",

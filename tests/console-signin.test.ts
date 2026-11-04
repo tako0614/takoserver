@@ -383,3 +383,36 @@ describe("Takoserver Console operator sign-in", () => {
     expect(calls).toEqual([["github", assertion, "operator-assertion"]]);
   });
 });
+
+test("operator assertion input retains its unique visible label target", async () => {
+  installSignInDom();
+  const originalFetch = globalThis.fetch;
+  const state = await import("../console/src/state.ts");
+  const { signInPage } = await import("../console/src/pages/signin.ts");
+  state.setApiOrigin("https://api.example.test");
+  state.sharedAuthAvailable.set(false);
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      if (new URL(String(input)).pathname !== "/v1/identity/providers")
+        throw new Error("unexpected fixture request");
+      return Response.json({
+        providers: [{ id: "local", displayName: "Operator", method: "operator-assertion" }],
+      });
+    },
+    { preconnect: originalFetch.preconnect },
+  );
+  try {
+    const page = requireSignInNode(signInPage());
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const nodes = page.all();
+    const input = nodes.find((n) => n.tag === "textarea");
+    const label = nodes.find((n) => n.tag === "label" && n.attributes.get("for") === "assertion");
+    expect(input).toBeDefined();
+    expect(label).toBeDefined();
+    expect(input?.attributes.get("id")).toBe(label?.attributes.get("for"));
+    expect(nodes.filter((n) => n.attributes.get("id") === "assertion")).toHaveLength(1);
+    expect(label?.textContent.length).toBeGreaterThan(0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
