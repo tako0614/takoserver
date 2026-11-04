@@ -12,6 +12,7 @@ import {
   AuthError,
   grants,
   type IdentityProviderDescriptor,
+  OrganizationRosterUnavailableError,
   PersonalOrganizationError,
 } from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
@@ -2430,6 +2431,8 @@ function classify(error: unknown): { code: string; status: number } {
     error instanceof FinancialHostedBrowserSelectionUnavailable ||
     error instanceof FinancialHostedBrowserRequestUnavailable
   )
+    return { code: "backend_unavailable", status: 503 };
+  if (error instanceof OrganizationRosterUnavailableError)
     return { code: "backend_unavailable", status: 503 };
   if (error instanceof PersonalOrganizationError)
     return { code: "billing_unavailable", status: 503 };

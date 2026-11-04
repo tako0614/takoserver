@@ -422,6 +422,17 @@ export class AuthError extends Error {
 }
 
 /** Unmapped historical ownership and damaged personal tuples require owner resolution. */
+/** A complete identity roster could not fit the bounded response work budget. */
+export class OrganizationRosterUnavailableError extends Error {
+  constructor() {
+    super("The complete Organization roster is unavailable");
+    this.name = "OrganizationRosterUnavailableError";
+  }
+}
+
+// This is a read-work budget, not permission to create or join Organizations.
+const COMPLETE_ORGANIZATION_ROSTER_LIMIT = 1_000;
+
 export class PersonalOrganizationError extends Error {
   readonly code = "personal_organization_unavailable";
   readonly status = 503;
@@ -717,7 +728,7 @@ export interface Accounts {
   organization(id: string): Promise<Organization | null>;
   /** The person behind a session, for a console to greet and to audit against. */
   principal(id: string): Promise<Principal | null>;
-  /** Every organization this principal owns, oldest first. */
+  /** Every organization this principal belongs to, oldest first; never a partial roster. */
   organizations(principalId: string): Promise<readonly Organization[]>;
   /**
    * The organization's live keys. Secrets are never stored, so they cannot be
@@ -1912,9 +1923,13 @@ function createAccountsInternal(
       const rows = await sql.query(
         `SELECT o.id, o.name, o.owner_principal_id, o.created_at FROM orgs o
          JOIN org_memberships m ON m.org_id = o.id
-         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC LIMIT 200`,
-        [principalId],
+         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC LIMIT ?`,
+        [principalId, COMPLETE_ORGANIZATION_ROSTER_LIMIT + 1],
       );
+      // One query keeps this success roster in one snapshot. Reading the extra
+      // row distinguishes a complete result from a silently truncated page.
+      if (rows.length > COMPLETE_ORGANIZATION_ROSTER_LIMIT)
+        throw new OrganizationRosterUnavailableError();
       return rows.map((row) => ({
         id: String(row.id),
         name: String(row.name),
