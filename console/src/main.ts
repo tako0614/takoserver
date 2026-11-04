@@ -322,13 +322,17 @@ function createOrganization(): void {
       }
       try {
         const { organization } = await api.createOrganization(name.value.trim());
-        if (!open || !isCurrent()) return;
+        if (!open || !isCurrent()) {
+          close();
+          return;
+        }
         organizations.update((all) => [...all, organization]);
         selectOrganization(organization.id);
         toast(tr("組織を作成しました", "Organization created"), "ok");
         close();
       } catch (error) {
         if (open && isCurrent()) toast(explain(error as Error), "bad");
+        else close();
       }
     },
   });

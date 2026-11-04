@@ -274,6 +274,7 @@ for (const kind of ["session", "origin", "origin-roundtrip", "dismiss"] as const
       expect(state.organizations()).toBe(originalOrganizations);
       expect(state.currentOrganizationId()).toBe(originalSelection);
       expect(toasts()).toHaveLength(originalToasts);
+      expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(0);
     });
   }
 }
@@ -323,4 +324,17 @@ test("blank current name does not POST and keeps the validation notice", async (
   await tick();
   expect(posts()).toHaveLength(0);
   expect(body.textContent).toContain("Give the organization a name");
+});
+
+test("an older dismissed completion cannot close a newer current dialog", async () => {
+  const answer = deferred();
+  reply = () => answer.promise;
+  openCreate().click();
+  dismiss();
+  openCreate();
+  const originalOrganizations = state.organizations();
+  answer.resolve(Response.json({ organization: created }, { status: 201 }));
+  await tick();
+  expect(state.organizations()).toBe(originalOrganizations);
+  expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(1);
 });
