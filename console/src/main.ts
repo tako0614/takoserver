@@ -288,10 +288,15 @@ function organizationPicker(): Child {
 }
 
 function createOrganization(): void {
+  const isCurrent = captureSessionScope();
+  let open = true;
   const name = h("input", { class: "input", placeholder: tr("本番環境", "Acme production") });
   const close = openModal({
     title: tr("組織を作成", "Create organization"),
     confirmLabel: tr("作成", "Create"),
+    onClose: () => {
+      open = false;
+    },
     body: h(
       "div",
       { class: "field" },
@@ -307,18 +312,27 @@ function createOrganization(): void {
       ),
     ),
     onConfirm: async () => {
+      if (!open || !isCurrent()) {
+        close();
+        return;
+      }
       if (name.value.trim() === "") {
         toast(tr("組織名を入力してください", "Give the organization a name"), "bad");
         return;
       }
       try {
         const { organization } = await api.createOrganization(name.value.trim());
+        if (!open || !isCurrent()) {
+          close();
+          return;
+        }
         organizations.update((all) => [...all, organization]);
         selectOrganization(organization.id);
         toast(tr("組織を作成しました", "Organization created"), "ok");
         close();
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (open && isCurrent()) toast(explain(error as Error), "bad");
+        else close();
       }
     },
   });

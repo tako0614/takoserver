@@ -10,7 +10,7 @@ import {
 import { type Child, h, live, text } from "../dom.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { effect, type Resource, resource, signal } from "../reactive.ts";
-import { api, currentOrganization, principal } from "../state.ts";
+import { api, captureSelectedOrganizationScope, currentOrganization, principal } from "../state.ts";
 import {
   browserSubscriptionCancelIntentLock,
   createSubscriptionCancelIntentStore,
@@ -57,6 +57,7 @@ import { createWorkspaceUsageController, type WorkspaceUsageState } from "../wor
  * to trust it.
  */
 export function billingPage(organizationId: string): Child {
+  const isPageCurrent = captureSelectedOrganizationScope(organizationId);
   const wallet = resource(() => api.wallet(organizationId));
   const usageSummary = resource(() => api.usageSummary(organizationId));
   const hostedSubscription = resource(() => api.subscription(organizationId));
@@ -204,7 +205,7 @@ export function billingPage(organizationId: string): Child {
         rerouteRequested = false;
         const mode = billingMode();
         if (mode === "legacy") {
-          settleReturn(organizationId, reloadWallet);
+          if (isPageCurrent()) settleReturn(organizationId, reloadWallet, isPageCurrent);
           returnSettled = true;
         } else if (mode === "hosted") {
           const checkoutHandled = await topUp.handleReturn();
@@ -228,7 +229,7 @@ export function billingPage(organizationId: string): Child {
   const openAddFunds = (): void => {
     const mode = billingMode();
     if (mode === "legacy") {
-      addFunds(organizationId, reloadWallet);
+      if (isPageCurrent()) addFunds(organizationId, reloadWallet, isPageCurrent);
       return;
     }
     const loaded = hostedSubscription.get();
@@ -584,13 +585,18 @@ function uiLocale(): "en-US" | "ja-JP" {
  * proof the amount is inside the proof. The number typed here is a request, not
  * a credit.
  */
-function addFunds(organizationId: string, reload: () => void): void {
+function addFunds(organizationId: string, reload: () => void, isScopeCurrent: () => boolean): void {
   const amount = h("input", { class: "input", type: "number", value: "50", min: "5", step: "5" });
   const busy = signal(false);
+  let open = true;
+  const isCurrent = () => open && isScopeCurrent();
 
   const close = openModal({
     title: tr("残高を追加", "Add funds"),
     confirmLabel: tr("支払いへ進む", "Continue to payment"),
+    onClose: () => {
+      open = false;
+    },
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -615,6 +621,10 @@ function addFunds(organizationId: string, reload: () => void): void {
       ),
     ),
     onConfirm: async () => {
+      if (!isCurrent()) {
+        close();
+        return;
+      }
       const dollars = Number(amount.value);
       if (!Number.isFinite(dollars) || dollars < 5) {
         toast(tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"), "bad");
@@ -623,14 +633,22 @@ function addFunds(organizationId: string, reload: () => void): void {
       busy.set(true);
       try {
         const started = await api.beginCheckout(organizationId, Math.round(dollars * 100));
+        if (!isCurrent()) {
+          close();
+          return;
+        }
         window.location.assign(started.checkout.url);
       } catch (error) {
+        if (!isCurrent()) {
+          close();
+          return;
+        }
         busy.set(false);
         const failure = error as { code?: string };
         if (failure.code === "not_found") {
           // This deployment takes no card. Offer the way it does take money.
           close();
-          operatorFunding(organizationId, reload);
+          operatorFunding(organizationId, reload, isScopeCurrent);
           return;
         }
         toast(explain(error as Error), "bad");
@@ -876,7 +894,13 @@ function topUpMessage(state: TopUpCheckoutState): HTMLElement | null {
  * asks for the proof and nothing else. A field for the amount would imply an
  * authority the caller does not have.
  */
-function operatorFunding(organizationId: string, reload: () => void): void {
+function operatorFunding(
+  organizationId: string,
+  reload: () => void,
+  isScopeCurrent: () => boolean,
+): void {
+  let open = true;
+  const isCurrent = () => open && isScopeCurrent();
   const input = h("textarea", {
     class: "textarea",
     placeholder: tr(
@@ -888,6 +912,9 @@ function operatorFunding(organizationId: string, reload: () => void): void {
   const close = openModal({
     title: tr("残高を追加", "Add funds"),
     confirmLabel: tr("残高へ反映", "Credit wallet"),
+    onClose: () => {
+      open = false;
+    },
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -920,6 +947,10 @@ function operatorFunding(organizationId: string, reload: () => void): void {
       ),
     ),
     onConfirm: async () => {
+      if (!isCurrent()) {
+        close();
+        return;
+      }
       const proof = input.value.trim();
       if (proof === "") {
         toast(tr("入金証明を貼り付けてください", "Paste a settlement proof first"), "bad");
@@ -927,11 +958,16 @@ function operatorFunding(organizationId: string, reload: () => void): void {
       }
       try {
         await api.fund(organizationId, proof);
+        if (!isCurrent()) {
+          close();
+          return;
+        }
         toast(tr("残高へ反映しました", "Wallet credited"), "ok");
         reload();
         close();
       } catch (error) {
-        toast(explain(error as Error), "bad");
+        if (isCurrent()) toast(explain(error as Error), "bad");
+        else close();
       }
     },
   });
@@ -945,7 +981,8 @@ function operatorFunding(organizationId: string, reload: () => void): void {
  * second attempt anyway, but a person should not be shown an error for
  * pressing refresh.
  */
-function settleReturn(organizationId: string, reload: () => void): void {
+function settleReturn(organizationId: string, reload: () => void, isCurrent: () => boolean): void {
+  if (!isCurrent()) return;
   const parameters = new URLSearchParams(window.location.search);
   const checkout = parameters.get("checkout");
   if (!checkout) return;
@@ -969,10 +1006,13 @@ function settleReturn(organizationId: string, reload: () => void): void {
   }
   api.fund(organizationId, checkout).then(
     () => {
+      if (!isCurrent()) return;
       toast(tr("支払いを受け付けました", "Payment received"), "ok");
       reload();
     },
-    (error: unknown) => toast(explain(error as Error), "bad"),
+    (error: unknown) => {
+      if (isCurrent()) toast(explain(error as Error), "bad");
+    },
   );
 }
 
