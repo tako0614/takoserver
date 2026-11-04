@@ -2427,7 +2427,8 @@ test("after a full reload without the in-memory exact intent, warning remains re
   await settle();
   expect(body.textContent).toContain("Acceptance is unknown");
   expect(body.textContent).toContain("it can no longer resend it exactly");
-  expect(body.textContent).toContain("An accepted create is listed at once");
+  expect(body.textContent).toContain("does not prove the original request was never accepted");
+  expect(body.textContent).toContain("Do not send the same change under a new key");
   expect(body.textContent).not.toContain("Use “Retry exact request”");
   expect(body.textContent).not.toContain("Retry exact request");
   expect(requests.every((request) => request.method === "GET")).toBe(true);
