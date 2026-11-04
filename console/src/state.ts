@@ -42,6 +42,13 @@ export const sharedAuthAvailable = signal<boolean | null>(null);
 let latestSharedAuthAvailabilityProbe = 0;
 export const principal = signal<Principal | null>(null);
 export const organizations = signal<readonly Organization[]>([]);
+let organizationCreationRevision = 0;
+const createdOrganizations = new Map<
+  string,
+  { readonly organization: Organization; readonly revision: number }
+>();
+let identityReadSequence = 0;
+let lastAppliedIdentityRead = 0;
 export const currentOrganizationId = signal<string | null>(localStorage.getItem(ORG_KEY));
 const organizationSelectionRevision = signal(0);
 
@@ -119,6 +126,10 @@ export async function refreshSharedAuthAvailability(clearImmediately = false): P
 
 function clearSession(): void {
   sessionRevision.update((revision) => revision + 1);
+  organizationCreationRevision = 0;
+  createdOrganizations.clear();
+  identityReadSequence = 0;
+  lastAppliedIdentityRead = 0;
   localStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(SESSION_KIND_KEY);
   localStorage.removeItem(ORG_KEY);
@@ -157,6 +168,10 @@ export async function signOut(): Promise<void> {
 
 export function adoptSession(kind: SessionKind = "legacy"): void {
   sessionRevision.update((revision) => revision + 1);
+  organizationCreationRevision = 0;
+  createdOrganizations.clear();
+  identityReadSequence = 0;
+  lastAppliedIdentityRead = 0;
   principal.set(null);
   organizations.set([]);
   localStorage.setItem(SESSION_KEY, "cookie");
@@ -200,6 +215,19 @@ export async function bootstrapSharedSession(): Promise<boolean> {
   return true;
 }
 
+/** Remember this session's create ACK without making an earlier /me authoritative over it. */
+export function recordCreatedOrganization(organization: Organization): void {
+  createdOrganizations.set(organization.id, {
+    organization,
+    revision: ++organizationCreationRevision,
+  });
+  organizations.update((all) =>
+    all.some((item) => item.id === organization.id)
+      ? all.map((item) => (item.id === organization.id ? organization : item))
+      : [...all, organization],
+  );
+}
+
 /** Load identity once per local session/origin, ignoring completions from a retired scope. */
 export function observeSessionIdentity(onError: (error: unknown) => void): () => void {
   let disposed = false;
@@ -210,16 +238,31 @@ export function observeSessionIdentity(onError: (error: unknown) => void): () =>
       organizations.set([]);
       return;
     }
+    const read = ++identityReadSequence;
+    const creationRevision = organizationCreationRevision;
     void api.me().then(
       (me) => {
-        if (disposed || !isCurrent()) return;
+        if (disposed || !isCurrent() || read < lastAppliedIdentityRead) return;
+        lastAppliedIdentityRead = read;
+        // Only a create acknowledged after this read began can supplement it.
+        // A later read may remove it; never union the old Organization list.
+        const additions = [...createdOrganizations.values()]
+          .filter(
+            ({ organization, revision }) =>
+              revision > creationRevision &&
+              !me.organizations.some((item) => item.id === organization.id),
+          )
+          .map(({ organization }) => organization);
         principal.set(me.principal);
-        organizations.set(me.organizations);
+        organizations.set(
+          additions.length > 0 ? [...me.organizations, ...additions] : me.organizations,
+        );
       },
       (error: unknown) => {
         if (
           !disposed &&
           isCurrent() &&
+          read >= lastAppliedIdentityRead &&
           (error as { isExpiredSession?: boolean }).isExpiredSession !== true
         )
           onError(error);

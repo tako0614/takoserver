@@ -148,6 +148,8 @@ const created = {
   createdAt: "2026-11-04T00:00:00Z",
 };
 let requests: Request[] = [];
+let identityReply: (() => Response | Promise<Response>) | null = null;
+const stopObservers: Array<() => void> = [];
 let reply: () => Response | Promise<Response> = () => Response.json({ organization: created });
 globalThis.fetch = Object.assign(
   async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -155,6 +157,7 @@ globalThis.fetch = Object.assign(
     requests.push(request);
     const path = new URL(request.url).pathname;
     if (request.method === "POST") return reply();
+    if (path === "/v1/me" && identityReply) return identityReply();
     if (path === "/v1/me")
       return Response.json({
         principal: {
@@ -226,6 +229,7 @@ const posts = () => requests.filter((request) => request.method === "POST");
 const toasts = () => body.all().filter((node) => node.className.startsWith("toast toast--"));
 
 beforeEach(async () => {
+  identityReply = null;
   globalThis.fetch = fixtureFetch;
   dismiss();
   state.setApiOrigin("https://api.example.test");
@@ -236,7 +240,10 @@ beforeEach(async () => {
   requests = [];
   reply = () => Response.json({ organization: created }, { status: 201 });
 });
-afterEach(() => dismiss());
+afterEach(() => {
+  dismiss();
+  for (const stop of stopObservers.splice(0)) stop();
+});
 afterAll(() => {
   for (const [name, descriptor] of saved) {
     if (descriptor) Object.defineProperty(globalThis, name, descriptor);
@@ -338,3 +345,133 @@ test("an older dismissed completion cannot close a newer current dialog", async 
   expect(state.organizations()).toBe(originalOrganizations);
   expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(1);
 });
+
+function identityResponse(rows = organizations): Response {
+  return Response.json({
+    principal: {
+      id: "owner",
+      provider: "local",
+      email: "owner@example.test",
+      displayName: "Owner",
+    },
+    organizations: rows,
+  });
+}
+
+for (const returned of ["old-list", "includes-created", "removes-old-org"] as const) {
+  test(`same-session pending identity preserves only new create ACKs (${returned})`, async () => {
+    const identity = deferred();
+    identityReply = () => identity.promise;
+    state.adoptSession();
+    state.organizations.set(organizations);
+    await tick();
+    openCreate().click();
+    await tick();
+    expect(state.currentOrganization()?.id).toBe(created.id);
+    const serverCreated = { ...created, name: "Server canonical name" };
+    identity.resolve(
+      identityResponse(
+        returned === "includes-created"
+          ? [...organizations, serverCreated]
+          : returned === "removes-old-org"
+            ? organizations.slice(0, 1)
+            : organizations,
+      ),
+    );
+    await tick();
+    expect(state.organizations().map((row) => row.id)).toEqual(
+      returned === "removes-old-org" ? ["org-a", "created-org"] : ["org-a", "org-b", "created-org"],
+    );
+    expect(state.organizations().filter((row) => row.id === created.id)).toHaveLength(1);
+    expect(state.currentOrganization()?.name).toBe(
+      returned === "includes-created" ? "Server canonical name" : "Fixture Org",
+    );
+    expect(requests.filter((request) => new URL(request.url).pathname === "/v1/me")).toHaveLength(
+      1,
+    );
+  });
+}
+
+test("later identity success can remove a created Org and cannot be overwritten by the older read", async () => {
+  const older = deferred();
+  const newer = deferred();
+  identityReply = () => older.promise;
+  state.adoptSession();
+  await tick();
+  openCreate().click();
+  await tick();
+  expect(state.currentOrganization()?.id).toBe(created.id);
+  identityReply = () => newer.promise;
+  stopObservers.push(
+    state.observeSessionIdentity(() => {
+      throw new Error("newer identity unexpectedly failed");
+    }),
+  );
+  newer.resolve(identityResponse(organizations.slice(0, 1)));
+  await tick();
+  expect(state.organizations().map((row) => row.id)).toEqual(["org-a"]);
+  older.resolve(identityResponse());
+  await tick();
+  expect(state.organizations().map((row) => row.id)).toEqual(["org-a"]);
+});
+
+test("a newer failed identity read does not discard a still-current older success", async () => {
+  const older = deferred();
+  const newer = deferred();
+  identityReply = () => older.promise;
+  state.adoptSession();
+  await tick();
+  openCreate().click();
+  await tick();
+  identityReply = () => newer.promise;
+  const failures: unknown[] = [];
+  stopObservers.push(state.observeSessionIdentity((error) => failures.push(error)));
+  newer.resolve(Response.json({ error: { code: "unavailable" } }, { status: 503 }));
+  await tick();
+  expect(failures).toHaveLength(1);
+  older.resolve(identityResponse());
+  await tick();
+  expect(state.organizations().map((row) => row.id)).toEqual(["org-a", "org-b", "created-org"]);
+});
+
+test("two acknowledged creates during one identity read are retained once each", async () => {
+  const identity = deferred();
+  identityReply = () => identity.promise;
+  state.adoptSession();
+  await tick();
+  openCreate().click();
+  await tick();
+  const second = { ...created, id: "created-second", name: "Second" };
+  reply = () => Response.json({ organization: second }, { status: 201 });
+  openCreate().click();
+  await tick();
+  identity.resolve(identityResponse());
+  await tick();
+  expect(state.organizations().map((row) => row.id)).toEqual([
+    "org-a",
+    "org-b",
+    "created-org",
+    "created-second",
+  ]);
+  expect(state.currentOrganization()?.id).toBe("created-second");
+});
+
+for (const kind of ["session", "origin"] as const) {
+  test(`a new ${kind} cannot inherit old create ACKs or identity responses`, async () => {
+    const older = deferred();
+    identityReply = () => older.promise;
+    state.adoptSession();
+    await tick();
+    openCreate().click();
+    await tick();
+    expect(state.currentOrganization()?.id).toBe(created.id);
+    identityReply = () => identityResponse([]);
+    if (kind === "origin") state.setApiOrigin("https://new.example.test");
+    state.adoptSession();
+    await tick();
+    older.resolve(identityResponse());
+    await tick();
+    expect(state.organizations()).toEqual([]);
+    expect(state.currentOrganization()).toBeNull();
+  });
+}
