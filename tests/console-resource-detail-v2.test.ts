@@ -463,11 +463,11 @@ test("overview leads with resources and shows the wallet once it is in use", asy
   const unfunded = await render("0");
   expect(unfunded).not.toContain("prepaid");
   expect(unfunded).not.toContain("Available");
-  expect(unfunded).not.toContain("Settled");
+  expect(unfunded).not.toContain("Current credit");
   expect(unfunded).toContain("Resources");
   const funded = await render("5000000");
   expect(funded).toContain("Available");
-  expect(funded).toContain("Settled");
+  expect(funded).toContain("Current credit");
   expect(funded.indexOf("Resources")).toBeLessThan(funded.indexOf("Available"));
   // A wallet that has been used keeps its cards when it is back at $0.
   const spent = await render("0", [
@@ -483,6 +483,114 @@ test("overview leads with resources and shows the wallet once it is in use", asy
   ]);
   expect(spent).toContain("Available");
   expect(spent).toContain("$0");
+});
+
+test.each([
+  {
+    name: "frozen credit is separate from available credit",
+    locale: "en" as const,
+    balances: { settledMicros: "90000000", frozenMicros: "40000000", refundReceivableMicros: "0" },
+    expected: ["Available $50", "Current credit $90", "Frozen $40", "Refund receivable $0"],
+    notice: null,
+  },
+  {
+    name: "positive refund debt blocks new billable work despite available credit",
+    locale: "en" as const,
+    balances: { settledMicros: "50000000", frozenMicros: "0", refundReceivableMicros: "60000000" },
+    expected: ["Available $50", "Current credit $50", "Frozen $0", "Refund receivable $60"],
+    notice: "New billable operations are blocked",
+  },
+  {
+    name: "debt-only wallets remain visible without recent ledger entries",
+    locale: "en" as const,
+    balances: {
+      availableMicros: "0",
+      settledMicros: "0",
+      frozenMicros: "0",
+      refundReceivableMicros: "60000000",
+    },
+    expected: ["Available $0", "Current credit $0", "Frozen $0", "Refund receivable $60"],
+    notice: "New billable operations are blocked",
+  },
+  {
+    name: "omitted refund fields stay unreported rather than zero",
+    locale: "en" as const,
+    balances: { settledMicros: "50000000" },
+    expected: [
+      "Available $50",
+      "Current credit $50",
+      "Frozen Not reported",
+      "Refund receivable Not reported",
+    ],
+    notice: "Available credit alone does not establish permission",
+  },
+  {
+    name: "Japanese overview retains the same refund restriction",
+    locale: "ja" as const,
+    balances: {
+      settledMicros: "90000000",
+      frozenMicros: "40000000",
+      refundReceivableMicros: "60000000",
+    },
+    expected: [
+      "利用可能 $50",
+      "現在のクレジット $90",
+      "返金処理中の凍結額 $40",
+      "返金未回収額 $60",
+    ],
+    notice: "利用可能残高があっても新しい課金操作はできません",
+  },
+])("overview wallet: $name", async ({ locale, balances, expected, notice }) => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  consoleLocale.set(locale);
+  setApiOrigin("https://api.example.test");
+  organizations.set([organization]);
+  selectOrganization(organization.id);
+  const walletPaths: string[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet")) {
+        walletPaths.push(path);
+        return Response.json({
+          wallet: {
+            organizationId: organization.id,
+            availableMicros: "50000000",
+            heldMicros: "0",
+            ...balances,
+            currency: "USD",
+            unit: "USD-micros",
+            moneyPolicy: "usd-micros-v2",
+            entries: [],
+          },
+        });
+      }
+      if (path.endsWith("/operations")) return Response.json({ operations: [] });
+      return Response.json({ items: [], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(overviewPage(organization) as unknown as NodeStub);
+  await settle();
+  expect(walletPaths).toEqual(["/v1/organizations/org-one/wallet"]);
+  for (const value of expected) expect(body.textContent).toContain(value);
+  const notices = body.all().filter((node) => node.attributes.get("role") === "status");
+  if (notice) expect(notices.some((node) => node.textContent.includes(notice))).toBe(true);
+  else expect(notices).toHaveLength(0);
+  expect(
+    body.all().some((node) => node.tag === "a" && node.attributes.get("href") === "/billing"),
+  ).toBe(true);
 });
 
 test("a By Form tile opens the list filtered to that exact Form", async () => {
