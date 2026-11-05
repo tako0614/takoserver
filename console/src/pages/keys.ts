@@ -2,8 +2,13 @@ import type { ApiKey } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../key-scopes.ts";
-import { effect, resource } from "../reactive.ts";
-import { api, captureSelectedOrganizationScope, hostV2Base } from "../state.ts";
+import { effect, resource, signal } from "../reactive.ts";
+import {
+  api,
+  captureSelectedOrganizationScope,
+  captureSessionScope,
+  hostV2Base,
+} from "../state.ts";
 import {
   badge,
   card,
@@ -25,6 +30,48 @@ const LIFETIMES: readonly { readonly label: () => string; readonly seconds: numb
   { label: () => tr("1年", "1 year"), seconds: 365 * 86_400 },
 ];
 
+interface UnshownKey {
+  readonly organizationId: string;
+  readonly id: string;
+  readonly name: string;
+  readonly isSessionCurrent: () => boolean;
+}
+
+// Same-tab recovery metadata only: never retain the secret or response object.
+// Reloading the tab drops these notices; the Host's key list remains authoritative.
+const unshownKeys = signal<readonly UnshownKey[]>([]);
+effect(() => {
+  const previous = unshownKeys();
+  const current = previous.filter((key) => key.isSessionCurrent());
+  if (current.length !== previous.length) unshownKeys.set(current);
+});
+
+function rememberUnshownKey(
+  key: ApiKey,
+  organizationId: string,
+  name: string,
+  isSessionCurrent: () => boolean,
+): void {
+  if (
+    !isSessionCurrent() ||
+    typeof key !== "object" ||
+    key === null ||
+    key.organizationId !== organizationId ||
+    typeof key.id !== "string" ||
+    key.id === "" ||
+    key.name !== name
+  )
+    return;
+  const metadata: UnshownKey = { organizationId, id: key.id, name, isSessionCurrent };
+  unshownKeys.update((previous) => [
+    ...previous.filter(
+      (item) =>
+        item.isSessionCurrent() && !(item.organizationId === organizationId && item.id === key.id),
+    ),
+    metadata,
+  ]);
+}
+
 /**
  * API keys, and the one moment their secret exists.
  *
@@ -33,6 +80,7 @@ const LIFETIMES: readonly { readonly label: () => string; readonly seconds: numb
  * by a stray click, because "I'll copy it in a second" is how people lose keys.
  */
 export function keysPage(organizationId: string): Child {
+  const isPageCurrent = captureSelectedOrganizationScope(organizationId);
   const keys = resource(() => api.apiKeys(organizationId));
   // Asked once per page. An already-open dialog follows the answer without
   // replacing the person's inputs; an unreadable document never offers AI.
@@ -68,6 +116,18 @@ export function keysPage(organizationId: string): Child {
       h(
         "button",
         {
+          class: "btn",
+          type: "button",
+          onClick: () => {
+            if (isPageCurrent()) keys.reload();
+          },
+        },
+        icon(ICON.refresh, 14),
+        text(tr("キー一覧を更新", "Refresh keys")),
+      ),
+      h(
+        "button",
+        {
           class: "btn btn--primary",
           type: "button",
           onClick: () => createKey(organizationId, keys.reload, aiAvailable, v2Endpoint()),
@@ -76,6 +136,61 @@ export function keysPage(organizationId: string): Child {
         text(tr("キーを作成", "Create key")),
       ),
     ),
+    live(() => {
+      const listed = keys.get();
+      if (!isPageCurrent() || listed.state !== "ready") return null;
+      // A local session marker is not remote authorization. Only show metadata
+      // already returned by this page's current owner-authorized key list.
+      return unshownKeys()
+        .filter(
+          (key) =>
+            key.isSessionCurrent() &&
+            key.organizationId === organizationId &&
+            listed.value.apiKeys.some(
+              (item) =>
+                item.organizationId === organizationId &&
+                item.id === key.id &&
+                item.name === key.name,
+            ),
+        )
+        .map((key) =>
+          h(
+            "div",
+            {
+              class: "notice notice--warn",
+              role: "status",
+              "aria-label": tr("シークレット未表示のAPIキー", "Unshown API key secret"),
+            },
+            icon(ICON.alert, 15),
+            h(
+              "div",
+              null,
+              h("strong", null, key.name),
+              h("div", { class: "mono" }, key.id),
+              h(
+                "p",
+                null,
+                tr(
+                  "作成は成功しましたが、シークレットの表示前にダイアログが閉じられました。再表示はできません。一覧でこのキーを失効し、必要なら新しいキーを作成してください。",
+                  "Creation succeeded, but the dialog closed before the secret was shown. It cannot be recovered. Revoke this key in the list, then create another if needed.",
+                ),
+              ),
+              h(
+                "button",
+                {
+                  class: "btn btn--sm",
+                  type: "button",
+                  onClick: () => {
+                    if (isPageCurrent() && key.isSessionCurrent())
+                      unshownKeys.update((items) => items.filter((item) => item !== key));
+                  },
+                },
+                tr("通知を閉じる", "Dismiss notice"),
+              ),
+            ),
+          ),
+        );
+    }),
     live(() =>
       whenReady(
         keys.get(),
@@ -207,6 +322,7 @@ function createKey(
   v2Endpoint: string,
 ): void {
   const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
+  const isSessionCurrent = captureSessionScope();
   const name = h("input", {
     class: "input",
     id: "create-key-name",
@@ -309,13 +425,17 @@ function createKey(
         toast(tr("スコープを1つ以上選択してください", "Choose at least one scope"), "bad");
         return;
       }
+      const requestedName = name.value.trim();
       try {
         const created = await api.createApiKey(organizationId, {
-          name: name.value.trim(),
+          name: requestedName,
           scopes: [...chosen],
           expiresInSeconds: Number(lifetime.value),
         });
-        if (!modal.isCurrent()) return;
+        if (!modal.isCurrent()) {
+          rememberUnshownKey(created.apiKey, organizationId, requestedName, isSessionCurrent);
+          return;
+        }
         modal.close();
         reload();
         revealSecret(organizationId, created.apiKey, created.secret, v2Endpoint, isScopeCurrent);

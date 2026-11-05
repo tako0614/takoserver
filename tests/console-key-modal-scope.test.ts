@@ -148,12 +148,13 @@ const existingKey = {
   expiresAt: "2099-01-01T00:00:00Z",
 };
 const created = {
-  apiKey: { id: "synthetic-key", name: "fixture-key", scopes: ["resources:write"] },
+  apiKey: { ...existingKey, id: "created-synthetic-key" },
   secret: "synthetic-key-secret",
 };
 let requests: Request[];
 let reply: (request: Request) => Response | Promise<Response>;
 let discoveryReply: () => Response | Promise<Response>;
+let keyListReply: (request: Request) => Response | Promise<Response>;
 
 function find(predicate: (node: TestNode) => boolean): TestNode {
   const result = body.all().find(predicate);
@@ -214,17 +215,15 @@ beforeEach(async () => {
   requests = [];
   reply = () => Response.json(created);
   discoveryReply = () => Response.json({ endpoints: {} });
+  keyListReply = () => Response.json({ apiKeys: [existingKey] });
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       requests.push(request);
       if (request.method === "POST" || request.method === "DELETE") return reply(request);
       if (new URL(request.url).pathname === "/.well-known/takoserver") return discoveryReply();
-      return Response.json(
-        new URL(request.url).pathname.endsWith("/api-keys")
-          ? { apiKeys: [existingKey] }
-          : { endpoints: {} },
-      );
+      if (new URL(request.url).pathname.endsWith("/api-keys")) return keyListReply(request);
+      return Response.json({ endpoints: {} });
     },
     { preconnect: originalFetch.preconnect },
   );
@@ -396,6 +395,203 @@ test("dismissing an in-flight create prevents late secret presentation", async (
   await tick();
   expect(secretVisible()).toBe(false);
   expect(reads()).toHaveLength(1);
+});
+
+const lostKey = { ...existingKey, id: "unshown-key" };
+const lostResult = { apiKey: lostKey, secret: "never-retain-this-synthetic-secret" };
+const keyNotices = () =>
+  body.all().filter((node) => node.attributes.get("aria-label") === "Unshown API key secret");
+
+async function revisitKeys(organizationId: string): Promise<void> {
+  state.selectOrganization(organizationId);
+  for (const node of body.all().filter((node) => node.className === "page")) node.remove();
+  render();
+  await tick();
+}
+
+test("returning to the original Org recovers only metadata confirmed by its owner key list", async () => {
+  const answer = deferred();
+  reply = () => answer.promise;
+  openCreate().click();
+  keyListReply = (request) =>
+    Response.json({ apiKeys: request.url.includes("/org-a/") ? [lostKey] : [] });
+  await revisitKeys("org-b");
+  answer.resolve(Response.json(lostResult, { status: 201 }));
+  await tick();
+  expect(keyNotices()).toHaveLength(0);
+  expect(body.textContent).not.toContain(lostKey.id);
+  expect(body.textContent).not.toContain(lostResult.secret);
+  expect(toasts()).toHaveLength(0);
+  expect(posts()).toHaveLength(1);
+  await revisitKeys("org-a");
+  expect(keyNotices()).toHaveLength(1);
+  expect(keyNotices()[0]?.textContent).toContain(lostKey.id);
+  expect(keyNotices()[0]?.textContent).toContain("Revoke");
+  expect(body.textContent).not.toContain(lostResult.secret);
+  expect([...storage.values()].join(" ")).not.toContain(lostResult.secret);
+  expect(posts()).toHaveLength(1);
+  expect(deletions()).toHaveLength(0);
+});
+
+test("a dismissed successful create becomes actionable after an explicit owner-list refresh", async () => {
+  const answer = deferred();
+  reply = () => answer.promise;
+  openCreate().click();
+  dismiss();
+  answer.resolve(Response.json(lostResult, { status: 201 }));
+  await tick();
+  expect(keyNotices()).toHaveLength(0);
+  expect(reads()).toHaveLength(1);
+  keyListReply = () => Response.json({ apiKeys: [lostKey] });
+  find((node) => node.tag === "button" && node.textContent.includes("Refresh keys")).click();
+  await tick();
+  expect(keyNotices()).toHaveLength(1);
+  expect(reads()).toHaveLength(2);
+  expect(posts()).toHaveLength(1);
+  expect(body.textContent).not.toContain(lostResult.secret);
+});
+
+test("multiple retired successes are retained without overwriting another key", async () => {
+  const first = deferred();
+  reply = () => first.promise;
+  openCreate().click();
+  dismiss();
+  const second = deferred();
+  reply = () => second.promise;
+  openCreate().click();
+  dismiss();
+  const otherKey = { ...lostKey, id: "another-unshown-key" };
+  second.resolve(Response.json({ ...lostResult, apiKey: otherKey }, { status: 201 }));
+  first.resolve(Response.json(lostResult, { status: 201 }));
+  await tick();
+  keyListReply = () => Response.json({ apiKeys: [lostKey, otherKey] });
+  await revisitKeys("org-a");
+  expect(keyNotices()).toHaveLength(2);
+  expect(
+    keyNotices()
+      .map((node) => node.textContent)
+      .join(" "),
+  ).toContain(lostKey.id);
+  expect(
+    keyNotices()
+      .map((node) => node.textContent)
+      .join(" "),
+  ).toContain(otherKey.id);
+  expect(body.textContent).not.toContain(lostResult.secret);
+  expect(posts()).toHaveLength(2);
+  expect(deletions()).toHaveLength(0);
+});
+
+async function finishUnshownCreate(): Promise<void> {
+  const answer = deferred();
+  reply = () => answer.promise;
+  openCreate().click();
+  dismiss();
+  answer.resolve(Response.json(lostResult, { status: 201 }));
+  await tick();
+}
+
+for (const kind of ["session", "origin"] as const) {
+  test(`unshown metadata cannot cross a ${kind} change even with a matching list`, async () => {
+    await finishUnshownCreate();
+    changeScope(kind);
+    state.organizations.set(organizations);
+    keyListReply = () => Response.json({ apiKeys: [lostKey] });
+    await revisitKeys("org-a");
+    expect(keyNotices()).toHaveLength(0);
+    expect(body.textContent).not.toContain(lostResult.secret);
+    expect(posts()).toHaveLength(1);
+  });
+
+  test(`late successful create cannot record metadata after a ${kind} change`, async () => {
+    const answer = deferred();
+    reply = () => answer.promise;
+    openCreate().click();
+    changeScope(kind);
+    state.organizations.set(organizations);
+    answer.resolve(Response.json(lostResult, { status: 201 }));
+    await tick();
+    keyListReply = () => Response.json({ apiKeys: [lostKey] });
+    await revisitKeys("org-a");
+    expect(keyNotices()).toHaveLength(0);
+    expect(body.textContent).not.toContain(lostResult.secret);
+    expect(posts()).toHaveLength(1);
+  });
+}
+
+test("owner list refusal hides metadata and an explicit successful read recovers it", async () => {
+  await finishUnshownCreate();
+  keyListReply = () => Response.json({ error: { code: "forbidden" } }, { status: 403 });
+  await revisitKeys("org-a");
+  expect(keyNotices()).toHaveLength(0);
+  expect(body.textContent).not.toContain(lostKey.id);
+  const answer = deferred();
+  keyListReply = () => answer.promise;
+  find((node) => node.tag === "button" && node.textContent.includes("Refresh keys")).click();
+  await tick();
+  expect(keyNotices()).toHaveLength(0);
+  answer.resolve(Response.json({ apiKeys: [lostKey] }));
+  await tick();
+  expect(keyNotices()).toHaveLength(1);
+  expect(posts()).toHaveLength(1);
+  expect(deletions()).toHaveLength(0);
+});
+
+for (const mismatch of ["organizationId", "id", "name"] as const) {
+  test(`owner list ${mismatch} mismatch cannot disclose unshown metadata`, async () => {
+    await finishUnshownCreate();
+    keyListReply = () => Response.json({ apiKeys: [{ ...lostKey, [mismatch]: "different" }] });
+    await revisitKeys("org-a");
+    expect(keyNotices()).toHaveLength(0);
+    expect(body.textContent).not.toContain(lostResult.secret);
+    expect(posts()).toHaveLength(1);
+  });
+}
+
+for (const mismatch of ["organizationId", "name"] as const) {
+  test(`late result ${mismatch} mismatch cannot create a recovery notice`, async () => {
+    const answer = deferred();
+    reply = () => answer.promise;
+    openCreate().click();
+    dismiss();
+    answer.resolve(
+      Response.json(
+        { ...lostResult, apiKey: { ...lostKey, [mismatch]: "different" } },
+        { status: 201 },
+      ),
+    );
+    await tick();
+    keyListReply = () => Response.json({ apiKeys: [lostKey] });
+    await revisitKeys("org-a");
+    expect(keyNotices()).toHaveLength(0);
+    expect(body.textContent).not.toContain(lostResult.secret);
+  });
+}
+
+test("notice dismissal is local and cannot be invoked from a retired Org page", async () => {
+  await finishUnshownCreate();
+  keyListReply = (request) =>
+    Response.json({ apiKeys: request.url.includes("/org-a/") ? [lostKey] : [] });
+  await revisitKeys("org-a");
+  const oldDismiss = find((node) => node.tag === "button" && node.textContent === "Dismiss notice");
+  const oldRefresh = find(
+    (node) => node.tag === "button" && node.textContent.includes("Refresh keys"),
+  );
+  await revisitKeys("org-b");
+  const before = requests.length;
+  oldDismiss.click();
+  oldRefresh.click();
+  await tick();
+  expect(requests).toHaveLength(before);
+  expect(keyNotices()).toHaveLength(0);
+  await revisitKeys("org-a");
+  expect(keyNotices()).toHaveLength(1);
+  const beforeDismiss = requests.length;
+  find((node) => node.tag === "button" && node.textContent === "Dismiss notice").click();
+  await tick();
+  expect(keyNotices()).toHaveLength(0);
+  expect(requests).toHaveLength(beforeDismiss);
+  expect(deletions()).toHaveLength(0);
 });
 
 test("a current failed create still reports the refusal without a secret or retry", async () => {
