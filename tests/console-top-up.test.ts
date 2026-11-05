@@ -1210,6 +1210,7 @@ function workspaceUsageBody(
   workspaces: readonly string[],
   cursor: string | null,
   snapshotAt = "2026-10-15T00:00:00.000Z",
+  rowAmounts = { usedMicros: "1000000", pendingMicros: "0" },
 ) {
   return {
     organizationId,
@@ -1228,9 +1229,8 @@ function workspaceUsageBody(
     },
     workspaces: workspaces.map((workspaceRef) => ({
       workspaceRef,
-      usedMicros: "1000000",
+      ...rowAmounts,
       heldMicros: "0",
-      pendingMicros: "0",
     })),
     unattributed: { usedMicros: "2000000", heldMicros: "0", pendingMicros: "0" },
     cursor,
@@ -1246,7 +1246,10 @@ describe("billing page Workspace usage", () => {
         queries.push(url.search);
         return Response.json(
           url.searchParams.has("cursor")
-            ? workspaceUsageBody(["ws_c"], null)
+            ? workspaceUsageBody(["ws_c"], null, undefined, {
+                usedMicros: "5000000",
+                pendingMicros: "250000",
+              })
             : workspaceUsageBody(["ws_a", "ws_b"], "next_page"),
         );
       },
@@ -1278,7 +1281,10 @@ describe("billing page Workspace usage", () => {
         return Response.json(
           firstPages === 1
             ? workspaceUsageBody(["ws_old"], "stale")
-            : workspaceUsageBody(["ws_new"], null, "2026-10-15T00:11:00.000Z"),
+            : workspaceUsageBody(["ws_new"], null, "2026-10-15T00:11:00.000Z", {
+                usedMicros: "7000000",
+                pendingMicros: "250000",
+              }),
         );
       },
     });
@@ -1303,13 +1309,60 @@ describe("billing page Workspace usage", () => {
       workspaceUsage: () =>
         ++reads === 1
           ? Response.json({ error: { code: "billing_unavailable" } }, { status: 503 })
-          : Response.json(workspaceUsageBody([], null)),
+          : Response.json({
+              ...workspaceUsageBody([], null),
+              totals: { usedMicros: "2000000", heldMicros: "0", pendingMicros: "0" },
+            }),
     });
     expect(failing.root.textContent).toContain("Workspace usage");
     await failing.click("Try again");
     expect(reads).toBe(2);
     expect(failing.root.textContent).toContain("No Workspace-attributed usage in this period.");
   });
+
+  test.each(["4000000", "6000000"])(
+    "a terminal page with non-reconciling usage %s preserves rows until manual retry",
+    async (invalidUsedMicros) => {
+      const queries: string[] = [];
+      let repaired = false;
+      const page = await billingPageFor({
+        subscription: "hosted",
+        workspaceUsage: (url) => {
+          queries.push(url.search);
+          return Response.json(
+            url.searchParams.has("cursor")
+              ? workspaceUsageBody(["ws_c"], null, undefined, {
+                  usedMicros: repaired ? "5000000" : invalidUsedMicros,
+                  pendingMicros: "250000",
+                })
+              : workspaceUsageBody(["ws_a", "ws_b"], "next_page"),
+          );
+        },
+      });
+      const usageText = () =>
+        page.root
+          .all()
+          .find(
+            (node) =>
+              node.tag === "section" && node.children[0]?.textContent.startsWith("Workspace usage"),
+          )?.textContent;
+      await page.click("Load more");
+      expect(usageText()).toContain("ws_a");
+      expect(usageText()).toContain("ws_b");
+      expect(usageText()).not.toContain("ws_c");
+      expect(usageText()).toContain("invalid_response");
+      expect(usageText()).toContain("Try again");
+      expect(queries).toEqual(["", "?cursor=next_page"]);
+
+      repaired = true;
+      await page.click("Try again");
+      expect(usageText()).toContain("ws_c");
+      expect(usageText()).not.toContain("invalid_response");
+      expect(usageText()).not.toContain("Try again");
+      expect(usageText()).not.toContain("Load more");
+      expect(queries).toEqual(["", "?cursor=next_page", "?cursor=next_page"]);
+    },
+  );
 });
 
 function deferredBillingResponse() {
