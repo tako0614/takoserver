@@ -360,15 +360,49 @@ function renderSelection(
   const locale = consoleLocale() === "ja" ? "ja-JP" : "en-US";
   const plans = subscriptionPlanOptions(subscription.planTable, locale);
   const available = formatMicrosCurrency(wallet.availableMicros, wallet.currency, locale);
+  const money = (micros: string | undefined) =>
+    micros === undefined
+      ? tr("未報告", "Not reported")
+      : formatMicrosCurrency(micros, wallet.currency, locale);
   const locked = preparation !== null;
   const preparationStatus = preparation ? renderPreparationState(preparation) : null;
-  const actions: Child[] = [
+  const walletFacts: Child[] = [
     h(
       "p",
       { role: "status" },
       tr(`利用可能残高: ${available}`, `Available wallet balance: ${available}`),
     ),
+    h(
+      "dl",
+      null,
+      ...[
+        [tr("現在のクレジット", "Current credit"), money(wallet.settledMicros)],
+        [tr("確保中", "Held"), money(wallet.heldMicros)],
+        [tr("返金処理中の凍結額", "Frozen"), money(wallet.frozenMicros)],
+        [tr("返金未回収額", "Refund receivable"), money(wallet.refundReceivableMicros)],
+      ].map(([label, amount]) => h("div", null, h("dt", null, label, ": "), h("dd", null, amount))),
+    ),
+    wallet.refundReceivableMicros === undefined
+      ? h(
+          "p",
+          { class: "notice notice--warn", role: "status" },
+          tr(
+            "返金未回収額は未報告です。利用可能残高だけでは新しい課金操作の可否は分かりません。操作時にHostが判定します。",
+            "Refund debt was not reported. Available credit alone does not establish permission for new billable operations; the Host decides when an operation is requested.",
+          ),
+        )
+      : BigInt(wallet.refundReceivableMicros) > 0n
+        ? h(
+            "p",
+            { class: "notice notice--bad", role: "status" },
+            tr(
+              "返金未回収額が残っているため、利用可能残高があっても新しい課金操作はできません。",
+              "New billable operations are blocked while a refund receivable remains, even when available credit is positive.",
+            ),
+          )
+        : null,
   ];
+  const actions: Child[] = [];
 
   if (capabilities.topUps && usage) {
     const amount = h("input", {
@@ -491,7 +525,7 @@ function renderSelection(
     );
   }
 
-  if (actions.length === 1)
+  if (actions.length === 0)
     actions.push(
       h(
         "p",
@@ -506,6 +540,7 @@ function renderSelection(
       "aria-label": tr("請求操作の選択", "Choose a billing action"),
     },
     h("h2", null, tr("現在の請求情報から選択", "Choose from current billing facts")),
+    ...walletFacts,
     ...actions,
     preparationStatus,
   );

@@ -556,6 +556,154 @@ test("view selection uses the locked organization reads and prepares a bounded t
   expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
 });
 
+test.each([
+  {
+    name: "frozen credit stays separate from available credit",
+    locale: "en" as const,
+    balances: { settledMicros: "14345678", frozenMicros: "2000000", refundReceivableMicros: "0" },
+    expected: [
+      "Current credit: $14.345678",
+      "Held: $2.345678",
+      "Frozen: $2",
+      "Refund receivable: $0",
+    ],
+    notice: null,
+  },
+  {
+    name: "known debt warns despite available credit",
+    locale: "en" as const,
+    balances: { frozenMicros: "0", refundReceivableMicros: "6000000" },
+    expected: [
+      "Current credit: $12.345678",
+      "Held: $2.345678",
+      "Frozen: $0",
+      "Refund receivable: $6",
+    ],
+    notice: "New billable operations are blocked",
+  },
+  {
+    name: "omitted refund fields remain unknown",
+    locale: "en" as const,
+    balances: { frozenMicros: undefined, refundReceivableMicros: undefined },
+    expected: [
+      "Current credit: $12.345678",
+      "Frozen: Not reported",
+      "Refund receivable: Not reported",
+    ],
+    notice: "Available credit alone does not establish permission",
+  },
+  {
+    name: "reported zero debt does not show a restriction",
+    locale: "en" as const,
+    balances: { frozenMicros: "0", refundReceivableMicros: "0" },
+    expected: ["Frozen: $0", "Refund receivable: $0"],
+    notice: null,
+  },
+  {
+    name: "Japanese selection discloses the same debt",
+    locale: "ja" as const,
+    balances: { frozenMicros: "0", refundReceivableMicros: "6000000" },
+    expected: [
+      "現在のクレジット: $12.345678",
+      "確保中: $2.345678",
+      "返金処理中の凍結額: $0",
+      "返金未回収額: $6",
+    ],
+    notice: "利用可能残高があっても新しい課金操作はできません",
+  },
+  {
+    name: "unavailable actions retain their explanation alongside wallet facts",
+    locale: "en" as const,
+    balances: { frozenMicros: "0", refundReceivableMicros: "0" },
+    expected: ["Frozen: $0", "Refund receivable: $0"],
+    notice: null,
+    noActions: true,
+  },
+])(
+  "continuation wallet disclosure: $name",
+  async ({ locale, balances, expected, notice, noActions }) => {
+    const { body, session } = installDom();
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const previousLocale = consoleLocale();
+    consoleLocale.set(locale);
+    try {
+      const requests: string[] = [];
+      globalThis.fetch = Object.assign(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(input)).pathname;
+          const method = init?.method ?? "GET";
+          requests.push(`${method} ${path}`);
+          if (method !== "GET") throw new Error("unexpected mutation");
+          if (path === `/v1/billing/hosted-continuations/${selector}`)
+            return Response.json(viewResponse());
+          if (path === "/v1/organizations/org-17/payments/subscription")
+            return Response.json(
+              subscriptionResponse(
+                null,
+                noActions
+                  ? {
+                      ...capabilities,
+                      topUps: false,
+                      subscriptionStart: false,
+                      subscriptionCancellation: false,
+                      subscriptionPlanChange: false,
+                    }
+                  : capabilities,
+              ),
+            );
+          if (path === "/v1/organizations/org-17/wallet")
+            return Response.json({ wallet: { ...walletResponse().wallet, ...balances } });
+          throw new Error(`unexpected request: ${path}`);
+        },
+        { preconnect: unexpectedPreconnect },
+      );
+      const { setApiOrigin } = await import("../console/src/state.ts");
+      const { hostedBillingContinuationPage } = await import(
+        "../console/src/pages/hosted-billing-continuation.ts"
+      );
+      setApiOrigin("https://api.example.test");
+      body.append(hostedBillingContinuationPage(selector) as unknown as TestNode);
+      await settle();
+      expect(body.textContent).toContain(
+        locale === "en" ? "Available wallet balance: $10" : "利用可能残高: $10",
+      );
+      for (const value of expected) expect(body.textContent).toContain(value);
+      const warnings = body.all().filter((node) => node.className.startsWith("notice "));
+      if (notice) expect(warnings.some((node) => node.textContent.includes(notice))).toBe(true);
+      else expect(warnings).toHaveLength(0);
+      if (noActions) {
+        expect(body.textContent).toContain("No billing action is currently available.");
+        expect(
+          body
+            .all()
+            .filter((node) => node.tag === "button" && node.textContent.startsWith("Prepare")),
+        ).toHaveLength(0);
+      } else {
+        // Disclosure does not add a new permission check or bypass explicit consent.
+        const consentText =
+          locale === "en"
+            ? "I consent to continue to interactive Checkout."
+            : "対話型Checkoutへ進むことに同意します。";
+        const consent = findByAttribute(body, "input", "aria-label", consentText);
+        const prepare = findButton(body, locale === "en" ? "Prepare top-up" : "チャージを準備");
+        expect(prepare?.disabled).toBe(true);
+        if (!consent || !prepare) throw new Error("existing selection controls missing");
+        consent.checked = true;
+        consent.change();
+        expect(prepare.disabled).toBe(false);
+      }
+      expect(requests).toEqual([
+        `GET /v1/billing/hosted-continuations/${selector}`,
+        "GET /v1/organizations/org-17/payments/subscription",
+        "GET /v1/organizations/org-17/wallet",
+      ]);
+      expect(session.size).toBe(0);
+    } finally {
+      consoleLocale.set(previousLocale);
+    }
+  },
+);
+
 test("selected subscription facts gate start, cancel and plan-change choices", async () => {
   const { body } = installDom();
   const currentSubscription = {
