@@ -25,7 +25,7 @@ import {
   sendResourceIntent,
 } from "../resource-intent.ts";
 import { health } from "../resource-state.ts";
-import { linkProps, navigate, resourcePath } from "../router.ts";
+import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, captureSelectedOrganizationScope } from "../state.ts";
 import { copyable, explain, type ModalOptions, openModal, toast } from "../ui.ts";
 
@@ -49,6 +49,8 @@ function openScopedResourceModal(
   options: ModalOptions,
   isScopeCurrent: () => boolean,
 ): ResourceModal {
+  const openedRoute = route();
+  const isCurrent = (): boolean => route() === openedRoute && isScopeCurrent();
   let open = true;
   let stop = (): void => {};
   const lifetime: { close: (() => void) | null } = { close: null };
@@ -62,9 +64,9 @@ function openScopedResourceModal(
     },
   });
   lifetime.close = close;
-  stop = watchResourceModalScope(isScopeCurrent, lifetime);
+  stop = watchResourceModalScope(isCurrent, lifetime);
   if (!open) stop();
-  return { close, isCurrent: () => open && isScopeCurrent() };
+  return { close, isCurrent: () => open && isCurrent() };
 }
 
 /** Do not retain the dialog after its scope watcher has been disposed. */

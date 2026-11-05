@@ -2531,16 +2531,124 @@ for (const change of ["session", "origin"] as const) {
   });
 }
 
-for (const action of ["create", "update", "delete"] as const) {
-  for (const outcome of ["accepted", "unknown", "refused"] as const) {
-    if (action === "delete" && outcome === "refused") continue;
-    test(`a late ${action} ${outcome} cannot navigate the replacement session`, async () => {
-      const { body, route, selectOrganization } = await setup();
-      const state = await import("../console/src/state.ts");
+for (const scopeChange of ["session", "route", "route-round-trip"] as const) {
+  for (const action of ["create", "update", "delete"] as const) {
+    for (const outcome of ["accepted", "unknown", "refused"] as const) {
+      if (action === "delete" && outcome === "refused") continue;
+      test(`a late ${action} ${outcome} cannot navigate the replacement ${scopeChange}`, async () => {
+        const { body, route, selectOrganization } = await setup();
+        const state = await import("../console/src/state.ts");
+        const mutations = await import("../console/src/pages/create-resource.ts");
+        const intents = await import("../console/src/resource-intent.ts");
+        const originalPrepare = intents.prepareResourceIntent;
+        const captured: { value?: ReturnType<typeof originalPrepare> } = {};
+        const writes: Request[] = [];
+        let finish: ((response: Response) => void) | undefined;
+        globalThis.fetch = Object.assign(
+          async (input: RequestInfo | URL, init?: RequestInit) => {
+            const request = new Request(input, init);
+            const url = new URL(request.url);
+            if (request.method !== "GET") {
+              writes.push(request);
+              return new Promise<Response>((resolve) => {
+                finish = resolve;
+              });
+            }
+            if (url.pathname.endsWith("/support"))
+              return Response.json({ form, supported: true, operations: ["create"] });
+            if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+            return Response.json({ items: [], nextCursor: null });
+          },
+          { preconnect: globalThis.fetch.preconnect },
+        );
+        if (action === "create") {
+          mutations.createResource("org-console");
+          await settle();
+          const inputs = body.all().filter((node) => node.tag === "input");
+          if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
+          inputs[0].value = form;
+          inputs[1].value = "held-original";
+        } else if (action === "update") mutations.updateResource("org-console", one);
+        else mutations.deleteResource("org-console", one);
+        await settle();
+        const capture = spyOn(intents, "prepareResourceIntent").mockImplementation((...args) => {
+          const intent = originalPrepare(...args);
+          captured.value = intent;
+          return intent;
+        });
+        try {
+          button(
+            body,
+            action === "create" ? "Create" : action === "update" ? "Update" : "Delete resource",
+          ).click();
+          await settle();
+        } finally {
+          capture.mockRestore();
+        }
+        if (!captured.value) throw new Error("actual original intent was not captured");
+        expect(writes).toHaveLength(1);
+        if (!finish) throw new Error("write was not pending");
+        const roster = state.organizations();
+        const identity = state.principal();
+        if (scopeChange === "session" && outcome === "refused") button(body, "Cancel").click();
+        else if (scopeChange === "session") {
+          state.adoptSession();
+          state.organizations.set(roster);
+          state.principal.set(identity);
+          selectOrganization("org-console");
+        }
+        const { navigate } = await import("../console/src/router.ts");
+        navigate("/settings");
+        if (scopeChange === "route-round-trip") navigate("/resources");
+        const destination = scopeChange === "route-round-trip" ? "/resources" : "/settings";
+        finish(
+          outcome === "accepted"
+            ? Response.json(
+                { ...op, action, generation: action === "create" ? 1 : one.generation + 1 },
+                { status: 202 },
+              )
+            : outcome === "unknown"
+              ? Response.json({ error: { code: "unavailable" } }, { status: 503 })
+              : Response.json({ error: { code: "forbidden" } }, { status: 403 }),
+        );
+        await settle();
+        if (outcome === "accepted") {
+          expect(captured.value.operationId).toBe(op.id);
+          expect(captured.value.uncertain).toBe(false);
+        } else if (outcome === "unknown") {
+          expect(captured.value.operationId).toBeNull();
+          expect(captured.value.uncertain).toBe(true);
+        } else {
+          const { ApiError } = await import("../console/src/api.ts");
+          // The actual stale callback must already have retired the refused record.
+          expect(
+            intents.discardRefusedResourceIntent(
+              captured.value.id,
+              new ApiError("forbidden", 403, "fixture-refusal"),
+            ),
+          ).toBe(false);
+          await expect(intents.sendResourceIntent(captured.value.id)).rejects.toMatchObject({
+            code: "intent_missing",
+          });
+        }
+        expect(captured.value.inFlight).toBe(false);
+        expect(route().path).toBe(destination);
+        expect(route().query.has("operation")).toBe(false);
+        expect(route().query.has("acceptance")).toBe(false);
+        expect(writes).toHaveLength(1);
+        expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(
+          0,
+        );
+      });
+    }
+  }
+}
+
+for (const retire of ["dismissing", "leaving"] as const) {
+  for (const action of ["create", "update", "delete"] as const) {
+    test(`${retire} ${action} during replay discovery prevents its later mutation`, async () => {
+      const { body } = await setup();
       const mutations = await import("../console/src/pages/create-resource.ts");
-      const intents = await import("../console/src/resource-intent.ts");
-      const originalPrepare = intents.prepareResourceIntent;
-      const captured: { value?: ReturnType<typeof originalPrepare> } = {};
       const writes: Request[] = [];
       let finish: ((response: Response) => void) | undefined;
       globalThis.fetch = Object.assign(
@@ -2549,13 +2657,14 @@ for (const action of ["create", "update", "delete"] as const) {
           const url = new URL(request.url);
           if (request.method !== "GET") {
             writes.push(request);
-            return new Promise<Response>((resolve) => {
-              finish = resolve;
-            });
+            return Response.json({ ...op, action }, { status: 202 });
           }
           if (url.pathname.endsWith("/support"))
             return Response.json({ form, supported: true, operations: ["create"] });
-          if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+          if (url.pathname === "/.well-known/takoform/v2")
+            return new Promise<Response>((resolve) => {
+              finish = resolve;
+            });
           return Response.json({ items: [], nextCursor: null });
         },
         { preconnect: globalThis.fetch.preconnect },
@@ -2570,119 +2679,23 @@ for (const action of ["create", "update", "delete"] as const) {
       } else if (action === "update") mutations.updateResource("org-console", one);
       else mutations.deleteResource("org-console", one);
       await settle();
-      const capture = spyOn(intents, "prepareResourceIntent").mockImplementation((...args) => {
-        const intent = originalPrepare(...args);
-        captured.value = intent;
-        return intent;
-      });
-      try {
-        button(
-          body,
-          action === "create" ? "Create" : action === "update" ? "Update" : "Delete resource",
-        ).click();
-        await settle();
-      } finally {
-        capture.mockRestore();
-      }
-      if (!captured.value) throw new Error("actual original intent was not captured");
-      expect(writes).toHaveLength(1);
-      if (!finish) throw new Error("write was not pending");
-      const roster = state.organizations();
-      const identity = state.principal();
-      if (outcome === "refused") button(body, "Cancel").click();
-      else {
-        state.adoptSession();
-        state.organizations.set(roster);
-        state.principal.set(identity);
-        selectOrganization("org-console");
-      }
-      route.set({ path: "/settings", segments: ["settings"], query: new URLSearchParams() });
-      finish(
-        outcome === "accepted"
-          ? Response.json(
-              { ...op, action, generation: action === "create" ? 1 : one.generation + 1 },
-              { status: 202 },
-            )
-          : outcome === "unknown"
-            ? Response.json({ error: { code: "unavailable" } }, { status: 503 })
-            : Response.json({ error: { code: "forbidden" } }, { status: 403 }),
-      );
+      button(
+        body,
+        action === "create" ? "Create" : action === "update" ? "Update" : "Delete resource",
+      ).click();
       await settle();
-      if (outcome === "accepted") {
-        expect(captured.value.operationId).toBe(op.id);
-        expect(captured.value.uncertain).toBe(false);
-      } else if (outcome === "unknown") {
-        expect(captured.value.operationId).toBeNull();
-        expect(captured.value.uncertain).toBe(true);
-      } else {
-        const { ApiError } = await import("../console/src/api.ts");
-        // The actual stale callback must already have retired the refused record.
-        expect(
-          intents.discardRefusedResourceIntent(
-            captured.value.id,
-            new ApiError("forbidden", 403, "fixture-refusal"),
-          ),
-        ).toBe(false);
-        await expect(intents.sendResourceIntent(captured.value.id)).rejects.toMatchObject({
-          code: "intent_missing",
-        });
+      if (!finish) throw new Error("replay discovery was not pending");
+      if (retire === "dismissing") button(body, "Cancel").click();
+      else {
+        const { navigate } = await import("../console/src/router.ts");
+        navigate("/settings");
       }
-      expect(captured.value.inFlight).toBe(false);
-      expect(route().path).toBe("/settings");
-      expect(route().query.has("operation")).toBe(false);
-      expect(route().query.has("acceptance")).toBe(false);
-      expect(writes).toHaveLength(1);
+      finish(Response.json(discovery));
+      await settle();
+      expect(writes).toHaveLength(0);
       expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(0);
     });
   }
-}
-
-for (const action of ["create", "update", "delete"] as const) {
-  test(`dismissing ${action} during replay discovery prevents its later mutation`, async () => {
-    const { body } = await setup();
-    const mutations = await import("../console/src/pages/create-resource.ts");
-    const writes: Request[] = [];
-    let finish: ((response: Response) => void) | undefined;
-    globalThis.fetch = Object.assign(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
-        const request = new Request(input, init);
-        const url = new URL(request.url);
-        if (request.method !== "GET") {
-          writes.push(request);
-          return Response.json({ ...op, action }, { status: 202 });
-        }
-        if (url.pathname.endsWith("/support"))
-          return Response.json({ form, supported: true, operations: ["create"] });
-        if (url.pathname === "/.well-known/takoform/v2")
-          return new Promise<Response>((resolve) => {
-            finish = resolve;
-          });
-        return Response.json({ items: [], nextCursor: null });
-      },
-      { preconnect: globalThis.fetch.preconnect },
-    );
-    if (action === "create") {
-      mutations.createResource("org-console");
-      await settle();
-      const inputs = body.all().filter((node) => node.tag === "input");
-      if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
-      inputs[0].value = form;
-      inputs[1].value = "held-original";
-    } else if (action === "update") mutations.updateResource("org-console", one);
-    else mutations.deleteResource("org-console", one);
-    await settle();
-    button(
-      body,
-      action === "create" ? "Create" : action === "update" ? "Update" : "Delete resource",
-    ).click();
-    await settle();
-    if (!finish) throw new Error("replay discovery was not pending");
-    button(body, "Cancel").click();
-    finish(Response.json(discovery));
-    await settle();
-    expect(writes).toHaveLength(0);
-    expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(0);
-  });
 }
 
 test("explicit recovery after a same-session Organization round trip retains the exact original request", async () => {
