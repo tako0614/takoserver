@@ -1,4 +1,9 @@
-import type { WorkspaceUsageAmounts, WorkspaceUsagePage, WorkspaceUsageRow } from "./api.ts";
+import {
+  ApiError,
+  type WorkspaceUsageAmounts,
+  type WorkspaceUsagePage,
+  type WorkspaceUsageRow,
+} from "./api.ts";
 import { signal } from "./reactive.ts";
 
 /** What every page of one snapshot must repeat exactly. */
@@ -59,6 +64,26 @@ export function createWorkspaceUsageController(options: WorkspaceUsageController
     ...(cursor === undefined ? {} : { cursor }),
   });
   let generation = 0;
+  // This controller requests the whole Organization, without a Workspace filter.
+  // Partial rows are a subset; once cursor is null, every amount must reconcile.
+  const assertRows = (
+    snapshot: WorkspaceUsageSnapshot,
+    rows: readonly WorkspaceUsageRow[],
+    complete: boolean,
+  ): void => {
+    for (const field of ["usedMicros", "heldMicros", "pendingMicros"] as const) {
+      const listed =
+        rows.reduce((sum, row) => sum + BigInt(row[field]), 0n) +
+        BigInt(snapshot.unattributed[field]);
+      const total = BigInt(snapshot.totals[field]);
+      if (complete ? listed !== total : listed > total)
+        throw new ApiError(
+          "invalid_response",
+          200,
+          `/v1/organizations/${encodeURIComponent(options.organizationId)}/wallet/usage-summary/workspaces`,
+        );
+    }
+  };
 
   const load = async (restarted: boolean): Promise<void> => {
     if (!isCurrent()) return;
@@ -67,9 +92,11 @@ export function createWorkspaceUsageController(options: WorkspaceUsageController
     try {
       const page = await options.api.workspaceUsage(options.organizationId, query());
       if (mine !== generation || !isCurrent()) return;
+      const snapshot = snapshotOf(page);
+      assertRows(snapshot, page.workspaces, page.cursor === null);
       current.set({
         status: "ready",
-        snapshot: snapshotOf(page),
+        snapshot,
         rows: page.workspaces,
         cursor: page.cursor,
         more: { status: "idle" },
@@ -118,9 +145,19 @@ export function createWorkspaceUsageController(options: WorkspaceUsageController
       await load(true);
       return;
     }
+    const rows = [...shown.rows, ...page.workspaces];
+    try {
+      assertRows(shown.snapshot, rows, page.cursor === null);
+    } catch (error) {
+      current.set({
+        ...shown,
+        more: { status: "error", error: asError(error) },
+      });
+      return;
+    }
     current.set({
       ...shown,
-      rows: [...shown.rows, ...page.workspaces],
+      rows,
       cursor: page.cursor,
       more: { status: "idle" },
     });
