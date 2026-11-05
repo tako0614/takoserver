@@ -116,7 +116,7 @@ export function resourcesPage(organizationId: string): Child {
   // Stop once this page has gone: rebuilt, another route, another
   // organization, or no document at all (a test that has finished).
   const stillShown = (): boolean =>
-    followToken === followGeneration &&
+    isCurrentPage() &&
     typeof document !== "undefined" &&
     currentOrganization()?.id === organizationId &&
     route().path === "/resources" &&
@@ -126,6 +126,7 @@ export function resourcesPage(organizationId: string): Child {
         clearTimeout(followTimer);
         try {
           const observed = await api.resourceOperation(organizationId, operationId);
+          if (!stillShown()) return observed;
           if (intentId) settleResourceIntent(intentId, observed);
           latest.set(observed);
           if (operationSettled(observed)) {
@@ -140,8 +141,10 @@ export function resourcesPage(organizationId: string): Child {
           }
           return observed;
         } catch (error) {
-          following.set(false);
-          reloadResources();
+          if (stillShown()) {
+            following.set(false);
+            reloadResources();
+          }
           throw error;
         }
       })
@@ -375,6 +378,7 @@ export function resourcesPage(organizationId: string): Child {
             { class: "card__body", style: { display: "grid", gap: "12px" } },
             copyable(operationId),
             live(() => {
+              if (!stillShown()) return null;
               const state = operation.get();
               const shown = latest();
               return state.state === "loading" && shown

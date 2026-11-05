@@ -376,3 +376,156 @@ for (const locale of ["en", "ja"] as const) {
     f.cleanup();
   });
 }
+
+type OperationScopeChange = ScopeChange | "route" | "organization";
+const operationScopeChanges: readonly OperationScopeChange[] = [
+  "route",
+  "route-roundtrip",
+  "organization",
+  "organization-roundtrip",
+  "session",
+  "origin",
+  "page-rebuild",
+];
+
+async function beginOperationRead() {
+  const fixture = await setup();
+  const { resourcesPage } = await import("../console/src/pages/resources.ts");
+  const { prepareResourceIntent, sendResourceIntent, discardResourceIntent } = await import(
+    "../console/src/resource-intent.ts"
+  );
+  const { adoptSession, organizations, setApiOrigin } = await import("../console/src/state.ts");
+  const { navigate } = await import("../console/src/router.ts");
+  const requests: Request[] = [];
+  let answer: ((response: Response) => void) | undefined;
+  let operationReads = 0;
+  const terminal = { ...op, status: "succeeded", effect: "complete" };
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push(request.clone());
+      if (request.method !== "GET") return Response.json(op, { status: 202 });
+      if (new URL(request.url).pathname.includes("/operations/")) {
+        operationReads += 1;
+        if (operationReads > 1) return Response.json(terminal);
+        return await new Promise<Response>((resolve) => {
+          answer = resolve;
+        });
+      }
+      return Response.json({ items: [], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  const original = prepareResourceIntent(
+    "org-console",
+    { action: "create", form, name: "follow-original", spec: {} },
+    3600,
+  );
+  cleanupIntents.push(() => discardResourceIntent(original.id));
+  await sendResourceIntent(original.id);
+  const originalPath = `/resources?operation=${op.id}&intent=${original.id}`;
+  fixture.route.set({
+    path: "/resources",
+    segments: ["resources"],
+    query: new URLSearchParams(originalPath.split("?")[1]),
+  });
+  fixture.body.append(resourcesPage("org-console") as unknown as TestNode);
+  await settle();
+  const listReads = () =>
+    requests.filter(
+      (request) => request.method === "GET" && new URL(request.url).pathname.endsWith("/resources"),
+    ).length;
+  expect(listReads()).toBe(1);
+  expect(operationReads).toBe(1);
+  return {
+    ...fixture,
+    original,
+    requests,
+    terminal,
+    listReads,
+    operationReads: () => operationReads,
+    answer(response: Response) {
+      if (!answer) throw new Error("original operation read is not held");
+      answer(response);
+    },
+    retire(change: OperationScopeChange) {
+      const orgs = organizations();
+      const owner = fixture.principal();
+      if (change === "route" || change === "route-roundtrip") {
+        navigate("/settings");
+        if (change === "route-roundtrip") navigate(originalPath);
+      } else if (change === "organization" || change === "organization-roundtrip") {
+        fixture.selectOrganization("other");
+        if (change === "organization-roundtrip") fixture.selectOrganization("org-console");
+      } else if (change === "session" || change === "origin") {
+        if (change === "session") adoptSession("shared-auth");
+        else setApiOrigin("https://replacement.example.test");
+        fixture.principal.set(owner);
+        organizations.set(orgs);
+        fixture.selectOrganization("org-console");
+      } else fixture.body.replaceChildren(resourcesPage("org-console") as unknown as TestNode);
+    },
+    rebuild() {
+      fixture.body.replaceChildren(resourcesPage("org-console") as unknown as TestNode);
+    },
+    sendResourceIntent,
+  };
+}
+
+for (const change of operationScopeChanges) {
+  for (const outcome of ["terminal", "error"] as const) {
+    test(`operation read scope: late ${outcome} cannot refresh a retired page after ${change}`, async () => {
+      const f = await beginOperationRead();
+      f.retire(change);
+      await settle();
+      const before = {
+        lists: f.listReads(),
+        operations: f.operationReads(),
+        text: f.body.textContent,
+        route: f.route(),
+      };
+      f.answer(
+        outcome === "terminal"
+          ? Response.json(f.terminal)
+          : Response.json({ error: { code: "unavailable" } }, { status: 503 }),
+      );
+      await settle();
+      expect(f.listReads()).toBe(before.lists);
+      expect(f.operationReads()).toBe(before.operations);
+      expect(f.body.textContent).toBe(before.text);
+      expect(f.route()).toBe(before.route);
+      expect(f.requests.filter((request) => request.method !== "GET")).toHaveLength(1);
+      expect(f.original.operationId).toBe(op.id);
+    });
+  }
+}
+
+test("operation read scope: returning to the original operation uses GET and settles the retained intent", async () => {
+  const f = await beginOperationRead();
+  f.retire("route-roundtrip");
+  await settle();
+  const before = f.listReads();
+  f.answer(Response.json(f.terminal));
+  await settle();
+  expect(f.listReads()).toBe(before);
+  // An expired replay check cannot send. The retained intent still exists until
+  // the current page reads its original terminal Operation for itself.
+  const expired = (f.original.firstSentAt ?? 0) + 3_600_001;
+  await expect(f.sendResourceIntent(f.original.id, expired)).rejects.toMatchObject({
+    code: "replay_window_expired",
+  });
+  f.rebuild();
+  await settle();
+  expect(f.operationReads()).toBe(2);
+  expect(f.body.textContent).toContain("Done");
+  expect(f.listReads()).toBe(before + 2);
+  await expect(f.sendResourceIntent(f.original.id, expired)).rejects.toMatchObject({
+    code: "intent_missing",
+  });
+  expect(f.requests.filter((request) => request.method !== "GET")).toHaveLength(1);
+  expect(
+    f.requests
+      .filter((request) => new URL(request.url).pathname.includes("/operations/"))
+      .every((request) => request.method === "GET" && request.url.endsWith(`/operations/${op.id}`)),
+  ).toBe(true);
+});
