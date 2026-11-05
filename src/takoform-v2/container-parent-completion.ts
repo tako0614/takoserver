@@ -9,6 +9,10 @@ const BINDING_FORMAT = "takoserver.container-parent-io-binding@1";
 const ORIGINAL_FORMAT = "takoserver.container-parent-io-original@1";
 const VERSION_FORM = "https://edge.forms.takoform.com/forms/WorkerVersion/0.7.0/";
 const TARGET_FORM = "https://edge.forms.takoform.com/forms/Container/0.1.0/";
+const CONSUMER_BINDING_FORMAT = "takoserver.container-parent-io-binding@2";
+const CONSUMER_ORIGINAL_FORMAT = "takoserver.container-parent-io-original@2";
+const CONSUMER_VERSION_FORM = "https://edge.forms.takoform.com/forms/WorkerVersion/0.8.0/";
+const CONTAINER_TWO_FORM = "https://edge.forms.takoform.com/forms/Container/0.2.0/";
 type Digest = `sha256:${string}`;
 
 export interface V2ContainerParentIoTarget {
@@ -62,6 +66,53 @@ export type V2ContainerParentIoReadback =
       readonly state: "complete";
       readonly original: V2ContainerParentIoOriginal;
     };
+
+/** Explicit @2 profile; no widening of the WorkerVersion 0.7 / @1 ABI. */
+export interface V2ContainerConsumerParentIoTarget
+  extends Omit<V2ContainerParentIoTarget, "workerVersionFormUrl" | "targetFormUrl"> {
+  readonly workerVersionFormUrl: typeof CONSUMER_VERSION_FORM;
+  readonly targetFormUrl: typeof TARGET_FORM | typeof CONTAINER_TWO_FORM;
+}
+export interface V2ContainerConsumerParentIoClaim extends Omit<V2ContainerParentIoClaim, "target"> {
+  readonly target: V2ContainerConsumerParentIoTarget;
+}
+/** Content only, with the same envelope and disjoint canonical/hash domains. */
+export type V2ContainerConsumerParentIoBinding = V2ContainerParentIoBinding;
+export interface V2ContainerConsumerParentIoBindingScope
+  extends Omit<V2ContainerParentIoBindingScope, "format" | "target"> {
+  readonly format: typeof CONSUMER_BINDING_FORMAT;
+  readonly target: V2ContainerConsumerParentIoTarget;
+}
+export interface V2ContainerConsumerParentIoOriginal
+  extends Omit<V2ContainerParentIoOriginal, "format"> {
+  readonly format: typeof CONSUMER_ORIGINAL_FORMAT;
+}
+export type V2ContainerConsumerParentIoReadback =
+  | { readonly state: "absent" | "pending" | "unknown" }
+  | { readonly state: "complete"; readonly original: V2ContainerConsumerParentIoOriginal };
+
+type ParentIoTarget = V2ContainerParentIoTarget | V2ContainerConsumerParentIoTarget;
+type ParentIoClaim<T extends ParentIoTarget> = Omit<V2ContainerParentIoClaim, "target"> & {
+  readonly target: T;
+};
+type ParentIoScope<T extends ParentIoTarget, F extends string> = Omit<
+  V2ContainerParentIoBindingScope,
+  "format" | "target"
+> & { readonly format: F; readonly target: T };
+type ParentIoOriginal<F extends string> = Omit<V2ContainerParentIoOriginal, "format"> & {
+  readonly format: F;
+};
+interface ParentIoProfile<T extends ParentIoTarget, B extends string, O extends string> {
+  readonly bindingFormat: B;
+  readonly originalFormat: O;
+  readonly isTarget: (value: unknown) => value is T;
+}
+interface ParentIoPorts<T extends ParentIoTarget> {
+  readonly readParent: (
+    handle: V2WorkerInvocationHandle,
+  ) => Promise<V2WorkerInvocationRecord | null>;
+  readonly authorize: (claim: ParentIoClaim<T>) => Promise<boolean>;
+}
 
 type Row = Record<string, unknown>;
 function row(value: unknown): value is Row {
@@ -158,15 +209,32 @@ const targetKeys = [
   "servingRevision",
   "ownerId",
 ];
-function target(value: unknown): value is V2ContainerParentIoTarget {
+function targetShape(value: unknown, versionForm: string, targetForms: readonly string[]): boolean {
   return (
     exact(value, targetKeys) &&
-    value.workerVersionFormUrl === VERSION_FORM &&
-    value.targetFormUrl === TARGET_FORM &&
+    value.workerVersionFormUrl === versionForm &&
+    typeof value.targetFormUrl === "string" &&
+    targetForms.includes(value.targetFormUrl) &&
     positive(value.targetGeneration) &&
     targetKeys.filter((k) => k !== "targetGeneration").every((k) => text(value[k]))
   );
 }
+function target(value: unknown): value is V2ContainerParentIoTarget {
+  return targetShape(value, VERSION_FORM, [TARGET_FORM]);
+}
+function consumerTarget(value: unknown): value is V2ContainerConsumerParentIoTarget {
+  return targetShape(value, CONSUMER_VERSION_FORM, [TARGET_FORM, CONTAINER_TWO_FORM]);
+}
+const parentProfile = {
+  bindingFormat: BINDING_FORMAT,
+  originalFormat: ORIGINAL_FORMAT,
+  isTarget: target,
+} as const;
+const consumerProfile = {
+  bindingFormat: CONSUMER_BINDING_FORMAT,
+  originalFormat: CONSUMER_ORIGINAL_FORMAT,
+  isTarget: consumerTarget,
+} as const;
 function selected(record: V2WorkerInvocationRecord): unknown {
   return Object.fromEntries(
     identityKeys.map((key) => [key, record[key as keyof V2WorkerInvocationRecord]]),
@@ -218,6 +286,7 @@ export function containerParentIoMatchesRecord(
 }
 
 export const isContainerParentIoTarget = target;
+export const isContainerConsumerParentIoTarget = consumerTarget;
 
 /**
  * Both ports are source-selected Host custody. authorize must compare accepted
@@ -236,11 +305,29 @@ export function createV2ContainerParentIoQualifier(options: {
   ) => Promise<V2WorkerInvocationRecord | null>;
   readonly authorize: (claim: V2ContainerParentIoClaim) => Promise<boolean>;
 }) {
+  return createParentIoQualifier(parentProfile, options);
+}
+
+/**
+ * Explicit WorkerVersion 0.8 profile. The same custody/currentness obligations
+ * apply, including the actual accepted 0.8 references and the exact Form's native
+ * owner. This does not supply private issuer/inventory/RPC coverage or enable it.
+ */
+export function createV2ContainerConsumerParentIoQualifier(
+  options: ParentIoPorts<V2ContainerConsumerParentIoTarget>,
+) {
+  return createParentIoQualifier(consumerProfile, options);
+}
+
+function createParentIoQualifier<T extends ParentIoTarget, B extends string, O extends string>(
+  profile: ParentIoProfile<T, B, O>,
+  options: ParentIoPorts<T>,
+) {
   const { readParent, authorize } = options;
   if (typeof readParent !== "function" || typeof authorize !== "function")
     throw new TypeError("Container parent custody ports required");
   return async (
-    input: V2ContainerParentIoClaim,
+    input: ParentIoClaim<T>,
   ): Promise<
     | (V2ContainerParentIoBinding & {
         readonly stillCurrent: () => Promise<boolean>;
@@ -257,7 +344,7 @@ export function createV2ContainerParentIoQualifier(options: {
         !text(claim.handle.custodyToken) ||
         claim.handle.custodyToken.length < 16 ||
         !identity(claim.expected) ||
-        !target(claim.target)
+        !profile.isTarget(claim.target)
       )
         return null;
       const canonicalExpected = canonicalJson(claim.expected);
@@ -282,14 +369,14 @@ export function createV2ContainerParentIoQualifier(options: {
       };
       if (!(await stillCurrent())) return null;
       const canonical = canonicalJson({
-        format: BINDING_FORMAT,
+        format: profile.bindingFormat,
         parent: await containerParentIoScope({
           handle: claim.handle,
           expected: claim.expected,
         }),
         target: claim.target,
       });
-      const digest = await hash(BINDING_FORMAT, canonical);
+      const digest = await hash(profile.bindingFormat, canonical);
       if (!(await stillCurrent())) return null;
       return Object.freeze({
         producerId: claim.target.producerId,
@@ -303,7 +390,7 @@ export function createV2ContainerParentIoQualifier(options: {
   };
 }
 
-function originalPayload(input: Omit<V2ContainerParentIoOriginal, "receiptDigest">) {
+function originalPayload<F extends string>(input: Omit<ParentIoOriginal<F>, "receiptDigest">) {
   return {
     format: input.format,
     bindingDigest: input.bindingDigest,
@@ -318,6 +405,20 @@ function originalPayload(input: Omit<V2ContainerParentIoOriginal, "receiptDigest
 export async function decodeV2ContainerParentIoBinding(
   input: V2ContainerParentIoBinding,
 ): Promise<V2ContainerParentIoBindingScope | null> {
+  return decodeParentIoBinding(input, parentProfile);
+}
+
+/** Content-only @2 decoder; no issuer authentication or live admission. */
+export async function decodeV2ContainerConsumerParentIoBinding(
+  input: V2ContainerConsumerParentIoBinding,
+): Promise<V2ContainerConsumerParentIoBindingScope | null> {
+  return decodeParentIoBinding(input, consumerProfile);
+}
+
+async function decodeParentIoBinding<T extends ParentIoTarget, B extends string, O extends string>(
+  input: V2ContainerParentIoBinding,
+  profile: ParentIoProfile<T, B, O>,
+): Promise<ParentIoScope<T, B> | null> {
   try {
     const binding = {
       producerId: input.producerId,
@@ -335,19 +436,19 @@ export async function decodeV2ContainerParentIoBinding(
     const scope: unknown = JSON.parse(binding.canonical);
     if (
       !exact(scope, ["format", "parent", "target"]) ||
-      scope.format !== BINDING_FORMAT ||
-      !target(scope.target) ||
+      scope.format !== profile.bindingFormat ||
+      !profile.isTarget(scope.target) ||
       scope.target.producerId !== binding.producerId ||
       !exact(scope.parent, ["invocationId", "custodyDigest", "selectionDigest"]) ||
       !text(scope.parent.invocationId) ||
       !isSha256Digest(scope.parent.custodyDigest) ||
       !isSha256Digest(scope.parent.selectionDigest) ||
       canonicalJson(scope) !== binding.canonical ||
-      (await hash(BINDING_FORMAT, binding.canonical)) !== binding.digest
+      (await hash(profile.bindingFormat, binding.canonical)) !== binding.digest
     )
       return null;
     return Object.freeze({
-      format: BINDING_FORMAT,
+      format: profile.bindingFormat,
       parent: Object.freeze({
         invocationId: scope.parent.invocationId,
         custodyDigest: scope.parent.custodyDigest,
@@ -366,6 +467,13 @@ export function v2ContainerParentIoOriginalDigest(
   return hash(ORIGINAL_FORMAT, canonicalJson(originalPayload(input)));
 }
 
+/** @2 content fingerprint only; self-hashed bytes are never an I/O original. */
+export function v2ContainerConsumerParentIoOriginalDigest(
+  input: Omit<V2ContainerConsumerParentIoOriginal, "receiptDigest">,
+): Promise<Digest> {
+  return hash(CONSUMER_ORIGINAL_FORMAT, canonicalJson(originalPayload(input)));
+}
+
 /**
  * readOriginal must be the fixed trusted owner durable reader, never tenant JSON.
  * A digest validates content, not origin/durability. No direct complete()/finish()
@@ -375,13 +483,32 @@ export async function readV2ContainerParentIoOriginal(
   input: V2ContainerParentIoBinding,
   readOriginal: (binding: V2ContainerParentIoBinding) => Promise<unknown>,
 ): Promise<V2ContainerParentIoReadback> {
+  return readParentIoOriginal(input, readOriginal, parentProfile);
+}
+
+/** Same fixed-owner/durable-original requirements, using only the @2 profile. */
+export async function readV2ContainerConsumerParentIoOriginal(
+  input: V2ContainerConsumerParentIoBinding,
+  readOriginal: (binding: V2ContainerConsumerParentIoBinding) => Promise<unknown>,
+): Promise<V2ContainerConsumerParentIoReadback> {
+  return readParentIoOriginal(input, readOriginal, consumerProfile);
+}
+
+async function readParentIoOriginal<T extends ParentIoTarget, B extends string, O extends string>(
+  input: V2ContainerParentIoBinding,
+  readOriginal: (binding: V2ContainerParentIoBinding) => Promise<unknown>,
+  profile: ParentIoProfile<T, B, O>,
+): Promise<
+  | { readonly state: "absent" | "pending" | "unknown" }
+  | { readonly state: "complete"; readonly original: ParentIoOriginal<O> }
+> {
   try {
     const binding = {
       producerId: input.producerId,
       canonical: input.canonical,
       digest: input.digest,
     };
-    if (!(await decodeV2ContainerParentIoBinding(binding))) return { state: "unknown" };
+    if (!(await decodeParentIoBinding(binding, profile))) return { state: "unknown" };
     const result: unknown = structuredClone(await readOriginal(Object.freeze({ ...binding })));
     if (
       exact(result, ["state"]) &&
@@ -401,7 +528,7 @@ export async function readV2ContainerParentIoOriginal(
         "outcome",
         "receiptDigest",
       ]) ||
-      o.format !== ORIGINAL_FORMAT ||
+      o.format !== profile.originalFormat ||
       o.bindingDigest !== binding.digest ||
       o.producerId !== binding.producerId ||
       !positive(o.ownerEpoch) ||
@@ -410,8 +537,11 @@ export async function readV2ContainerParentIoOriginal(
       !isSha256Digest(o.receiptDigest)
     )
       return { state: "unknown" };
-    const original = o as unknown as V2ContainerParentIoOriginal;
-    if ((await v2ContainerParentIoOriginalDigest(original)) !== original.receiptDigest)
+    const original = o as unknown as ParentIoOriginal<O>;
+    if (
+      (await hash(profile.originalFormat, canonicalJson(originalPayload(original)))) !==
+      original.receiptDigest
+    )
       return { state: "unknown" };
     return { state: "complete", original: Object.freeze({ ...original }) };
   } catch {

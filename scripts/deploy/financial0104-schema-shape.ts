@@ -12,8 +12,8 @@ import { ROOT_0105_OBJECTS } from "../../src/root-0105-org-capture-triggers.ts";
 import { SHARED_APP_STAGING_PHYSICAL_DDL } from "../../src/shared-app-staging-adoption.ts";
 import { SHARED_APP_STAGING_ORIGIN_HISTORY_DDL } from "../../src/shared-app-staging-origin-history.ts";
 import {
+  forwardWorkerNative106SchemaReady,
   forwardWorkerNativePredecessorReady,
-  forwardWorkerNativeSchemaReady,
 } from "../../src/takoform-v2/forward-worker-native-schema.ts";
 import {
   V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_NAME,
@@ -314,7 +314,7 @@ export function root0106PredecessorPredicate(): string {
 }
 
 export function root0106CatalogPredicate(): string {
-  return forwardWorkerNativeSchemaReady();
+  return forwardWorkerNative106SchemaReady();
 }
 
 function shared107Declarations(): readonly { readonly type: string; readonly name: string }[] {
