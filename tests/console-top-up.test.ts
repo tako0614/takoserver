@@ -804,6 +804,7 @@ async function billingPageFor(input: {
   readonly receiptState?: TopUpReceipt["state"];
   readonly workspaceUsage?: (url: URL) => Response | Promise<Response>;
   readonly checkoutResponse?: () => Response | Promise<Response>;
+  readonly subscriptionCheckoutResponse?: () => Response | Promise<Response>;
   readonly fundingResponse?: () => Response | Promise<Response>;
   readonly subscriptionResponse?: () => Response | Promise<Response>;
   readonly walletResponse?: () => Response | Promise<Response>;
@@ -836,12 +837,16 @@ async function billingPageFor(input: {
       location: Object.assign(location, { assign: (url: string) => assigned.push(url) }),
       localStorage: storage,
       history: {
+        pushState: (_state: unknown, _title: string, url: string) => {
+          location.href = new URL(url, location).href;
+        },
         replaceState: (_state: unknown, _title: string, url: string) => {
           replaced.push(url);
           location.search = new URL(url, location).search;
         },
       },
       addEventListener: () => undefined,
+      scrollTo: () => undefined,
     },
   });
   const lock = exclusiveLock();
@@ -867,6 +872,8 @@ async function billingPageFor(input: {
       if (method === "GET" && url.pathname === `${base}/wallet` && input.walletResponse)
         return input.walletResponse();
       if (url.pathname === `${base}/payments/subscription`) {
+        if (method === "POST" && input.subscriptionCheckoutResponse)
+          return input.subscriptionCheckoutResponse();
         if (input.subscriptionResponse) return input.subscriptionResponse();
         if (input.subscription === "loading") return new Promise<Response>(() => undefined);
         if (input.subscription === "failing")
@@ -935,6 +942,12 @@ async function billingPageFor(input: {
   const toastHost = mountToasts();
   if (!(toastHost instanceof TestNode)) throw new Error("toast host did not render a test node");
   body.append(toastHost);
+  const { route } = await import("../console/src/router.ts");
+  route.set({
+    path: "/billing",
+    segments: ["billing"],
+    query: new URLSearchParams(location.search),
+  });
   const root = billingPage(organizationId) as unknown as TestNode;
   await flush();
   const button = (label: string) =>
@@ -1145,6 +1158,109 @@ describe("billing page top-up lane", () => {
     expect(page.assigned).toEqual([checkoutUrl]);
     expect(page.calls()).not.toContain(fundingCall);
   });
+
+  for (const lane of ["hosted", "legacy"] as const) {
+    for (const roundTrip of [false, true]) {
+      for (const outcome of ["accepted", "unknown", "not-found"] as const) {
+        test(`route retirement suppresses late ${lane} ${outcome} Checkout after ${roundTrip ? "round trip" : "departure"}`, async () => {
+          let finish: ((response: Response) => void) | undefined;
+          const page = await billingPageFor({
+            subscription: lane,
+            checkoutResponse: () =>
+              new Promise<Response>((resolve) => {
+                finish = resolve;
+              }),
+          });
+          await page.click("Add funds");
+          await page.click("Continue to payment");
+          expect(page.calls().filter((call) => call === checkoutCall)).toHaveLength(1);
+          const original = page.values.get(storageKey);
+          if (lane === "hosted") expect(original).toBeDefined();
+          if (!finish) throw new Error("original Checkout is not pending");
+          const { navigate, route } = await import("../console/src/router.ts");
+          navigate("/settings");
+          if (roundTrip) navigate("/billing");
+          finish(
+            outcome === "accepted"
+              ? Response.json({ checkout: { url: checkoutUrl } }, { status: 201 })
+              : Response.json(
+                  { error: { code: outcome === "unknown" ? "unavailable" : "not_found" } },
+                  { status: outcome === "unknown" ? 503 : 404 },
+                ),
+          );
+          await flush();
+          expect(page.assigned).toEqual([]);
+          expect(route().path).toBe(roundTrip ? "/billing" : "/settings");
+          expect(
+            page.body.all().filter((node) => node.attributes.get("role") === "dialog"),
+          ).toHaveLength(0);
+          expect(page.body.textContent).not.toContain("Settlement proof");
+          expect(page.calls().filter((call) => call === checkoutCall)).toHaveLength(1);
+          expect(page.calls()).not.toContain(fundingCall);
+          if (lane === "hosted") expect(page.values.get(storageKey)).toBe(original);
+        });
+      }
+      test(`route retirement prevents an unsent ${lane} modal after ${roundTrip ? "round trip" : "departure"}`, async () => {
+        const page = await billingPageFor({ subscription: lane });
+        await page.click("Add funds");
+        const confirm = page.body
+          .all()
+          .find(
+            (node) => node.tag === "button" && node.textContent.trim() === "Continue to payment",
+          );
+        if (!confirm) throw new Error("Checkout confirm missing");
+        const { navigate } = await import("../console/src/router.ts");
+        navigate("/settings");
+        if (roundTrip) navigate("/billing");
+        await flush();
+        confirm.click();
+        await flush();
+        expect(page.calls()).not.toContain(checkoutCall);
+        expect(page.assigned).toEqual([]);
+        expect(
+          page.body.all().filter((node) => node.attributes.get("role") === "dialog"),
+        ).toHaveLength(0);
+        expect(page.values.has(storageKey)).toBe(false);
+      });
+    }
+  }
+
+  for (const roundTrip of [false, true]) {
+    for (const outcome of ["accepted", "unknown"] as const) {
+      test(`route retirement suppresses late subscription ${outcome} after ${roundTrip ? "round trip" : "departure"}`, async () => {
+        let finish: ((response: Response) => void) | undefined;
+        const page = await billingPageFor({
+          subscription: "hosted",
+          subscriptionCheckoutResponse: () =>
+            new Promise<Response>((resolve) => {
+              finish = resolve;
+            }),
+        });
+        await page.click("Begin hosted-10 subscription");
+        const call = `POST /v1/organizations/${organizationId}/payments/subscription`;
+        expect(page.calls().filter((sent) => sent === call)).toHaveLength(1);
+        const originals = [...page.values.entries()];
+        expect(originals.some(([key]) => key.includes("subscription-intent"))).toBe(true);
+        if (!finish) throw new Error("original subscription Checkout is not pending");
+        const { navigate, route } = await import("../console/src/router.ts");
+        navigate("/settings");
+        if (roundTrip) navigate("/billing");
+        finish(
+          outcome === "accepted"
+            ? Response.json(
+                { checkout: { state: "open", id: "cs_test_subscription", url: checkoutUrl } },
+                { status: 201 },
+              )
+            : Response.json({ error: { code: "unavailable" } }, { status: 503 }),
+        );
+        await flush();
+        expect(page.assigned).toEqual([]);
+        expect(route().path).toBe(roundTrip ? "/billing" : "/settings");
+        expect(page.calls().filter((sent) => sent === call)).toHaveLength(1);
+        expect([...page.values.entries()]).toEqual(originals);
+      });
+    }
+  }
 
   test("Add funds sends nothing while the lane is unknown", async () => {
     for (const subscription of ["loading", "failing"] as const) {
@@ -1534,8 +1650,16 @@ describe("rendered legacy billing completion scope", () => {
         await page.click("Continue to payment");
         const proof = page.body.all().find((node) => node.tag === "textarea");
         if (proof) proof.value = "synthetic-settlement-proof";
+        const confirm = page.body
+          .all()
+          .find((node) => node.tag === "button" && node.textContent.trim() === "Credit wallet");
+        if (!confirm) throw new Error("original proof confirm missing");
         await retireBillingScope(change, page);
-        await page.click("Credit wallet");
+        expect(
+          page.body.all().filter((node) => node.attributes.get("role") === "dialog"),
+        ).toHaveLength(0);
+        confirm.click();
+        await flush();
         expect(page.calls()).not.toContain(fundingCall);
       });
 
