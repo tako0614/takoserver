@@ -93,6 +93,8 @@ export interface Wallet {
   readonly settledMicros: string;
   readonly heldMicros: string;
   readonly availableMicros: string;
+  readonly frozenMicros?: string;
+  readonly refundReceivableMicros?: string;
   readonly entries: readonly LedgerEntry[];
 }
 
@@ -474,7 +476,17 @@ function decodeWallet(payload: unknown, organizationId: string): Wallet {
   const settledMicros = unsignedMicros(wallet.settledMicros);
   const heldMicros = unsignedMicros(wallet.heldMicros);
   const availableMicros = unsignedMicros(wallet.availableMicros);
-  if (BigInt(settledMicros) - BigInt(heldMicros) !== BigInt(availableMicros)) {
+  const frozenMicros =
+    wallet.frozenMicros === undefined ? undefined : unsignedMicros(wallet.frozenMicros);
+  const refundReceivableMicros =
+    wallet.refundReceivableMicros === undefined
+      ? undefined
+      : unsignedMicros(wallet.refundReceivableMicros);
+  const baseAccountedMicros = BigInt(availableMicros) + BigInt(heldMicros);
+  // Preserve the legacy two-term invariant when the server omits frozen credit.
+  const accountedMicros =
+    frozenMicros === undefined ? baseAccountedMicros : baseAccountedMicros + BigInt(frozenMicros);
+  if (BigInt(settledMicros) !== accountedMicros) {
     throw new TypeError("invalid wallet conservation");
   }
   const entries = wallet.entries.map((entry): LedgerEntry => {
@@ -499,7 +511,16 @@ function decodeWallet(payload: unknown, organizationId: string): Wallet {
       createdAt: entry.createdAt,
     };
   });
-  return { organizationId, currency: "USD", settledMicros, heldMicros, availableMicros, entries };
+  return {
+    organizationId,
+    currency: "USD",
+    settledMicros,
+    heldMicros,
+    availableMicros,
+    ...(frozenMicros === undefined ? {} : { frozenMicros }),
+    ...(refundReceivableMicros === undefined ? {} : { refundReceivableMicros }),
+    entries,
+  };
 }
 
 const WORKSPACE_USAGE_KEYS = [

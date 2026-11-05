@@ -806,6 +806,7 @@ async function billingPageFor(input: {
   readonly checkoutResponse?: () => Response | Promise<Response>;
   readonly fundingResponse?: () => Response | Promise<Response>;
   readonly subscriptionResponse?: () => Response | Promise<Response>;
+  readonly walletResponse?: () => Response | Promise<Response>;
 }) {
   const values = input.storage ?? new Map<string, string>();
   const storage = {
@@ -863,6 +864,8 @@ async function billingPageFor(input: {
         call: `${method} ${url.pathname}`,
         body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
       });
+      if (method === "GET" && url.pathname === `${base}/wallet` && input.walletResponse)
+        return input.walletResponse();
       if (url.pathname === `${base}/payments/subscription`) {
         if (input.subscriptionResponse) return input.subscriptionResponse();
         if (input.subscription === "loading") return new Promise<Response>(() => undefined);
@@ -974,6 +977,119 @@ function seededStorage(amountMinor = 5000) {
 }
 
 describe("billing page top-up lane", () => {
+  test("billing wallet keeps optional refund data unknown instead of inventing zero debt", async () => {
+    for (const refundFields of [{}, { frozenMicros: "0" }, { refundReceivableMicros: "0" }]) {
+      const page = await billingPageFor({
+        subscription: "legacy",
+        walletResponse: () =>
+          Response.json({
+            wallet: {
+              organizationId,
+              currency: "USD",
+              settledMicros: "4000000",
+              heldMicros: "1000000",
+              availableMicros: "3000000",
+              entries: [],
+              ...refundFields,
+            },
+          }),
+      });
+      const cards = page.root.all().filter((node) => node.className === "card");
+      const walletCard = (label: string) =>
+        cards.find((node) =>
+          node
+            .all()
+            .some((child) => child.className === "stat__label" && child.textContent === label),
+        );
+      const value = (label: string) =>
+        walletCard(label)
+          ?.all()
+          .find((node) => node.className === "stat__value")?.textContent;
+      expect(value("Available")).toBe("$3");
+      expect(value("Frozen")).toBe("frozenMicros" in refundFields ? "$0" : "Not reported");
+      expect(value("Refund receivable")).toBe(
+        "refundReceivableMicros" in refundFields ? "$0" : "Not reported",
+      );
+      expect(page.root.textContent.includes("Refund debt was not reported")).toBe(
+        !("refundReceivableMicros" in refundFields),
+      );
+      expect(page.root.textContent).not.toContain("New billable operations are blocked");
+      if (!("frozenMicros" in refundFields)) {
+        expect(walletCard("Available")?.textContent).toContain("reported by this Host");
+        expect(walletCard("Current credit")?.textContent).not.toContain(
+          "including held and frozen",
+        );
+      }
+      expect(page.calls().every((call) => call.startsWith("GET "))).toBe(true);
+    }
+  });
+
+  test("billing wallet shows frozen credit and receivable separately from available credit", async () => {
+    const page = await billingPageFor({
+      subscription: "legacy",
+      walletResponse: () =>
+        Response.json({
+          wallet: {
+            organizationId,
+            currency: "USD",
+            settledMicros: "9000000",
+            heldMicros: "1000000",
+            frozenMicros: "3000000",
+            availableMicros: "5000000",
+            refundReceivableMicros: "2000000",
+            entries: [],
+          },
+        }),
+    });
+    const cards = page.root.all().filter((node) => node.className === "card");
+    const walletCard = (label: string) =>
+      cards.find((node) =>
+        node
+          .all()
+          .some((child) => child.className === "stat__label" && child.textContent === label),
+      );
+    for (const [label, value] of [
+      ["Available", "$5"],
+      ["Current credit", "$9"],
+      ["Held", "$1"],
+      ["Frozen", "$3"],
+      ["Refund receivable", "$2"],
+    ]) {
+      expect(
+        walletCard(label ?? "")
+          ?.all()
+          .find((node) => node.className === "stat__value")?.textContent,
+      ).toBe(value);
+    }
+    expect(walletCard("Available")?.textContent).toContain("current credit − held − frozen");
+    expect(page.root.textContent).toContain("New billable operations are blocked");
+    expect(page.root.textContent).toContain("even when available credit is positive");
+    expect(page.calls().every((call) => call.startsWith("GET "))).toBe(true);
+  });
+
+  test("billing wallet keeps zero refund amounts visible without a debt restriction", async () => {
+    const page = await billingPageFor({
+      subscription: "legacy",
+      walletResponse: () =>
+        Response.json({
+          wallet: {
+            organizationId,
+            currency: "USD",
+            settledMicros: "0",
+            heldMicros: "0",
+            frozenMicros: "0",
+            availableMicros: "0",
+            refundReceivableMicros: "0",
+            entries: [],
+          },
+        }),
+    });
+    expect(page.root.textContent).toContain("Frozen");
+    expect(page.root.textContent).toContain("Refund receivable");
+    expect(page.root.textContent).not.toContain("New billable operations are blocked");
+    expect(page.calls().every((call) => call.startsWith("GET "))).toBe(true);
+  });
+
   test("a legacy Host still exchanges the returned session through funding", async () => {
     const page = await billingPageFor({
       subscription: "legacy",

@@ -212,6 +212,8 @@ function walletResponse() {
       settledMicros: "12345678",
       heldMicros: "2345678",
       availableMicros: "10000000",
+      frozenMicros: "0",
+      refundReceivableMicros: "0",
       entries: [],
     },
   };
