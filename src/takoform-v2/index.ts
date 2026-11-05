@@ -44,9 +44,19 @@ export {
 } from "./configured-private-inputs.ts";
 export { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";
 export {
+  createV2ContainerConsumerParentIoQualifier,
   createV2ContainerParentIoQualifier,
+  decodeV2ContainerConsumerParentIoBinding,
   decodeV2ContainerParentIoBinding,
+  isContainerConsumerParentIoTarget,
+  readV2ContainerConsumerParentIoOriginal,
   readV2ContainerParentIoOriginal,
+  type V2ContainerConsumerParentIoBinding,
+  type V2ContainerConsumerParentIoBindingScope,
+  type V2ContainerConsumerParentIoClaim,
+  type V2ContainerConsumerParentIoOriginal,
+  type V2ContainerConsumerParentIoReadback,
+  type V2ContainerConsumerParentIoTarget,
   type V2ContainerParentIoBinding,
   type V2ContainerParentIoBindingScope,
   type V2ContainerParentIoClaim,
@@ -54,10 +64,14 @@ export {
   type V2ContainerParentIoParent,
   type V2ContainerParentIoReadback,
   type V2ContainerParentIoTarget,
+  v2ContainerConsumerParentIoOriginalDigest,
   v2ContainerParentIoOriginalDigest,
 } from "./container-parent-completion.ts";
 export {
+  createV2ContainerConsumerParentIoInventory,
   createV2ContainerParentIoInventory,
+  type V2ContainerConsumerParentIoInventoryReadback,
+  type V2ContainerConsumerParentIoInventoryStorage,
   type V2ContainerParentIoInventoryReadback,
   type V2ContainerParentIoInventoryStorage,
 } from "./container-parent-io-inventory.ts";
@@ -281,6 +295,8 @@ export {
   type V2ForwardContainerBindingClaim,
   type V2ForwardContainerBindingSnapshot,
 } from "./forward-container-binding-authority.ts";
+/** Unregistered source data only, never a migration registration or apply authority. */
+export { createContainerConsumerWorkerNativeSourceRecipe } from "./forward-worker-native-schema.ts";
 export {
   createInternalV2ModuleWorkerForm,
   MODULE_WORKER_LIFECYCLE_BACKEND_ID,
@@ -349,6 +365,7 @@ export {
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
 export {
+  createContainerConsumerV2NativeDeletionCustody,
   createForwardV2NativeDeletionCustody,
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
@@ -356,6 +373,7 @@ export {
   type V2NativeDeletionItem,
 } from "./worker-native-deletions.ts";
 export {
+  createContainerConsumerV2NativeEffectCustody,
   createForwardV2NativeEffectCustody,
   createRetainedV2NativeEffectCustody,
   createV2NativeEffectCustody,

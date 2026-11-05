@@ -6,14 +6,21 @@ import type {
 import {
   containerParentIoMatchesRecord,
   containerParentIoScope,
+  createV2ContainerConsumerParentIoQualifier,
   createV2ContainerParentIoQualifier,
+  decodeV2ContainerConsumerParentIoBinding,
   decodeV2ContainerParentIoBinding,
+  isContainerConsumerParentIoTarget,
   isContainerParentIoTarget,
+  readV2ContainerConsumerParentIoOriginal,
   readV2ContainerParentIoOriginal,
+  type V2ContainerConsumerParentIoReadback,
+  type V2ContainerConsumerParentIoTarget,
   type V2ContainerParentIoBinding,
   type V2ContainerParentIoBindingScope,
   type V2ContainerParentIoClaim,
   type V2ContainerParentIoParent,
+  type V2ContainerParentIoReadback,
   type V2ContainerParentIoTarget,
 } from "./container-parent-completion.ts";
 
@@ -34,22 +41,73 @@ export type V2ContainerParentIoInventoryReadback =
   | { readonly state: "absent" | "open" | "pending" | "unknown" }
   | { readonly state: "sealed_io_complete"; readonly childCount: number };
 
-const EPOCH_KEY = "container-parent-io/v1/epoch";
-const HEADER = "takoserver.container-parent-io-inventory@1";
-const CHILD = "takoserver.container-parent-io-inventory-child@1";
+/** Same durable storage port; @2 uses a separate keyspace, never a data migration. */
+export type V2ContainerConsumerParentIoInventoryStorage = V2ContainerParentIoInventoryStorage;
+export type V2ContainerConsumerParentIoInventoryReadback = V2ContainerParentIoInventoryReadback;
+
+type ParentIoTarget = V2ContainerParentIoTarget | V2ContainerConsumerParentIoTarget;
+type ParentIoClaim<T extends ParentIoTarget> = Omit<V2ContainerParentIoClaim, "target"> & {
+  readonly target: T;
+};
+interface InventoryOptions<T extends ParentIoTarget> {
+  readonly storage: V2ContainerParentIoInventoryStorage;
+  readonly readParent: (
+    handle: V2WorkerInvocationHandle,
+  ) => Promise<V2WorkerInvocationRecord | null>;
+  readonly authorize: (claim: ParentIoClaim<T>) => Promise<boolean>;
+  readonly readOriginal: (binding: V2ContainerParentIoBinding) => Promise<unknown>;
+}
+interface InventoryProfile<T extends ParentIoTarget> {
+  readonly prefix: string;
+  readonly headerFormat: string;
+  readonly childFormat: string;
+  readonly isTarget: (value: unknown) => value is T;
+  readonly qualifier: (
+    ports: Pick<InventoryOptions<T>, "readParent" | "authorize">,
+  ) => (
+    claim: ParentIoClaim<T>,
+  ) => Promise<
+    (V2ContainerParentIoBinding & { readonly stillCurrent: () => Promise<boolean> }) | null
+  >;
+  readonly decode: (
+    binding: V2ContainerParentIoBinding,
+  ) => Promise<{ readonly parent: Header["parent"]; readonly target: T } | null>;
+  readonly readOriginal: (
+    binding: V2ContainerParentIoBinding,
+    reader: InventoryOptions<T>["readOriginal"],
+  ) => Promise<V2ContainerParentIoReadback | V2ContainerConsumerParentIoReadback>;
+}
+const parentProfile: InventoryProfile<V2ContainerParentIoTarget> = {
+  prefix: "container-parent-io/v1",
+  headerFormat: "takoserver.container-parent-io-inventory@1",
+  childFormat: "takoserver.container-parent-io-inventory-child@1",
+  isTarget: isContainerParentIoTarget,
+  qualifier: createV2ContainerParentIoQualifier,
+  decode: decodeV2ContainerParentIoBinding,
+  readOriginal: readV2ContainerParentIoOriginal,
+};
+const consumerProfile: InventoryProfile<V2ContainerConsumerParentIoTarget> = {
+  prefix: "container-parent-io/v2",
+  headerFormat: "takoserver.container-parent-io-inventory@2",
+  childFormat: "takoserver.container-parent-io-inventory-child@2",
+  isTarget: isContainerConsumerParentIoTarget,
+  qualifier: createV2ContainerConsumerParentIoQualifier,
+  decode: decodeV2ContainerConsumerParentIoBinding,
+  readOriginal: readV2ContainerConsumerParentIoOriginal,
+};
 const PAGE_SIZE = 128; // A read page, not a limit on the number of admitted children.
 interface Header {
-  readonly format: typeof HEADER;
+  readonly format: string;
   readonly parent: V2ContainerParentIoBindingScope["parent"];
   readonly epoch: number;
   readonly state: "open" | "sealed";
   readonly next: number;
 }
-interface Child {
-  readonly format: typeof CHILD;
+interface Child<T extends ParentIoTarget> {
+  readonly format: string;
   readonly sequence: number;
   readonly epoch: number;
-  readonly target: V2ContainerParentIoTarget;
+  readonly target: T;
   readonly binding: V2ContainerParentIoBinding | null;
 }
 function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
@@ -64,23 +122,30 @@ function exact(value: unknown, keys: readonly string[]): value is Record<string,
 function integer(value: unknown, minimum: number): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
 }
-function header(value: unknown, parent: Header["parent"]): value is Header {
+function header(
+  value: unknown,
+  parent: Header["parent"],
+  profile: { readonly headerFormat: string },
+): value is Header {
   return (
     exact(value, ["format", "parent", "epoch", "state", "next"]) &&
-    value.format === HEADER &&
+    value.format === profile.headerFormat &&
     canonicalJson(value.parent) === canonicalJson(parent) &&
     integer(value.epoch, 1) &&
     (value.state === "open" || value.state === "sealed") &&
     integer(value.next, 0)
   );
 }
-function child(value: unknown): value is Child {
+function child<T extends ParentIoTarget>(
+  value: unknown,
+  profile: InventoryProfile<T>,
+): value is Child<T> {
   return (
     exact(value, ["format", "sequence", "epoch", "target", "binding"]) &&
-    value.format === CHILD &&
+    value.format === profile.childFormat &&
     integer(value.sequence, 0) &&
     integer(value.epoch, 1) &&
-    isContainerParentIoTarget(value.target) &&
+    profile.isTarget(value.target) &&
     (value.binding === null || exact(value.binding, ["producerId", "canonical", "digest"]))
   );
 }
@@ -122,7 +187,28 @@ export async function createV2ContainerParentIoInventory(options: {
   readonly authorize: (claim: V2ContainerParentIoClaim) => Promise<boolean>;
   readonly readOriginal: (binding: V2ContainerParentIoBinding) => Promise<unknown>;
 }) {
+  return createInventory(options, parentProfile);
+}
+
+/**
+ * Explicit @2 inventory for accepted WorkerVersion 0.8 child I/O. Fixed source
+ * ports, complete entry coverage and the exact Form's native producer remain
+ * mandatory. Separate epochs fence only earlier @2 instances. An absent/empty
+ * @2 set cannot discharge an @1 set or attest all-profile/parent retirement;
+ * the Host must select the profile from genuine accepted source, not a DTO.
+ */
+export async function createV2ContainerConsumerParentIoInventory(
+  options: InventoryOptions<V2ContainerConsumerParentIoTarget>,
+) {
+  return createInventory(options, consumerProfile);
+}
+
+async function createInventory<T extends ParentIoTarget>(
+  options: InventoryOptions<T>,
+  profile: InventoryProfile<T>,
+) {
   const { storage, readParent, authorize, readOriginal } = options;
+  const epochKey = `${profile.prefix}/epoch`;
   if (
     !storage ||
     [
@@ -137,12 +223,12 @@ export async function createV2ContainerParentIoInventory(options: {
   )
     throw new TypeError("Container inventory custody ports required");
   const epoch = await storage.transaction(async (tx) => {
-    const previous = await tx.get(EPOCH_KEY);
+    const previous = await tx.get(epochKey);
     if (previous !== undefined && !integer(previous, 1))
       throw new TypeError("Invalid inventory epoch");
     const next = (previous ?? 0) as number;
     if (next >= Number.MAX_SAFE_INTEGER) throw new TypeError("Inventory epoch exhausted");
-    await tx.put(EPOCH_KEY, next + 1);
+    await tx.put(epochKey, next + 1);
     return next + 1;
   });
   async function scope(input: V2ContainerParentIoParent) {
@@ -151,7 +237,7 @@ export async function createV2ContainerParentIoInventory(options: {
     if (!derived) return null;
     const record = structuredClone(await readParent(structuredClone(parent.handle)));
     if (!containerParentIoMatchesRecord(parent, record)) return null;
-    const key = `container-parent-io/v1/parent/${await bytesDigest(new TextEncoder().encode(derived.invocationId))}`;
+    const key = `${profile.prefix}/parent/${await bytesDigest(new TextEncoder().encode(derived.invocationId))}`;
     return { parent, derived, key, record };
   }
   async function current(
@@ -159,9 +245,9 @@ export async function createV2ContainerParentIoInventory(options: {
     key: string,
     parent: Header["parent"],
   ): Promise<Header | null> {
-    if ((await tx.get(EPOCH_KEY)) !== epoch) return null;
+    if ((await tx.get(epochKey)) !== epoch) return null;
     const value = await tx.get(key);
-    return header(value, parent) ? value : null;
+    return header(value, parent, profile) ? value : null;
   }
   const sendable = (record: V2WorkerInvocationRecord | null) =>
     record?.phase === "send_authorized" &&
@@ -208,14 +294,16 @@ export async function createV2ContainerParentIoInventory(options: {
         const s = await scope(input);
         if (!s || !sendable(s.record)) return false;
         const opened = await storage.transaction(async (tx) => {
-          if ((await tx.get(EPOCH_KEY)) !== epoch) return false;
+          if ((await tx.get(epochKey)) !== epoch) return false;
           const previous = await tx.get(s.key);
           if (previous !== undefined)
             return (
-              header(previous, s.derived) && previous.epoch === epoch && previous.state === "open"
+              header(previous, s.derived, profile) &&
+              previous.epoch === epoch &&
+              previous.state === "open"
             );
           await tx.put(s.key, {
-            format: HEADER,
+            format: profile.headerFormat,
             parent: s.derived,
             epoch,
             state: "open",
@@ -229,10 +317,7 @@ export async function createV2ContainerParentIoInventory(options: {
         return false;
       }
     },
-    async issue(
-      input: V2ContainerParentIoParent,
-      targetInput: Omit<V2ContainerParentIoTarget, "producerId">,
-    ) {
+    async issue(input: V2ContainerParentIoParent, targetInput: Omit<T, "producerId">) {
       try {
         // Detach both inputs before any owner/storage await. IDs are Host-issued.
         const parent = structuredClone(input);
@@ -240,8 +325,7 @@ export async function createV2ContainerParentIoInventory(options: {
           ...structuredClone(targetInput),
           producerId: crypto.randomUUID(),
         };
-        if (Object.hasOwn(targetInput, "producerId") || !isContainerParentIoTarget(target))
-          return null;
+        if (Object.hasOwn(targetInput, "producerId") || !profile.isTarget(target)) return null;
         const s = await scope(parent);
         if (!s || !sendable(s.record)) return null;
         const sequence = await storage.transaction(async (tx) => {
@@ -251,12 +335,12 @@ export async function createV2ContainerParentIoInventory(options: {
           const key = childKey(s.key, h.next);
           if ((await tx.get(key)) !== undefined) return null;
           await tx.put(key, {
-            format: CHILD,
+            format: profile.childFormat,
             sequence: h.next,
             epoch,
             target,
             binding: null,
-          } satisfies Child);
+          } satisfies Child<T>);
           await tx.put(s.key, { ...h, next: h.next + 1 });
           return h.next;
         });
@@ -270,13 +354,13 @@ export async function createV2ContainerParentIoInventory(options: {
               !!h &&
               h.epoch === epoch &&
               h.state === "open" &&
-              child(c) &&
+              child(c, profile) &&
               c.epoch === epoch &&
               c.sequence === sequence &&
               canonicalJson(c.target) === canonicalJson(target)
             );
           });
-        const qualify = createV2ContainerParentIoQualifier({
+        const qualify = profile.qualifier({
           readParent,
           authorize: async (claim) =>
             (await admitted()) && (await authorize(claim)) === true && (await admitted()),
@@ -295,7 +379,7 @@ export async function createV2ContainerParentIoInventory(options: {
             !h ||
             h.epoch !== epoch ||
             h.state !== "open" ||
-            !child(c) ||
+            !child(c, profile) ||
             c.epoch !== epoch ||
             c.sequence !== sequence ||
             c.binding !== null ||
@@ -336,7 +420,7 @@ export async function createV2ContainerParentIoInventory(options: {
         if (!h)
           return {
             state:
-              (await storage.get(EPOCH_KEY)) === epoch && (await storage.get(s.key)) === undefined
+              (await storage.get(epochKey)) === epoch && (await storage.get(s.key)) === undefined
                 ? "absent"
                 : "unknown",
           };
@@ -360,7 +444,7 @@ export async function createV2ContainerParentIoInventory(options: {
             if (
               seen >= h.next ||
               key !== childKey(s.key, seen) ||
-              !child(raw) ||
+              !child(raw, profile) ||
               raw.sequence !== seen ||
               raw.epoch !== h.epoch ||
               !raw.binding
@@ -369,14 +453,14 @@ export async function createV2ContainerParentIoInventory(options: {
             const c = structuredClone(raw);
             const binding = c.binding;
             if (!binding) return { state: "unknown" };
-            const decoded = await decodeV2ContainerParentIoBinding(binding);
+            const decoded = await profile.decode(binding);
             if (
               !decoded ||
               canonicalJson(decoded.parent) !== canonicalJson(h.parent) ||
               canonicalJson(decoded.target) !== canonicalJson(c.target)
             )
               return { state: "unknown" };
-            const result = await readV2ContainerParentIoOriginal(binding, readOriginal);
+            const result = await profile.readOriginal(binding, readOriginal);
             if (!(await unchanged())) return { state: "unknown" };
             if (result.state !== "complete") return { state: result.state };
             seen++;
