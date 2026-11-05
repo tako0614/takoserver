@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { ApiError, type WorkspaceUsagePage, type WorkspaceUsageRow } from "../console/src/api.ts";
+import {
+  ApiError,
+  decodeWorkspaceUsagePage,
+  type WorkspaceUsagePage,
+  type WorkspaceUsageRow,
+} from "../console/src/api.ts";
 import { createWorkspaceUsageController } from "../console/src/workspace-usage.ts";
 
 const organizationId = "org-example";
@@ -55,7 +60,9 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 test("pages append rows of one snapshot while totals stay the snapshot's, never a page sum", async () => {
   const { controller, calls } = harness((query) =>
-    query.cursor === undefined ? page([row("ws_a"), row("ws_b")], "c1") : page([row("ws_c")], null),
+    query.cursor === undefined
+      ? page([row("ws_a", "3"), row("ws_b", "3")], "c1")
+      : page([row("ws_c", "2")], null),
   );
   expect(controller.state()).toEqual({ status: "loading" });
   controller.reload();
@@ -88,7 +95,7 @@ test("an expired continuation (409) restarts from page one and drops the old sna
     if (query.cursor !== undefined) return new ApiError("expired", 409, path);
     return call === 1
       ? page([row("ws_a"), row("ws_b")], "c1")
-      : page([row("ws_x")], null, { snapshotAt: "2026-10-15T00:11:00.000Z" });
+      : page([row("ws_x", "8")], null, { snapshotAt: "2026-10-15T00:11:00.000Z" });
   });
   controller.reload();
   await settle();
@@ -112,7 +119,10 @@ test("a continuation from a different snapshot is never merged; the view restart
     const { controller, calls } = harness((query, call) =>
       query.cursor !== undefined
         ? page([row("ws_c")], null, change)
-        : page([row(call === 1 ? "ws_a" : "ws_0"), row("ws_b")], call === 1 ? "c1" : null),
+        : page(
+            [row(call === 1 ? "ws_a" : "ws_0", "4"), row("ws_b", "4")],
+            call === 1 ? "c1" : null,
+          ),
     );
     controller.reload();
     await settle();
@@ -129,7 +139,7 @@ test("a continuation from a different snapshot is never merged; the view restart
   const { controller } = harness((query, call) =>
     query.cursor !== undefined
       ? page([row("ws_b")], null)
-      : page([row("ws_a"), row("ws_b")], call === 1 ? "c1" : null),
+      : page([row("ws_a", "4"), row("ws_b", "4")], call === 1 ? "c1" : null),
   );
   controller.reload();
   await settle();
@@ -141,9 +151,9 @@ test("a continuation from a different snapshot is never merged; the view restart
 test("a failed continuation keeps the shown page and retries the same cursor", async () => {
   let fail = true;
   const { controller, calls } = harness((query) => {
-    if (query.cursor === undefined) return page([row("ws_a"), row("ws_b")], "c1");
+    if (query.cursor === undefined) return page([row("ws_a", "3"), row("ws_b", "3")], "c1");
     if (fail) return new ApiError("billing_unavailable", 503, path);
-    return page([row("ws_c")], null);
+    return page([row("ws_c", "2")], null);
   });
   controller.reload();
   await settle();
@@ -165,6 +175,96 @@ test("a failed continuation keeps the shown page and retries the same cursor", a
   expect(state.rows.map((entry) => entry.workspaceRef)).toEqual(["ws_a", "ws_b", "ws_c"]);
 });
 
+test.each(
+  (["usedMicros", "heldMicros", "pendingMicros"] as const).flatMap((field) => [
+    { field, next: "6", defect: "overrun" },
+    { field, next: "1", defect: "terminal undercount" },
+  ]),
+)("individually valid pages refuse $field $defect", async ({ field, next }) => {
+  const amounts = (value: string) => ({
+    usedMicros: "0",
+    heldMicros: "0",
+    pendingMicros: "0",
+    [field]: value,
+  });
+  const decodedPage = (workspaceRef: string, value: string, cursor: string | null) =>
+    decodeWorkspaceUsagePage(
+      {
+        ...page([{ workspaceRef, ...amounts(value) }], cursor, {
+          totals: amounts("10"),
+          unattributed: amounts("2"),
+        }),
+        usageSummary: {
+          organizationId,
+          currency: "USD",
+          unit: "USD-micros",
+          periodStart: "2026-10-01T00:00:00.000Z",
+          periodEnd: "2026-11-01T00:00:00.000Z",
+        },
+      },
+      organizationId,
+    );
+  let repaired = false;
+  const { controller, calls } = harness((query) =>
+    query.cursor === undefined
+      ? decodedPage("ws_a", "6", "c1")
+      : decodedPage("ws_b", repaired ? "2" : next, null),
+  );
+  controller.reload();
+  await settle();
+  const original = controller.state();
+  if (original.status !== "ready") throw new Error("not ready");
+
+  await controller.loadMore();
+  const refused = controller.state();
+  expect(refused).toMatchObject({
+    status: "ready",
+    cursor: "c1",
+    more: { status: "error", error: { code: "invalid_response" } },
+  });
+  if (refused.status !== "ready") throw new Error("not ready");
+  expect(refused.rows).toBe(original.rows);
+  expect(refused.snapshot).toBe(original.snapshot);
+  expect(calls.map((call) => call.cursor)).toEqual([undefined, "c1"]);
+
+  repaired = true;
+  await controller.loadMore();
+  const recovered = controller.state();
+  expect(recovered).toMatchObject({ status: "ready", cursor: null, more: { status: "idle" } });
+  if (recovered.status !== "ready") throw new Error("not ready");
+  expect(recovered.rows.map((entry) => entry.workspaceRef)).toEqual(["ws_a", "ws_b"]);
+  expect(calls.map((call) => call.cursor)).toEqual([undefined, "c1", "c1"]);
+});
+
+test.each(["usedMicros", "heldMicros", "pendingMicros"] as const)(
+  "a terminal first page cannot silently omit %s and can recover by explicit reload",
+  async (field) => {
+    const amounts = (value: string) => ({
+      usedMicros: "0",
+      heldMicros: "0",
+      pendingMicros: "0",
+      [field]: value,
+    });
+    const { controller, calls } = harness((_query, call) =>
+      page([{ workspaceRef: "ws_a", ...amounts(call === 1 ? "7" : "8") }], null, {
+        totals: amounts("10"),
+        unattributed: amounts("2"),
+      }),
+    );
+    controller.reload();
+    await settle();
+    expect(controller.state()).toMatchObject({
+      status: "error",
+      error: { code: "invalid_response" },
+    });
+    expect(calls).toEqual([{ limit: 2 }]);
+    controller.reload();
+    await settle();
+    expect(controller.state()).toMatchObject({ status: "ready", cursor: null });
+    expect(calls).toEqual([{ limit: 2 }, { limit: 2 }]);
+  },
+);
+
 test("a Host without the breakdown hides it; other first-page failures are retryable errors", async () => {
   const absent = harness(() => new ApiError("not_found", 404, path));
   absent.controller.reload();
@@ -173,7 +273,9 @@ test("a Host without the breakdown hides it; other first-page failures are retry
 
   let call = 0;
   const flaky = harness(() =>
-    ++call === 1 ? new ApiError("billing_unavailable", 503, path) : page([], null),
+    ++call === 1
+      ? new ApiError("billing_unavailable", 503, path)
+      : page([], null, { totals: { usedMicros: "2", heldMicros: "0", pendingMicros: "0" } }),
   );
   flaky.controller.reload();
   await settle();
@@ -195,7 +297,10 @@ test("a refresh supersedes an in-flight continuation, and a left Organization ig
         releaseMore = resolve;
       });
     firstPages += 1;
-    return page([row(firstPages === 1 ? "ws_a" : "ws_new")], firstPages === 1 ? "c1" : null);
+    return page(
+      [row(firstPages === 1 ? "ws_a" : "ws_new", firstPages === 1 ? "1" : "8")],
+      firstPages === 1 ? "c1" : null,
+    );
   });
   controller.reload();
   await settle();
@@ -222,7 +327,7 @@ test("a refresh supersedes an in-flight continuation, and a left Organization ig
 test("a retired usage controller cannot dispatch a reload or replace its current state", async () => {
   let current = true;
   const { controller, calls } = harness(
-    () => page([row("ws_original")], null),
+    () => page([row("ws_original", "8")], null),
     () => current,
   );
   controller.reload();
