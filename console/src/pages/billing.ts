@@ -10,6 +10,7 @@ import {
 import { type Child, h, live, text } from "../dom.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { effect, type Resource, resource, signal } from "../reactive.ts";
+import { route } from "../router.ts";
 import { api, captureSelectedOrganizationScope, currentOrganization, principal } from "../state.ts";
 import {
   browserSubscriptionCancelIntentLock,
@@ -39,6 +40,7 @@ import {
   explain,
   ICON,
   icon,
+  type ModalOptions,
   openModal,
   skeletonRows,
   stat,
@@ -58,7 +60,10 @@ let nextFundingInputId = 0;
  * when the server reports positive available credit.
  */
 export function billingPage(organizationId: string): Child {
-  const isPageCurrent = captureSelectedOrganizationScope(organizationId);
+  const openedRoute = route();
+  const isRouteCurrent = () => route() === openedRoute;
+  const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
+  const isPageCurrent = () => isRouteCurrent() && isOrganizationCurrent();
   const wallet = resource(() => api.wallet(organizationId));
   const usageSummary = resource(() => api.usageSummary(organizationId));
   const hostedSubscription = resource(() => api.subscription(organizationId));
@@ -78,6 +83,7 @@ export function billingPage(organizationId: string): Child {
     reloadWallet();
   };
   const ownerCanManage = () => {
+    if (!isRouteCurrent()) return false;
     const who = principal();
     const organization = currentOrganization();
     return Boolean(
@@ -85,6 +91,7 @@ export function billingPage(organizationId: string): Child {
     );
   };
   const ownerScope = () => {
+    if (!isRouteCurrent()) return null;
     const who = principal();
     const organization = currentOrganization();
     if (!who || !organization) return null;
@@ -159,6 +166,7 @@ export function billingPage(organizationId: string): Child {
     const controller = createSubscriptionCancellationController({
       organizationId,
       getScope: () => {
+        if (!isRouteCurrent()) return null;
         const who = principal();
         const organization = currentOrganization();
         const loaded = hostedSubscription.get();
@@ -228,6 +236,7 @@ export function billingPage(organizationId: string): Child {
     queueMicrotask(() => void routeReturn());
   });
   const openAddFunds = (): void => {
+    if (!isRouteCurrent()) return;
     const mode = billingMode();
     if (mode === "legacy") {
       if (isPageCurrent()) addFunds(organizationId, reloadWallet, isPageCurrent);
@@ -235,7 +244,12 @@ export function billingPage(organizationId: string): Child {
     }
     const loaded = hostedSubscription.get();
     if (mode === "hosted" && loaded.state === "ready") {
-      hostedAddFunds(topUp, topUpBounds(loaded.value.planTable));
+      const isModalScopeCurrent = captureSelectedOrganizationScope(organizationId);
+      hostedAddFunds(
+        topUp,
+        topUpBounds(loaded.value.planTable),
+        () => isRouteCurrent() && isModalScopeCurrent(),
+      );
       return;
     }
     toast(
@@ -624,6 +638,34 @@ function uiLocale(): "en-US" | "ja-JP" {
   return consoleLocale() === "ja" ? "ja-JP" : "en-US";
 }
 
+function openBillingModal(options: ModalOptions, isScopeCurrent: () => boolean): () => void {
+  let open = true;
+  let stop = (): void => {};
+  const lifetime: { close: (() => void) | null } = { close: null };
+  const close = openModal({
+    ...options,
+    onClose: () => {
+      open = false;
+      lifetime.close = null;
+      stop();
+      options.onClose?.();
+    },
+  });
+  lifetime.close = close;
+  stop = watchBillingModalScope(isScopeCurrent, lifetime);
+  if (!open) stop();
+  return close;
+}
+
+function watchBillingModalScope(
+  isScopeCurrent: () => boolean,
+  lifetime: { close: (() => void) | null },
+): () => void {
+  return effect(() => {
+    if (!isScopeCurrent()) lifetime.close?.();
+  });
+}
+
 /**
  * Adding money.
  *
@@ -650,70 +692,73 @@ function addFunds(organizationId: string, reload: () => void, isScopeCurrent: ()
   let open = true;
   const isCurrent = () => open && isScopeCurrent();
 
-  const close = openModal({
-    title: tr("残高を追加", "Add funds"),
-    confirmLabel: tr("支払いへ進む", "Continue to payment"),
-    onClose: () => {
-      open = false;
-    },
-    body: h(
-      "div",
-      { style: { display: "grid", gap: "14px" } },
-      h(
+  const close = openBillingModal(
+    {
+      title: tr("残高を追加", "Add funds"),
+      confirmLabel: tr("支払いへ進む", "Continue to payment"),
+      onClose: () => {
+        open = false;
+      },
+      body: h(
         "div",
-        { class: "field" },
-        h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
-        amount,
+        { style: { display: "grid", gap: "14px" } },
         h(
-          "small",
-          null,
-          tr(
-            "一度だけ決済します。支払い確定後に残高へ反映されます。",
-            "Charged once. The balance is credited when the payment settles.",
+          "div",
+          { class: "field" },
+          h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
+          amount,
+          h(
+            "small",
+            null,
+            tr(
+              "一度だけ決済します。支払い確定後に残高へ反映されます。",
+              "Charged once. The balance is credited when the payment settles.",
+            ),
           ),
         ),
+        live(() =>
+          busy()
+            ? h("div", { class: "dim" }, tr("支払い画面を開いています…", "Opening Stripe…"))
+            : h("div"),
+        ),
       ),
-      live(() =>
-        busy()
-          ? h("div", { class: "dim" }, tr("支払い画面を開いています…", "Opening Stripe…"))
-          : h("div"),
-      ),
-    ),
-    onConfirm: async () => {
-      if (!isCurrent()) {
-        close();
-        return;
-      }
-      const dollars = Number(amount.value);
-      if (!Number.isFinite(dollars) || dollars < 5) {
-        toast(tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"), "bad");
-        return;
-      }
-      busy.set(true);
-      try {
-        const started = await api.beginCheckout(organizationId, Math.round(dollars * 100));
+      onConfirm: async () => {
         if (!isCurrent()) {
           close();
           return;
         }
-        window.location.assign(started.checkout.url);
-      } catch (error) {
-        if (!isCurrent()) {
-          close();
+        const dollars = Number(amount.value);
+        if (!Number.isFinite(dollars) || dollars < 5) {
+          toast(tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"), "bad");
           return;
         }
-        busy.set(false);
-        const failure = error as { code?: string };
-        if (failure.code === "not_found") {
-          // This deployment takes no card. Offer the way it does take money.
-          close();
-          operatorFunding(organizationId, reload, isScopeCurrent);
-          return;
+        busy.set(true);
+        try {
+          const started = await api.beginCheckout(organizationId, Math.round(dollars * 100));
+          if (!isCurrent()) {
+            close();
+            return;
+          }
+          window.location.assign(started.checkout.url);
+        } catch (error) {
+          if (!isCurrent()) {
+            close();
+            return;
+          }
+          busy.set(false);
+          const failure = error as { code?: string };
+          if (failure.code === "not_found") {
+            // This deployment takes no card. Offer the way it does take money.
+            close();
+            operatorFunding(organizationId, reload, isScopeCurrent);
+            return;
+          }
+          toast(explain(error as Error), "bad");
         }
-        toast(explain(error as Error), "bad");
-      }
+      },
     },
-  });
+    isScopeCurrent,
+  );
 }
 
 /** Current bounds for a new hosted top-up, from the Host-authored plan table. */
@@ -741,6 +786,7 @@ function money(amountMinor: number): string {
 function hostedAddFunds(
   topUp: ReturnType<typeof createTopUpCheckoutController>,
   bounds: { readonly minimumMinor: number; readonly maximumMinor: number } | null,
+  isScopeCurrent: () => boolean,
 ): void {
   const state = topUp.state();
   const pending =
@@ -755,90 +801,94 @@ function hostedAddFunds(
     step: "1",
   });
 
-  openModal({
-    title: tr("残高を追加", "Add funds"),
-    confirmLabel: tr("支払いへ進む", "Continue to payment"),
-    confirmBlocked: () => ["busy", "redirecting"].includes(topUp.state().status),
-    body: h(
-      "div",
-      { style: { display: "grid", gap: "14px" } },
-      h(
+  openBillingModal(
+    {
+      title: tr("残高を追加", "Add funds"),
+      confirmLabel: tr("支払いへ進む", "Continue to payment"),
+      confirmBlocked: () => ["busy", "redirecting"].includes(topUp.state().status),
+      body: h(
         "div",
-        { class: "field" },
-        h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
-        amount,
+        { style: { display: "grid", gap: "14px" } },
         h(
-          "small",
-          null,
-          bounds
-            ? tr(
-                `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}。一度だけ決済し、支払い確定後に残高へ反映されます。`,
-                `${money(bounds.minimumMinor)}–${money(bounds.maximumMinor)}. Charged once; the balance is credited when the payment settles.`,
-              )
-            : tr(
-                "一度だけ決済します。支払い確定後に残高へ反映されます。",
-                "Charged once. The balance is credited when the payment settles.",
-              ),
+          "div",
+          { class: "field" },
+          h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
+          amount,
+          h(
+            "small",
+            null,
+            bounds
+              ? tr(
+                  `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}。一度だけ決済し、支払い確定後に残高へ反映されます。`,
+                  `${money(bounds.minimumMinor)}–${money(bounds.maximumMinor)}. Charged once; the balance is credited when the payment settles.`,
+                )
+              : tr(
+                  "一度だけ決済します。支払い確定後に残高へ反映されます。",
+                  "Charged once. The balance is credited when the payment settles.",
+                ),
+          ),
         ),
-      ),
-      live(() => {
-        const current = topUp.state();
-        if (current.status === "amount_conflict" || current.status === "unresolved")
-          return h(
-            "div",
-            { class: "notice notice--warn", role: "status" },
-            icon(ICON.alert, 15),
-            h(
+        live(() => {
+          const current = topUp.state();
+          if (current.status === "amount_conflict" || current.status === "unresolved")
+            return h(
               "div",
-              { style: { display: "grid", gap: "8px", justifyItems: "start" } },
+              { class: "notice notice--warn", role: "status" },
+              icon(ICON.alert, 15),
               h(
-                "span",
-                null,
-                tr(
-                  `前回の支払い（${money(current.amountMinor)}）が完了していません。別の金額にする前に、前回の支払いを再開してください。`,
-                  `An earlier payment of ${money(current.amountMinor)} is not finished. Resume it before choosing a different amount.`,
+                "div",
+                { style: { display: "grid", gap: "8px", justifyItems: "start" } },
+                h(
+                  "span",
+                  null,
+                  tr(
+                    `前回の支払い（${money(current.amountMinor)}）が完了していません。別の金額にする前に、前回の支払いを再開してください。`,
+                    `An earlier payment of ${money(current.amountMinor)} is not finished. Resume it before choosing a different amount.`,
+                  ),
+                ),
+                h(
+                  "button",
+                  {
+                    class: "btn",
+                    type: "button",
+                    onClick: () => void topUp.start(current.amountMinor),
+                  },
+                  tr(
+                    `前回の支払い（${money(current.amountMinor)}）を再開`,
+                    `Resume the ${money(current.amountMinor)} payment`,
+                  ),
                 ),
               ),
-              h(
-                "button",
-                {
-                  class: "btn",
-                  type: "button",
-                  onClick: () => void topUp.start(current.amountMinor),
-                },
-                tr(
-                  `前回の支払い（${money(current.amountMinor)}）を再開`,
-                  `Resume the ${money(current.amountMinor)} payment`,
-                ),
-              ),
-            ),
+            );
+          return topUpMessage(current);
+        }),
+      ),
+      onConfirm: async () => {
+        if (!isScopeCurrent()) return;
+        const dollars = Number(amount.value);
+        const amountMinor = Math.round(dollars * 100);
+        const minimumMinor = bounds?.minimumMinor ?? 500;
+        if (
+          !Number.isFinite(dollars) ||
+          amountMinor < minimumMinor ||
+          (bounds !== null && amountMinor > bounds.maximumMinor)
+        ) {
+          toast(
+            bounds
+              ? tr(
+                  `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}の金額を入力してください`,
+                  `Enter an amount from ${money(bounds.minimumMinor)} to ${money(bounds.maximumMinor)}`,
+                )
+              : tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"),
+            "bad",
           );
-        return topUpMessage(current);
-      }),
-    ),
-    onConfirm: async () => {
-      const dollars = Number(amount.value);
-      const amountMinor = Math.round(dollars * 100);
-      const minimumMinor = bounds?.minimumMinor ?? 500;
-      if (
-        !Number.isFinite(dollars) ||
-        amountMinor < minimumMinor ||
-        (bounds !== null && amountMinor > bounds.maximumMinor)
-      ) {
-        toast(
-          bounds
-            ? tr(
-                `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}の金額を入力してください`,
-                `Enter an amount from ${money(bounds.minimumMinor)} to ${money(bounds.maximumMinor)}`,
-              )
-            : tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"),
-          "bad",
-        );
-        return;
-      }
-      await topUp.start(amountMinor);
+          return;
+        }
+        await topUp.start(amountMinor);
+      },
     },
-  });
+    isScopeCurrent,
+  );
 }
 
 /** What the page says about a hosted top-up outside the modal: returns and resumes. */
@@ -972,68 +1022,71 @@ function operatorFunding(
     ),
   });
 
-  const close = openModal({
-    title: tr("残高を追加", "Add funds"),
-    confirmLabel: tr("残高へ反映", "Credit wallet"),
-    onClose: () => {
-      open = false;
-    },
-    body: h(
-      "div",
-      { style: { display: "grid", gap: "14px" } },
-      h(
+  const close = openBillingModal(
+    {
+      title: tr("残高を追加", "Add funds"),
+      confirmLabel: tr("残高へ反映", "Credit wallet"),
+      onClose: () => {
+        open = false;
+      },
+      body: h(
         "div",
-        { class: "notice" },
-        icon(ICON.alert, 15),
+        { style: { display: "grid", gap: "14px" } },
         h(
           "div",
-          null,
-          tr(
-            "この環境ではカード決済を利用できません。金額は入金証明から取得し、同じ証明を複数回提示しても一度だけ反映します。",
-            "This deployment does not take card payments. The amount comes from the proof, not from you, and presenting the same proof twice credits once.",
+          { class: "notice" },
+          icon(ICON.alert, 15),
+          h(
+            "div",
+            null,
+            tr(
+              "この環境ではカード決済を利用できません。金額は入金証明から取得し、同じ証明を複数回提示しても一度だけ反映します。",
+              "This deployment does not take card payments. The amount comes from the proof, not from you, and presenting the same proof twice credits once.",
+            ),
           ),
         ),
-      ),
-      h(
-        "div",
-        { class: "field" },
-        h("label", { for: inputId }, tr("入金証明", "Settlement proof")),
-        input,
         h(
-          "small",
-          null,
-          tr(
-            "運営者がこの組織に対して発行した証明です。",
-            "Issued by the operator against this organization.",
+          "div",
+          { class: "field" },
+          h("label", { for: inputId }, tr("入金証明", "Settlement proof")),
+          input,
+          h(
+            "small",
+            null,
+            tr(
+              "運営者がこの組織に対して発行した証明です。",
+              "Issued by the operator against this organization.",
+            ),
           ),
         ),
       ),
-    ),
-    onConfirm: async () => {
-      if (!isCurrent()) {
-        close();
-        return;
-      }
-      const proof = input.value.trim();
-      if (proof === "") {
-        toast(tr("入金証明を貼り付けてください", "Paste a settlement proof first"), "bad");
-        return;
-      }
-      try {
-        await api.fund(organizationId, proof);
+      onConfirm: async () => {
         if (!isCurrent()) {
           close();
           return;
         }
-        toast(tr("残高へ反映しました", "Wallet credited"), "ok");
-        reload();
-        close();
-      } catch (error) {
-        if (isCurrent()) toast(explain(error as Error), "bad");
-        else close();
-      }
+        const proof = input.value.trim();
+        if (proof === "") {
+          toast(tr("入金証明を貼り付けてください", "Paste a settlement proof first"), "bad");
+          return;
+        }
+        try {
+          await api.fund(organizationId, proof);
+          if (!isCurrent()) {
+            close();
+            return;
+          }
+          toast(tr("残高へ反映しました", "Wallet credited"), "ok");
+          reload();
+          close();
+        } catch (error) {
+          if (isCurrent()) toast(explain(error as Error), "bad");
+          else close();
+        }
+      },
     },
-  });
+    isScopeCurrent,
+  );
 }
 
 /**
