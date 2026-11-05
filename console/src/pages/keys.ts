@@ -3,6 +3,7 @@ import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../key-scopes.ts";
 import { effect, resource, signal } from "../reactive.ts";
+import { route } from "../router.ts";
 import {
   api,
   captureSelectedOrganizationScope,
@@ -460,6 +461,8 @@ function createKey(
 }
 
 function openScopedKeyModal(options: ModalOptions, isScopeCurrent: () => boolean) {
+  const openedRoute = route();
+  const isCurrent = (): boolean => route() === openedRoute && isScopeCurrent();
   let open = true;
   let stop = (): void => {};
   const lifetime: KeyModalLifetime = { close: null };
@@ -473,10 +476,10 @@ function openScopedKeyModal(options: ModalOptions, isScopeCurrent: () => boolean
     },
   });
   lifetime.close = close;
-  stop = watchKeyModalScope(isScopeCurrent, lifetime);
+  stop = watchKeyModalScope(isCurrent, lifetime);
   // An already-retired page may open a dialog before the first effect runs.
   if (!open) stop();
-  return { close, isCurrent: () => open && isScopeCurrent() };
+  return { close, isCurrent: () => open && isCurrent() };
 }
 
 interface KeyModalLifetime {

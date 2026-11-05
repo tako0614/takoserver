@@ -105,6 +105,10 @@ class TestNode {
 const body = new TestNode("body");
 const documentEvents = new TestNode("document");
 const storage = new Map<string, string>();
+const location = new URL("https://console.example.test/keys");
+const moveLocation = (_state: unknown, _title: string, path: string | URL | null): void => {
+  if (path !== null) location.href = new URL(path, location).href;
+};
 Object.assign(globalThis, {
   Node: TestNode,
   HTMLInputElement: TestNode,
@@ -123,11 +127,17 @@ Object.assign(globalThis, {
     addEventListener: documentEvents.addEventListener.bind(documentEvents),
     removeEventListener: documentEvents.removeEventListener.bind(documentEvents),
   },
-  window: { location: new URL("https://console.example.test/"), addEventListener() {} },
+  window: {
+    location,
+    history: { pushState: moveLocation, replaceState: moveLocation },
+    scrollTo() {},
+    addEventListener() {},
+  },
 });
 
 const state = await import("../console/src/state.ts");
 const { keysPage } = await import("../console/src/pages/keys.ts");
+const { navigate } = await import("../console/src/router.ts");
 const { mountToasts, openModal } = await import("../console/src/ui.ts");
 const { setConsoleLocale } = await import("../console/src/i18n.ts");
 setConsoleLocale("en");
@@ -190,11 +200,15 @@ function deferred() {
   return { promise, resolve };
 }
 
-function changeScope(kind: "org" | "roundtrip" | "session" | "origin"): void {
+function changeScope(
+  kind: "org" | "roundtrip" | "session" | "origin" | "route" | "route-roundtrip",
+): void {
   if (kind === "org" || kind === "roundtrip") state.selectOrganization("org-b");
   if (kind === "roundtrip") state.selectOrganization("org-a");
   if (kind === "session") state.adoptSession();
   if (kind === "origin") state.setApiOrigin("https://other.example.test");
+  if (kind === "route" || kind === "route-roundtrip") navigate("/settings");
+  if (kind === "route-roundtrip") navigate("/keys");
 }
 
 const posts = () => requests.filter((request) => request.method === "POST");
@@ -205,6 +219,7 @@ const toasts = () => body.all().filter((node) => node.className.startsWith("toas
 
 beforeEach(async () => {
   dismiss();
+  navigate("/keys");
   body.replaceChildren();
   storage.clear();
   state.setApiOrigin("https://api.example.test");
@@ -349,7 +364,7 @@ for (const [label, payload, status] of [
   });
 }
 
-for (const kind of ["org", "roundtrip", "session", "origin"] as const) {
+for (const kind of ["org", "roundtrip", "session", "origin", "route", "route-roundtrip"] as const) {
   test(`a retired create dialog cannot dispatch (${kind})`, async () => {
     const confirm = openCreate();
     changeScope(kind);
@@ -663,7 +678,7 @@ test("current revocation failure reports the refusal without refresh or retry", 
   expect(body.all().filter((node) => node.attributes.get("role") === "dialog")).toHaveLength(1);
 });
 
-for (const kind of ["org", "roundtrip", "session", "origin"] as const) {
+for (const kind of ["org", "roundtrip", "session", "origin", "route", "route-roundtrip"] as const) {
   test(`a retired revoke dialog cannot dispatch (${kind})`, async () => {
     const confirm = openRevoke();
     changeScope(kind);
@@ -721,3 +736,27 @@ test("pending revocation rejects local reentry", async () => {
   expect(deletions()).toHaveLength(1);
   expect(reads()).toHaveLength(2);
 });
+
+for (const kind of ["route", "route-roundtrip"] as const) {
+  test(`route-retired success keeps unshown recovery metadata, never the secret (${kind})`, async () => {
+    const answer = deferred();
+    reply = () => answer.promise;
+    openCreate().click();
+    changeScope(kind);
+    answer.resolve(Response.json(lostResult, { status: 201 }));
+    await tick();
+    expect(body.textContent).not.toContain(lostResult.secret);
+    expect(toasts()).toHaveLength(0);
+    expect(posts()).toHaveLength(1);
+    expect(reads()).toHaveLength(1);
+    keyListReply = () => Response.json({ apiKeys: [lostKey] });
+    navigate("/keys");
+    await revisitKeys("org-a");
+    expect(keyNotices()).toHaveLength(1);
+    expect(keyNotices()[0]?.textContent).toContain(lostKey.id);
+    expect(body.textContent).not.toContain(lostResult.secret);
+    expect([...storage.values()].join(" ")).not.toContain(lostResult.secret);
+    expect(posts()).toHaveLength(1);
+    expect(deletions()).toHaveLength(0);
+  });
+}
