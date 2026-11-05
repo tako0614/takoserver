@@ -982,7 +982,9 @@ test("wallet micros decode as canonical bounded USD strings and display exact fr
     currency: "USD",
     settledMicros: "1234000001",
     heldMicros: "1",
-    availableMicros: "1234000000",
+    availableMicros: "1233999990",
+    frozenMicros: "10",
+    refundReceivableMicros: "25000",
     entries: [
       {
         id: "entry-one",
@@ -1015,6 +1017,8 @@ test("wallet rejects numeric, unsafe or nonconserving money responses", async ()
         settledMicros: 10000,
         heldMicros: "0",
         availableMicros: "10000",
+        frozenMicros: "0",
+        refundReceivableMicros: "0",
         entries: [],
       },
     }),
@@ -1028,6 +1032,8 @@ test("wallet rejects numeric, unsafe or nonconserving money responses", async ()
         settledMicros: "9007199254740992",
         heldMicros: "0",
         availableMicros: "9007199254740992",
+        frozenMicros: "0",
+        refundReceivableMicros: "0",
         entries: [],
       },
     }),
@@ -1041,6 +1047,53 @@ test("wallet rejects numeric, unsafe or nonconserving money responses", async ()
         settledMicros: "10000",
         heldMicros: "0",
         availableMicros: "9999",
+        frozenMicros: "0",
+        refundReceivableMicros: "0",
+        entries: [],
+      },
+    }),
+  );
+  await expect(client().wallet(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() =>
+    Response.json({
+      wallet: {
+        organizationId: org,
+        currency: "USD",
+        settledMicros: "10000",
+        heldMicros: "0",
+        availableMicros: "10000",
+        frozenMicros: 0,
+        refundReceivableMicros: "0",
+        entries: [],
+      },
+    }),
+  );
+  await expect(client().wallet(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() =>
+    Response.json({
+      wallet: {
+        organizationId: org,
+        currency: "USD",
+        settledMicros: "10000",
+        heldMicros: "0",
+        availableMicros: "9000",
+        frozenMicros: "1000",
+        refundReceivableMicros: "-1",
+        entries: [],
+      },
+    }),
+  );
+  await expect(client().wallet(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() =>
+    Response.json({
+      wallet: {
+        organizationId: org,
+        currency: "USD",
+        settledMicros: "10000",
+        heldMicros: "0",
+        availableMicros: "9999",
+        frozenMicros: "2",
+        refundReceivableMicros: "0",
         entries: [],
       },
     }),
@@ -1056,6 +1109,8 @@ test("Hosted selection wallet uses a raw finite Org segment, shared cookie, and 
     settledMicros: "10000000",
     heldMicros: "0",
     availableMicros: "10000000",
+    frozenMicros: "0",
+    refundReceivableMicros: "0",
     entries: [],
   };
   const seen = transport(() => Response.json({ wallet }));

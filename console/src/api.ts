@@ -93,6 +93,8 @@ export interface Wallet {
   readonly settledMicros: string;
   readonly heldMicros: string;
   readonly availableMicros: string;
+  readonly frozenMicros: string;
+  readonly refundReceivableMicros: string;
   readonly entries: readonly LedgerEntry[];
 }
 
@@ -474,7 +476,12 @@ function decodeWallet(payload: unknown, organizationId: string): Wallet {
   const settledMicros = unsignedMicros(wallet.settledMicros);
   const heldMicros = unsignedMicros(wallet.heldMicros);
   const availableMicros = unsignedMicros(wallet.availableMicros);
-  if (BigInt(settledMicros) - BigInt(heldMicros) !== BigInt(availableMicros)) {
+  const frozenMicros = unsignedMicros(wallet.frozenMicros);
+  const refundReceivableMicros = unsignedMicros(wallet.refundReceivableMicros);
+  if (
+    BigInt(settledMicros) !==
+    BigInt(availableMicros) + BigInt(heldMicros) + BigInt(frozenMicros)
+  ) {
     throw new TypeError("invalid wallet conservation");
   }
   const entries = wallet.entries.map((entry): LedgerEntry => {
@@ -499,7 +506,16 @@ function decodeWallet(payload: unknown, organizationId: string): Wallet {
       createdAt: entry.createdAt,
     };
   });
-  return { organizationId, currency: "USD", settledMicros, heldMicros, availableMicros, entries };
+  return {
+    organizationId,
+    currency: "USD",
+    settledMicros,
+    heldMicros,
+    availableMicros,
+    frozenMicros,
+    refundReceivableMicros,
+    entries,
+  };
 }
 
 const WORKSPACE_USAGE_KEYS = [

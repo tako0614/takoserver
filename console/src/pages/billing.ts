@@ -53,10 +53,9 @@ let nextFundingInputId = 0;
 /**
  * The wallet, and the ledger it is derived from.
  *
- * There is no balance column anywhere in this product — available is settled
- * minus held, recomputed from entries that are only ever appended. The page is
- * built to say so, because a customer who can see the arithmetic does not have
- * to trust it.
+ * Available credit excludes held and refund-frozen allocations. Refund
+ * receivables are separate debt: they can block new billable operations even
+ * when the server reports positive available credit.
  */
 export function billingPage(organizationId: string): Child {
   const isPageCurrent = captureSelectedOrganizationScope(organizationId);
@@ -293,7 +292,7 @@ export function billingPage(organizationId: string): Child {
               stat(
                 tr("利用可能", "Available"),
                 formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
-                tr("確定残高 − 確保中", "settled − held"),
+                tr("現在のクレジット − 確保中 − 凍結額", "current credit − held − frozen"),
               ),
               stat(
                 tr("確保中", "Held"),
@@ -301,9 +300,25 @@ export function billingPage(organizationId: string): Child {
                 tr("処理中の操作に予約済み", "reserved against live work"),
               ),
               stat(
-                tr("確定残高", "Settled"),
+                tr("現在のクレジット", "Current credit"),
                 formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
-                tr("入金と確定済み請求", "funded and captured"),
+                tr(
+                  "確保中・凍結中を含む有効なクレジット",
+                  "eligible credit, including held and frozen",
+                ),
+              ),
+              stat(
+                tr("返金処理中の凍結額", "Frozen"),
+                formatMicrosCurrency(held.frozenMicros, held.currency, uiLocale()),
+                tr(
+                  "返金処理中のため利用できません",
+                  "unavailable while refund settlement is pending",
+                ),
+              ),
+              stat(
+                tr("返金未回収額", "Refund receivable"),
+                formatMicrosCurrency(held.refundReceivableMicros, held.currency, uiLocale()),
+                tr("利用可能残高に含まれない債務", "debt, separate from spendable credit"),
               ),
               live(() =>
                 whenReady(
@@ -323,6 +338,16 @@ export function billingPage(organizationId: string): Child {
                 ),
               ),
             ),
+            BigInt(held.refundReceivableMicros) > 0n
+              ? h(
+                  "div",
+                  { class: "notice notice--bad", role: "status" },
+                  tr(
+                    "返金未回収額が残っているため、利用可能残高があっても新しい課金操作はできません。",
+                    "New billable operations are blocked while a refund receivable remains, even when available credit is positive.",
+                  ),
+                )
+              : null,
             card(
               tr("取引履歴", "Ledger"),
               held.entries.length === 0
