@@ -258,7 +258,7 @@ function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
   );
 }
 
-/** A wallet that has been used, in one line after what was deployed. */
+/** A used wallet's current credit and refund restrictions, after what was deployed. */
 function walletLine(held: Wallet): Child {
   const money = (micros: string) => formatMicrosCurrency(micros, held.currency, uiLocale());
   return h(
@@ -275,7 +275,7 @@ function walletLine(held: Wallet): Child {
         " ",
         h("strong", null, money(held.availableMicros)),
       ),
-      h("span", null, tr("確定残高", "Settled"), " ", money(held.settledMicros)),
+      h("span", null, tr("現在のクレジット", "Current credit"), " ", money(held.settledMicros)),
       BigInt(held.heldMicros) > 0n
         ? h(
             "span",
@@ -283,8 +283,43 @@ function walletLine(held: Wallet): Child {
             tr(`${money(held.heldMicros)}を確保中`, `${money(held.heldMicros)} held`),
           )
         : null,
+      h(
+        "span",
+        null,
+        tr("返金処理中の凍結額", "Frozen"),
+        " ",
+        held.frozenMicros === undefined ? tr("未報告", "Not reported") : money(held.frozenMicros),
+      ),
+      h(
+        "span",
+        null,
+        tr("返金未回収額", "Refund receivable"),
+        " ",
+        held.refundReceivableMicros === undefined
+          ? tr("未報告", "Not reported")
+          : money(held.refundReceivableMicros),
+      ),
       h("a", { ...linkProps("/billing") }, tr("使用量と請求", "Usage & billing")),
     ),
+    held.refundReceivableMicros === undefined
+      ? h(
+          "div",
+          { class: "notice notice--warn", role: "status" },
+          tr(
+            "返金未回収額は未報告です。利用可能残高だけでは新しい課金操作の可否は分かりません。操作時にHostが判定します。",
+            "Refund debt was not reported. Available credit alone does not establish permission for new billable operations; the Host decides when an operation is requested.",
+          ),
+        )
+      : BigInt(held.refundReceivableMicros) > 0n
+        ? h(
+            "div",
+            { class: "notice notice--bad", role: "status" },
+            tr(
+              "返金未回収額が残っているため、利用可能残高があっても新しい課金操作はできません。",
+              "New billable operations are blocked while a refund receivable remains, even when available credit is positive.",
+            ),
+          )
+        : null,
   );
 }
 
@@ -508,10 +543,11 @@ function uiLocale(): "en-US" | "ja-JP" {
   return consoleLocale() === "ja" ? "ja-JP" : "en-US";
 }
 
-/** Whether the wallet holds money now or has any history at all. */
+/** Whether the wallet has credit, a reported refund debt, or any history. */
 function walletInUse(wallet: Wallet): boolean {
   return (
     wallet.entries.length > 0 ||
+    (wallet.refundReceivableMicros !== undefined && BigInt(wallet.refundReceivableMicros) > 0n) ||
     [wallet.availableMicros, wallet.heldMicros, wallet.settledMicros].some(
       (micros) => BigInt(micros) !== 0n,
     )
