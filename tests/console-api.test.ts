@@ -1008,6 +1008,39 @@ test("wallet micros decode as canonical bounded USD strings and display exact fr
   expect(formatMicrosCurrency("-10001", "USD", "en-US")).toBe("-$0.010001");
 });
 
+test("wallet accepts the legacy shape and preserves optional frozen and receivable fields", async () => {
+  const legacyWallet = {
+    organizationId: org,
+    currency: "USD",
+    settledMicros: "10000",
+    heldMicros: "0",
+    availableMicros: "10000",
+    entries: [],
+  };
+  transport(() => Response.json({ wallet: legacyWallet }));
+  const legacy = await client().wallet(org);
+  expect(legacy.wallet).toEqual(legacyWallet);
+  expect("frozenMicros" in legacy.wallet).toBe(false);
+  expect("refundReceivableMicros" in legacy.wallet).toBe(false);
+
+  const frozenWallet = {
+    ...legacyWallet,
+    settledMicros: "10000",
+    availableMicros: "9000",
+    frozenMicros: "1000",
+  };
+  transport(() => Response.json({ wallet: frozenWallet }));
+  const frozen = await client().wallet(org);
+  expect(frozen.wallet).toEqual(frozenWallet);
+  expect("refundReceivableMicros" in frozen.wallet).toBe(false);
+
+  const receivableWallet = { ...legacyWallet, refundReceivableMicros: "2500" };
+  transport(() => Response.json({ wallet: receivableWallet }));
+  const receivable = await client().wallet(org);
+  expect(receivable.wallet).toEqual(receivableWallet);
+  expect("frozenMicros" in receivable.wallet).toBe(false);
+});
+
 test("wallet rejects numeric, unsafe or nonconserving money responses", async () => {
   transport(() =>
     Response.json({
@@ -1019,6 +1052,48 @@ test("wallet rejects numeric, unsafe or nonconserving money responses", async ()
         availableMicros: "10000",
         frozenMicros: "0",
         refundReceivableMicros: "0",
+        entries: [],
+      },
+    }),
+  );
+  await expect(client().wallet(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() =>
+    Response.json({
+      wallet: {
+        organizationId: org,
+        currency: "USD",
+        settledMicros: "10000",
+        heldMicros: "0",
+        availableMicros: "10000",
+        frozenMicros: null,
+        entries: [],
+      },
+    }),
+  );
+  await expect(client().wallet(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() =>
+    Response.json({
+      wallet: {
+        organizationId: org,
+        currency: "USD",
+        settledMicros: "10000",
+        heldMicros: "0",
+        availableMicros: "10000",
+        refundReceivableMicros: null,
+        entries: [],
+      },
+    }),
+  );
+  await expect(client().wallet(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() =>
+    Response.json({
+      wallet: {
+        organizationId: org,
+        currency: "USD",
+        settledMicros: "10000",
+        heldMicros: "0",
+        availableMicros: "9000",
+        frozenMicros: "2",
         entries: [],
       },
     }),

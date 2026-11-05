@@ -977,6 +977,53 @@ function seededStorage(amountMinor = 5000) {
 }
 
 describe("billing page top-up lane", () => {
+  test("billing wallet keeps optional refund data unknown instead of inventing zero debt", async () => {
+    for (const refundFields of [{}, { frozenMicros: "0" }, { refundReceivableMicros: "0" }]) {
+      const page = await billingPageFor({
+        subscription: "legacy",
+        walletResponse: () =>
+          Response.json({
+            wallet: {
+              organizationId,
+              currency: "USD",
+              settledMicros: "4000000",
+              heldMicros: "1000000",
+              availableMicros: "3000000",
+              entries: [],
+              ...refundFields,
+            },
+          }),
+      });
+      const cards = page.root.all().filter((node) => node.className === "card");
+      const walletCard = (label: string) =>
+        cards.find((node) =>
+          node
+            .all()
+            .some((child) => child.className === "stat__label" && child.textContent === label),
+        );
+      const value = (label: string) =>
+        walletCard(label)
+          ?.all()
+          .find((node) => node.className === "stat__value")?.textContent;
+      expect(value("Available")).toBe("$3");
+      expect(value("Frozen")).toBe("frozenMicros" in refundFields ? "$0" : "Not reported");
+      expect(value("Refund receivable")).toBe(
+        "refundReceivableMicros" in refundFields ? "$0" : "Not reported",
+      );
+      expect(page.root.textContent.includes("Refund debt was not reported")).toBe(
+        !("refundReceivableMicros" in refundFields),
+      );
+      expect(page.root.textContent).not.toContain("New billable operations are blocked");
+      if (!("frozenMicros" in refundFields)) {
+        expect(walletCard("Available")?.textContent).toContain("reported by this Host");
+        expect(walletCard("Current credit")?.textContent).not.toContain(
+          "including held and frozen",
+        );
+      }
+      expect(page.calls().every((call) => call.startsWith("GET "))).toBe(true);
+    }
+  });
+
   test("billing wallet shows frozen credit and receivable separately from available credit", async () => {
     const page = await billingPageFor({
       subscription: "legacy",
