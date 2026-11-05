@@ -192,7 +192,8 @@ export function createForwardV2NativeDeletionCustody(options: {
  * FAILS CLOSED against the installed 106 forward native schema: its stage/send/absence guards
  * admit only WorkerVersion 0.5.0 / 0.7.0, so a 0.8.0 deletion cannot be staged until a
  * successor schema widens those domains. This follows from the schema guards, not a deletion
- * execution test. Not exported from the package barrel.
+ * execution test. The explicit candidate barrel export does not install that successor or
+ * qualify provider-side deletion; its actual source/lease/readback checks remain mandatory.
  */
 export function createContainerConsumerV2NativeDeletionCustody(options: {
   readonly sql: Sql;
@@ -224,11 +225,14 @@ function createNativeDeletionCustody(
       (await sql.query(`SELECT 1 WHERE ${v2WorkerInvocationDrainSchemaReady()}`)).length === 1;
     return {
       unsafe: unsafePredicate(kind !== "endpoint", drainAware),
+      // Callers combine this invocation seal with claim/readySuffix in the
+      // same statement. Repeating the native catalog here exceeds D1's SQL
+      // byte limit; neither seal may move to the earlier schema probe.
       ready: `(${
         drainAware
           ? v2WorkerInvocationDrainSchemaReady()
           : v2WorkerInvocationLegacySchemaReady(kind)
-      })${readySuffix}`,
+      })`,
     };
   }
 

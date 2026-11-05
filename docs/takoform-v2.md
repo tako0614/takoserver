@@ -1049,6 +1049,34 @@ This first contract refuses WorkerVersion 0.8.0 and Container 0.2.0 by exact
 Form URL. It does not inspect or qualify native schema 0106; that source/apply
 work remains separate and on hold.
 
+The explicit `V2ContainerConsumerParentIo*` source profile adds
+`takoserver.container-parent-io-binding@2` and
+`takoserver.container-parent-io-original@2` for WorkerVersion 0.8.0 with either
+Container 0.1.0 or 0.2.0. The canonical format and digest domains are disjoint
+from @1; neither decoder nor original reader accepts the other profile. The
+same shared qualifier/decoder engine preserves the closed @1 checks and does
+not reinterpret 0.8 as 0.7. All parent/target fields and source-selected custody
+requirements below apply to both profiles. The @2 authorizer must verify the
+actual accepted 0.8 binding references and the native owner for the exact target
+Form, not a fallback owner selected by untrusted content.
+
+This is a Core source contract, not an implementation of private 0.8 admission,
+issuer, native one-use journal, native RPC or physical completion. Those
+components must explicitly adopt @2 through their owning source and trusted
+ports. The @1 inventory contract refuses @2; downstream RPC owners must select
+and validate the matching profile explicitly. The new target predicate or a
+successful content decode does not expand source coverage
+or grant a send. Existing Form definitions, default dispatch, installed pins and
+native schema 0106 are unchanged.
+
+An unregistered [consumer native-source candidate](container-consumer-native-source.md)
+preserves the registered106 SQL and existing physical databases. It prepares an
+explicit compatible successor source for Version0.8 effects and cleanup; it is
+not selected by a migration, default Form map or live target. The candidate
+curated API exports the existing consumer effect/deletion custody and the pure
+unregistered recipe for an explicit private producer. This does not install
+the successor or remove the normal private writer's0.8 no-send guard.
+
 The Core qualifier captures the exact accepted parent invocation/custody and full
 Worker selection, then compares the durable parent row and the source-selected
 accepted-binding/native-owner authorization before and after asynchronous hashing.
@@ -1110,6 +1138,20 @@ locators, never plaintext custody or the currentness closure. Each issuance
 returns the same qualifier's Host-memory currentness check, which also refuses
 after the set is sealed or its physical owner's epoch changes. A dropped reply
 does not remove the admitted intent or authorize a resend.
+
+`createV2ContainerConsumerParentIoInventory` explicitly selects the @2 codec
+and the same inventory engine for WorkerVersion 0.8.0 / Container 0.1.0 or
+0.2.0. Its durable namespace is `container-parent-io/v2`, with inventory and
+child formats `takoserver.container-parent-io-inventory@2` and
+`takoserver.container-parent-io-inventory-child@2`. The @1 factory retains
+`container-parent-io/v1`, its original formats and exact 0.7 / 0.1 Form limits.
+No factory discovers, migrates or falls back to the other profile's records.
+Epochs fence previous instances within their own profile; constructing @2 does
+not fence an @1 issuer. A Host that owns both profiles must retain their proper
+instances and select from genuine accepted source, including the exact native
+owner. An absent or sealed empty @2 set cannot discharge an @1 set, prove
+all-profile coverage, or grant parent retirement. Private issuer/entry/native
+integration remains separate work; these storage ports do not supply it.
 
 Sealing atomically closes new child admission. Reading a sealed set validates
 every retained binding and its own fixed-owner original; absent, pending,

@@ -118,6 +118,12 @@ import { createV2WorkflowClassAdmission } from "../src/takoform-v2/workflow-clas
 import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 
 const RUNTIME_EXPORTS = [
+  "createV2ContainerConsumerParentIoQualifier",
+  "createV2ContainerConsumerParentIoInventory",
+  "decodeV2ContainerConsumerParentIoBinding",
+  "isContainerConsumerParentIoTarget",
+  "readV2ContainerConsumerParentIoOriginal",
+  "v2ContainerConsumerParentIoOriginalDigest",
   "createV2ContainerParentIoQualifier",
   "createV2ContainerParentIoInventory",
   "decodeV2ContainerParentIoBinding",
@@ -173,9 +179,12 @@ const RUNTIME_EXPORTS = [
   "createV2HeldOrPublicArtifactSource",
   "createV2PublicHttpsArtifactSource",
   "createForwardV2NativeEffectCustody",
+  "createContainerConsumerV2NativeEffectCustody",
   "createRetainedV2NativeEffectCustody",
   "createV2NativeEffectCustody",
   "createForwardV2NativeDeletionCustody",
+  "createContainerConsumerV2NativeDeletionCustody",
+  "createContainerConsumerWorkerNativeSourceRecipe",
   "createV2NativeDeletionCustody",
   "createV2ServiceBindingAuthority",
   "createForwardV2WorkerInvocationLifecycle",

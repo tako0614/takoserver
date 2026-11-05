@@ -10,11 +10,13 @@ import {
 
 const OLD_VERSION = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/";
 const FORWARD_VERSION = "https://edge.forms.takoform.com/forms/WorkerVersion/0.7.0/";
+const CONSUMER_VERSION = "https://edge.forms.takoform.com/forms/WorkerVersion/0.8.0/";
 const OLD_DEPLOYMENT = "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/";
 const FORWARD_DEPLOYMENT = "https://edge.forms.takoform.com/forms/WorkerDeployment/0.6.0/";
 const VERSION_DOMAIN = `'${OLD_VERSION}', '${FORWARD_VERSION}'`;
 const DEPLOYMENT_DOMAIN = `'${OLD_DEPLOYMENT}', '${FORWARD_DEPLOYMENT}'`;
 const ASSERTION = "_tf_forward_worker_native106_assert";
+const CONSUMER_ASSERTION = "_tf_container_consumer_native_source_assert";
 const AFFECTED_TABLES = [
   "tf_v2_worker_native_effects",
   "tf_v2_worker_native_deletions",
@@ -106,6 +108,28 @@ const successorObjects = sourceObjects.map((entry) =>
     ? { ...entry, sql: successorTrigger(entry.name, entry.sql) }
     : entry,
 );
+// Fetch-only Version0.8 needs both upload and historical cleanup. Cron and
+// Queue guards deliberately retain their existing Version/Deployment domains.
+const consumerChangedNames = Object.freeze(
+  changedNames.filter(
+    (name) =>
+      name !== "queue_v2_batch_execution_send_guard" &&
+      name !== "tf_v2_worker_cron_match_insert_guard",
+  ),
+);
+const consumerObjects = successorObjects.map((entry) =>
+  entry.type === "trigger" && consumerChangedNames.includes(entry.name) && entry.sql !== null
+    ? {
+        ...entry,
+        sql: replaceExact(
+          entry.sql,
+          `IN (${VERSION_DOMAIN})`,
+          `IN (${VERSION_DOMAIN}, '${CONSUMER_VERSION}')`,
+          1,
+        ),
+      }
+    : entry,
+);
 if (
   sourceObjects.filter((entry) => entry.type === "trigger" && changedNames.includes(entry.name))
     .length !== changedNames.length ||
@@ -126,13 +150,20 @@ function exactCatalog(
     readonly sql: string | null;
   }[],
   balanced = false,
+  alternatives?: ReadonlyMap<string, string>,
 ): string {
   const names = AFFECTED_TABLES.map(literal).join(", ");
   const members = objects.map(
     (entry) =>
       `(type = ${literal(entry.type)} AND name = ${literal(entry.name)} AND
         tbl_name = ${literal(entry.tbl_name)} AND
-        ${entry.sql === null ? "sql IS NULL" : `sql = ${literal(entry.sql)}`})`,
+        ${
+          entry.sql === null
+            ? "sql IS NULL"
+            : alternatives?.has(entry.name)
+              ? `(sql = ${literal(entry.sql)} OR sql = ${literal(alternatives.get(entry.name) ?? "")})`
+              : `sql = ${literal(entry.sql)}`
+        })`,
   );
   // This complete seal is embedded in authority-changing statements. A flat
   // left-associated OR chain exceeds D1's expression depth when combined with
@@ -184,15 +215,60 @@ const SUCCESSOR_READY = `(${PHYSICAL_READY}) AND (${exactCatalog(successorObject
 // The registered recipe's assertion bytes above are immutable. Runtime guards
 // use the same complete catalog with a shallower boolean expression instead.
 const RUNTIME_SUCCESSOR_READY = `(${PHYSICAL_READY}) AND (${exactCatalog(successorObjects, true)}) AND (${INDEX_READY})`;
+const consumerTriggers = consumerObjects.filter(
+  (entry) =>
+    entry.type === "trigger" && consumerChangedNames.includes(entry.name) && entry.sql !== null,
+);
+if (consumerTriggers.length !== 4) throw new Error("Container consumer native source changed");
+const consumerAlternatives = new Map(
+  consumerTriggers.map((entry) => [entry.name, entry.sql ?? ""]),
+);
+const consumerDomainMarker = `IN (${VERSION_DOMAIN}, '${CONSUMER_VERSION}')`;
+if (
+  consumerTriggers.some((entry) => {
+    const old = successorObjects.find((old) => old.name === entry.name)?.sql;
+    return (
+      typeof old !== "string" ||
+      old.includes(consumerDomainMarker) ||
+      entry.sql?.split(consumerDomainMarker).length !== 2
+    );
+  })
+)
+  throw new Error("Container consumer cohort discriminator changed");
+// The alternate members are accepted only as a complete cohort. A partially
+// replaced effect/deletion closure cannot authorize either old or new writes.
+// exactCatalog still compares every full OLD/NEW SQL string. Within that exact
+// set, the source-checked marker distinguishes NEW without embedding all four
+// trigger bodies twice and exceeding D1's per-statement byte limit.
+const CONSUMER_COHORT = `(SELECT count(*) FROM main.sqlite_schema WHERE
+  type = 'trigger' AND name IN (${consumerTriggers.map((entry) => literal(entry.name)).join(", ")})
+  AND instr(sql, ${literal(consumerDomainMarker)}) > 0) IN (0, 4)`;
+const NO_CONSUMER_SHADOW = `NOT EXISTS (SELECT 1 FROM sqlite_temp_schema
+  WHERE name COLLATE NOCASE = ${literal(CONSUMER_ASSERTION)})`;
+const RUNTIME_COMPATIBLE_READY = `(${PHYSICAL_READY}) AND
+  (${exactCatalog(successorObjects, true, consumerAlternatives)}) AND
+  (${CONSUMER_COHORT}) AND (${INDEX_READY}) AND (${NO_CONSUMER_SHADOW})`;
+const CONSUMER_READY = `(${PHYSICAL_READY}) AND (${exactCatalog(consumerObjects, true)}) AND
+  (${INDEX_READY}) AND (${NO_CONSUMER_SHADOW})`;
 
 /** Core physical predecessor only; the owning Root wrapper pins any formal lineage. */
 export function forwardWorkerNativePredecessorReady(): string {
   return SOURCE_READY;
 }
 
-/** Exact installed successor closure, evaluated within every Forward authority write. */
-export function forwardWorkerNativeSchemaReady(): string {
+/** Exact registered 106 closure for deploy catalog checks, without runtime successor compatibility. */
+export function forwardWorkerNative106SchemaReady(): string {
   return RUNTIME_SUCCESSOR_READY;
+}
+
+/** Runtime closure: exact 106 or the complete source-selected consumer successor cohort. */
+export function forwardWorkerNativeSchemaReady(): string {
+  return RUNTIME_COMPATIBLE_READY;
+}
+
+/** Source-only profile. Its recipe is not a registered migration or an apply authority. */
+export function containerConsumerWorkerNativeSchemaReady(): string {
+  return CONSUMER_READY;
 }
 
 function assertion(condition: string): string {
@@ -224,6 +300,38 @@ export function createForwardWorkerNative106Recipe() {
         ...triggerSql.map((entry) => `${entry.sql};`),
       ]),
       step("postcondition", [assertion(SUCCESSOR_READY), `DROP TABLE main.${ASSERTION};`]),
+    ]),
+  });
+}
+
+/**
+ * Unregistered source candidate after exact106. No migration number, target or
+ * apply path is selected. The owner must supply one transaction with rollback
+ * on every error. Existing rows/identity/checks remain; only four guards change.
+ * Deploy a compatible runtime before any separately authorized physical change.
+ */
+export function createContainerConsumerWorkerNativeSourceRecipe() {
+  const step = (name: string, statements: readonly string[]) =>
+    Object.freeze({ name, statements: Object.freeze([...statements]) });
+  const assert = (condition: string) =>
+    `INSERT OR ROLLBACK INTO main.${CONSUMER_ASSERTION}(ok)
+SELECT 1 WHERE (${condition}) IS NOT 1;`;
+  return Object.freeze({
+    name: "takoserver.container-consumer-native-source@1",
+    predecessor: "0106_forward_worker_native_custody.sql",
+    registered: false,
+    transaction: "owning-single-transaction-with-rollback-on-every-error",
+    steps: Object.freeze([
+      step("precondition", [
+        `CREATE TABLE main.${CONSUMER_ASSERTION}(ok INTEGER PRIMARY KEY);`,
+        `INSERT INTO main.${CONSUMER_ASSERTION}(ok) VALUES (1);`,
+        assert(RUNTIME_SUCCESSOR_READY),
+      ]),
+      step("replace-guards", [
+        ...consumerChangedNames.map((name) => `DROP TRIGGER main.${name};`),
+        ...consumerTriggers.map((entry) => `${entry.sql};`),
+      ]),
+      step("postcondition", [assert(CONSUMER_READY), `DROP TABLE main.${CONSUMER_ASSERTION};`]),
     ]),
   });
 }

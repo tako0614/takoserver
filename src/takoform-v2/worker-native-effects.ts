@@ -170,8 +170,9 @@ export function createForwardV2NativeEffectCustody(options: {
  *
  * FAILS CLOSED against the installed 106 forward native schema: its insert guard admits only
  * WorkerVersion 0.5.0 / 0.7.0, so a grant for a 0.8.0 Version throws at the insert guard until a
- * successor schema widens those domains together with the readiness predicate every forward
- * custody repeats. Deliberately not exported from the package barrel; a test pins the refusal.
+ * successor source widens those domains together with the readiness predicate every forward
+ * custody repeats. The explicit candidate barrel export neither installs that source nor
+ * qualifies a real native sender; the unchanged106 refusal remains pinned by a test.
  */
 export function createContainerConsumerV2NativeEffectCustody(options: {
   readonly sql: Sql;
