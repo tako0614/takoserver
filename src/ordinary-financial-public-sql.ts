@@ -191,24 +191,41 @@ function operation(tokens: readonly Token[]): number {
   refuse("CTE operation");
 }
 
-function statementEffects(tokens: readonly Token[]): Effect[] {
+function statementEffects(tokens: readonly Token[], retainedTopLevel = false): Effect[] {
   const start = operation(tokens);
   const first = tokens[start]?.text;
+  const retainedIssuerInsert =
+    retainedTopLevel && start === 0 && tokens[0]?.kind === "word" && first === "INSERT";
   if (first === "SELECT") return [];
   if (first === "REPLACE") refuse("REPLACE");
   if (first !== "INSERT" && first !== "UPDATE" && first !== "DELETE") refuse("statement kind");
   let index = start + 1;
   if (first === "INSERT") {
     if (tokens[index]?.text === "OR") {
-      if (tokens[index + 1]?.text !== "IGNORE") refuse("INSERT conflict mode");
+      const conflict = tokens[index + 1];
+      if (
+        conflict?.text !== "IGNORE" &&
+        !(retainedIssuerInsert && conflict?.kind === "word" && conflict.text === "ABORT")
+      )
+        refuse("INSERT conflict mode");
       index += 2;
     }
     if (tokens[index++]?.text !== "INTO") refuse("INSERT target");
   } else if (first === "UPDATE") {
     if (tokens[index]?.text === "OR") refuse("UPDATE conflict mode");
   } else if (tokens[index++]?.text !== "FROM") refuse("DELETE target");
+  if (tokens[index + 1]?.text === ".") {
+    if (
+      !retainedIssuerInsert ||
+      tokens[index]?.kind !== "word" ||
+      tokens[index]?.text !== "MAIN" ||
+      tokens[index + 2]?.kind !== "word" ||
+      tokens[index + 3]?.text === "."
+    )
+      refuse("qualified target");
+    index += 2;
+  }
   const target = identifier(tokens[index]);
-  if (tokens[index + 1]?.text === ".") refuse("qualified target");
   const events: Event[] = [first];
   if (first === "INSERT") {
     const parts = words(tokens.slice(index + 1));
@@ -411,8 +428,13 @@ function validWrite(value: unknown): value is SqlWrite {
  * Build an immutable private façade over the actual Root-selected first-primary D1 Sql.
  * Generic Sql adapters, including attach-capable connections, are outside this contract.
  * This helper does not qualify or select its input.
+ * The retained grammar is for the owning Container request constructor; it changes
+ * syntax only and never grants Financial, user or DELETE authority.
  */
-export function createOrdinaryFinancialPublicSql(raw: Sql): Sql {
+export function createOrdinaryFinancialPublicSql(
+  raw: Sql,
+  grammar: "ordinary" | "retained-container" = "ordinary",
+): Sql {
   const original = capture(raw);
   const execute = async (statements: readonly SqlStatement[]): Promise<readonly SqlWrite[]> => {
     const batch = snapshotStatements(statements);
@@ -422,7 +444,9 @@ export function createOrdinaryFinancialPublicSql(raw: Sql): Sql {
     for (const statement of batch) {
       if (MONEY_CUTOVER_CONTROL_REFERENCE.test(statement.sql.trim()))
         refuse("Money cutover control reference");
-      effects.push(...statementEffects(singleStatement(statement.sql)));
+      effects.push(
+        ...statementEffects(singleStatement(statement.sql), grammar === "retained-container"),
+      );
     }
     const initialRows = (await original.query.call(raw, CATALOG_SQL)).map(catalogRow);
     original.current();
