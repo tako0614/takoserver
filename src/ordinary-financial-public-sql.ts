@@ -102,7 +102,7 @@ function lex(sql: string, mode: "statement" | "catalog" = "statement"): Token[] 
   for (let i = 0; i < sql.length; ) {
     const c = sql[i];
     if (c === undefined) refuse("statement index");
-    if ((catalog ? /[ \t\n\v\f\r\uFEFF]/u : /\s/u).test(c)) {
+    if ((catalog ? /[ \t\n\v\f\r\uFEFF]/u : /[ \t\n\f\r]/u).test(c)) {
       i++;
       continue;
     }
@@ -191,7 +191,7 @@ function operation(tokens: readonly Token[]): number {
     else if (
       token?.kind === "word" &&
       depth === 0 &&
-      ["SELECT", "INSERT", "UPDATE", "DELETE"].includes(token.text)
+      ["SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE"].includes(token.text)
     )
       return i;
     if (depth < 0) refuse("CTE parentheses");

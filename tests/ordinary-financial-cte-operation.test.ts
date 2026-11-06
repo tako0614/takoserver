@@ -14,7 +14,8 @@ for (const grammar of ["ordinary", "retained-container"] as const) {
     databases.push(database);
     database.exec(`CREATE TABLE orgs(id TEXT PRIMARY KEY);
       CREATE TABLE financial_source_events(id TEXT PRIMARY KEY)`);
-    return { database, sql: createOrdinaryFinancialPublicSql(createSqliteSql(database), grammar) };
+    const raw = createSqliteSql(database);
+    return { database, raw, sql: createOrdinaryFinancialPublicSql(raw, grammar) };
   }
 
   test(`${grammar} distinguishes a quoted CTE name from the outer operation`, async () => {
@@ -53,5 +54,44 @@ for (const grammar of ["ordinary", "retained-container"] as const) {
     expect(database.query("SELECT count(*) AS n FROM financial_source_events").get()).toEqual({
       n: 0,
     });
+  });
+
+  test(`${grammar} keeps the existing REPLACE refusal after an ordinary CTE`, async () => {
+    const { database, sql } = fixture();
+    await expect(
+      sql.run("WITH ids AS (SELECT ? AS id) REPLACE INTO orgs(id) SELECT id FROM ids", [
+        "ordinary-only",
+      ]),
+    ).rejects.toThrow("ordinary public SQL refused: REPLACE");
+    expect(database.query("SELECT count(*) AS n FROM orgs").get()).toEqual({ n: 0 });
+  });
+
+  test(`${grammar} refuses unsupported separators before a raw read`, async () => {
+    const { raw } = fixture();
+    let queries = 0;
+    const sql = createOrdinaryFinancialPublicSql(
+      {
+        run: raw.run,
+        batch: raw.batch,
+        async query(...args) {
+          queries++;
+          return raw.query(...args);
+        },
+      },
+      grammar,
+    );
+    for (const separator of ["\u00a0", "\uFEFF", "\u3000"])
+      await expect(sql.query(`SELECT${separator}1`)).rejects.toThrow("unknown token");
+    expect(queries).toBe(0);
+  });
+
+  test(`${grammar} retains supported ASCII whitespace and quoted Unicode data`, async () => {
+    const { database, sql } = fixture();
+    const id = "label\u00a0\uFEFF\u3000";
+    const write = await sql.run(
+      "INSERT\nINTO\torgs(id)\rVALUES\f('label\u00a0\uFEFF\u3000') RETURNING id",
+    );
+    expect(write).toEqual({ changes: 1, rows: [{ id }] });
+    expect(database.query("SELECT id FROM orgs").all()).toEqual([{ id }]);
   });
 }
