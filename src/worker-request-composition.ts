@@ -106,8 +106,11 @@ export interface WorkerRequestSql {
 /**
  * `retained-container-primary` reuses the ordinary first-primary session, ACK
  * and backing checks, with the Financial fence's retained grammar. Auth,
- * Financial, native-binding, Writer-epoch and selected-Money readers refuse it;
- * only the backing assertion and the fixed Auth catalog observation accept it.
+ * Financial, native-binding, Writer-epoch and selected-Money readers refuse it.
+ * It is accepted only by the backing assertion, the fixed Auth catalog
+ * observation, and the retained-origin checks
+ * (`assertWorkerRequestRetainedContainerOrigin`,
+ * `isWorkerRequestRetainedContainerOrigin`) that composeApp uses.
  */
 type WorkerRequestOriginPurpose =
   | "native-primary"
