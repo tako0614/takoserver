@@ -182,16 +182,16 @@ function singleStatement(sql: string): Token[] {
 }
 
 function operation(tokens: readonly Token[]): number {
-  if (tokens[0]?.text !== "WITH") return 0;
+  if (tokens[0]?.kind !== "word" || tokens[0].text !== "WITH") return 0;
   let depth = 0;
   for (let i = 1; i < tokens.length; i++) {
-    const text = tokens[i]?.text;
-    if (text === "(") depth++;
-    else if (text === ")") depth--;
+    const token = tokens[i];
+    if (token?.kind === "punct" && token.text === "(") depth++;
+    else if (token?.kind === "punct" && token.text === ")") depth--;
     else if (
+      token?.kind === "word" &&
       depth === 0 &&
-      text !== undefined &&
-      ["SELECT", "INSERT", "UPDATE", "DELETE"].includes(text)
+      ["SELECT", "INSERT", "UPDATE", "DELETE"].includes(token.text)
     )
       return i;
     if (depth < 0) refuse("CTE parentheses");
