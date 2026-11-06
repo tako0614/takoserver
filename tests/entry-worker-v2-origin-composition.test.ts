@@ -1489,3 +1489,162 @@ test("sharedAuth still requires its genuine canonical Hosted realm before Contai
     await f.runtime.dispose();
   }
 }, 60_000);
+
+test("retained Container request SQL is a code literal and refuses conflicting construction", async () => {
+  const composers = {
+    composeV2Forms: () => ({ forms: {}, retainedForms: {} }),
+    composeV2ContainerHostAcceptance: (() => {
+      throw new Error("construction refusal must not compose");
+    }) as NonNullable<WorkerEntryOptions["composeV2ContainerHostAcceptance"]>,
+  };
+  const sharedAuthStaging: NonNullable<WorkerEntryOptions["sharedAuthStaging"]> = {
+    kind: "shared-auth-staging-v1",
+    clientSecret: "fixture-retained-container-not-a-credential",
+    encryptionKey: new Uint8Array(32),
+    principals: {
+      async resolve(): Promise<never> {
+        throw new Error("this fixture grants no Principal producer");
+      },
+    },
+  };
+  for (const value of [false, 1, "true", {}] as unknown[])
+    expect(() =>
+      createWorkerEntry({ ...composers, retainedContainerRequestSql: value as true }),
+    ).toThrow("retained Container request SQL selection must be the code literal true");
+  expect(() =>
+    createWorkerEntry({
+      composeV2Forms: composers.composeV2Forms,
+      retainedContainerRequestSql: true,
+    }),
+  ).toThrow("retained Container request SQL requires its Container and Form composers");
+  expect(() =>
+    createWorkerEntry({
+      composeV2ContainerHostAcceptance: composers.composeV2ContainerHostAcceptance,
+      retainedContainerRequestSql: true,
+    }),
+  ).toThrow("retained Container request SQL requires its Container and Form composers");
+  expect(() =>
+    createWorkerEntry({ ...composers, sharedAuthStaging, retainedContainerRequestSql: true }),
+  ).toThrow("retained Container request SQL refuses shared or native Auth selection");
+  expect(() =>
+    createWorkerEntry({
+      ...composers,
+      observeSharedAuthRequest() {},
+      retainedContainerRequestSql: true,
+    }),
+  ).toThrow("retained Container request SQL refuses shared or native Auth selection");
+  expect(() =>
+    createWorkerEntry({ ...composers, retainedContainerRequestSql: true }),
+  ).not.toThrow();
+  expect(() => createWorkerEntry(composers)).not.toThrow();
+});
+
+test("retained Container option refuses a selected Money writer; absence keeps the Money requirement", async () => {
+  const f = await fixture("entry-retained-container-money-conflict", false);
+  try {
+    let compositions = 0;
+    const composers = {
+      composeV2Forms: () => ({ forms: {}, retainedForms: {} }),
+      composeV2ContainerHostAcceptance: (({ sql }) => {
+        compositions++;
+        return createV2ContainerHostAcceptance({
+          sql,
+          installationId: "retained-money-installation",
+          backendId: "retained-money-backend",
+          targetKey: "retained-money-target",
+        });
+      }) as NonNullable<WorkerEntryOptions["composeV2ContainerHostAcceptance"]>,
+    };
+    // Option absent: an environment field cannot select the retained origin.
+    const today = createWorkerEntry(composers);
+    const envSelected = { ...f.env, retainedContainerRequestSql: true } as WorkerEnv;
+    const absent = await request(today, envSelected, "/resources");
+    expect(absent.status).toBe(503);
+    expect(await absent.text()).toContain("requires the selected Money writer");
+    await expect(today.scheduled({}, envSelected)).rejects.toThrow(
+      "requires the selected Money writer",
+    );
+    expect(f.primaries).toHaveLength(0);
+    // Option present with a selected Money writer: refuse before any primary or body.
+    await selectRequestWriter(f);
+    const retained = createWorkerEntry({ ...composers, retainedContainerRequestSql: true });
+    const response = await request(retained, f.env, "/resources", {
+      method: "POST",
+      headers: { "idempotency-key": "retained-money-conflict-0001" },
+      body: JSON.stringify({ form: FORM, space: ORG, name: "retained-money", spec: {} }),
+    });
+    expect(response.status).toBe(503);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(await response.json()).toMatchObject({
+      error: { code: "backend_unavailable", details: { reason: "runtime-configuration" } },
+    });
+    await expect(retained.scheduled({}, f.env)).rejects.toThrow(
+      "retained Container Worker refuses a selected Money writer",
+    );
+    expect(f.primaries).toHaveLength(0);
+    expect(f.rootQueries).toEqual([]);
+    expect(compositions).toBe(0);
+    // The same composers without the option keep today's Money-preserved request origin.
+    expect((await request(today, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
+      200,
+    );
+    expect(f.primaries).toHaveLength(1);
+    expect(compositions).toBe(1);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("retained Container option builds its own Money-free first-primary and keeps startup schema reads", async () => {
+  const f = await fixture("entry-retained-container-startup", false);
+  try {
+    let compositions = 0;
+    let formCompositions = 0;
+    const entry = createWorkerEntry({
+      retainedContainerRequestSql: true,
+      composeV2Forms: () => {
+        formCompositions++;
+        return { forms: {}, retainedForms: {} };
+      },
+      composeV2ContainerHostAcceptance({ sql }) {
+        compositions++;
+        return createV2ContainerHostAcceptance({
+          sql,
+          installationId: "retained-startup-installation",
+          backendId: "retained-startup-backend",
+          targetKey: "retained-startup-target",
+        });
+      },
+    });
+    for (let index = 0; index < 2; index++) {
+      const response = await request(entry, f.env, "/resources");
+      expect(response.status).toBe(503);
+      const body = await response.text();
+      // The unchanged read-only 0094 startup proof runs on the retained fence. Its
+      // `PRAGMA table_info` read is outside the Financial fence grammar, so serving refuses.
+      expect(body).toContain("Worker requires the complete 0094 USD-micros D1 schema");
+      expect(JSON.parse(body)).toMatchObject({
+        error: { code: "backend_unavailable", details: { reason: "runtime-configuration" } },
+      });
+    }
+    await expect(entry.scheduled({}, f.env)).rejects.toThrow("complete 0094 USD-micros D1 schema");
+    expect(f.primaries).toHaveLength(3);
+    expect(f.primaries.every((primary) => primary.constraint === "first-primary")).toBe(true);
+    expect(new Set(f.primaries.map((primary) => primary.native)).size).toBe(3);
+    for (const primary of f.primaries) {
+      expect(primary.queries.some((query) => /money_cutover/iu.test(query))).toBe(false);
+      expect(primary.queries.some((query) => /PRAGMA/iu.test(query))).toBe(false);
+    }
+    expect(f.rootQueries).toEqual([]);
+    expect(formCompositions).toBe(0);
+    expect(compositions).toBe(0);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);

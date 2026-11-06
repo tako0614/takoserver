@@ -102,11 +102,16 @@ export interface WorkerRequestSql {
   readonly moneyGuard: MoneyCutoverGuardState | "fresh-native" | "not-selected";
 }
 
+/**
+ * `retained-container-primary` shares the ordinary first-primary/fence/backing
+ * implementation, but no Auth, Financial or Money reader allowlists it.
+ */
 type WorkerRequestOriginPurpose =
   | "native-primary"
   | "shared-auth-staging"
   | "auth103-fresh-native"
-  | "ordinary-native-primary";
+  | "ordinary-native-primary"
+  | "retained-container-primary";
 const requestOrigins = new WeakMap<
   WorkerRequestSql,
   {
@@ -144,6 +149,17 @@ export async function createWorkerOrdinaryPrimaryRequestSql(options: {
   return await constructWorkerPrimaryRequestSql(options, "ordinary-native-primary");
 }
 
+/**
+ * A code-selected retained-Container request owns the same first-primary and
+ * ordinary write fence with its retained grammar. It has no Money custody and
+ * is not an Auth, Financial or DELETE authority; consumer readers refuse it.
+ */
+export async function createWorkerRetainedContainerRequestSql(options: {
+  readonly database: WorkerRequestDatabase;
+}): Promise<WorkerRequestSql> {
+  return await constructWorkerPrimaryRequestSql(options, "retained-container-primary");
+}
+
 async function constructWorkerPrimaryRequestSql(
   options: {
     readonly database: WorkerRequestDatabase;
@@ -151,7 +167,8 @@ async function constructWorkerPrimaryRequestSql(
   },
   purpose: WorkerRequestOriginPurpose,
 ): Promise<WorkerRequestSql> {
-  const ordinary = purpose === "ordinary-native-primary";
+  const ordinary =
+    purpose === "ordinary-native-primary" || purpose === "retained-container-primary";
   const diagnostic = purpose === "shared-auth-staging" ? "shared-login Worker" : "Worker";
   if (ordinary !== (options.writerEpoch === undefined))
     throw new TypeError("Worker request Money writer selection differs");
@@ -180,7 +197,10 @@ async function constructWorkerPrimaryRequestSql(
     ordinaryRawSqlMethods = Object.freeze(
       (["query", "run", "batch"] as const).map((name) => dataMethod(rawSql, name)),
     );
-    ordinarySql = createOrdinaryFinancialPublicSql(rawSql);
+    ordinarySql =
+      purpose === "retained-container-primary"
+        ? createOrdinaryFinancialPublicSql(rawSql, "retained-container")
+        : createOrdinaryFinancialPublicSql(rawSql);
     sql = ordinarySql;
   } else {
     if (writerEpoch === undefined)
@@ -1204,7 +1224,10 @@ function assertWorkerRequestBacking(connection: WorkerRequestSql) {
     if (connection.moneyGuard !== "fresh-native" || origin.writerEpoch !== undefined)
       throw new TypeError("fresh Auth103 request backing differs");
     assertFreshNativeSqlBackingOrigin(connection.sql, origin.rawSql);
-  } else if (origin.purpose === "ordinary-native-primary") {
+  } else if (
+    origin.purpose === "ordinary-native-primary" ||
+    origin.purpose === "retained-container-primary"
+  ) {
     if (
       connection.moneyGuard !== "not-selected" ||
       origin.writerEpoch !== undefined ||
@@ -1220,7 +1243,11 @@ function assertWorkerRequestBacking(connection: WorkerRequestSql) {
         return name === undefined || dataMethod(connection.sql, name) !== method;
       })
     )
-      throw new TypeError("Worker request ordinary primary origin differs");
+      throw new TypeError(
+        origin.purpose === "retained-container-primary"
+          ? "Worker request retained Container primary origin differs"
+          : "Worker request ordinary primary origin differs",
+      );
   } else {
     if (origin.writerEpoch === undefined || connection.moneyGuard === "not-selected")
       throw new TypeError("Money request backing differs");
