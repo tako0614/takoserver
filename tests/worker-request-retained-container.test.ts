@@ -9,7 +9,6 @@ import { createHash } from "node:crypto";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
 import { createAuth103SourceClock } from "../src/auth103-source-clock.ts";
 import { CONTAINER_CONTRACT as C } from "../src/container-contract.ts";
-import { captureWorkerRetainedContainerFormSelection } from "../src/entry-worker.ts";
 import {
   createWorkerRequestConsumersWithFinancialAuthSourceClock,
   FinancialAuthConsumerUnavailable,
@@ -37,11 +36,15 @@ import type { V2Backend, V2Form } from "../src/takoform-v2/types.ts";
 import {
   assertWorkerRequestBackingOrigin,
   assertWorkerRequestFinancialSqlOrigin,
+  assertWorkerRequestNativeBinding,
+  assertWorkerRequestRetainedContainerOrigin,
+  captureWorkerRetainedContainerFormSelection,
   captureWorkerSharedAuthStaging,
   createWorkerOrdinaryPrimaryRequestSql,
   createWorkerRequestConsumers,
   createWorkerRetainedContainerRequestSql,
   initializeWorkerRequestNativeInputs,
+  isWorkerRequestRetainedContainerOrigin,
   queryWorkerRequestFinancialCurrentConsentOriginal,
   queryWorkerRequestOrdinaryAuth103CurrentRegistration,
   readWorkerRequestConsumers,
@@ -216,17 +219,38 @@ test("retained Container origin owns one first-primary without Money custody or 
   expect(f.sessions).toHaveLength(1);
   expect(f.sessions[0]?.constraint).toBe("first-primary");
   expect(f.sessions[0]?.queries).toEqual([]);
+  const sessionsAfterConstruction = f.sessions.length;
   expect(connection.moneyGuard).toBe("not-selected");
   expect(Object.isFrozen(connection)).toBe(true);
   expect(Object.isFrozen(connection.sql)).toBe(true);
-  expect(readWorkerRequestWriterEpochOrigin(connection)).toBeUndefined();
+  // Not an ordinary Auth origin: native-binding and Writer-epoch readers refuse it.
+  expect(() => readWorkerRequestWriterEpochOrigin(connection)).toThrow(
+    "Worker request retained Container origin has no Writer selection",
+  );
+  expect(() => assertWorkerRequestNativeBinding(connection, f.binding)).toThrow(
+    "Worker request retained Container origin has no native Auth binding",
+  );
+  const ordinary = await createWorkerOrdinaryPrimaryRequestSql({ database: f.binding });
+  expect(readWorkerRequestWriterEpochOrigin(ordinary)).toBeUndefined();
+  expect(() => assertWorkerRequestNativeBinding(ordinary, f.binding)).not.toThrow();
+  // The entry's own origin check accepts only this purpose and backing.
+  expect(isWorkerRequestRetainedContainerOrigin(connection)).toBe(true);
+  expect(isWorkerRequestRetainedContainerOrigin(ordinary)).toBe(false);
+  expect(isWorkerRequestRetainedContainerOrigin({ ...connection })).toBe(false);
+  expect(() => assertWorkerRequestRetainedContainerOrigin(connection)).not.toThrow();
+  expect(() => assertWorkerRequestRetainedContainerOrigin(ordinary)).toThrow(
+    "Worker request retained Container origin differs",
+  );
+  expect(() => assertWorkerRequestRetainedContainerOrigin({ ...connection })).toThrow(
+    "Worker request backing has not been constructed",
+  );
   expect(() => assertWorkerRequestBackingOrigin(connection)).not.toThrow();
   expect(() => assertMoneyCutoverSqlOrigin(connection.sql, { writerEpoch: "x" })).toThrow();
   const { withSession: _withSession, ...withoutPrimary } = f.binding;
   await expect(
     createWorkerRetainedContainerRequestSql({ database: withoutPrimary }),
   ).rejects.toThrow("Worker requires a native primary D1 session");
-  expect(f.sessions).toHaveLength(1);
+  expect(f.sessions).toHaveLength(sessionsAfterConstruction + 1);
 });
 
 test("only the retained purpose selects the retained grammar; ordinary keeps its refusal", async () => {
@@ -413,6 +437,9 @@ test("copied, substituted and foreign connections or changed binding methods ref
     throw new Error("replacement must not be called");
   };
   expect(() => assertWorkerRequestBackingOrigin(connection)).toThrow(
+    "Worker request primary session methods differ",
+  );
+  expect(() => assertWorkerRequestRetainedContainerOrigin(connection)).toThrow(
     "Worker request primary session methods differ",
   );
   session.prepare = prepare;

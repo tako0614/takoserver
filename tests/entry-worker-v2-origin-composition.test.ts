@@ -6,7 +6,6 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
 import {
-  type captureWorkerRetainedContainerFormSelection,
   createWorkerEntry,
   type WorkerEntryOptions,
   type WorkerEnv,
@@ -43,6 +42,7 @@ import type { V2HostDeleteAcceptanceContext } from "../src/takoform-v2/host-acce
 import type { V2Form } from "../src/takoform-v2/types.ts";
 import { WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT } from "../src/worker-endpoint-origin-reservations.ts";
 import {
+  type captureWorkerRetainedContainerFormSelection,
   createWorkerPrimaryRequestSql,
   createWorkerRequestConsumers,
   createWorkerRequestSql,
@@ -1583,7 +1583,9 @@ test("retained Container option refuses a selected Money writer; absence keeps t
     });
     expect(response.status).toBe(503);
     expect(response.headers.get("cache-control")).toBe("no-store");
-    expect(await response.json()).toMatchObject({
+    const conflict = await response.text();
+    expect(conflict).toContain("retained Container Worker refuses a selected Money writer");
+    expect(JSON.parse(conflict)).toMatchObject({
       error: { code: "backend_unavailable", details: { reason: "runtime-configuration" } },
     });
     await expect(retained.scheduled({}, f.env)).rejects.toThrow(
@@ -1891,14 +1893,70 @@ test("retained Container DELETE without its owner original refuses and rolls bac
         "takoform-expected-generation": "1",
       },
     });
-    expect(refused.status).toBeGreaterThanOrEqual(500);
+    expect(refused.status).toBe(500);
+    expect(await refused.json()).toMatchObject({ status: 500, code: "internal_error" });
     expect(contexts).toHaveLength(1);
     const acceptances = f.coreBatches
       .slice(batchesBefore)
       .filter((batch) => batch.at(-2)?.sql.startsWith(RETAINED_WRAPPED_TERMINAL));
     expect(acceptances).toHaveLength(1);
-    expect(String(f.coreBatchError())).toMatch(/container_owner_invariant|NOT NULL constraint/u);
+    expect(String(f.coreBatchError())).toMatch(/container_owner_invariant/u);
     expect(await retainedContainerRows(f)).toEqual(before);
+    expect(f.providerCalls()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("retained Form snapshot: a selection moved after capture cannot admit a fresh Container", async () => {
+  const f = await fixture("entry-retained-container-held-selection", false);
+  try {
+    await f.sql.batch(v2ContainerOwnerMigrationCandidate());
+    const held: {
+      forms: Record<string, V2Form>;
+      retainedForms: Record<string, V2Form>;
+    } = {
+      forms: { [FORM]: f.form },
+      retainedForms: { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() },
+    };
+    let moved = 0;
+    const entry = createWorkerEntry({
+      retainedContainerRequestSql: true,
+      composeV2Forms: () => held,
+      composeV2ContainerHostAcceptance({ sql }) {
+        // After the retained-only check, the composer's own object admits Container 0.1.
+        const container = held.retainedForms[CONTAINER_CONTRACT.formUrl];
+        if (container) {
+          delete held.retainedForms[CONTAINER_CONTRACT.formUrl];
+          held.forms[CONTAINER_CONTRACT.formUrl] = container;
+          moved++;
+        }
+        return createV2ContainerHostAcceptance({
+          sql,
+          installationId: RETAINED_CONTAINER_INSTALLATION,
+          backendId: RETAINED_CONTAINER_BACKEND,
+          targetKey: RETAINED_CONTAINER_TARGET,
+        });
+      },
+    });
+    const fresh = await request(entry, f.env, "/resources", {
+      method: "POST",
+      headers: { "idempotency-key": "retained-entry-held-fresh-container" },
+      body: JSON.stringify({
+        form: CONTAINER_CONTRACT.formUrl,
+        space: ORG,
+        name: "retained-entry-held",
+        spec: RETAINED_CONTAINER_SPEC,
+      }),
+    });
+    expect(moved).toBe(1);
+    expect(Object.hasOwn(held.forms, CONTAINER_CONTRACT.formUrl)).toBe(true);
+    expect(fresh.status).toBe(422);
+    expect(await fresh.json()).toMatchObject({ code: "unsupported_form" });
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_container_acceptances")).toEqual([
+      { n: 0 },
+    ]);
     expect(f.providerCalls()).toBe(0);
   } finally {
     await f.runtime.dispose();

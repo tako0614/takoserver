@@ -6,7 +6,6 @@ import {
 import { createAuth103SourceClock } from "./auth103-source-clock.ts";
 import { parseBillingConfig } from "./billing-config.ts";
 import { createCatalog } from "./catalog.ts";
-import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "./container-contract.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { errorEnvelopeResponse } from "./error-envelope.ts";
 import {
@@ -90,11 +89,14 @@ import {
 } from "./worker-endpoint-origin-reservations.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 import {
+  assertWorkerRequestRetainedContainerOrigin,
+  captureWorkerRetainedContainerFormSelection,
   captureWorkerSharedAuthStaging,
   createWorkerOrdinaryPrimaryRequestSql,
   createWorkerPrimaryRequestSql,
   createWorkerRequestSql,
   createWorkerRetainedContainerRequestSql,
+  isWorkerRequestRetainedContainerOrigin,
   readWorkerRequestFinancialInputs,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
@@ -496,57 +498,6 @@ function hasSelectedV2PrivateInputHooks(
     }
   }
   return false;
-}
-
-/** The canonical Container Forms a retained-Container origin may hold only as retained. */
-const RETAINED_CONTAINER_FORM_URLS: readonly string[] = Object.freeze([
-  CONTAINER_CONTRACT.formUrl,
-  V2_CONTAINER_F2_FORM,
-]);
-
-function plainFormMap(value: unknown): value is object {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  const prototype = Object.getPrototypeOf(value);
-  return prototype === Object.prototype || prototype === null;
-}
-
-/**
- * Validate and snapshot a retained-Container Form selection without invoking
- * getters. Every canonical Container Form is absent from the admitted map and
- * at least one is retained, so fresh Container CREATE/UPDATE stays refused.
- * The frozen snapshot is the selection the application reads. Grants nothing.
- */
-export function captureWorkerRetainedContainerFormSelection(
-  selection: unknown,
-): WorkerEntryV2FormMaps {
-  const refusal =
-    "retained Container Worker requires canonical Container Forms only in retainedForms";
-  if (!plainFormMap(selection)) throw new TypeError(refusal);
-  const keys = Reflect.ownKeys(selection);
-  if (keys.length !== 2 || !keys.includes("forms") || !keys.includes("retainedForms"))
-    throw new TypeError(refusal);
-  const snapshot = (name: "forms" | "retainedForms"): Readonly<Record<string, unknown>> => {
-    const descriptor = Object.getOwnPropertyDescriptor(selection, name);
-    if (!descriptor?.enumerable || !("value" in descriptor) || !plainFormMap(descriptor.value))
-      throw new TypeError(refusal);
-    const source = descriptor.value;
-    const copy = Object.create(null) as Record<string, unknown>;
-    for (const url of Reflect.ownKeys(source)) {
-      const entry = Object.getOwnPropertyDescriptor(source, url);
-      if (typeof url !== "string" || !entry?.enumerable || !("value" in entry))
-        throw new TypeError(refusal);
-      copy[url] = entry.value;
-    }
-    return Object.freeze(copy);
-  };
-  const forms = snapshot("forms");
-  const retainedForms = snapshot("retainedForms");
-  if (
-    RETAINED_CONTAINER_FORM_URLS.some((url) => Object.hasOwn(forms, url)) ||
-    !RETAINED_CONTAINER_FORM_URLS.some((url) => Object.hasOwn(retainedForms, url))
-  )
-    throw new TypeError(refusal);
-  return Object.freeze({ forms, retainedForms }) as unknown as WorkerEntryV2FormMaps;
 }
 
 export interface WorkerEntryOptions {
@@ -1123,6 +1074,13 @@ async function composeApp(
     readonly retainedContainer?: true;
   },
 ): Promise<App> {
+  if (request !== undefined)
+    startupStage("runtime-configuration", () => {
+      if (request.retainedContainer === true)
+        assertWorkerRequestRetainedContainerOrigin(request.connection);
+      else if (isWorkerRequestRetainedContainerOrigin(request.connection))
+        throw new TypeError("retained Container request origin requires its code selection");
+    });
   const nativeAuthSelected = auth103NativeSourceCodeSelected();
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
     throw new WorkerStartupError(
@@ -1437,8 +1395,9 @@ async function composeApp(
     }
   }
   if (request?.retainedContainer === true) {
-    selectedV2Forms = startupStage("runtime-configuration", () =>
-      captureWorkerRetainedContainerFormSelection(selectedV2Forms),
+    selectedV2Forms = startupStage(
+      "runtime-configuration",
+      () => captureWorkerRetainedContainerFormSelection(selectedV2Forms) as WorkerEntryV2FormMaps,
     );
     selectedV2PrivateInputHooks = hasSelectedV2PrivateInputHooks(selectedV2Forms);
   }
