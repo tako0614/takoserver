@@ -94,13 +94,15 @@ function identifier(token: Token | undefined): string {
   return token.text.toLowerCase();
 }
 
-function lex(sql: string): Token[] {
-  if (new TextEncoder().encode(sql).length > 100_000) refuse("statement size");
+function lex(sql: string, mode: "statement" | "catalog" = "statement"): Token[] {
+  const catalog = mode === "catalog";
+  if (new TextEncoder().encode(sql).length > (catalog ? MAX_CATALOG_BYTES : 100_000))
+    refuse("statement size");
   const result: Token[] = [];
   for (let i = 0; i < sql.length; ) {
     const c = sql[i];
     if (c === undefined) refuse("statement index");
-    if (/\s/u.test(c)) {
+    if ((catalog ? /[ \t\n\v\f\r\uFEFF]/u : /\s/u).test(c)) {
       i++;
       continue;
     }
@@ -137,10 +139,16 @@ function lex(sql: string): Token[] {
       result.push({ kind: c === "'" ? "string" : "identifier", text: value });
       continue;
     }
-    if (/[A-Za-z_]/u.test(c)) {
+    if (/[A-Za-z_]/u.test(c) || (catalog && c.charCodeAt(0) >= 0x80)) {
       const start = i++;
-      while (i < sql.length && /[A-Za-z0-9_$]/u.test(sql[i] ?? "")) i++;
-      result.push({ kind: "word", text: sql.slice(start, i).toUpperCase() });
+      while (
+        i < sql.length &&
+        (/[A-Za-z0-9_$]/u.test(sql[i] ?? "") || (catalog && sql.charCodeAt(i) >= 0x80))
+      )
+        i++;
+      const text = sql.slice(start, i);
+      const kind = catalog && /\P{ASCII}/u.test(text) ? "identifier" : "word";
+      result.push({ kind, text: kind === "word" ? text.toUpperCase() : text });
       continue;
     }
     if (/[0-9]/u.test(c)) {
@@ -316,6 +324,24 @@ function isD1InternalTableWithoutForeignKeys(row: CatalogRow): boolean {
   return !tokens.some((token) => token.kind === "word" && token.text === "REFERENCES");
 }
 
+function tableMayReplace(sql: string): boolean {
+  // The catalog already has its own byte bound; do not apply the smaller
+  // caller-statement limit to otherwise supported table definitions.
+  const tokens = lex(sql, "catalog");
+  for (let index = 0; index + 2 < tokens.length; index++) {
+    if (
+      tokens[index]?.kind === "word" &&
+      tokens[index]?.text === "ON" &&
+      tokens[index + 1]?.kind === "word" &&
+      tokens[index + 1]?.text === "CONFLICT" &&
+      tokens[index + 2]?.kind === "word" &&
+      tokens[index + 2]?.text === "REPLACE"
+    )
+      return true;
+  }
+  return false;
+}
+
 function guardedWrite(
   effects: readonly Effect[],
   catalog: readonly CatalogRow[],
@@ -323,6 +349,7 @@ function guardedWrite(
 ): void {
   const objects = new Map<string, CatalogRow>();
   const triggers: Trigger[] = [];
+  const replacePolicies = new Map<string, boolean>();
   for (const row of catalog) {
     if (objects.has(row.name.toLowerCase())) refuse("duplicate catalog name");
     objects.set(row.name.toLowerCase(), row);
@@ -338,6 +365,20 @@ function guardedWrite(
       refuse("write target catalog");
     if (PROTECTED.has(effect.target) || MONEY_CUTOVER_CONTROLS.has(effect.target))
       refuse("protected write");
+    // A table's REPLACE policy can delete another row even under a bare
+    // INSERT/UPDATE. Those implicit effects are outside this fence's grammar.
+    if (
+      object.type === "table" &&
+      object.sql !== null &&
+      effect.events.some((event) => event === "INSERT" || event === "UPDATE")
+    ) {
+      let replaces = replacePolicies.get(effect.target);
+      if (replaces === undefined) {
+        replaces = tableMayReplace(object.sql);
+        replacePolicies.set(effect.target, replaces);
+      }
+      if (replaces) refuse("table conflict mode");
+    }
     for (const event of effect.events) {
       const key = `${effect.target}:${event}`;
       if (seen.has(key)) continue;
