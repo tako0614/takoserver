@@ -199,11 +199,74 @@ function operation(tokens: readonly Token[]): number {
   refuse("CTE operation");
 }
 
-function statementEffects(tokens: readonly Token[], retainedTopLevel = false): Effect[] {
-  const start = operation(tokens);
+/** Syntax only: admission authority still belongs to the captured Host issuer. */
+function retainedAdmissionInsert(tokens: readonly Token[], sql: string): number | undefined {
+  // The lexer intentionally groups numbers and string literals together. This
+  // code-owned prefix distinguishes SELECT 1 from SELECT '1' without widening it.
+  if (!sql.startsWith("WITH host_form_admission AS (SELECT 1 AS permitted")) return;
+  const fixed = ["WITH", "HOST_FORM_ADMISSION", "AS", "(", "SELECT", "1", "AS", "PERMITTED"];
+  if (
+    fixed.some(
+      (text, index) =>
+        tokens[index]?.text !== text ||
+        tokens[index]?.kind !== (index === 3 ? "punct" : index === 5 ? "string" : "word"),
+    )
+  )
+    return;
+  let close = 8;
+  if (tokens[close]?.kind === "word" && tokens[close]?.text === "WHERE") {
+    if (tokens[++close]?.kind !== "punct" || tokens[close]?.text !== "(") return;
+    const begin = ++close;
+    let depth = 1;
+    for (; close < tokens.length; close++) {
+      const token = tokens[close];
+      if (token?.kind === "word") {
+        if (
+          [
+            "INSERT",
+            "UPDATE",
+            "DELETE",
+            "REPLACE",
+            "CREATE",
+            "ALTER",
+            "DROP",
+            "ATTACH",
+            "DETACH",
+            "PRAGMA",
+            "VACUUM",
+            "REINDEX",
+            "ANALYZE",
+            "WITH",
+          ].includes(token.text)
+        )
+          return;
+      } else if (token?.kind === "punct") {
+        if (token.text === "(") depth++;
+        else if (token.text === ")" && --depth === 0) break;
+      }
+    }
+    if (close === begin || depth !== 0) return;
+    close++;
+  }
+  if (
+    tokens[close]?.kind !== "punct" ||
+    tokens[close]?.text !== ")" ||
+    tokens[close + 1]?.kind !== "word" ||
+    tokens[close + 1]?.text !== "INSERT"
+  )
+    return;
+  return close + 1;
+}
+
+function statementEffects(tokens: readonly Token[], retainedTopLevel = false, sql = ""): Effect[] {
+  const wrapped = retainedTopLevel ? retainedAdmissionInsert(tokens, sql) : undefined;
+  const start = wrapped ?? operation(tokens);
   const first = tokens[start]?.text;
   const retainedIssuerInsert =
-    retainedTopLevel && start === 0 && tokens[0]?.kind === "word" && first === "INSERT";
+    retainedTopLevel &&
+    (start === 0 || wrapped !== undefined) &&
+    tokens[start]?.kind === "word" &&
+    first === "INSERT";
   if (first === "SELECT") return [];
   if (first === "REPLACE") refuse("REPLACE");
   if (first !== "INSERT" && first !== "UPDATE" && first !== "DELETE") refuse("statement kind");
@@ -486,7 +549,11 @@ export function createOrdinaryFinancialPublicSql(
       if (MONEY_CUTOVER_CONTROL_REFERENCE.test(statement.sql.trim()))
         refuse("Money cutover control reference");
       effects.push(
-        ...statementEffects(singleStatement(statement.sql), grammar === "retained-container"),
+        ...statementEffects(
+          singleStatement(statement.sql),
+          grammar === "retained-container",
+          statement.sql,
+        ),
       );
     }
     const initialRows = (await original.query.call(raw, CATALOG_SQL)).map(catalogRow);
@@ -559,7 +626,18 @@ export function createOrdinaryFinancialPublicSql(
       if (MONEY_CUTOVER_CONTROL_REFERENCE.test(statement.sql.trim()))
         refuse("Money cutover control reference");
       const tokens = singleStatement(statement.sql);
-      if (tokens[0]?.kind === "word" && tokens[0].text === "SELECT") {
+      const tableInfo =
+        tokens.length === 5 &&
+        tokens[0]?.kind === "word" &&
+        tokens[0].text === "PRAGMA" &&
+        tokens[1]?.kind === "word" &&
+        tokens[1].text === "TABLE_INFO" &&
+        tokens[2]?.kind === "punct" &&
+        tokens[2]?.text === "(" &&
+        tokens[3]?.kind === "word" &&
+        tokens[4]?.kind === "punct" &&
+        tokens[4]?.text === ")";
+      if ((tokens[0]?.kind === "word" && tokens[0].text === "SELECT") || tableInfo) {
         const temp = await original.query.call(raw, TEMP_SQL);
         original.current();
         if (temp.length !== 1 || temp[0]?.n !== 0) refuse("temporary catalog");
