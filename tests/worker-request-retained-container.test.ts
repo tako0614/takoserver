@@ -73,7 +73,13 @@ function track(db: Database): Database {
 }
 
 /** Structural first-primary binding: every session statement runs on this local SQLite. */
-function primaryBinding(sql: Sql) {
+function primaryBinding(
+  sql: Sql,
+  shape: (
+    statements: readonly SqlStatement[],
+    results: readonly D1ResultLike[],
+  ) => readonly D1ResultLike[] = (_statements, results) => results,
+) {
   const sessions: {
     readonly constraint: "first-primary";
     readonly session: D1DatabaseLike;
@@ -122,7 +128,10 @@ function primaryBinding(sql: Sql) {
           });
           queries.push(...inputs.map((input) => input.sql));
           batches.push(inputs);
-          return (await sql.batch(inputs)).map((result) => ack(result.rows, result.changes));
+          const results = (await sql.batch(inputs)).map((result) =>
+            ack(result.rows, result.changes),
+          );
+          return [...shape(inputs, results)];
         },
       };
       sessions.push({ constraint, session, queries, batches });
@@ -239,6 +248,13 @@ test("only the retained purpose selects the retained grammar; ordinary keeps its
   expect(body).toHaveLength(2);
   expect(body?.[0]).toEqual(statement);
   expect(body?.[1]?.sql).toContain("main.sqlite_schema");
+  // The engine's fixed admission wrapper is likewise retained-only grammar.
+  const wrapped = {
+    sql: "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.retained_probe(id,name) VALUES(?,?)",
+    params: ["wrapped", "kept"],
+  };
+  await expect(ordinary.sql.batch([wrapped])).rejects.toThrow("ordinary public SQL refused");
+  expect(await retained.sql.batch([wrapped])).toEqual([{ rows: [], changes: 1 }]);
   // An explicit ABORT failure aborts the original atomic batch.
   await expect(
     retained.sql.batch([
@@ -248,6 +264,7 @@ test("only the retained purpose selects the retained grammar; ordinary keeps its
   ).rejects.toThrow();
   expect(f.db.query("SELECT id, name FROM retained_probe ORDER BY id").all()).toEqual([
     { id: "one", name: "kept" },
+    { id: "wrapped", name: "kept" },
   ]);
 });
 
@@ -426,12 +443,30 @@ function containerForm(): V2Form {
   return { validateCreate() {}, validateUpdate() {}, backend };
 }
 
-function engineFor(sql: Sql, forms: "admitted" | "retained") {
-  const host = createV2ContainerHostAcceptance({
+function engineFor(
+  sql: Sql,
+  forms: "admitted" | "retained",
+  issuer: "selected" | "none" = "selected",
+  observeDelete?: (context: V2HostDeleteAcceptanceContext) => void,
+) {
+  const actual = createV2ContainerHostAcceptance({
     sql,
     installationId: "test-installation",
     backendId: "test-container-backend",
     targetKey: "test-container-target",
+  });
+  const prepareDelete = actual.prepareDelete;
+  if (!prepareDelete) throw new Error("owning DELETE method unavailable");
+  // Own methods delegate to the actual issuer; the original context object passes through.
+  const host = Object.freeze({
+    assertSql: (value: Sql) => actual.assertSql(value),
+    initialOutput: (scope: Parameters<typeof actual.initialOutput>[0]) =>
+      actual.initialOutput(scope),
+    prepare: (context: Parameters<typeof actual.prepare>[0]) => actual.prepare(context),
+    prepareDelete: (context: V2HostDeleteAcceptanceContext) => {
+      observeDelete?.(context);
+      return Reflect.apply(prepareDelete, actual, [context]);
+    },
   });
   const form = containerForm();
   return createTakoformV2Engine(
@@ -445,7 +480,7 @@ function engineFor(sql: Sql, forms: "admitted" | "retained") {
       forms: forms === "admitted" ? { [C.formUrl]: form } : {},
       ...(forms === "retained" ? { retainedForms: { [C.formUrl]: form } } : {}),
     },
-    host,
+    issuer === "selected" ? host : undefined,
   );
 }
 
@@ -453,7 +488,8 @@ function snapshot(db: Database) {
   const catalog = db
     .query("SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name")
     .all();
-  const rows = (name: string) => db.query(`SELECT * FROM main.${name} ORDER BY 1`).all();
+  const rows = (name: string) =>
+    db.query<Record<string, unknown>, []>(`SELECT * FROM main.${name} ORDER BY 1`).all();
   return {
     catalog: createHash("sha256").update(JSON.stringify(catalog)).digest("hex"),
     resources: rows("tf_v2_resources"),
@@ -463,7 +499,7 @@ function snapshot(db: Database) {
 }
 
 /** Audited full100 + owner candidate catalog, with one settled Container from setup only. */
-async function retainedContainerCatalog() {
+async function retainedContainerCatalog(owner: "original" | "missing" = "original") {
   const db = track(new Database(":memory:"));
   db.exec("PRAGMA foreign_keys=ON");
   expect(currentAuditedSchemaMigrations()).toHaveLength(100);
@@ -471,7 +507,7 @@ async function retainedContainerCatalog() {
   const setupSql = createSqliteSql(db);
   await setupSql.batch(v2ContainerOwnerMigrationCandidate());
   // Pre-existing state is written by an unfenced setup engine, never by the retained origin.
-  const setup = engineFor(setupSql, "admitted");
+  const setup = engineFor(setupSql, "admitted", owner === "original" ? "selected" : "none");
   const created = await setup.acceptCreate({
     principal: "container-owner-test",
     key: "container-retained-create",
@@ -507,25 +543,206 @@ test("retained Forms keep fresh Container CREATE/UPDATE at 422 on the retained o
   expect(primary.sessions[0]?.batches).toEqual([]);
 });
 
-test("exact engine DELETE batch on the retained origin: current Financial grammar boundary", async () => {
+const normalized = (statements: readonly SqlStatement[]) =>
+  statements.map(({ sql, params }) => ({ sql, params: [...(params ?? [])] }));
+
+/** Retained engine whose Store/issuer Sql forwards to the retained origin and records submissions. */
+function observedRetainedEngine(connection: WorkerRequestSql) {
+  const submitted: (readonly SqlStatement[])[] = [];
+  const contexts: V2HostDeleteAcceptanceContext[] = [];
+  const observed: Sql = Object.freeze({
+    query: (text: string, params?: readonly SqlParam[]) => connection.sql.query(text, params),
+    run: (text: string, params?: readonly SqlParam[]) => connection.sql.run(text, params),
+    async batch(statements: readonly SqlStatement[]) {
+      submitted.push(normalized(statements));
+      return await connection.sql.batch(statements);
+    },
+  });
+  const engine = engineFor(observed, "retained", "selected", (context) => contexts.push(context));
+  return { engine, submitted, contexts };
+}
+
+const isWrappedContainerTerminal = (statement: SqlStatement | undefined) =>
+  statement?.sql.startsWith(
+    "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances ",
+  ) === true;
+
+test("exact engine-wrapped DELETE batch commits on the retained origin with its original statements", async () => {
   const { db, setupSql, created } = await retainedContainerCatalog();
   const primary = primaryBinding(setupSql);
   const connection = await createWorkerRetainedContainerRequestSql({ database: primary.binding });
-  const engine = engineFor(connection.sql, "retained");
+  const { engine, submitted, contexts } = observedRetainedEngine(connection);
   const before = snapshot(db);
-  const pending = engine.acceptDelete({
+  expect(before.owner[0]).toHaveLength(1);
+  const deleted = await engine.acceptDelete({
     principal: "container-owner-test",
     key: "container-retained-delete",
     uid: created.resourceUid,
     expectedGeneration: 1,
   });
-  // bc6d55d admits only a token-zero INSERT; the Core store wraps every Host terminal in
-  // `WITH host_form_admission AS (...)`, so the fence refuses before any catalog or body read.
-  await expect(pending).rejects.toThrow("ordinary public SQL refused: INSERT conflict mode");
-  expect(primary.sessions[0]?.batches).toEqual([]);
-  expect(primary.sessions[0]?.queries.some((query) => query.includes("sqlite_schema"))).toBe(false);
+  expect(deleted).toMatchObject({
+    action: "delete",
+    generation: 2,
+    resourceUid: created.resourceUid,
+    status: "queued",
+  });
+  // The issuer saw the Store's original DELETE context once.
+  expect(contexts).toHaveLength(1);
+  expect(contexts[0]).toMatchObject({
+    action: "delete",
+    operationId: deleted.id,
+    resourceUid: created.resourceUid,
+    generation: 2,
+    form: C.formUrl,
+    backendId: "test-container-backend",
+    targetKey: "test-container-target",
+    referencesJson: null,
+  });
+  // One acceptance batch; its last statement is the Store's wrapped Host terminal.
+  expect(submitted).toHaveLength(1);
+  const original = submitted[0] ?? [];
+  const terminal = original.at(-1);
+  expect(isWrappedContainerTerminal(terminal)).toBe(true);
+  expect(terminal?.params?.[0]).toBe(deleted.id);
+  expect(terminal?.params?.[10]).toBe("delete");
+  expect(terminal?.params?.[12]).toBe(deleted.id);
+  // Backing: one catalog/metadata snapshot, then exactly the original body plus one guard.
+  const backing = primary.sessions[0]?.batches ?? [];
+  expect(backing).toHaveLength(2);
+  expect(backing[0]?.[0]?.sql).toContain("main.sqlite_schema");
+  expect(normalized(backing[1] ?? []).slice(0, -1)).toEqual(normalized(original));
+  expect(backing[1]).toHaveLength(original.length + 1);
+  expect(backing[1]?.at(-1)?.sql).toContain("main.sqlite_schema");
+  expect(primary.sessions).toHaveLength(1);
   expect(primary.sessions[0]?.queries.some((query) => /money_cutover/iu.test(query))).toBe(false);
+  // The acknowledged batch committed Core and owner state together.
+  const after = snapshot(db);
+  expect(after.catalog).toBe(before.catalog);
+  expect(after.resources).toHaveLength(1);
+  expect(after.resources[0]).toMatchObject({
+    uid: created.resourceUid,
+    generation: 2,
+    phase: "deleting",
+    busy_operation: deleted.id,
+  });
+  expect(after.operations.find((row) => row.id === deleted.id)).toMatchObject({
+    action: "delete",
+    generation: 2,
+    status: "queued",
+  });
+  expect(after.owner[1]?.find((row) => row.operation_id === deleted.id)).toMatchObject({
+    action: "delete",
+    generation: 2,
+  });
+  expect(after.owner[0]?.[0]).toMatchObject({
+    resource_uid: created.resourceUid,
+    retire_operation_id: deleted.id,
+  });
+});
+
+test("catalog drift during the engine-wrapped DELETE body rolls back Core and owner state", async () => {
+  const { db, setupSql, created } = await retainedContainerCatalog();
+  let armed = true;
+  const drifting: Sql = {
+    query: (text, params) => setupSql.query(text, params),
+    run: (text, params) => setupSql.run(text, params),
+    async batch(statements) {
+      if (armed && isWrappedContainerTerminal(statements.at(-2))) {
+        armed = false;
+        db.exec("CREATE INDEX retained_engine_drift ON tf_v2_resources(uid)");
+      }
+      return setupSql.batch(statements);
+    },
+  };
+  const primary = primaryBinding(drifting);
+  const connection = await createWorkerRetainedContainerRequestSql({ database: primary.binding });
+  const { engine, submitted } = observedRetainedEngine(connection);
+  const before = snapshot(db);
+  await expect(
+    engine.acceptDelete({
+      principal: "container-owner-test",
+      key: "container-retained-drift",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+    }),
+  ).rejects.toThrow();
+  expect(armed).toBe(false);
+  expect(submitted).toHaveLength(1);
+  const after = snapshot(db);
+  expect(after.catalog).not.toBe(before.catalog);
+  expect({ ...after, catalog: before.catalog }).toEqual(before);
+});
+
+test("missing owner original refuses the engine-wrapped DELETE and rolls back", async () => {
+  const { db, setupSql, created } = await retainedContainerCatalog("missing");
+  const primary = primaryBinding(setupSql);
+  const connection = await createWorkerRetainedContainerRequestSql({ database: primary.binding });
+  const { engine, submitted } = observedRetainedEngine(connection);
+  const before = snapshot(db);
+  // Missing-original precondition: the Core Resource exists, its owner instance does not.
+  expect(before.resources).toHaveLength(1);
+  expect(before.owner[0]).toEqual([]);
+  expect(
+    db
+      .query(`SELECT count(*) AS n FROM main.${recipe.tables[0].name} WHERE resource_uid = ?`)
+      .get(created.resourceUid),
+  ).toEqual({ n: 0 });
+  const refused: unknown = await engine
+    .acceptDelete({
+      principal: "container-owner-test",
+      key: "container-retained-missing",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+    })
+    .then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+  expect(refused).toBeInstanceOf(SqlError);
+  expect(String((refused as Error).message)).toMatch(
+    /container_owner_invariant|NOT NULL constraint failed/u,
+  );
+  expect(submitted).toHaveLength(1);
+  expect(isWrappedContainerTerminal(submitted[0]?.at(-1))).toBe(true);
+  expect(primary.sessions[0]?.batches).toHaveLength(2);
   expect(snapshot(db)).toEqual(before);
+});
+
+test("a lost DELETE acknowledgement is never resent; the engine reads back the committed Operation", async () => {
+  const { db, setupSql, created } = await retainedContainerCatalog();
+  let dropped = 0;
+  const primary = primaryBinding(setupSql, (statements, results) => {
+    if (!isWrappedContainerTerminal(statements.at(-2))) return results;
+    dropped++;
+    // The body committed, but its explicit D1 acknowledgement is incomplete.
+    return results.map(
+      ({ success, results: rows }) => ({ success, results: rows }) as D1ResultLike,
+    );
+  });
+  const connection = await createWorkerRetainedContainerRequestSql({ database: primary.binding });
+  const { engine, submitted } = observedRetainedEngine(connection);
+  const request = {
+    principal: "container-owner-test",
+    key: "container-retained-unknown",
+    uid: created.resourceUid,
+    expectedGeneration: 1,
+  };
+  const recovered = await engine.acceptDelete(request);
+  expect(dropped).toBe(1);
+  expect(recovered).toMatchObject({ action: "delete", generation: 2, status: "queued" });
+  expect(submitted).toHaveLength(1);
+  expect(primary.sessions[0]?.batches).toHaveLength(2);
+  const committed = snapshot(db);
+  expect(committed.resources[0]).toMatchObject({
+    generation: 2,
+    phase: "deleting",
+    busy_operation: recovered.id,
+  });
+  // The same idempotency key replays the committed Operation without another batch.
+  expect(await engine.acceptDelete(request)).toMatchObject({ id: recovered.id, generation: 2 });
+  expect(submitted).toHaveLength(1);
+  expect(primary.sessions[0]?.batches).toHaveLength(2);
+  expect(snapshot(db)).toEqual(committed);
 });
 
 for (const [label, form] of [

@@ -6,12 +6,15 @@
 import { expect, test } from "bun:test";
 import { resolve } from "node:path";
 import {
+  type captureWorkerRetainedContainerFormSelection,
   createWorkerEntry,
   type WorkerEntryOptions,
   type WorkerEnv,
 } from "@takoserver/core/worker-entry";
 import { Miniflare } from "miniflare";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
+import { CONTAINER_CONTRACT } from "../src/container-contract.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { HOSTED_EDGE_SUPPLIES_KIND } from "../src/hosted-edge-supplies.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -31,7 +34,12 @@ import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import { createD1Sql, type D1DatabaseLike, type D1StatementLike } from "../src/sql-d1.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
-import { createV2ContainerHostAcceptance } from "../src/takoform-v2/container-owner-schema.ts";
+import {
+  createV2ContainerHostAcceptance,
+  V2_CONTAINER_OWNER_RECIPE,
+} from "../src/takoform-v2/container-owner-schema.ts";
+import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
+import type { V2HostDeleteAcceptanceContext } from "../src/takoform-v2/host-acceptance.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 import { WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT } from "../src/worker-endpoint-origin-reservations.ts";
 import {
@@ -1598,52 +1606,300 @@ test("retained Container option refuses a selected Money writer; absence keeps t
   }
 }, 60_000);
 
-test("retained Container option builds its own Money-free first-primary and keeps startup schema reads", async () => {
+const RETAINED_CONTAINER_BACKEND = "retained-entry-container-backend";
+const RETAINED_CONTAINER_TARGET = "retained-entry-container-target";
+const RETAINED_CONTAINER_INSTALLATION = "retained-entry-container-installation";
+const RETAINED_CONTAINER_SPEC = {
+  image: `registry.example/image@sha256:${"d".repeat(64)}`,
+  httpPort: 8080,
+  healthPath: "/",
+  workloadRevision: "r1",
+  requiredSensitiveVars: [],
+  outboundInternet: true,
+};
+const RETAINED_WRAPPED_TERMINAL =
+  "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances ";
+
+function retainedContainerForm(): V2Form {
+  const noEffect = async () =>
+    ({ kind: "no_effect", code: "fixture_no_effect", message: "No effect" }) as const;
+  return {
+    validateCreate() {},
+    validateUpdate() {},
+    backend: {
+      id: RETAINED_CONTAINER_BACKEND,
+      targetKey: RETAINED_CONTAINER_TARGET,
+      execute: noEffect,
+      reconcile: noEffect,
+    },
+  };
+}
+
+/** Test-only pre-existing state from an unfenced setup engine on the same local D1. */
+async function seedRetainedContainer(
+  f: Awaited<ReturnType<typeof fixture>>,
+  owner: "original" | "missing",
+) {
+  await f.sql.batch(v2ContainerOwnerMigrationCandidate());
+  const setup = createTakoformV2Engine(
+    {
+      sql: f.sql,
+      replayWindowSeconds: 120,
+      now: () => new Date(),
+      async authorize() {
+        return true;
+      },
+      forms: { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() },
+    },
+    owner === "original"
+      ? createV2ContainerHostAcceptance({
+          sql: f.sql,
+          installationId: RETAINED_CONTAINER_INSTALLATION,
+          backendId: RETAINED_CONTAINER_BACKEND,
+          targetKey: RETAINED_CONTAINER_TARGET,
+        })
+      : undefined,
+  );
+  const created = await setup.acceptCreate({
+    principal: `org:${ORG}`,
+    key: "retained-entry-setup-create",
+    input: {
+      form: CONTAINER_CONTRACT.formUrl,
+      space: ORG,
+      name: "retained-entry",
+      spec: RETAINED_CONTAINER_SPEC,
+    },
+  });
+  expect((await setup.runNext())?.status).toBe("failed");
+  return created;
+}
+
+async function retainedContainerRows(f: Awaited<ReturnType<typeof fixture>>) {
+  const rows = async (table: string) => await f.sql.query(`SELECT * FROM ${table} ORDER BY 1`);
+  return {
+    resources: await rows("tf_v2_resources"),
+    operations: await rows("tf_v2_operations"),
+    owner: await Promise.all(V2_CONTAINER_OWNER_RECIPE.tables.map(({ name }) => rows(name))),
+  };
+}
+
+/** Retained entry whose Container issuer is wrapped only to observe original DELETE contexts. */
+function retainedContainerEntry(
+  f: Awaited<ReturnType<typeof fixture>>,
+  selection: () => Parameters<typeof captureWorkerRetainedContainerFormSelection>[0] = () => ({
+    forms: { [FORM]: f.form },
+    retainedForms: { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() },
+  }),
+) {
+  const contexts: V2HostDeleteAcceptanceContext[] = [];
+  const counts = { forms: 0, containers: 0 };
+  const entry = createWorkerEntry({
+    retainedContainerRequestSql: true,
+    composeV2Forms: () => {
+      counts.forms++;
+      return selection() as never;
+    },
+    composeV2ContainerHostAcceptance({ sql }) {
+      counts.containers++;
+      const actual = createV2ContainerHostAcceptance({
+        sql,
+        installationId: RETAINED_CONTAINER_INSTALLATION,
+        backendId: RETAINED_CONTAINER_BACKEND,
+        targetKey: RETAINED_CONTAINER_TARGET,
+      });
+      const prepareDelete = actual.prepareDelete;
+      if (!prepareDelete) throw new Error("owning DELETE method unavailable");
+      return {
+        assertSql: (value) => actual.assertSql(value),
+        initialOutput: (scope) => actual.initialOutput(scope),
+        prepare: (context) => actual.prepare(context),
+        prepareDelete: (context) => {
+          contexts.push(context);
+          return Reflect.apply(prepareDelete, actual, [context]);
+        },
+      };
+    },
+  });
+  return { entry, contexts, counts };
+}
+
+test("retained Container option passes unchanged startup reads on its own Money-free primary", async () => {
   const f = await fixture("entry-retained-container-startup", false);
   try {
-    let compositions = 0;
-    let formCompositions = 0;
-    const entry = createWorkerEntry({
-      retainedContainerRequestSql: true,
-      composeV2Forms: () => {
-        formCompositions++;
-        return { forms: {}, retainedForms: {} };
-      },
-      composeV2ContainerHostAcceptance({ sql }) {
-        compositions++;
-        return createV2ContainerHostAcceptance({
-          sql,
-          installationId: "retained-startup-installation",
-          backendId: "retained-startup-backend",
-          targetKey: "retained-startup-target",
-        });
-      },
-    });
-    for (let index = 0; index < 2; index++) {
+    const { entry, counts } = retainedContainerEntry(f);
+    for (let index = 0; index < 2; index++)
+      expect((await request(entry, f.env, "/resources")).status).toBe(200);
+    expect(f.primaries).toHaveLength(2);
+    expect(f.primaries.every((primary) => primary.constraint === "first-primary")).toBe(true);
+    expect(new Set(f.primaries.map((primary) => primary.native)).size).toBe(2);
+    for (const primary of f.primaries) {
+      // The unchanged read-only 0094 and Stripe realm proofs ran on this retained primary.
+      expect(primary.queries.some((query) => query.startsWith("PRAGMA table_info("))).toBe(true);
+      expect(primary.queries).toContain("SELECT mode FROM stripe_mode_realm WHERE singleton = 1");
+      expect(primary.queries.some((query) => /money_cutover/iu.test(query))).toBe(false);
+    }
+    expect(counts).toEqual({ forms: 2, containers: 2 });
+    expect(f.rootQueries).toEqual([]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
+    // An unrelated admitted Form keeps its ordinary acceptance on the retained origin.
+    expect(
+      (await create(entry, f.env, "retained-unrelated", "retained-unrelated-0001")).status,
+    ).toBe(202);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 1 }]);
+    expect(f.primaries).toHaveLength(3);
+    expect(f.effects()).toBe(0);
+    // A scheduled invocation owns its own retained primary; its pass runs that Operation once.
+    await entry.scheduled({}, f.env);
+    expect(f.primaries).toHaveLength(4);
+    expect(f.primaries.at(-1)?.queries.some((query) => /money_cutover/iu.test(query))).toBe(false);
+    expect(f.effects()).toBe(1);
+    expect(f.providerCalls()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("retained Container option refuses admitted or unwrapped Container Forms before Container composition", async () => {
+  const f = await fixture("entry-retained-container-admitted", false);
+  try {
+    const refusal =
+      "retained Container Worker requires canonical Container Forms only in retainedForms";
+    for (const selection of [
+      () => ({
+        forms: { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() },
+        retainedForms: {},
+      }),
+      () => ({
+        forms: { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() },
+        retainedForms: { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() },
+      }),
+      () => ({ [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() }),
+      () => ({ forms: { [FORM]: f.form }, retainedForms: {} }),
+    ]) {
+      const { entry, counts } = retainedContainerEntry(f, selection);
       const response = await request(entry, f.env, "/resources");
       expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
       const body = await response.text();
-      // The unchanged read-only 0094 startup proof runs on the retained fence. Its
-      // `PRAGMA table_info` read is outside the Financial fence grammar, so serving refuses.
-      expect(body).toContain("Worker requires the complete 0094 USD-micros D1 schema");
+      expect(body).toContain(refusal);
       expect(JSON.parse(body)).toMatchObject({
         error: { code: "backend_unavailable", details: { reason: "runtime-configuration" } },
       });
+      expect(counts).toEqual({ forms: 1, containers: 0 });
     }
-    await expect(entry.scheduled({}, f.env)).rejects.toThrow("complete 0094 USD-micros D1 schema");
-    expect(f.primaries).toHaveLength(3);
-    expect(f.primaries.every((primary) => primary.constraint === "first-primary")).toBe(true);
-    expect(new Set(f.primaries.map((primary) => primary.native)).size).toBe(3);
-    for (const primary of f.primaries) {
-      expect(primary.queries.some((query) => /money_cutover/iu.test(query))).toBe(false);
-      expect(primary.queries.some((query) => /PRAGMA/iu.test(query))).toBe(false);
-    }
-    expect(f.rootQueries).toEqual([]);
-    expect(formCompositions).toBe(0);
-    expect(compositions).toBe(0);
     expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
     expect(f.providerCalls()).toBe(0);
     expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("retained Container option accepts the exact engine-wrapped Container DELETE without Money", async () => {
+  const f = await fixture("entry-retained-container-delete", false);
+  try {
+    const created = await seedRetainedContainer(f, "original");
+    const before = await retainedContainerRows(f);
+    expect(before.owner[0]).toHaveLength(1);
+    const { entry, contexts, counts } = retainedContainerEntry(f);
+    expect((await request(entry, f.env, `/resources/${created.resourceUid}`)).status).toBe(200);
+    // Fresh Container CREATE stays refused on the retained origin.
+    const fresh = await request(entry, f.env, "/resources", {
+      method: "POST",
+      headers: { "idempotency-key": "retained-entry-fresh-container" },
+      body: JSON.stringify({
+        form: CONTAINER_CONTRACT.formUrl,
+        space: ORG,
+        name: "retained-entry-fresh",
+        spec: RETAINED_CONTAINER_SPEC,
+      }),
+    });
+    expect(fresh.status).toBe(422);
+    expect(await retainedContainerRows(f)).toEqual(before);
+    const batchesBefore = f.coreBatches.length;
+    const deleted = await request(entry, f.env, `/resources/${created.resourceUid}`, {
+      method: "DELETE",
+      headers: {
+        "idempotency-key": "retained-entry-container-delete",
+        "takoform-expected-generation": "1",
+      },
+    });
+    expect(deleted.status).toBe(202);
+    const operation = (await deleted.json()) as { id: string; action: string; generation: number };
+    expect(operation).toMatchObject({ action: "delete", generation: 2 });
+    // The issuer received the Store's original DELETE context once.
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0]).toMatchObject({
+      action: "delete",
+      operationId: operation.id,
+      resourceUid: created.resourceUid,
+      generation: 2,
+      form: CONTAINER_CONTRACT.formUrl,
+      backendId: RETAINED_CONTAINER_BACKEND,
+      targetKey: RETAINED_CONTAINER_TARGET,
+    });
+    // The wrapped terminal reached the primary unchanged, followed only by the catalog guard.
+    const acceptances = f.coreBatches
+      .slice(batchesBefore)
+      .filter((batch) => batch.at(-2)?.sql.startsWith(RETAINED_WRAPPED_TERMINAL));
+    expect(acceptances).toHaveLength(1);
+    const batch = acceptances[0] ?? [];
+    expect(batch.at(-2)?.params?.[0]).toBe(operation.id);
+    expect(batch.at(-2)?.params?.[10]).toBe("delete");
+    expect(batch.at(-2)?.params?.[12]).toBe(operation.id);
+    expect(batch.at(-1)?.sql).toContain("main.sqlite_schema");
+    expect(f.coreBatchError()).toBeUndefined();
+    const after = await retainedContainerRows(f);
+    expect(after.resources[0]).toMatchObject({
+      uid: created.resourceUid,
+      generation: 2,
+      phase: "deleting",
+      busy_operation: operation.id,
+    });
+    expect(after.owner[1]?.find((row) => row.operation_id === operation.id)).toMatchObject({
+      action: "delete",
+      generation: 2,
+    });
+    expect(after.owner[0]?.[0]).toMatchObject({ retire_operation_id: operation.id });
+    // Every request owned a distinct Money-free first-primary.
+    expect(f.primaries).toHaveLength(3);
+    expect(new Set(f.primaries.map((primary) => primary.native)).size).toBe(3);
+    for (const primary of f.primaries)
+      expect(primary.queries.some((query) => /money_cutover/iu.test(query))).toBe(false);
+    expect(counts).toEqual({ forms: 3, containers: 3 });
+    expect(f.rootQueries).toEqual([]);
+    expect(f.providerCalls()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("retained Container DELETE without its owner original refuses and rolls back through the entry", async () => {
+  const f = await fixture("entry-retained-container-missing", false);
+  try {
+    const created = await seedRetainedContainer(f, "missing");
+    const before = await retainedContainerRows(f);
+    // Missing-original precondition: the Core Resource exists, its owner instance does not.
+    expect(before.resources).toHaveLength(1);
+    expect(before.owner[0]).toEqual([]);
+    const { entry, contexts } = retainedContainerEntry(f);
+    const batchesBefore = f.coreBatches.length;
+    const refused = await request(entry, f.env, `/resources/${created.resourceUid}`, {
+      method: "DELETE",
+      headers: {
+        "idempotency-key": "retained-entry-missing-delete",
+        "takoform-expected-generation": "1",
+      },
+    });
+    expect(refused.status).toBeGreaterThanOrEqual(500);
+    expect(contexts).toHaveLength(1);
+    const acceptances = f.coreBatches
+      .slice(batchesBefore)
+      .filter((batch) => batch.at(-2)?.sql.startsWith(RETAINED_WRAPPED_TERMINAL));
+    expect(acceptances).toHaveLength(1);
+    expect(String(f.coreBatchError())).toMatch(/container_owner_invariant|NOT NULL constraint/u);
+    expect(await retainedContainerRows(f)).toEqual(before);
+    expect(f.providerCalls()).toBe(0);
   } finally {
     await f.runtime.dispose();
   }
