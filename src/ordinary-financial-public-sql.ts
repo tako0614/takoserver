@@ -96,6 +96,7 @@ function identifier(token: Token | undefined): string {
 
 function lex(sql: string, mode: "statement" | "catalog" = "statement"): Token[] {
   const catalog = mode === "catalog";
+  if (!catalog && sql.includes("\0")) refuse("NUL statement");
   if (new TextEncoder().encode(sql).length > (catalog ? MAX_CATALOG_BYTES : 100_000))
     refuse("statement size");
   const result: Token[] = [];
@@ -183,6 +184,7 @@ function singleStatement(sql: string): Token[] {
 
 function operation(tokens: readonly Token[]): number {
   if (tokens[0]?.kind !== "word" || tokens[0].text !== "WITH") return 0;
+  // REPLACE is an operation token; a CTE with that name must be quoted.
   let depth = 0;
   for (let i = 1; i < tokens.length; i++) {
     const token = tokens[i];
