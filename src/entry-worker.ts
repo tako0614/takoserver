@@ -89,10 +89,14 @@ import {
 } from "./worker-endpoint-origin-reservations.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 import {
+  assertWorkerRequestRetainedContainerOrigin,
+  captureWorkerRetainedContainerFormSelection,
   captureWorkerSharedAuthStaging,
   createWorkerOrdinaryPrimaryRequestSql,
   createWorkerPrimaryRequestSql,
   createWorkerRequestSql,
+  createWorkerRetainedContainerRequestSql,
+  isWorkerRequestRetainedContainerOrigin,
   readWorkerRequestFinancialInputs,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
@@ -512,6 +516,13 @@ export interface WorkerEntryOptions {
   readonly composeV2WorkerEndpointOrigin?: WorkerEntryV2WorkerEndpointOriginComposer;
   /** Operator code only; omission leaves Container acceptance unselected. */
   readonly composeV2ContainerHostAcceptance?: WorkerEntryV2ContainerHostAcceptanceComposer;
+  /**
+   * Operator code literal only; never environment, request or manifest data.
+   * Selects the distinct retained-Container request SQL origin for the selected
+   * Container composer: no Money writer, shared Auth or native Auth, and every
+   * canonical Container Form only retained. Conflicts refuse; nothing downgrades.
+   */
+  readonly retainedContainerRequestSql?: true;
   /** Operator code only; absent means every configured artifact Form remains held-only. */
   readonly composeV2ArtifactSource?: WorkerEntryV2ArtifactSourceComposer;
   /**
@@ -1060,8 +1071,16 @@ async function composeApp(
   request?: {
     readonly connection: WorkerRequestSql;
     readonly sharedAuth?: WorkerSharedAuthStaging;
+    readonly retainedContainer?: true;
   },
 ): Promise<App> {
+  if (request !== undefined)
+    startupStage("runtime-configuration", () => {
+      if (request.retainedContainer === true)
+        assertWorkerRequestRetainedContainerOrigin(request.connection);
+      else if (isWorkerRequestRetainedContainerOrigin(request.connection))
+        throw new TypeError("retained Container request origin requires its code selection");
+    });
   const nativeAuthSelected = auth103NativeSourceCodeSelected();
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
     throw new WorkerStartupError(
@@ -1375,6 +1394,13 @@ async function composeApp(
       );
     }
   }
+  if (request?.retainedContainer === true) {
+    selectedV2Forms = startupStage(
+      "runtime-configuration",
+      () => captureWorkerRetainedContainerFormSelection(selectedV2Forms) as WorkerEntryV2FormMaps,
+    );
+    selectedV2PrivateInputHooks = hasSelectedV2PrivateInputHooks(selectedV2Forms);
+  }
   let selectedV2WorkerEndpointOrigin: WorkerEntryV2WorkerEndpointOriginSelection | undefined;
   if (composeV2WorkerEndpointOrigin !== undefined) {
     try {
@@ -1584,6 +1610,24 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
     options.sharedAuthStaging === undefined
       ? undefined
       : captureWorkerSharedAuthStaging(options.sharedAuthStaging);
+  const retainedContainerRequestSql = options.retainedContainerRequestSql;
+  if (retainedContainerRequestSql !== undefined) {
+    if (retainedContainerRequestSql !== true)
+      throw new TypeError("retained Container request SQL selection must be the code literal true");
+    if (
+      typeof composeV2ContainerHostAcceptance !== "function" ||
+      typeof composeV2Forms !== "function"
+    )
+      throw new TypeError(
+        "retained Container request SQL requires its Container and Form composers",
+      );
+    if (
+      sharedAuthStaging !== undefined ||
+      observeSharedAuthRequest !== undefined ||
+      auth103NativeSourceCodeSelected()
+    )
+      throw new TypeError("retained Container request SQL refuses shared or native Auth selection");
+  }
   const sharedRequestSelected = () =>
     sharedAuthStaging !== undefined || auth103NativeSourceCodeSelected();
   // Build selection is not authority; every selected HTTP request still performs
@@ -1626,6 +1670,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         {
           connection,
           ...(selectedSharedAuth === undefined ? {} : { sharedAuth: selectedSharedAuth }),
+          ...(retainedContainerRequestSql === true ? { retainedContainer: true as const } : {}),
         },
       );
     }
@@ -1712,13 +1757,17 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
             moneyPolicy === null &&
             auth103NativeSourceCodeSelected() &&
             auth103NativeStorageSourceProfile() === "ordinary";
-          if (moneyPolicy === null && !ordinaryNativeAuth)
+          if (retainedContainerRequestSql !== true && moneyPolicy === null && !ordinaryNativeAuth)
             throw new TypeError(
               sharedAuthStaging === undefined
                 ? "Container Worker requires the selected Money writer for its native request origin"
                 : "shared-login Worker requires the selected Money writer",
             );
-          if (ordinaryNativeAuth) {
+          if (retainedContainerRequestSql === true) {
+            if (moneyPolicy !== null)
+              throw new TypeError("retained Container Worker refuses a selected Money writer");
+            connection = await createWorkerRetainedContainerRequestSql({ database: env.STATE_DB });
+          } else if (ordinaryNativeAuth) {
             connection = await createWorkerOrdinaryPrimaryRequestSql({ database: env.STATE_DB });
           } else if (!sharedRequestSelected()) {
             const selectedMoneyEpoch = moneyPolicy;
@@ -1806,13 +1855,17 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
           writerEpoch === null &&
           auth103NativeSourceCodeSelected() &&
           auth103NativeStorageSourceProfile() === "ordinary";
-        if (writerEpoch === null && !ordinaryNativeAuth)
+        if (retainedContainerRequestSql !== true && writerEpoch === null && !ordinaryNativeAuth)
           throw new TypeError(
             sharedAuthStaging === undefined
               ? "Container Worker requires the selected Money writer for its native request origin"
               : "shared-login Worker requires the selected Money writer",
           );
-        if (ordinaryNativeAuth) {
+        if (retainedContainerRequestSql === true) {
+          if (writerEpoch !== null)
+            throw new TypeError("retained Container Worker refuses a selected Money writer");
+          connection = await createWorkerRetainedContainerRequestSql({ database: env.STATE_DB });
+        } else if (ordinaryNativeAuth) {
           connection = await createWorkerOrdinaryPrimaryRequestSql({ database: env.STATE_DB });
         } else if (!sharedRequestSelected()) {
           const selectedMoneyEpoch = writerEpoch;

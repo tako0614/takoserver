@@ -24,6 +24,7 @@ import {
   auth103NativeCurrentnessSql,
 } from "./auth103-native-source-contract.ts";
 import { readAuth103SourceClock } from "./auth103-source-clock.ts";
+import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "./container-contract.ts";
 import {
   createCredentialAuthorityClassStore,
   type RpAuthorityRecord,
@@ -102,11 +103,21 @@ export interface WorkerRequestSql {
   readonly moneyGuard: MoneyCutoverGuardState | "fresh-native" | "not-selected";
 }
 
+/**
+ * `retained-container-primary` reuses the ordinary first-primary session, ACK
+ * and backing checks, with the Financial fence's retained grammar. Auth,
+ * Financial, native-binding, Writer-epoch and selected-Money readers refuse it.
+ * It is accepted only by the backing assertion, the fixed Auth catalog
+ * observation, and the retained-origin checks
+ * (`assertWorkerRequestRetainedContainerOrigin`,
+ * `isWorkerRequestRetainedContainerOrigin`) that composeApp uses.
+ */
 type WorkerRequestOriginPurpose =
   | "native-primary"
   | "shared-auth-staging"
   | "auth103-fresh-native"
-  | "ordinary-native-primary";
+  | "ordinary-native-primary"
+  | "retained-container-primary";
 const requestOrigins = new WeakMap<
   WorkerRequestSql,
   {
@@ -144,6 +155,17 @@ export async function createWorkerOrdinaryPrimaryRequestSql(options: {
   return await constructWorkerPrimaryRequestSql(options, "ordinary-native-primary");
 }
 
+/**
+ * A code-selected retained-Container request owns the same first-primary and
+ * ordinary write fence with its retained grammar. It has no Money custody and
+ * is not an Auth, Financial or DELETE authority; consumer readers refuse it.
+ */
+export async function createWorkerRetainedContainerRequestSql(options: {
+  readonly database: WorkerRequestDatabase;
+}): Promise<WorkerRequestSql> {
+  return await constructWorkerPrimaryRequestSql(options, "retained-container-primary");
+}
+
 async function constructWorkerPrimaryRequestSql(
   options: {
     readonly database: WorkerRequestDatabase;
@@ -151,7 +173,8 @@ async function constructWorkerPrimaryRequestSql(
   },
   purpose: WorkerRequestOriginPurpose,
 ): Promise<WorkerRequestSql> {
-  const ordinary = purpose === "ordinary-native-primary";
+  const ordinary =
+    purpose === "ordinary-native-primary" || purpose === "retained-container-primary";
   const diagnostic = purpose === "shared-auth-staging" ? "shared-login Worker" : "Worker";
   if (ordinary !== (options.writerEpoch === undefined))
     throw new TypeError("Worker request Money writer selection differs");
@@ -180,7 +203,10 @@ async function constructWorkerPrimaryRequestSql(
     ordinaryRawSqlMethods = Object.freeze(
       (["query", "run", "batch"] as const).map((name) => dataMethod(rawSql, name)),
     );
-    ordinarySql = createOrdinaryFinancialPublicSql(rawSql);
+    ordinarySql =
+      purpose === "retained-container-primary"
+        ? createOrdinaryFinancialPublicSql(rawSql, "retained-container")
+        : createOrdinaryFinancialPublicSql(rawSql);
     sql = ordinarySql;
   } else {
     if (writerEpoch === undefined)
@@ -301,6 +327,78 @@ export function captureWorkerSharedAuthStaging(
         }),
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
+}
+
+/** The canonical Container Forms a retained-Container origin may hold only as retained. */
+const RETAINED_CONTAINER_FORM_URLS: readonly string[] = Object.freeze([
+  CONTAINER_CONTRACT.formUrl,
+  V2_CONTAINER_F2_FORM,
+]);
+
+export interface WorkerRetainedContainerFormSelection {
+  readonly forms: Readonly<Record<string, unknown>>;
+  readonly retainedForms: Readonly<Record<string, unknown>>;
+}
+
+function plainFormMap(value: unknown): value is object {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * Validate and snapshot a code-composed retained-Container Form selection
+ * without invoking getters. Every canonical Container Form is absent from the
+ * admitted map and at least one is retained, so fresh Container CREATE/UPDATE
+ * stays refused. The frozen snapshot is what the application reads. Grants nothing.
+ */
+export function captureWorkerRetainedContainerFormSelection(
+  selection: unknown,
+): WorkerRetainedContainerFormSelection {
+  const refusal =
+    "retained Container Worker requires canonical Container Forms only in retainedForms";
+  if (!plainFormMap(selection)) throw new TypeError(refusal);
+  const keys = Reflect.ownKeys(selection);
+  if (keys.length !== 2 || !keys.includes("forms") || !keys.includes("retainedForms"))
+    throw new TypeError(refusal);
+  const snapshot = (name: "forms" | "retainedForms"): Readonly<Record<string, unknown>> => {
+    const descriptor = Object.getOwnPropertyDescriptor(selection, name);
+    if (!descriptor?.enumerable || !("value" in descriptor) || !plainFormMap(descriptor.value))
+      throw new TypeError(refusal);
+    const source = descriptor.value;
+    const copy = Object.create(null) as Record<string, unknown>;
+    for (const url of Reflect.ownKeys(source)) {
+      const entry = Object.getOwnPropertyDescriptor(source, url);
+      if (typeof url !== "string" || !entry?.enumerable || !("value" in entry))
+        throw new TypeError(refusal);
+      copy[url] = entry.value;
+    }
+    return Object.freeze(copy);
+  };
+  const forms = snapshot("forms");
+  const retainedForms = snapshot("retainedForms");
+  if (
+    RETAINED_CONTAINER_FORM_URLS.some((url) => Object.hasOwn(forms, url)) ||
+    !RETAINED_CONTAINER_FORM_URLS.some((url) => Object.hasOwn(retainedForms, url))
+  )
+    throw new TypeError(refusal);
+  return Object.freeze({ forms, retainedForms });
+}
+
+/** The code-selected retained-Container entry accepts only its own purpose and backing. */
+export function assertWorkerRequestRetainedContainerOrigin(connection: WorkerRequestSql): void {
+  const origin = assertWorkerRequestBacking(connection);
+  if (
+    origin.purpose !== "retained-container-primary" ||
+    connection.moneyGuard !== "not-selected" ||
+    origin.writerEpoch !== undefined
+  )
+    throw new TypeError("Worker request retained Container origin differs");
+}
+
+/** Purpose read only; an entry without the code selection refuses such an origin. */
+export function isWorkerRequestRetainedContainerOrigin(connection: WorkerRequestSql): boolean {
+  return requestOrigins.get(connection)?.purpose === "retained-container-primary";
 }
 
 export interface WorkerRequestAppInputs {
@@ -1136,6 +1234,8 @@ export function assertWorkerRequestNativeBinding(
   expectedPlatformDatabase: unknown,
 ): void {
   const original = assertWorkerRequestBacking(connection);
+  if (original.purpose === "retained-container-primary")
+    throw new TypeError("Worker request retained Container origin has no native Auth binding");
   if (original.database !== expectedPlatformDatabase)
     throw new TypeError("Worker request platform database binding differs");
 }
@@ -1182,11 +1282,15 @@ export async function queryWorkerRequestOrdinaryAuth103CurrentRegistration(
   return result;
 }
 
-/** Private source assertion input; undefined is an exact ordinary-origin value. */
+/** Private source assertion input; undefined is an exact ordinary-origin value.
+ * The retained-Container origin is not an ordinary Auth origin and refuses. */
 export function readWorkerRequestWriterEpochOrigin(
   connection: WorkerRequestSql,
 ): string | undefined {
-  return assertWorkerRequestBacking(connection).writerEpoch;
+  const origin = assertWorkerRequestBacking(connection);
+  if (origin.purpose === "retained-container-primary")
+    throw new TypeError("Worker request retained Container origin has no Writer selection");
+  return origin.writerEpoch;
 }
 
 function assertWorkerRequestBacking(connection: WorkerRequestSql) {
@@ -1204,7 +1308,10 @@ function assertWorkerRequestBacking(connection: WorkerRequestSql) {
     if (connection.moneyGuard !== "fresh-native" || origin.writerEpoch !== undefined)
       throw new TypeError("fresh Auth103 request backing differs");
     assertFreshNativeSqlBackingOrigin(connection.sql, origin.rawSql);
-  } else if (origin.purpose === "ordinary-native-primary") {
+  } else if (
+    origin.purpose === "ordinary-native-primary" ||
+    origin.purpose === "retained-container-primary"
+  ) {
     if (
       connection.moneyGuard !== "not-selected" ||
       origin.writerEpoch !== undefined ||
@@ -1220,7 +1327,11 @@ function assertWorkerRequestBacking(connection: WorkerRequestSql) {
         return name === undefined || dataMethod(connection.sql, name) !== method;
       })
     )
-      throw new TypeError("Worker request ordinary primary origin differs");
+      throw new TypeError(
+        origin.purpose === "retained-container-primary"
+          ? "Worker request retained Container primary origin differs"
+          : "Worker request ordinary primary origin differs",
+      );
   } else {
     if (origin.writerEpoch === undefined || connection.moneyGuard === "not-selected")
       throw new TypeError("Money request backing differs");
