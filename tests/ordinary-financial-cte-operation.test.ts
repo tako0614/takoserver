@@ -51,9 +51,7 @@ for (const grammar of ["ordinary", "retained-container"] as const) {
       "WITH labels AS (SELECT '(' AS label) INSERT INTO orgs(id) SELECT label FROM labels RETURNING id",
     );
     expect(write).toEqual({ changes: 1, rows: [{ id: "(" }] });
-    expect(database.query("SELECT count(*) AS n FROM financial_source_events").get()).toEqual({
-      n: 0,
-    });
+    expect(database.query("SELECT id FROM orgs").all()).toEqual([{ id: "(" }]);
   });
 
   test(`${grammar} keeps the existing REPLACE refusal after an ordinary CTE`, async () => {
@@ -92,6 +90,60 @@ for (const grammar of ["ordinary", "retained-container"] as const) {
       "INSERT\nINTO\torgs(id)\rVALUES\f('label\u00a0\uFEFF\u3000') RETURNING id",
     );
     expect(write).toEqual({ changes: 1, rows: [{ id }] });
+    expect(database.query("SELECT id FROM orgs").all()).toEqual([{ id }]);
+  });
+
+  test(`${grammar} documents the quotation rule for an operation-keyword CTE name`, async () => {
+    const { database, sql } = fixture();
+    await expect(
+      sql.run("WITH replace AS (SELECT ? AS id) INSERT INTO orgs(id) SELECT id FROM replace", [
+        "unquoted",
+      ]),
+    ).rejects.toThrow("ordinary public SQL refused: REPLACE");
+    expect(database.query("SELECT count(*) AS n FROM orgs").get()).toEqual({ n: 0 });
+    expect(
+      await sql.run(
+        'WITH "replace" AS (SELECT ? AS id) INSERT INTO orgs(id) SELECT id FROM "replace" RETURNING id',
+        ["quoted"],
+      ),
+    ).toEqual({ changes: 1, rows: [{ id: "quoted" }] });
+    expect(database.query("SELECT id FROM orgs").all()).toEqual([{ id: "quoted" }]);
+  });
+
+  test(`${grammar} rejects NUL statements before any backing method`, async () => {
+    const { raw } = fixture();
+    const calls = { query: 0, run: 0, batch: 0 };
+    const sql = createOrdinaryFinancialPublicSql(
+      {
+        async query(...args) {
+          calls.query++;
+          return raw.query(...args);
+        },
+        async run(...args) {
+          calls.run++;
+          return raw.run(...args);
+        },
+        async batch(...args) {
+          calls.batch++;
+          return raw.batch(...args);
+        },
+      },
+      grammar,
+    );
+    const statement = "SELECT 1 --\0";
+    await expect(sql.query(statement)).rejects.toThrow("NUL statement");
+    await expect(sql.run(statement)).rejects.toThrow("NUL statement");
+    await expect(sql.batch([{ sql: statement }])).rejects.toThrow("NUL statement");
+    expect(calls).toEqual({ query: 0, run: 0, batch: 0 });
+  });
+
+  test(`${grammar} retains NUL within bound data without treating it as SQL`, async () => {
+    const { database, sql } = fixture();
+    const id = "bound\0data";
+    expect(await sql.run("INSERT INTO orgs(id) VALUES(?) RETURNING id", [id])).toEqual({
+      changes: 1,
+      rows: [{ id }],
+    });
     expect(database.query("SELECT id FROM orgs").all()).toEqual([{ id }]);
   });
 }
