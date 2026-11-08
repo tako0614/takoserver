@@ -962,7 +962,7 @@ export async function deployWranglerLifecycleChange(input: {
       ...(input.secretsFilePath === undefined ? [] : ["--secrets-file", input.secretsFilePath]),
     ]),
     { ...(input.environment ?? {}), WRANGLER_OUTPUT_FILE_PATH: outputPath },
-    "Worker lifecycle deployment could not be started; run --status before repair",
+    "Worker lifecycle deployment acknowledgement is indeterminate; run --status before repair",
   );
   if (deployed.exitCode !== 0) {
     throw mutationError(
@@ -1027,7 +1027,7 @@ async function publishWranglerVersionWhileLeased(
       ...(input.secretsFilePath === undefined ? [] : ["--secrets-file", input.secretsFilePath]),
     ]),
     { ...environment, WRANGLER_OUTPUT_FILE_PATH: uploadOutputPath },
-    "Worker Version upload could not be started; do not retry before --status",
+    "Worker Version upload acknowledgement is indeterminate; do not retry before --status",
   );
   if (upload.exitCode !== 0) {
     throw mutationError(
@@ -1085,7 +1085,7 @@ async function publishWranglerVersionWhileLeased(
       input.message,
     ]),
     { ...environment, WRANGLER_OUTPUT_FILE_PATH: deployOutputPath },
-    "Worker Version deployment could not be started; run --status before repair",
+    "Worker Version deployment acknowledgement is indeterminate; run --status before repair",
   );
   if (deployed.exitCode !== 0) {
     throw mutationError(
@@ -1159,7 +1159,7 @@ export async function deployExistingWranglerVersion(input: {
       input.message,
     ]),
     { ...(input.environment ?? {}), WRANGLER_OUTPUT_FILE_PATH: outputPath },
-    "Worker rollback deployment could not be started; run --status before repair",
+    "Worker rollback deployment acknowledgement is indeterminate; run --status before repair",
   );
   if (deployed.exitCode !== 0) {
     throw mutationError(
@@ -1199,6 +1199,8 @@ async function runPublicationCommand(
   try {
     return await run(command, { env: environment });
   } catch {
+    // A process promise can reject after spawn, including while reading its
+    // output. Without an acknowledgement, never infer that it did not start.
     throw mutationError(message, "process invocation failed");
   }
 }

@@ -694,6 +694,72 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
+  test.each(["exit", "throw"] as const)(
+    "ordinary Worker lost upload ACK stops once and status observes only active predecessor (%s)",
+    async (loss) => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-worker-unknown-upload-"));
+      try {
+        const current = fixture({ selectedTarget: v2Target });
+        let uploads = 0;
+        const options = {
+          ...current,
+          outputDirectory: root,
+          publicationLeaseRoot: join(root, "lease"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          integrationStorageVerification: integrationStorageVerificationOptions(v2Target),
+          run: (async (argv, environment) => {
+            if (
+              argv.includes("versions") &&
+              argv.includes("upload") &&
+              !argv.includes("--dry-run")
+            ) {
+              uploads++;
+              if (loss === "throw") throw new Error("fixture process failed after starting upload");
+              return { exitCode: 1, stdout: "", stderr: "fixture lost upload ACK" };
+            }
+            return await current.run(argv, environment);
+          }) satisfies WorkerProcess,
+        };
+        const invocation = {
+          surface: "takoserver-worker" as const,
+          action: "apply" as const,
+          environment: "integration" as const,
+          commit: COMMIT,
+        };
+        const failure = await runWorker(invocation, v2Target, options).catch(
+          (error: unknown) => error,
+        );
+        expect(failure).toBeInstanceOf(DeployError);
+        if (!(failure instanceof DeployError)) throw new Error("expected unknown upload failure");
+        expect(failure.phase).toBe("mutation");
+        expect(failure.message).toContain("indeterminate");
+        expect(failure.message).toContain("--status");
+        expect(failure.message).not.toContain("could not be started");
+        expect(uploads).toBe(1);
+        expect(current.calls.filter((argv) => argv.join(" ") === "bun run check")).toHaveLength(1);
+        // Active traffic alone cannot show whether the unacknowledged upload
+        // created an inactive Version. Status must not retry that upload.
+        const status = await runWorker({ ...invocation, action: "status" }, v2Target, {
+          ...options,
+        });
+        expect(status).toMatchObject({
+          versionId: VERSION_BEFORE,
+          deployedCommit: LIVE_COMMIT,
+          selectedCommit: COMMIT,
+          commitMatches: false,
+          publicationLease: { state: "available" },
+        });
+        expect(uploads).toBe(1);
+        expect(current.calls.filter((argv) => argv.join(" ") === "bun run check")).toHaveLength(1);
+        expect(
+          current.calls.filter((argv) => argv.includes("versions") && argv.includes("deploy")),
+        ).toHaveLength(0);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   test("fixed 0075 proof loss after readback is verification-unknown, never a second upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-v2-post-drift-"));
     try {

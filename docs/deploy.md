@@ -1566,8 +1566,10 @@ The routine surfaces are:
   another host can still race the final traffic mutation. A
   failed post-upload re-read means traffic is indeterminate: this invocation
   has not started its traffic deployment, but it does not claim the uploaded
-  Version is inactive or that another actor left traffic unchanged. After a
-  successful traffic mutation, authoritative history must identify the exact
+  Version is inactive or that another actor left traffic unchanged. An upload
+  process rejection is also indeterminate: it can happen after the child started,
+  including while collecting its output. It is not proof that no upload began.
+  After a successful traffic mutation, authoritative history must identify the exact
   uploaded Version and deployment; its actual immediate predecessor, not the
   earlier observation, is printed as the rollback target. A concurrent
   deployment observed by that readback fails verification instead of triggering
@@ -3241,6 +3243,14 @@ the same surface with `--status`. A failed post-condition means the mutation
 was acknowledged but must be repaired or rolled back explicitly. Routine
 Worker, Console, and Pages output the immediately previous provider-history
 identity; irreversible surfaces state their forward-repair boundary.
+
+For routine staged Worker publication, `--status` reports the active deployment,
+Version, source and current lease state. An unchanged active predecessor or an
+available local lease does not prove that an unacknowledged upload created no
+inactive Version. Status performs no upload and does not recover the lost upload
+identity. Assess authoritative provider state before deciding an explicit repair;
+active-only readback is not permission to blindly repeat `--apply`. The routine
+command has no cross-invocation one-shot journal or automatic recovery/retry.
 
 For an integration legacy Worker cutover, repeat `--status` with the same
 `--legacy-predecessor-version` after an indeterminate acknowledgement. The
