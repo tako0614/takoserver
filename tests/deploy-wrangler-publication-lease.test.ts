@@ -15,7 +15,7 @@ const workerName = "local-publication-lease";
 const versionId = "11111111-1111-4111-8111-111111111111";
 const deploymentId = "22222222-2222-4222-8222-222222222222";
 type Operation = "staged" | "lifecycle" | "existing";
-type Loss = "released" | "clone" | "proof" | "upload" | "none";
+type Loss = "released" | "clone" | "proof" | "upload" | "process" | "traffic-process" | "none";
 
 async function fixture(operation: Operation, loss: Loss) {
   const root = mkdtempSync(join(userInfo().homedir, ".core-publication-lease-test-"));
@@ -43,6 +43,9 @@ async function fixture(operation: Operation, loss: Loss) {
     run: async (argv: readonly string[]) => {
       effects++;
       const upload = argv.includes("upload");
+      if (loss === "process" || (loss === "traffic-process" && !upload)) {
+        throw new Error("fixture output read failed after process start: private-diagnostic");
+      }
       if (upload && loss === "upload") await acquired.release();
       return {
         exitCode: 0,
@@ -128,3 +131,28 @@ test("Core staged final send retains unknown classification after upload loses t
     await f.dispose();
   }
 });
+
+for (const [operation, loss] of [
+  ["staged", "process"],
+  ["staged", "traffic-process"],
+  ["lifecycle", "process"],
+  ["existing", "process"],
+] as const) {
+  test(`Core publication process rejection preserves unknown outcome (${operation}/${loss})`, async () => {
+    const f = await fixture(operation, loss);
+    try {
+      const failure = await f.invoke().catch((error: unknown) => error);
+      expect(f.effects).toBe(loss === "traffic-process" ? 2 : 1);
+      expect(failure).toBeInstanceOf(DeployError);
+      if (!(failure instanceof DeployError)) throw new Error("expected unknown process outcome");
+      expect(failure.phase).toBe("mutation");
+      expect(failure.message).toContain("indeterminate");
+      expect(failure.message).toContain("--status");
+      expect(failure.message).not.toContain("could not be started");
+      expect(failure.detail).toBe("process invocation failed");
+      expect(JSON.stringify(failure)).not.toContain("private-diagnostic");
+    } finally {
+      await f.dispose();
+    }
+  });
+}
