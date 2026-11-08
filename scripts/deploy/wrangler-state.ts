@@ -283,6 +283,7 @@ export interface WranglerLifecycleDeployment {
   readonly targets: readonly string[];
 }
 
+/** Publication requires the exact live object returned by the acquire function below. */
 export interface WranglerVersionPublicationLease {
   readonly accountId: string;
   readonly workerName: string;
@@ -865,7 +866,7 @@ export async function publishWranglerVersion(input: {
   readonly accountId: string;
   readonly workerName: string;
   readonly message: string;
-  /** Caller-held target lease; the caller releases it only after authoritative verification. */
+  /** Exact acquired target lease; caller releases it only after authoritative verification. */
   readonly lease: WranglerVersionPublicationLease;
   /** Re-read and compare the pinned active deployment after upload, immediately before traffic. */
   readonly assertPredecessorStillCurrent: () => Promise<void>;
@@ -931,17 +932,18 @@ export async function deployWranglerLifecycleChange(input: {
   if (input.lease.accountId !== input.accountId || input.lease.workerName !== input.workerName) {
     throw preflightError("Wrangler lifecycle deployment lease does not match the exact target");
   }
+  const outputPath = join(input.root, "wrangler-lifecycle-deploy.jsonl");
   try {
     await input.assertCurrentStillExpected();
+    mkdirSync(input.root, { recursive: true, mode: 0o700 });
+    rmSync(outputPath, { force: true });
+    assertWranglerVersionPublicationLeaseCurrent(input.lease);
   } catch (error) {
     throw mutationError(
       "Worker lifecycle predecessor re-fence failed; this invocation did not start a deployment",
       safeErrorDetail(error),
     );
   }
-  mkdirSync(input.root, { recursive: true, mode: 0o700 });
-  const outputPath = join(input.root, "wrangler-lifecycle-deploy.jsonl");
-  rmSync(outputPath, { force: true });
   const deployed = await runPublicationCommand(
     input.run ?? runCommand,
     deployWranglerCommand(input.wranglerPath, [
@@ -1005,6 +1007,7 @@ async function publishWranglerVersionWhileLeased(
   rmSync(deployOutputPath, { force: true });
   const environment = input.environment ?? {};
 
+  assertWranglerVersionPublicationLeaseCurrent(input.lease);
   const upload = await runPublicationCommand(
     run,
     deployWranglerCommand(input.wranglerPath, [
@@ -1058,6 +1061,7 @@ async function publishWranglerVersionWhileLeased(
 
   try {
     await input.assertPredecessorStillCurrent();
+    assertWranglerVersionPublicationLeaseCurrent(input.lease);
   } catch (error) {
     throw mutationError(
       "Worker predecessor re-fence failed after Version upload; traffic state is indeterminate, " +
@@ -1128,17 +1132,18 @@ export async function deployExistingWranglerVersion(input: {
   if (input.lease.accountId !== input.accountId || input.lease.workerName !== input.workerName) {
     throw preflightError("Wrangler existing Version deployment lease does not match the target");
   }
+  const outputPath = join(input.root, "wrangler-existing-version-deploy.jsonl");
   try {
     await input.assertCurrentStillExpected();
+    mkdirSync(input.root, { recursive: true, mode: 0o700 });
+    rmSync(outputPath, { force: true });
+    assertWranglerVersionPublicationLeaseCurrent(input.lease);
   } catch (error) {
     throw mutationError(
       "Worker rollback predecessor re-fence failed; this invocation did not mutate traffic",
       safeErrorDetail(error),
     );
   }
-  mkdirSync(input.root, { recursive: true, mode: 0o700 });
-  const outputPath = join(input.root, "wrangler-existing-version-deploy.jsonl");
-  rmSync(outputPath, { force: true });
   const deployed = await runPublicationCommand(
     input.run ?? runCommand,
     deployWranglerCommand(input.wranglerPath, [

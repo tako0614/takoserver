@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -216,12 +216,21 @@ describe("Wrangler OAuth Worker reader", () => {
 
 describe("Wrangler staged Version secrets option", () => {
   const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-version-secrets-${crypto.randomUUID()}`;
-  afterAll(() => rmSync(root, { recursive: true, force: true }));
-  const lease = {
-    accountId: target.accountId,
-    workerName: WORKER,
-    release: async () => {},
-  };
+  let lease: WranglerVersionPublicationLease;
+  beforeAll(async () => {
+    lease = await acquireWranglerVersionPublicationLease({
+      accountId: target.accountId,
+      workerName: WORKER,
+      root: `${root}/lease`,
+    });
+  });
+  afterAll(async () => {
+    try {
+      await lease?.release();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   test("omits the option by default and preserves the existing upload argv", async () => {
     const commands: string[][] = [];
@@ -409,11 +418,11 @@ describe("Wrangler version publication output", () => {
       "[code: 10021] [code: 10022] [code: 10023] [code: 10024] [code: 1234567]",
       "ECONNRESET ETIMEDOUT fetch failed ECONNRESET_SECRET raw diagnostic text",
     ].join("\n");
-    const lease = {
+    const lease = await acquireWranglerVersionPublicationLease({
       accountId: target.accountId,
       workerName: target.workerName,
-      release: async () => {},
-    };
+      root: `${root}/lease`,
+    });
     const commands: string[][] = [];
     try {
       const failure = await deployWranglerLifecycleChange({
@@ -455,17 +464,21 @@ describe("Wrangler version publication output", () => {
       expect(error.detail).not.toContain("raw diagnostic text");
       expect((error.detail?.match(/\[code:/gu) ?? []).length).toBeLessThanOrEqual(3);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      try {
+        await lease.release();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
   test("falls back to the exit code when no allowlisted failure detail exists", async () => {
     const root = `${process.env.TMPDIR ?? "/tmp"}/takoserver-lifecycle-failure-empty-${crypto.randomUUID()}`;
-    const lease = {
+    const lease = await acquireWranglerVersionPublicationLease({
       accountId: target.accountId,
       workerName: target.workerName,
-      release: async () => {},
-    };
+      root: `${root}/lease`,
+    });
     try {
       const failure = await deployWranglerLifecycleChange({
         root,
@@ -485,7 +498,11 @@ describe("Wrangler version publication output", () => {
       expect(failure).toBeInstanceOf(DeployError);
       expect((failure as DeployError).detail).toBe("exit=7");
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      try {
+        await lease.release();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
@@ -500,11 +517,11 @@ describe("Wrangler version publication output", () => {
       "[code: 10021] [code: 10022] [code: 10023] [code: 10024] [code: 1234567]",
       "ECONNRESET ETIMEDOUT fetch failed ECONNRESET_SECRET raw diagnostic text",
     ].join("\n");
-    const lease = {
+    const lease = await acquireWranglerVersionPublicationLease({
       accountId: target.accountId,
       workerName: target.workerName,
-      release: async () => {},
-    };
+      root: `${root}/lease`,
+    });
     const assertSafeFailure = (failure: unknown, expectedExit: number): void => {
       expect(failure).toBeInstanceOf(DeployError);
       const error = failure as DeployError;
@@ -612,7 +629,11 @@ describe("Wrangler version publication output", () => {
       expect(rollbackAttempts).toBe(1);
       expect(rollbackCommands[0]).toContain(`${VERSION}@100%`);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      try {
+        await lease.release();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     }
   });
 
