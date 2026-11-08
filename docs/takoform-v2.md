@@ -1121,8 +1121,14 @@ content-digest validator through a **fixed trusted owner readback port**. The
 hash authenticates neither issuer nor durability. Synthetic contract tests do
 not qualify the private journal, Container execution or a live provider.
 
-Readback distinguishes absent, pending, unknown and complete. Missing or malformed
-originals, wrong scope and unreadable acknowledgements remain nonpositive. A
+Readback distinguishes absent, pending, unknown, closed and complete. Missing or
+malformed originals, wrong scope and unreadable acknowledgements remain
+nonpositive. Exactly `{ state: "closed", bindingDigest }` means the fixed owner
+durably recorded that no native request was ever made with the child's one-use
+send key (never presented, or presented and provably not sent) and refuses any
+later presentation of that key. Its `bindingDigest` must equal the child's
+binding digest, checked as for a complete original; a bare or foreign `closed`
+reads `unknown`. It is trusted only as far as a complete original. A
 complete child original proves only that exact transport attempt. Parent
 retirement or Deployment DELETE additionally requires durable inventory of all
 children, a closed-admission seal, aggregation of every admitted attempt and the
@@ -1180,6 +1186,40 @@ Neither that side effect nor a positive closed-set read proves parent retirement
 every consumer must independently reassert native retirement, complete source
 coverage and every child's fixed-owner original. The method closes admission
 only and does not release a process or authorize Deployment DELETE.
+
+An inventory constructed with the optional fixed `closeOriginal` port (the same
+trusted owner and journal keyspace as `readOriginal`) opts into
+`closeUnsentAfterNativeRetirement(parent)`. That method is an effect, never a
+verdict. It requires the fixed Core parent reader to match the full custody and
+selection and to supply a valid native retirement, then an existing sealed set.
+Callers cannot satisfy that precondition with a DTO: a close adds no send, but it
+would refuse a live parent's later presentation. It works in two passes. It first
+validates the whole stored set and reads every child's original; a missing,
+surplus or foreign child, a count mismatch, an unreadable page or a changed
+header refuses before any close. Only then does it ask the owner to close the
+children whose validated original reads exactly `absent`. The owner's
+compare-and-set writes `closed` only on a still-undefined key and never rewrites
+a row, so a presentation that commits `pending` first keeps its row, and
+`pending`, `unknown` and `complete` children are never touched. Repeating the
+call is idempotent. Its current-epoch checks stop a superseded inventory
+instance only on a best-effort basis; safety rests on the native retirement.
+
+This relies on an owner invariant. A defined one-use journal key never reverts
+to undefined for the life of the inventory: no delete, reset, re-key, prefix or
+version change, storage re-creation or class migration may re-home a binding.
+`absent` therefore means never defined in that owner's durable journal, and
+`readOriginal`, `closeOriginal` and every presentation of a binding must route
+to the same owner keyspace. The native journal pins what its code controls;
+durable storage re-creation and class migration are outside its reach and are
+preconditions of the deployment and the Host wiring. With the port, an unbound child (an issuance that never left
+`issue()`) is read and closed under the deterministic binding the qualifier would
+have produced; the stored intent stays unbound. Without the port, unbound
+children stay unresolved exactly as before. A sealed set whose children are all
+complete or closed, with at least one closed, reads
+`{ state: "sealed_io_settled", childCount, closedCount }`. With no closed child
+the read is exactly `sealed_io_complete`, and `pending`, `unknown` and `absent`
+never settle. A settled read reports child I/O only, under the same
+consumer obligations as `sealed_io_complete`.
 
 `sealed_io_complete` reports only all registered children's transport I/O. Even
 a sealed zero-child set requires a durable pre-dispatch open. Before this can
