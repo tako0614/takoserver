@@ -1082,6 +1082,21 @@ Fixtures that need a migrated SQLite database copy one built from the real
 migration chain (`tests/helpers/migrated-database.ts`) instead of replaying the
 chain for every test; built images are shared for the length of one run only.
 
+On Linux, `TAKOSERVER_ARTIFACT_RESUME_STATE_TMPFS_ROOT` may name an existing
+absolute directory on tmpfs for the single native D1 artifact-resume fixture.
+Only that fixture's disposable Miniflare resource state moves to a fresh child
+directory; TMPDIR, other files and build caches keep their original locations.
+Unset, the fixture uses Miniflare's default temporary state. The fixture keeps
+the real D1 runtime, migrations, query budget and 30-second timeout. It tests SQL
+checkpoint reconciliation on one runtime, not disk-crash durability. State
+allocation is sampled every 250 ms; exceeding 64 MiB disposes that runtime and
+fails the test (this is not an instantaneous filesystem quota). Successful
+runtime disposal precedes state removal, and removal failures fail the test.
+A failed disposal or abrupt process exit may retain its child directory for
+owner diagnosis; it must not be treated as a passing or cleaned-up run.
+The tmpfs helper's lifecycle regressions require Linux with `/dev/shm` on tmpfs;
+their explicit skips elsewhere do not qualify this optional route there.
+
 A green gate is not a rollout. `bun run check` and local native evidence do not
 show that any deployment works: not a self-host's public TLS and DNS, not the
 hosted service's D1 or Workers for Platforms, and not adoption by downstream

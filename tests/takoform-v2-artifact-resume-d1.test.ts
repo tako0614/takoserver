@@ -8,34 +8,41 @@ import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleForm } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
 import type { V2Operation } from "../src/takoform-v2/types.ts";
+import { createBoundedMiniflareState } from "./helpers/bounded-miniflare-state.ts";
 
 const MANIFEST_URL = "https://artifacts.example.test/resume/manifest.json";
 const FILE_URL = "https://artifacts.example.test/resume/large.bin";
 const FILE_BYTES = new Uint8Array(8 * 1024 * 1024).fill(0x61);
 
 test("native D1 resumes one accepted artifact Operation within each invocation query budget", async () => {
-  const runtime = new Miniflare({
-    workers: [
-      {
-        config: {
-          name: "v2-artifact-resume-d1-test",
-          type: "worker",
-          compatibilityDate: "2026-08-17",
-          manifest: {
-            mainModule: "worker.js",
-            modules: {
-              "worker.js": {
-                type: "esm",
-                contents: "export default { fetch() { return new Response('ok'); } };",
+  const fixture = createBoundedMiniflareState(
+    (state) =>
+      new Miniflare({
+        ...state,
+        workers: [
+          {
+            config: {
+              name: "v2-artifact-resume-d1-test",
+              type: "worker",
+              compatibilityDate: "2026-08-17",
+              manifest: {
+                mainModule: "worker.js",
+                modules: {
+                  "worker.js": {
+                    type: "esm",
+                    contents: "export default { fetch() { return new Response('ok'); } };",
+                  },
+                },
               },
+              env: { STATE_DB: { type: "d1", id: "v2-artifact-resume-d1-test" } },
+              triggers: [],
             },
           },
-          env: { STATE_DB: { type: "d1", id: "v2-artifact-resume-d1-test" } },
-          triggers: [],
-        },
-      },
-    ],
-  });
+        ],
+      }),
+    process.env.TAKOSERVER_ARTIFACT_RESUME_STATE_TMPFS_ROOT,
+  );
+  const runtime = fixture.runtime;
   try {
     const database = await runtime.getD1Database("STATE_DB");
     for (const migration of MIGRATIONS.filter(({ name }) =>
@@ -368,7 +375,7 @@ test("native D1 resumes one accepted artifact Operation within each invocation q
       },
     );
   } finally {
-    await runtime.dispose();
+    await fixture.dispose();
   }
 }, 30_000);
 
