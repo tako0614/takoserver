@@ -39,6 +39,33 @@ code composer; its previous bare map still means complete public Forms. Neither
 map placement nor a private fixture by itself proves conformance to a Form's
 whole required ABI. The normal Bun entry retains its complete-capability gate.
 
+Operator code may additionally select `retainedExecutionActions` on the engine
+or application, or `v2RetainedExecutionActions` on `createWorkerEntry`/`buildApp`.
+This map lists allowed actions (`create`, `update`, `delete`) for exact
+retained-only Form URLs. Omission, an empty map, and unlisted Forms preserve
+ordinary execution; an empty action list holds all actions for that Form. Public
+or absent Forms and malformed action lists refuse construction. Selection is
+copied before asynchronous Worker composition and bound to each selected
+retained adapter's backend ID and target key at engine construction.
+
+For that exact Form/backend/target, held queued or uncertain operations are
+excluded before claim, deferral, private-input validation or dispatch. Their
+status, lease, retry time and Resource state remain unchanged, while later
+eligible work can progress. Adapter identity drift after construction cannot
+select a different accepted target; that candidate follows the existing
+unavailable-adapter deferral. Same-Resource busy-operation admission remains
+unchanged. Removing the selection resumes ordinary execution; an uncertain
+operation still reconciles its original identity rather than repeating execute.
+
+This is independent of `allowFreshCreateAndUpdate` and grants no authority. It
+neither cancels running work nor fences serving, external effects or other
+executors. Every HTTP wake, scheduled pass and reconstructed entry that must
+hold work must select the policy in its own code. An old/default engine sharing
+the database can still execute that work. SQL uses one JSON bind for the holds
+in addition to the two time parameters, avoiding a bind count proportional to
+Form count; unusually large maps can still increase query cost. This capability
+alone does not select a managed Root transition or establish deployment readiness.
+
 Read requests never execute an operation. The embedding application runs the
 executor independently, including after a process restart. The accepted backend
 identity, target and execution key survive that restart. If their outcome is

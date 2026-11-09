@@ -319,6 +319,7 @@ export type {
   V2Execution,
   V2Form,
   V2ReferenceRequirement,
+  V2RetainedExecutionActions,
 } from "./types.ts";
 export { TakoformV2Error } from "./types.ts";
 export {

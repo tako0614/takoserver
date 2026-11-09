@@ -3,6 +3,8 @@ import type { V2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
 import type { V2PrivateInputCustody, V2PrivateInputMap } from "./private-inputs.ts";
 
 export type V2Action = "create" | "update" | "delete";
+/** Code-selected allowed execution actions for exact retained-only Forms. */
+export type V2RetainedExecutionActions = Readonly<Record<string, readonly V2Action[]>>;
 export type V2Effect = "none" | "unknown" | "partial" | "complete";
 export type V2Status =
   | "queued"
@@ -235,6 +237,13 @@ export interface V2EngineOptions {
    * reads or DELETE. It does not fence serving or asynchronous delivery.
    */
   readonly allowFreshCreateAndUpdate?: boolean;
+  /**
+   * Code-only selection, captured at construction. Listed retained Forms run
+   * only these actions; omitted Forms preserve ordinary execution. An empty
+   * list holds all actions before claim, without changing their durable state.
+   * This is not fresh admission, cancellation, a serving fence or authorization.
+   */
+  readonly retainedExecutionActions?: V2RetainedExecutionActions;
   /**
    * Internal adapters for already accepted Resources/Operations only. These
    * URLs are never public Form support and cannot accept a new CREATE/UPDATE.
