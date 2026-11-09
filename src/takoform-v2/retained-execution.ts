@@ -1,6 +1,8 @@
 import { isV2FormUrl } from "./identity.ts";
 import type { V2Action, V2Form, V2RetainedExecutionActions } from "./types.ts";
 
+export type { V2RetainedExecutionActions } from "./types.ts";
+
 const actions: readonly V2Action[] = ["create", "update", "delete"];
 
 /** Capture operator code selection before asynchronous composition can begin. */

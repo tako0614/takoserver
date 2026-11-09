@@ -378,9 +378,17 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // Code-selected action restrictions carry contracts, never native adapters
+    // or Form construction. Only the explicit entry/application/engine callers
+    // below may consume this exact policy module.
+    name: "v2-retained-execution",
+    match: /^src\/takoform-v2\/retained-execution\.ts$/u,
+    may: ["v2-contract"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
-    may: ["core", "v2-contract", "v2-private", "v2-state"],
+    may: ["core", "v2-contract", "v2-private", "v2-state", "v2-retained-execution"],
   },
   {
     name: "v2-http",
@@ -418,6 +426,7 @@ const LAYERS: readonly Layer[] = [
       "v2-contract",
       "v2-private",
       "v2-config",
+      "v2-retained-execution",
       "v2-accounts",
       "v2-form",
       "v2-host",
@@ -1132,6 +1141,8 @@ for (const path of walk("src")) {
       violations.push(`${path} (${layer.name}) imports unclassified module ${target}`);
       continue;
     }
+    const exactRetainedExecutionEntryEdge =
+      path === "src/entry-worker.ts" && target === "src/takoform-v2/retained-execution.ts";
     const exactHostAcceptanceEdge =
       target === "src/takoform-v2/host-acceptance.ts" &&
       [
@@ -1273,6 +1284,7 @@ for (const path of walk("src")) {
         );
     if (
       !layer.may.includes(targetLayer.name) &&
+      !exactRetainedExecutionEntryEdge &&
       !exactHostAcceptanceEdge &&
       !exactHostAcceptanceCompositionTypeEdge(path, target) &&
       !exactContainerHostAcceptanceEdge &&

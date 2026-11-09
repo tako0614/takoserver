@@ -81,8 +81,10 @@ import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
 import type { V2HostAcceptance } from "./takoform-v2/host-acceptance.ts";
-import { captureV2RetainedExecutionActions } from "./takoform-v2/retained-execution.ts";
-import type { V2RetainedExecutionActions } from "./takoform-v2/types.ts";
+import {
+  captureV2RetainedExecutionActions,
+  type V2RetainedExecutionActions,
+} from "./takoform-v2/retained-execution.ts";
 import { drainV2Operations } from "./takoform-v2/worker-wake.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
