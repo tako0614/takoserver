@@ -115,6 +115,131 @@ test("SQLiteDatabase Form keeps Selfhost backend identity unless an explicit val
   }
 });
 
+test("UID shard inspection yields to an asynchronous owner in the same Node process", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-shard-inspection-"));
+  const database = control(root, true);
+  const clock = () => new Date("2026-10-07T00:00:00Z");
+  const { engine, store } = host(root, database, clock);
+  const peer = createSelfhostV2SQLiteStore({
+    root: join(root, "native"),
+    sql: createSqliteSql(database),
+    targetKey: TARGET,
+    now: clock,
+  });
+  try {
+    const accepted = await created(engine);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    let entered!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const leading = store.withAuthorizedDatabase({
+      resourceUid: accepted.resourceUid,
+      stillAuthorized: async () => true,
+      async use(native) {
+        native.exec("CREATE TABLE preserved (value INTEGER PRIMARY KEY)");
+        native.exec("INSERT INTO preserved VALUES (7)");
+        entered();
+        await Bun.sleep(30);
+      },
+    });
+    await ready;
+    const observing = peer.inspectOwnedDatabase({
+      resourceUid: accepted.resourceUid,
+      stillAuthorized: async () => true,
+    });
+    const [, result] = await Promise.all([leading, observing]);
+    expect(result).toBe("confirmed");
+    expect(
+      await store.withAuthorizedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+        use(native) {
+          return native.prepare("SELECT value FROM preserved").all();
+        },
+      }),
+    ).toEqual([{ value: 7 }]);
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("UID shard inspection still refuses an owner that does not release its physical lock", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-shard-busy-"));
+  const database = control(root, true);
+  const { engine, store } = host(root, database, () => new Date("2026-10-07T00:00:00Z"));
+  let release: (() => void) | undefined;
+  let leading: Promise<void> | undefined;
+  try {
+    const accepted = await created(engine);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    let entered!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    leading = store.withAuthorizedDatabase({
+      resourceUid: accepted.resourceUid,
+      stillAuthorized: async () => true,
+      async use() {
+        entered();
+        await held;
+      },
+    });
+    await ready;
+    expect(
+      await store.inspectOwnedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+      }),
+    ).toBe("unknown");
+  } finally {
+    release?.();
+    await leading;
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("UID shard acquisition never retries SQL work after a busy error", async () => {
+  const root = mkdtempSync(join(tmpdir(), "v2-sqlite-shard-no-sql-retry-"));
+  const database = control(root, true);
+  const { engine, store } = host(root, database, () => new Date("2026-10-07T00:00:00Z"));
+  try {
+    const accepted = await created(engine);
+    expect((await engine.runNext())?.status).toBe("succeeded");
+    let writes = 0;
+    await expect(
+      store.withAuthorizedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+        use(native) {
+          writes++;
+          native.exec("CREATE TABLE committed (value INTEGER PRIMARY KEY)");
+          native.exec("INSERT INTO committed VALUES (7)");
+          throw new Error("database is locked");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "busy" });
+    expect(writes).toBe(1);
+    expect(
+      await store.withAuthorizedDatabase({
+        resourceUid: accepted.resourceUid,
+        stillAuthorized: async () => true,
+        use(native) {
+          return native.prepare("SELECT value FROM committed").all();
+        },
+      }),
+    ).toEqual([{ value: 7 }]);
+  } finally {
+    database.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("UID-owned native bytes survive process-like reopen and same-spec PUT; DELETE removes only that UID", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-db-"));
   let database = control(root, true);

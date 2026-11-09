@@ -188,27 +188,35 @@ export function createSelfhostV2SQLiteStore(
   const shardFor = (uid: string) => createHash("sha256").update(uid).digest("hex").slice(0, 2);
 
   async function withShardLock<T>(shard: string, work: () => Promise<T>): Promise<T> {
-    const mutex = new DatabaseSync(join(locks, `${shard}.sqlite`));
-    let locked = false;
-    try {
-      mutex.exec("PRAGMA busy_timeout = 1000");
-      mutex.exec("BEGIN EXCLUSIVE");
-      locked = true;
-      return await work();
-    } catch (error) {
-      if (error instanceof SelfhostV2SQLiteStoreError) throw error;
-      const message = error instanceof Error ? error.message : "";
-      if (/locked|busy/iu.test(message)) throw new SelfhostV2SQLiteStoreError("busy");
-      throw error;
-    } finally {
-      if (locked) {
-        try {
-          mutex.exec("ROLLBACK");
-        } catch {
-          // A failed release can only make the outcome uncertain to the caller.
+    const deadline = performance.now() + 1_000;
+    for (;;) {
+      if (performance.now() >= deadline) throw new SelfhostV2SQLiteStoreError("busy");
+      const mutex = new DatabaseSync(join(locks, `${shard}.sqlite`));
+      let locked = false;
+      try {
+        // A synchronous wait prevents an owner awaiting D1 from releasing this
+        // same process's lock. Keep the one-second acquisition budget, yielding
+        // between failed attempts. Once work begins, it must never be retried.
+        mutex.exec("PRAGMA busy_timeout = 0");
+        mutex.exec("BEGIN EXCLUSIVE");
+        locked = true;
+        return await work();
+      } catch (error) {
+        if (error instanceof SelfhostV2SQLiteStoreError) throw error;
+        const message = error instanceof Error ? error.message : "";
+        if (!/locked|busy/iu.test(message)) throw error;
+        if (locked || performance.now() >= deadline) throw new SelfhostV2SQLiteStoreError("busy");
+      } finally {
+        if (locked) {
+          try {
+            mutex.exec("ROLLBACK");
+          } catch {
+            // A failed release can only make the outcome uncertain to the caller.
+          }
         }
+        mutex.close();
       }
-      mutex.close();
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
     }
   }
 
