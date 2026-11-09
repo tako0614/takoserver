@@ -29,6 +29,7 @@ import {
   constants as fsConstants,
   readdirSync,
   readFileSync,
+  statfsSync,
   statSync,
 } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
@@ -49,13 +50,14 @@ export interface NativeEvidenceStatus {
 export interface NativeEvidenceProbe {
   isExecutableFile(path: string): boolean;
   sha256(path: string): string | null;
+  isLinuxTmpfsDirectory?(path: string): boolean;
 }
 
 export interface NativeEvidenceCapability {
   readonly id: string;
   readonly label: string;
-  /** Environment variable whose presence turns the gated tests on. */
-  readonly environment: string;
+  /** Opt-in variable, absent for an automatically detected host prerequisite. */
+  readonly environment?: string;
   /** Further variables the same gated tests need once they run. */
   readonly companionEnvironment: readonly string[];
   /** What the gated tests would prove if they ran. */
@@ -530,6 +532,31 @@ export const NATIVE_EVIDENCE_CAPABILITIES: readonly NativeEvidenceCapability[] =
       };
     },
   },
+  {
+    id: "linux-tmpfs",
+    label: "automatic Linux tmpfs fixture support",
+    companionEnvironment: [],
+    proves:
+      "bounded temporary fixture state lifecycle and cleanup; not Native runtime qualification or disk crash durability",
+    enable: "a Linux host with /dev/shm mounted as tmpfs (no opt-in variable)",
+    inspect: (_configured, _environment, probe) => {
+      try {
+        if (probe.isLinuxTmpfsDirectory?.("/dev/shm")) {
+          return {
+            state: "ready",
+            detail: "Linux /dev/shm tmpfs is available; the automatic tests still need to run",
+            readinessOnly: true,
+          };
+        }
+      } catch {
+        // A missing or unreadable host prerequisite has the same skip semantics.
+      }
+      return {
+        state: "unconfigured",
+        detail: "Linux /dev/shm tmpfs is unavailable or could not be inspected",
+      };
+    },
+  },
 ];
 
 export interface NativeEvidenceGate {
@@ -544,7 +571,7 @@ export interface NativeEvidenceGate {
 }
 
 const ENVIRONMENT_PREFIX = "process.env.";
-const CAPABILITY_CALL = "nativeEvidenceBinary(";
+const CAPABILITY_CALL = /\b(nativeEvidenceBinary|nativeEvidenceHostAvailable)\s*\(/gu;
 
 function environmentReferences(text: string): string[] {
   const found: string[] = [];
@@ -685,19 +712,16 @@ function maskLiterals(source: string, literals: readonly SourceLiteral[]): strin
   return characters.join("");
 }
 
-/** Argument spans of every `nativeEvidenceBinary(...)` call, nested parens balanced. */
+/** Argument spans of capability helper calls, nested parens balanced. */
 function capabilityCallArguments(
   masked: string,
   from: number,
   to: number,
-): { start: number; end: number }[] {
-  const found: { start: number; end: number }[] = [];
-  let cursor = from;
-  for (;;) {
-    const at = masked.indexOf(CAPABILITY_CALL, cursor);
-    if (at < 0 || at >= to) break;
+): { start: number; end: number; binary: boolean }[] {
+  const found: { start: number; end: number; binary: boolean }[] = [];
+  for (const match of masked.slice(from, to).matchAll(CAPABILITY_CALL)) {
     let depth = 0;
-    let index = at + CAPABILITY_CALL.length - 1;
+    let index = from + match.index + match[0].length - 1;
     const start = index + 1;
     for (; index < masked.length; index += 1) {
       const character = masked[index];
@@ -707,8 +731,7 @@ function capabilityCallArguments(
         if (depth === 0) break;
       }
     }
-    found.push({ start, end: index });
-    cursor = index;
+    found.push({ start, end: index, binary: match[1] === "nativeEvidenceBinary" });
   }
   return found;
 }
@@ -733,10 +756,10 @@ function claimsIn(
     const id = named[0];
     if (id !== undefined && id !== "" && !capabilities.includes(id)) capabilities.push(id);
     const capability = NATIVE_EVIDENCE_CAPABILITIES.find((entry) => entry.id === id);
-    if (capability !== undefined && !environments.includes(capability.environment)) {
+    if (capability?.environment !== undefined && !environments.includes(capability.environment)) {
       environments.push(capability.environment);
     }
-    const override = named[1];
+    const override = argument.binary ? named[1] : undefined;
     if (override !== undefined && override !== "" && !environments.includes(override)) {
       environments.push(override);
     }
@@ -806,7 +829,7 @@ function classify(environments: readonly string[], capabilities: readonly string
     (capability) =>
       (capabilities.length > 0
         ? capabilities.every((id) => id === capability.id)
-        : environments.includes(capability.environment)) &&
+        : capability.environment !== undefined && environments.includes(capability.environment)) &&
       environments.every(
         (name) => name === capability.environment || capability.companionEnvironment.includes(name),
       ),
@@ -875,7 +898,7 @@ export interface NativeEvidenceSummary {
   readonly label: string;
   readonly state: NativeEvidenceState;
   readonly detail: string;
-  readonly environment: string;
+  readonly environment: string | undefined;
   readonly proves: string;
   readonly enable: string;
   readonly tests: number;
@@ -891,7 +914,7 @@ export function summarizeNativeEvidence(input: {
   return NATIVE_EVIDENCE_CAPABILITIES.map((capability) => {
     const owned = input.gates.filter((gate) => gate.capability === capability.id);
     const status = capability.inspect(
-      input.environment[capability.environment],
+      capability.environment === undefined ? undefined : input.environment[capability.environment],
       input.environment,
       input.probe,
     );
@@ -920,7 +943,7 @@ export function renderNativeEvidenceReport(input: {
   lines.push(`native evidence: ${total} gated tests in ${files} files`);
   for (const summary of input.summaries) {
     lines.push("");
-    lines.push(`  ${summary.label} (${summary.environment})`);
+    lines.push(`  ${summary.label} (${summary.environment ?? "automatic host prerequisite"})`);
     lines.push(`    state: ${summary.state} — ${summary.detail}`);
     if (summary.state === "unconfigured") {
       lines.push(
@@ -971,6 +994,13 @@ export function nativeEvidenceExitCode(input: {
 
 /** Real host probes. */
 export const hostProbe: NativeEvidenceProbe = {
+  isLinuxTmpfsDirectory(path) {
+    try {
+      return process.platform === "linux" && statfsSync(path).type === 0x01021994;
+    } catch {
+      return false;
+    }
+  },
   isExecutableFile(path) {
     try {
       if (!statSync(path).isFile()) return false;
