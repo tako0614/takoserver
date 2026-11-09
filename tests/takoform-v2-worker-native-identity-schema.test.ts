@@ -799,7 +799,10 @@ function candidateFixture(file = ":memory:"): Database {
   if (file !== ":memory:") {
     const db = new Database(file);
     try {
-      replay(db);
+      // Seed the fresh file before any reader opens. Keep the candidate's WAL
+      // transaction separate; setup does not need one durable commit per DDL.
+      db.exec("PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = OFF;");
+      db.transaction(() => replay(db)).immediate();
       return db;
     } catch (error) {
       db.close();
