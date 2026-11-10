@@ -45,7 +45,12 @@ const TARGET = "sqlite-binding-target";
 const BUNDLE_FORM = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
 const WORKERD = nativeEvidenceBinary("workerd-artifact");
 
-async function fixture(bindingName = "DB", invocationScoped = false, includeAux = false) {
+async function fixture(
+  bindingName = "DB",
+  invocationScoped = false,
+  includeAux = false,
+  references: "exact" | "missing" | "extra" | "readiness" = "exact",
+) {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-binding-"));
   const stagingRoot = join(root, "sql-input-staging");
   mkdirSync(stagingRoot, { mode: 0o700 });
@@ -113,6 +118,7 @@ async function fixture(bindingName = "DB", invocationScoped = false, includeAux 
   }
   settled("worker-one", MODULE_WORKER_FORM_URL, "worker");
   settled("bundle-one", BUNDLE_FORM, "bundle");
+  if (references === "extra") settled("extra-one", BUNDLE_FORM, "extra-bundle");
   const spec = JSON.stringify({
     worker: { resourceUid: "worker-one" },
     bundle: { resourceUid: "bundle-one" },
@@ -145,12 +151,14 @@ async function fixture(bindingName = "DB", invocationScoped = false, includeAux 
     ["bundle-one", BUNDLE_FORM],
     [databaseUid, SQLITE_DATABASE_FORM_URL],
     ...(auxDatabaseUid ? ([[auxDatabaseUid, SQLITE_DATABASE_FORM_URL]] as [string, string][]) : []),
+    ...(references === "extra" ? ([["extra-one", BUNDLE_FORM]] as [string, string][]) : []),
   ];
   for (const [uid, form] of referenceTargets) {
+    if (references === "missing" && uid === "bundle-one") continue;
     control
       .prepare(`INSERT INTO tf_v2_operation_references
-      (operation_id,target_uid,form_url,readiness) VALUES ('op-version-one',?,?,'observed')`)
-      .run(uid, form);
+      (operation_id,target_uid,form_url,readiness) VALUES ('op-version-one',?,?,?)`)
+      .run(uid, form, references === "readiness" && uid === "worker-one" ? "ready" : "observed");
   }
   control.exec(
     "UPDATE tf_v2_operation_reference_sets SET sealed=1 WHERE operation_id='op-version-one'",
@@ -392,6 +400,67 @@ test("SQLite bindings refuse incomplete or unresolved WorkerVersion observations
     });
   } finally {
     host.close();
+  }
+});
+
+test("SQLite binding authority never combines a revoked Version with a later database revision", async () => {
+  const host = await fixture();
+  try {
+    const before = await createSQLiteWorkerBindingAuthority({
+      sql: host.sql,
+      targetKey: TARGET,
+    }).resolveCurrentBinding(host.grant, "DB");
+    expect(before).not.toBeNull();
+    let changed = false;
+    const interleavedSql: typeof host.sql = {
+      ...host.sql,
+      async query(statement, params) {
+        const rows = await host.sql.query(statement, params);
+        if (!changed) {
+          changed = true;
+          // Revoke the Version before the database's next revision exists.
+          // A result may describe the earlier snapshot or refuse; there was
+          // never a valid snapshot containing this Version and the new DB.
+          host.control
+            .prepare(
+              "UPDATE tf_v2_resources SET observed_json = '{\"ready\":false}' WHERE uid = 'version-one'",
+            )
+            .run();
+          const update = await host.engine.acceptUpdate({
+            principal: "alice",
+            key: "sqlite-binding-coherent-read-0001",
+            uid: host.databaseUid,
+            expectedGeneration: 1,
+            spec: {},
+          });
+          expect(update.generation).toBe(2);
+          expect((await host.engine.runNext())?.status).toBe("succeeded");
+        }
+        return rows;
+      },
+    };
+    const authority = createSQLiteWorkerBindingAuthority({
+      sql: interleavedSql,
+      targetKey: TARGET,
+    });
+    const observed = await authority.resolveCurrentBinding(host.grant, "DB");
+    expect(changed).toBe(true);
+    expect([null, before]).toContainEqual(observed);
+    expect(await authority.resolveCurrentBinding(host.grant, "DB")).toBeNull();
+  } finally {
+    host.close();
+  }
+});
+
+test("SQLite binding authority refuses a missing, extra, or altered sealed reference", async () => {
+  for (const references of ["missing", "extra", "readiness"] as const) {
+    const host = await fixture("DB", false, false, references);
+    try {
+      const authority = createSQLiteWorkerBindingAuthority({ sql: host.sql, targetKey: TARGET });
+      expect(await authority.resolveCurrentBinding(host.grant, "DB")).toBeNull();
+    } finally {
+      host.close();
+    }
   }
 });
 
