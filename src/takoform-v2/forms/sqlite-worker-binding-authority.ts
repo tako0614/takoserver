@@ -39,18 +39,16 @@ export function createSQLiteWorkerBindingAuthority(options: {
     // active edge, and the current database revision together. Separate
     // awaited reads can otherwise return a vector that never existed.
     const versionRows = await options.sql.query(
-      `SELECT r.generation, r.last_operation, r.spec_json, r.observed_json,
+      `WITH current_binding AS (
+       SELECT r.generation, r.last_operation, r.spec_json, r.observed_json,
               database_resource.generation AS database_generation,
-              database_resource.last_operation AS database_last_operation,
-              ref.target_uid, ref.form_url, ref.readiness,
-              ref.target_spec_path, ref.target_spec_equals
+              database_resource.last_operation AS database_last_operation
        FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
        JOIN tf_v2_resources database_resource
          ON database_resource.uid = ? AND database_resource.form_url = ?
        JOIN tf_v2_operations database_op ON database_op.id = database_resource.last_operation
-       JOIN tf_v2_operation_references ref ON ref.operation_id = op.id
        JOIN tf_v2_operation_reference_sets sealed
-         ON sealed.operation_id = ref.operation_id AND sealed.sealed = 1
+         ON sealed.operation_id = op.id AND sealed.sealed = 1
        WHERE r.uid = ? AND r.form_url = ? AND r.principal = ? AND r.space = ?
          AND r.target_key = ? AND r.deleted_at IS NULL AND r.busy_operation IS NULL
          AND r.phase = 'idle' AND r.observed_generation = r.generation
@@ -73,7 +71,18 @@ export function createSQLiteWorkerBindingAuthority(options: {
          AND database_op.accepted_spec_json = database_resource.spec_json
          AND EXISTS (SELECT 1 FROM tf_v2_resource_references edge
                      WHERE edge.referrer_uid = r.uid AND edge.target_uid = database_resource.uid)
-       ORDER BY ref.target_uid`,
+       )
+       SELECT 'metadata' AS row_kind, generation, last_operation, spec_json, observed_json,
+              database_generation, database_last_operation,
+              NULL AS target_uid, NULL AS form_url, NULL AS readiness,
+              NULL AS target_spec_path, NULL AS target_spec_equals
+       FROM current_binding
+       UNION ALL
+       SELECT 'reference' AS row_kind, NULL, NULL, NULL, NULL, NULL, NULL,
+              ref.target_uid, ref.form_url, ref.readiness, ref.target_spec_path, ref.target_spec_equals
+       FROM current_binding chosen
+       JOIN tf_v2_operation_references ref ON ref.operation_id = chosen.last_operation
+       ORDER BY row_kind, target_uid`,
       [
         desired.resourceUid,
         SQLITE_DATABASE_FORM_URL,
@@ -87,6 +96,8 @@ export function createSQLiteWorkerBindingAuthority(options: {
     const version = versionRows[0];
     if (
       !version ||
+      version.row_kind !== "metadata" ||
+      versionRows.slice(1).some((row) => row.row_kind !== "reference") ||
       typeof version.spec_json !== "string" ||
       typeof version.observed_json !== "string"
     )
@@ -117,7 +128,8 @@ export function createSQLiteWorkerBindingAuthority(options: {
     )
       return null;
     const requirements = referencesForWorkerVersion(spec);
-    const references = versionRows;
+    // A large accepted spec is returned once, not once per outbound reference.
+    const references = versionRows.slice(1);
     if (
       references.length !== requirements.length ||
       requirements.some((expected, index) => {

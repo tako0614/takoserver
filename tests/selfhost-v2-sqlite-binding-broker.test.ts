@@ -50,6 +50,7 @@ async function fixture(
   invocationScoped = false,
   includeAux = false,
   references: "exact" | "missing" | "extra" | "readiness" = "exact",
+  largeVersion = false,
 ) {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-binding-"));
   const stagingRoot = join(root, "sql-input-staging");
@@ -119,10 +120,20 @@ async function fixture(
   settled("worker-one", MODULE_WORKER_FORM_URL, "worker");
   settled("bundle-one", BUNDLE_FORM, "bundle");
   if (references === "extra") settled("extra-one", BUNDLE_FORM, "extra-bundle");
+  const serviceBindings = largeVersion
+    ? Array.from({ length: 64 }, (_, index) => {
+        const uid = `capacity-service-${index}`;
+        settled(uid, MODULE_WORKER_FORM_URL, `service-${index}`);
+        return { name: `S${index}`, resource: { resourceUid: uid } };
+      })
+    : [];
   const spec = JSON.stringify({
     worker: { resourceUid: "worker-one" },
     bundle: { resourceUid: "bundle-one" },
     handlers: ["fetch"],
+    ...(largeVersion
+      ? { vars: { fixture: Array(64).fill("x".repeat(8192)) }, serviceBindings }
+      : {}),
     sqliteBindings: [
       { name: bindingName, resource: { resourceUid: databaseUid } },
       ...(auxDatabaseUid ? [{ name: "AUX", resource: { resourceUid: auxDatabaseUid } }] : []),
@@ -152,6 +163,10 @@ async function fixture(
     [databaseUid, SQLITE_DATABASE_FORM_URL],
     ...(auxDatabaseUid ? ([[auxDatabaseUid, SQLITE_DATABASE_FORM_URL]] as [string, string][]) : []),
     ...(references === "extra" ? ([["extra-one", BUNDLE_FORM]] as [string, string][]) : []),
+    ...serviceBindings.map((binding): [string, string] => [
+      binding.resource.resourceUid,
+      MODULE_WORKER_FORM_URL,
+    ]),
   ];
   for (const [uid, form] of referenceTargets) {
     if (references === "missing" && uid === "bundle-one") continue;
@@ -461,6 +476,35 @@ test("SQLite binding authority refuses a missing, extra, or altered sealed refer
     } finally {
       host.close();
     }
+  }
+});
+
+test("SQLite binding authority resolves a large Version and its complete declared references", async () => {
+  const host = await fixture("DB", false, false, "exact", true);
+  try {
+    let largestReplyBytes = 0;
+    const measuredSql: typeof host.sql = {
+      ...host.sql,
+      async query(statement, params) {
+        const rows = await host.sql.query(statement, params);
+        largestReplyBytes = Math.max(
+          largestReplyBytes,
+          new TextEncoder().encode(JSON.stringify(rows)).byteLength,
+        );
+        return rows;
+      },
+    };
+    const authority = createSQLiteWorkerBindingAuthority({ sql: measuredSql, targetKey: TARGET });
+    expect(await authority.resolveCurrentBinding(host.grant, "DB")).toMatchObject({
+      resourceUid: host.databaseUid,
+    });
+    expect(await authority.resolveCurrentBinding(host.grant, "S0")).toBeNull();
+    // This half-MiB fixture plus 67 small references fits a one-MiB reply.
+    // Repeating its full spec per reference makes the reply exceed 33 MiB.
+    // This is the fixture's transport budget, not a new product input limit.
+    expect(largestReplyBytes).toBeLessThan(1_048_576);
+  } finally {
+    host.close();
   }
 });
 
