@@ -1,3 +1,4 @@
+import type { AiGateway } from "../../src/ai-port.ts";
 import { buildApp } from "../../src/app.ts";
 import type { BillingConfig } from "../../src/billing-config.ts";
 import { resolveIdentity } from "../../src/identity-setup.ts";
@@ -171,6 +172,7 @@ export async function createSignedConsoleHost(
   consoleOrigin: string,
   io: LocalConsoleIo = {},
   billingConfig?: BillingConfig,
+  ai?: AiGateway,
 ) {
   const origin = "https://api.logout-cookie.test";
   const now = "2026-11-13T00:00:00.000Z";
@@ -223,6 +225,7 @@ export async function createSignedConsoleHost(
     const app = buildApp({
       sql,
       ...(billingConfig === undefined ? {} : { billingConfig }),
+      ...(ai === undefined ? {} : { ai }),
       objects: createMemoryObjectStore(),
       identity: setup.verifier,
       identityProviders: setup.providers,
@@ -288,6 +291,7 @@ export async function createSignedConsoleHost(
       sql,
       requests,
       transport,
+      tick: () => app.tick(),
       assertion,
       cookiePresent: () => cookie !== "",
       pending: () => inFlight,
