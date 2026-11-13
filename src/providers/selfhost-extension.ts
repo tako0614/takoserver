@@ -1,5 +1,9 @@
 /** Node/filesystem-native adapters; not part of the portable Worker extension. */
 export {
+  createSelfhostLinuxOciCore,
+  type SelfhostLinuxOciCoreSelection,
+} from "../selfhost-linux-oci-core.ts";
+export {
   createWorkerdWorkerModuleInspector,
   type WorkerdWorkerModuleInspectorOptions,
 } from "../workerd-worker-module-inspector.ts";

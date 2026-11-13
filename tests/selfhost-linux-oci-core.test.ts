@@ -5,6 +5,10 @@ import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import {
+  createSelfhostLinuxOciCore,
+  type SelfhostLinuxOciCoreSelection,
+} from "@takoserver/core/provider-extension/selfhost";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
 import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "../src/container-contract.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
@@ -13,10 +17,6 @@ import {
   validateDockerContainerPrivateInputs,
   validateDockerContainerSpec,
 } from "../src/providers/docker-container-configured-inputs.ts";
-import {
-  createSelfhostLinuxOciCore,
-  type SelfhostLinuxOciCoreSelection,
-} from "../src/selfhost-linux-oci-core.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
