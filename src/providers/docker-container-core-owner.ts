@@ -127,6 +127,14 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciStartedObservation>;
+  /** Internal original OCI creator publisher. The private creator completes
+   * its own fixed HTTP exchange before invoking this source; no returned status,
+   * runtime DTO, verification callback or arbitrary session is accepted. */
+  publishAcceptedOciServing(
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<void>;
   /** Stop/reap only an original retained init under the accepted UPDATE/DELETE
    * and original remove lease; records exit, never network terminal/deletion. */
   stopRetainedInit(
@@ -1615,6 +1623,130 @@ export function createDockerContainerCoreOwner(
     return Object.freeze(records);
   }
 
+  // Internal continuations come only from the two original producers below.
+  // They are never supplied through a public owner port or registration API.
+  async function publishBoundServing(
+    lease: Lease,
+    verify: () => Promise<void>,
+    reload: () => Promise<BoundStart>,
+    beforePublish?: () => void,
+  ): Promise<void> {
+    await verify();
+    if (!(await current(lease))) return fail();
+    const before = await reload();
+    const nativeId = before.record.nativeId;
+    if (!hex(nativeId)) return fail();
+    const attempts = await sql.query(
+      "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
+      [before.intent.resourceUid, before.intent.policy.generation],
+    );
+    if (attempts.length !== 1) return fail();
+    const attempt = attempts[0]!;
+    const claimedAt = attempt.claimed_at_ms;
+    if (
+      attempt.attempt !== 1 ||
+      attempt.create_claim_id !== before.record.claimId ||
+      attempt.native_id !== nativeId ||
+      typeof claimedAt !== "number" ||
+      !Number.isSafeInteger(claimedAt) ||
+      claimedAt < 0 ||
+      attempt.confirmed_exited_at_ms !== null ||
+      (attempt.state !== "pending" && attempt.state !== "running")
+    )
+      return fail();
+    const runningAt = attempt.state === "pending" ? now() : attempt.confirmed_running_at_ms;
+    if (
+      typeof runningAt !== "number" ||
+      !Number.isSafeInteger(runningAt) ||
+      runningAt < claimedAt ||
+      (attempt.state === "pending" && attempt.confirmed_running_at_ms !== null)
+    )
+      return fail();
+    if (before.proof.i_serving_generation === before.intent.policy.generation) {
+      if (before.proof.v_retention !== "serving" || attempt.state !== "running") return fail();
+      await verify();
+      if (!(await current(lease))) return fail();
+      return;
+    }
+    const oldEpoch = before.proof.i_runtime_epoch;
+    if (typeof oldEpoch !== "number" || !Number.isSafeInteger(oldEpoch + 1)) return fail();
+    await verify();
+    if (!(await current(lease))) return fail();
+    const guard = fence(before.proof);
+    const statements: SqlStatement[] = [];
+    if (attempt.state === "pending")
+      statements.push({
+        sql:
+          "UPDATE tf_v2_container_start_attempts SET state='running',confirmed_running_at_ms=? WHERE resource_uid=? AND generation=? AND attempt=1 AND create_claim_id=? AND native_id=? AND state='pending' AND claimed_at_ms=? AND confirmed_running_at_ms IS NULL AND confirmed_exited_at_ms IS NULL AND " +
+          guard.sql,
+        params: [
+          runningAt,
+          before.intent.resourceUid,
+          before.intent.policy.generation,
+          before.record.claimId,
+          nativeId,
+          claimedAt,
+          ...guard.params,
+        ],
+      });
+    statements.push({
+      sql:
+        "UPDATE tf_v2_container_instances SET serving_generation=?,runtime_epoch=runtime_epoch+1 WHERE resource_uid=? AND " +
+        guard.sql +
+        " AND EXISTS (SELECT 1 FROM tf_v2_container_start_attempts s WHERE s.resource_uid=? AND s.generation=? AND s.attempt=1 AND s.create_claim_id=? AND s.native_id=? AND s.state='running' AND s.claimed_at_ms=? AND s.confirmed_running_at_ms=? AND s.confirmed_exited_at_ms IS NULL)",
+      params: [
+        before.intent.policy.generation,
+        before.intent.resourceUid,
+        ...guard.params,
+        before.intent.resourceUid,
+        before.intent.policy.generation,
+        before.record.claimId,
+        nativeId,
+        claimedAt,
+        runningAt,
+      ],
+    });
+    // The OCI loan can revoke during the final current/load Sql await.
+    // Its original lexical fence runs synchronously before the first write;
+    // the legacy Docker producer supplies no additional continuation.
+    beforePublish?.();
+    const writes = await sql.batch(statements);
+    if (writes.length !== statements.length || writes.some((write) => write.changes !== 1))
+      return fail();
+    const after = await reload();
+    if (
+      after.proof.i_serving_generation !== before.intent.policy.generation ||
+      after.proof.i_runtime_epoch !== oldEpoch + 1 ||
+      after.proof.i_management_epoch !== before.proof.i_management_epoch ||
+      after.proof.i_desired_generation !== before.proof.i_desired_generation ||
+      after.proof.v_retention !== "serving" ||
+      after.record.claimId !== before.record.claimId ||
+      after.record.nativeId !== before.record.nativeId
+    )
+      return fail();
+    // Advance only existing live leases for this exact accepted/native binding
+    // after reading the successful SQL transition. Other generations still revoke.
+    for (const held of leases) {
+      if (
+        held.active &&
+        !held.controller.signal.aborted &&
+        held.phase !== "remove" &&
+        held.record.claimId === after.record.claimId &&
+        held.record.nativeId === after.record.nativeId &&
+        held.record.intent.policy.generation === after.intent.policy.generation &&
+        intentJson(held.record.intent) === intentJson(after.intent) &&
+        held.proof.i_management_epoch === before.proof.i_management_epoch &&
+        held.proof.i_runtime_epoch === before.proof.i_runtime_epoch &&
+        held.proof.i_desired_generation === before.proof.i_desired_generation &&
+        held.proof.q_claim_id === after.record.claimId &&
+        held.proof.q_native_id === after.record.nativeId
+      )
+        held.proof = after.proof;
+    }
+    await verify();
+    if (!(await current(lease))) return fail();
+  }
+
   const owner: DockerPhysicalCoreOwnerPort = Object.freeze<DockerPhysicalCoreOwnerPort>({
     async publishServing(input, native, policy, runtime) {
       const selected = await allocation(input, native, policy);
@@ -1645,114 +1777,9 @@ export function createDockerContainerCoreOwner(
         runtime instanceof LinuxDockerRuntimePreparation
           ? await verifyLinuxRuntime.call(runtime, selected.native)
           : await verifyOriginalRuntime.call(runtime, selected.native);
-      await runtimeGuard();
-      if (!(await current(lease))) return fail();
-      const before = await boundNative(selected.native, selected.intent.policy);
-      const attempts = await sql.query(
-        "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
-        [before.intent.resourceUid, before.intent.policy.generation],
+      await publishBoundServing(lease, runtimeGuard, () =>
+        boundNative(selected.native, selected.intent.policy),
       );
-      if (attempts.length !== 1) return fail();
-      const attempt = attempts[0]!;
-      const claimedAt = attempt.claimed_at_ms;
-      if (
-        attempt.attempt !== 1 ||
-        attempt.create_claim_id !== before.record.claimId ||
-        attempt.native_id !== before.native.nativeId ||
-        typeof claimedAt !== "number" ||
-        !Number.isSafeInteger(claimedAt) ||
-        claimedAt < 0 ||
-        attempt.confirmed_exited_at_ms !== null ||
-        (attempt.state !== "pending" && attempt.state !== "running")
-      )
-        return fail();
-      const runningAt = attempt.state === "pending" ? now() : attempt.confirmed_running_at_ms;
-      if (
-        typeof runningAt !== "number" ||
-        !Number.isSafeInteger(runningAt) ||
-        runningAt < claimedAt ||
-        (attempt.state === "pending" && attempt.confirmed_running_at_ms !== null)
-      )
-        return fail();
-      if (before.proof.i_serving_generation === before.intent.policy.generation) {
-        if (before.proof.v_retention !== "serving" || attempt.state !== "running") return fail();
-        await runtimeGuard();
-        if (!(await current(lease))) return fail();
-        return;
-      }
-      const oldEpoch = before.proof.i_runtime_epoch;
-      if (typeof oldEpoch !== "number" || !Number.isSafeInteger(oldEpoch + 1)) return fail();
-      await runtimeGuard();
-      if (!(await current(lease))) return fail();
-      const guard = fence(before.proof);
-      const statements: SqlStatement[] = [];
-      if (attempt.state === "pending")
-        statements.push({
-          sql:
-            "UPDATE tf_v2_container_start_attempts SET state='running',confirmed_running_at_ms=? WHERE resource_uid=? AND generation=? AND attempt=1 AND create_claim_id=? AND native_id=? AND state='pending' AND claimed_at_ms=? AND confirmed_running_at_ms IS NULL AND confirmed_exited_at_ms IS NULL AND " +
-            guard.sql,
-          params: [
-            runningAt,
-            before.intent.resourceUid,
-            before.intent.policy.generation,
-            before.record.claimId,
-            before.native.nativeId,
-            claimedAt,
-            ...guard.params,
-          ],
-        });
-      statements.push({
-        sql:
-          "UPDATE tf_v2_container_instances SET serving_generation=?,runtime_epoch=runtime_epoch+1 WHERE resource_uid=? AND " +
-          guard.sql +
-          " AND EXISTS (SELECT 1 FROM tf_v2_container_start_attempts s WHERE s.resource_uid=? AND s.generation=? AND s.attempt=1 AND s.create_claim_id=? AND s.native_id=? AND s.state='running' AND s.claimed_at_ms=? AND s.confirmed_running_at_ms=? AND s.confirmed_exited_at_ms IS NULL)",
-        params: [
-          before.intent.policy.generation,
-          before.intent.resourceUid,
-          ...guard.params,
-          before.intent.resourceUid,
-          before.intent.policy.generation,
-          before.record.claimId,
-          before.native.nativeId,
-          claimedAt,
-          runningAt,
-        ],
-      });
-      const writes = await sql.batch(statements);
-      if (writes.length !== statements.length || writes.some((write) => write.changes !== 1))
-        return fail();
-      const after = await boundNative(before.native, before.intent.policy);
-      if (
-        after.proof.i_serving_generation !== before.intent.policy.generation ||
-        after.proof.i_runtime_epoch !== oldEpoch + 1 ||
-        after.proof.i_management_epoch !== before.proof.i_management_epoch ||
-        after.proof.i_desired_generation !== before.proof.i_desired_generation ||
-        after.proof.v_retention !== "serving" ||
-        after.record.claimId !== before.record.claimId ||
-        after.record.nativeId !== before.record.nativeId
-      )
-        return fail();
-      // Advance only existing live leases for this exact accepted/native binding
-      // after reading the successful SQL transition. Other generations still revoke.
-      for (const held of leases) {
-        if (
-          held.active &&
-          !held.controller.signal.aborted &&
-          held.phase !== "remove" &&
-          held.record.claimId === after.record.claimId &&
-          held.record.nativeId === after.record.nativeId &&
-          held.record.intent.policy.generation === after.intent.policy.generation &&
-          intentJson(held.record.intent) === intentJson(after.intent) &&
-          held.proof.i_management_epoch === before.proof.i_management_epoch &&
-          held.proof.i_runtime_epoch === before.proof.i_runtime_epoch &&
-          held.proof.i_desired_generation === before.proof.i_desired_generation &&
-          held.proof.q_claim_id === after.record.claimId &&
-          held.proof.q_native_id === after.record.nativeId
-        )
-          held.proof = after.proof;
-      }
-      await runtimeGuard();
-      if (!(await current(lease))) return fail();
     },
 
     async readStartClaim(native, policy) {
@@ -2280,6 +2307,100 @@ export function createDockerContainerCoreOwner(
         return fail();
       executionScope(scope.execution);
       return observation;
+    },
+    async publishAcceptedOciServing(input, originalCustody, signal) {
+      if (
+        !own(input, ["claimId", "intent", "nativeId", "state"]) ||
+        !hex(input.claimId) ||
+        !hex(input.nativeId) ||
+        input.state !== "bound" ||
+        !(signal instanceof AbortSignal) ||
+        signal.aborted
+      )
+        return fail();
+      const captured = Object.freeze({
+        claimId: input.claimId,
+        intent: intentSnapshot(input.intent),
+        nativeId: input.nativeId,
+        state: "bound" as const,
+      });
+      const lease = await activeRecord(captured, "reconcile");
+      const loaded = await boundStartRecord(captured);
+      if (
+        !usable(loaded.proof, "reconcile") ||
+        loaded.proof.i_desired_generation !== loaded.intent.policy.generation ||
+        loaded.proof.i_retired_at_ms !== null
+      )
+        return fail();
+      const selected = [...executions].filter(
+        (scope) =>
+          scope.operationId === loaded.proof.a_operation_id &&
+          scope.resourceUid === loaded.intent.resourceUid &&
+          scope.generation === loaded.intent.policy.generation,
+      );
+      const scope = selected.length === 1 ? selected[0] : undefined;
+      if (!scope) return fail();
+      const local = () => {
+        if (
+          signal.aborted ||
+          !lease.active ||
+          lease.controller.signal.aborted ||
+          !leases.has(lease)
+        )
+          return fail();
+        executionScope(scope.execution);
+      };
+      let identity: LinuxOciStartedObservation | undefined;
+      const verify = async () => {
+        local();
+        await assertExecution(scope.execution);
+        if (!(await current(lease))) return fail();
+        local();
+        const observation = await observeOriginalLinuxOciOwnedRunning(
+          originalCustody,
+          result,
+          captured,
+          signal,
+        );
+        if (
+          observation.nativeId !== captured.nativeId ||
+          (identity !== undefined &&
+            (observation.namespaceDevice !== identity.namespaceDevice ||
+              observation.namespaceInode !== identity.namespaceInode))
+        )
+          return fail();
+        identity = observation;
+        // This publisher never promotes pending to running. Only the original
+        // completed START confirmation may have established this exact row.
+        const attempts = await sql.query(
+          "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
+          [captured.intent.resourceUid, captured.intent.policy.generation],
+        );
+        const attempt = attempts[0];
+        if (
+          attempts.length !== 1 ||
+          !attempt ||
+          attempt.attempt !== 1 ||
+          attempt.create_claim_id !== captured.claimId ||
+          attempt.native_id !== captured.nativeId ||
+          attempt.state !== "running" ||
+          attempt.confirmed_exited_at_ms !== null ||
+          typeof attempt.claimed_at_ms !== "number" ||
+          !Number.isSafeInteger(attempt.claimed_at_ms) ||
+          attempt.claimed_at_ms < 0 ||
+          typeof attempt.confirmed_running_at_ms !== "number" ||
+          !Number.isSafeInteger(attempt.confirmed_running_at_ms) ||
+          attempt.confirmed_running_at_ms < attempt.claimed_at_ms
+        )
+          return fail();
+        await assertExecution(scope.execution);
+        if (!(await current(lease))) return fail();
+        local();
+      };
+      await publishBoundServing(lease, verify, () => boundStartRecord(captured), local);
+      // SQL may already have published when cancellation wins. Keep that
+      // actual fact; no rollback, START/OPEN replay or manufactured completion.
+      local();
     },
     async stopRetainedInit(execution, input, originalCustody, signal) {
       if (

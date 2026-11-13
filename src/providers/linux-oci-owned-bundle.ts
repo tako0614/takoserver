@@ -652,6 +652,192 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       .catch(() => undefined);
     return running;
   }
+  /** A fixed HTTP status fact under this original creator's current running
+   * allocation. Selected-policy C observations require actual admission and
+   * fresh original policy/uplink readback. Neither a status nor this result
+   * publishes serving or completes an operation. The observations describe the
+   * guarded exchange interval, not an atomic current-running handoff. A later
+   * serving CAS must revalidate START and original native custody itself. */
+  function observeAcceptedHttpHealth(
+    execution: V2Execution,
+    externalSignal?: AbortSignal,
+  ): Promise<{ readonly nativeId: string; readonly statusCode: number }> {
+    if (closed) return Promise.reject(new Error("linux_oci_owned_bundle_closed"));
+    if (physicalBinary === undefined || hostTopology === undefined || egressLimits === undefined)
+      return Promise.reject(new Error("linux_oci_owned_bundle_http_not_configured"));
+    if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
+      return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
+    const cancel = new AbortController();
+    const abort = () => cancel.abort();
+    cancellation.add(cancel);
+    externalSignal?.addEventListener("abort", abort, { once: true });
+    if (externalSignal?.aborted) abort();
+    const timer = setTimeout(abort, timeout);
+    const local = () => {
+      if (closed || cancel.signal.aborted) return fail("revoked");
+    };
+    const running = Promise.resolve().then(async () => {
+      const observed = await core.withExecution(execution, async () => {
+        local();
+        const accepted = await core.readAcceptedExecution(execution);
+        if (accepted.action === "delete") return fail("not_create");
+        const current = accepted.retained.find(
+          ({ record }) => record.intent.policy.generation === accepted.generation,
+        );
+        if (
+          !current ||
+          current.removedAtMs !== null ||
+          current.record.state !== "bound" ||
+          current.record.nativeId === null
+        )
+          return fail("retained_native_unknown");
+        const { record } = current;
+        const nativeId = nativeBindings.get(record.claimId),
+          session = nativeSessions.get(record.claimId);
+        if (
+          !session ||
+          nativeId === undefined ||
+          nativeId !== record.nativeId ||
+          record.intent.installationId !== accepted.installationId ||
+          record.intent.resourceUid !== accepted.resourceUid ||
+          record.intent.incarnationId !== accepted.incarnationId ||
+          record.intent.revision !== accepted.revision ||
+          canonicalJson(record.intent.policy) !== canonicalJson(await acceptedPolicy(accepted)) ||
+          canonicalJson(record.intent.requiredSecretNames) !==
+            canonicalJson(accepted.requiredSecretNames)
+        )
+          return fail("retained_native_unknown");
+        validateDockerContainerSpec(accepted.spec);
+        const { httpPort, healthPath } = accepted.spec;
+        if (typeof httpPort !== "number" || typeof healthPath !== "string")
+          return fail("invalid_request");
+        const result = await core.owner.withAuthority(record, "reconcile", async (held) => {
+          const value = await held.withEnvironment(async (_values, signal) => {
+            const loan = new AbortController();
+            const revoke = () => loan.abort();
+            signal.addEventListener("abort", revoke, { once: true });
+            cancel.signal.addEventListener("abort", revoke, { once: true });
+            if (signal.aborted || cancel.signal.aborted) revoke();
+            const guard = async () => {
+              local();
+              if (loan.signal.aborted || !(await held.stillCurrent())) return fail("revoked");
+              const fresh = await core.readAcceptedExecution(execution);
+              const saved = fresh.retained.find(
+                ({ record: item }) => item.claimId === record.claimId,
+              );
+              if (
+                fresh.generation !== accepted.generation ||
+                fresh.revision !== accepted.revision ||
+                fresh.incarnationId !== accepted.incarnationId ||
+                !saved ||
+                saved.removedAtMs !== null ||
+                canonicalJson(saved.record) !== canonicalJson(record) ||
+                nativeSessions.get(record.claimId) !== session ||
+                nativeBindings.get(record.claimId) !== nativeId
+              )
+                return fail("revoked");
+              // confirmAcceptedRunning is deliberately idempotent for exited
+              // attempts too. Health requires an ACTUAL running row instead;
+              // it never inserts, restarts or un-exits a START attempt.
+              const attempts = await sql.query(
+                "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
+                [record.intent.resourceUid, record.intent.policy.generation],
+              );
+              const attempt = attempts[0];
+              if (
+                attempts.length !== 1 ||
+                !attempt ||
+                attempt.attempt !== 1 ||
+                attempt.create_claim_id !== record.claimId ||
+                attempt.native_id !== nativeId ||
+                attempt.state !== "running" ||
+                attempt.confirmed_exited_at_ms !== null ||
+                typeof attempt.claimed_at_ms !== "number" ||
+                !Number.isSafeInteger(attempt.claimed_at_ms) ||
+                attempt.claimed_at_ms < 0 ||
+                typeof attempt.confirmed_running_at_ms !== "number" ||
+                !Number.isSafeInteger(attempt.confirmed_running_at_ms) ||
+                attempt.confirmed_running_at_ms < attempt.claimed_at_ms
+              )
+                return fail("retained_start_unknown");
+              local();
+              if (loan.signal.aborted) return fail("revoked");
+            };
+            let probe: ReturnType<typeof createLinuxOciHttpHealthProbe> | undefined;
+            try {
+              await guard();
+              if (httpProbes.has(record.claimId)) return fail("http_custody_retained");
+              const before = await observeOriginalLinuxOciOwnedRunning(
+                originalNativeCustody,
+                core,
+                record,
+                loan.signal,
+              );
+              await guard();
+              // No await from the final local fence through registration.
+              // The HTTP helper registers its own active scope before IO.
+              local();
+              if (loan.signal.aborted) return fail("revoked");
+              if (httpProbes.has(record.claimId)) return fail("http_custody_retained");
+              probe = createLinuxOciHttpHealthProbe({
+                address: hostTopology.peerIpv4Guest,
+                httpPort,
+                healthPath,
+                timeoutMs: Math.min(timeout, 10_000),
+              });
+              httpProbes.set(record.claimId, probe);
+              const fact = await probe.observe(loan.signal);
+              await guard();
+              const after = await observeOriginalLinuxOciOwnedRunning(
+                originalNativeCustody,
+                core,
+                record,
+                loan.signal,
+              );
+              if (
+                after.nativeId !== before.nativeId ||
+                after.namespaceDevice !== before.namespaceDevice ||
+                after.namespaceInode !== before.namespaceInode
+              )
+                return fail("retained_native_unknown");
+              await guard();
+              return Object.freeze({ nativeId, statusCode: fact.statusCode });
+            } finally {
+              try {
+                if (probe) {
+                  await probe.close();
+                  if (httpProbes.get(record.claimId) === probe) httpProbes.delete(record.claimId);
+                }
+              } finally {
+                loan.abort();
+                signal.removeEventListener("abort", revoke);
+                cancel.signal.removeEventListener("abort", revoke);
+              }
+            }
+          });
+          local();
+          if (held.revocation.aborted) return fail("revoked");
+          return value;
+        });
+        // Original withAuthority performs a final awaited currentness read.
+        local();
+        return result;
+      });
+      local();
+      return observed;
+    });
+    scopes.add(running);
+    void running
+      .finally(() => {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener("abort", abort);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+      })
+      .catch(() => undefined);
+    return running;
+  }
+
   const artifact = Object.freeze({
     acceptance: core.acceptance,
     configuredInputs: Object.freeze({
@@ -1128,19 +1314,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         .catch(() => undefined);
       return running;
     },
-    /** A fixed HTTP status fact under this original creator's current running
-     * allocation. Selected-policy C observations require actual admission and
-     * fresh original policy/uplink readback. Neither a status nor this result
-     * publishes serving or completes an operation. The observations describe the
-     * guarded exchange interval, not an atomic current-running handoff. A later
-     * serving CAS must revalidate START and original native custody itself. */
-    observeAcceptedHttpHealth(
-      execution: V2Execution,
-      externalSignal?: AbortSignal,
-    ): Promise<{ readonly nativeId: string; readonly statusCode: number }> {
+    observeAcceptedHttpHealth,
+    /** Original fixed HTTP exchange followed by a fresh native/START-bound
+     * serving CAS. No caller-supplied health/status receipt is consumed. */
+    publishAcceptedServing(execution: V2Execution, externalSignal?: AbortSignal): Promise<void> {
       if (closed) return Promise.reject(new Error("linux_oci_owned_bundle_closed"));
-      if (physicalBinary === undefined || hostTopology === undefined || egressLimits === undefined)
-        return Promise.reject(new Error("linux_oci_owned_bundle_http_not_configured"));
       if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
         return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
       const cancel = new AbortController();
@@ -1153,8 +1331,12 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         if (closed || cancel.signal.aborted) return fail("revoked");
       };
       const running = Promise.resolve().then(async () => {
-        const observed = await core.withExecution(execution, async () => {
-          local();
+        local();
+        // This is the closed-over original implementation, not an overridable
+        // method/callback or a returned status supplied by a caller.
+        await observeAcceptedHttpHealth(execution, cancel.signal);
+        local();
+        await core.withExecution(execution, async () => {
           const accepted = await core.readAcceptedExecution(execution);
           if (accepted.action === "delete") return fail("not_create");
           const current = accepted.retained.find(
@@ -1168,8 +1350,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           )
             return fail("retained_native_unknown");
           const { record } = current;
-          const nativeId = nativeBindings.get(record.claimId),
-            session = nativeSessions.get(record.claimId);
+          const session = nativeSessions.get(record.claimId),
+            nativeId = nativeBindings.get(record.claimId);
           if (
             !session ||
             nativeId === undefined ||
@@ -1183,12 +1365,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               canonicalJson(accepted.requiredSecretNames)
           )
             return fail("retained_native_unknown");
-          validateDockerContainerSpec(accepted.spec);
-          const { httpPort, healthPath } = accepted.spec;
-          if (typeof httpPort !== "number" || typeof healthPath !== "string")
-            return fail("invalid_request");
-          const result = await core.owner.withAuthority(record, "reconcile", async (held) => {
-            const value = await held.withEnvironment(async (_values, signal) => {
+          await core.owner.withAuthority(record, "reconcile", async (held) => {
+            await held.withEnvironment(async (_values, signal) => {
               const loan = new AbortController();
               const revoke = () => loan.abort();
               signal.addEventListener("abort", revoke, { once: true });
@@ -1212,95 +1390,25 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                   nativeBindings.get(record.claimId) !== nativeId
                 )
                   return fail("revoked");
-                // confirmAcceptedRunning is deliberately idempotent for exited
-                // attempts too. Health requires an ACTUAL running row instead;
-                // it never inserts, restarts or un-exits a START attempt.
-                const attempts = await sql.query(
-                  "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
-                  [record.intent.resourceUid, record.intent.policy.generation],
-                );
-                const attempt = attempts[0];
-                if (
-                  attempts.length !== 1 ||
-                  !attempt ||
-                  attempt.attempt !== 1 ||
-                  attempt.create_claim_id !== record.claimId ||
-                  attempt.native_id !== nativeId ||
-                  attempt.state !== "running" ||
-                  attempt.confirmed_exited_at_ms !== null ||
-                  typeof attempt.claimed_at_ms !== "number" ||
-                  !Number.isSafeInteger(attempt.claimed_at_ms) ||
-                  attempt.claimed_at_ms < 0 ||
-                  typeof attempt.confirmed_running_at_ms !== "number" ||
-                  !Number.isSafeInteger(attempt.confirmed_running_at_ms) ||
-                  attempt.confirmed_running_at_ms < attempt.claimed_at_ms
-                )
-                  return fail("retained_start_unknown");
                 local();
                 if (loan.signal.aborted) return fail("revoked");
               };
-              let probe: ReturnType<typeof createLinuxOciHttpHealthProbe> | undefined;
               try {
                 await guard();
-                if (httpProbes.has(record.claimId)) return fail("http_custody_retained");
-                const before = await observeOriginalLinuxOciOwnedRunning(
-                  originalNativeCustody,
-                  core,
-                  record,
-                  loan.signal,
-                );
+                await core.publishAcceptedOciServing(record, originalNativeCustody, loan.signal);
                 await guard();
-                // No await from the final local fence through registration.
-                // The HTTP helper registers its own active scope before IO.
-                local();
-                if (loan.signal.aborted) return fail("revoked");
-                if (httpProbes.has(record.claimId)) return fail("http_custody_retained");
-                probe = createLinuxOciHttpHealthProbe({
-                  address: hostTopology.peerIpv4Guest,
-                  httpPort,
-                  healthPath,
-                  timeoutMs: Math.min(timeout, 10_000),
-                });
-                httpProbes.set(record.claimId, probe);
-                const fact = await probe.observe(loan.signal);
-                await guard();
-                const after = await observeOriginalLinuxOciOwnedRunning(
-                  originalNativeCustody,
-                  core,
-                  record,
-                  loan.signal,
-                );
-                if (
-                  after.nativeId !== before.nativeId ||
-                  after.namespaceDevice !== before.namespaceDevice ||
-                  after.namespaceInode !== before.namespaceInode
-                )
-                  return fail("retained_native_unknown");
-                await guard();
-                return Object.freeze({ nativeId, statusCode: fact.statusCode });
               } finally {
-                try {
-                  if (probe) {
-                    await probe.close();
-                    if (httpProbes.get(record.claimId) === probe) httpProbes.delete(record.claimId);
-                  }
-                } finally {
-                  loan.abort();
-                  signal.removeEventListener("abort", revoke);
-                  cancel.signal.removeEventListener("abort", revoke);
-                }
+                loan.abort();
+                signal.removeEventListener("abort", revoke);
+                cancel.signal.removeEventListener("abort", revoke);
               }
             });
             local();
             if (held.revocation.aborted) return fail("revoked");
-            return value;
           });
-          // Original withAuthority performs a final awaited currentness read.
           local();
-          return result;
         });
         local();
-        return observed;
       });
       scopes.add(running);
       void running

@@ -2902,3 +2902,365 @@ test("accepted OCI HTTP rejects a later Sql-port substitution before artifact or
     }),
   ).rejects.toThrow("Sql");
 });
+
+// Publication follows the actual original HTTP implementation. These original
+// engine/Sql + raw HTTP/stdio journeys prove source binding and SQL effects;
+// their raw replies establish no real C admission, network or terminal proof.
+test("accepted OCI serving publisher uses actual HTTP and original native START before the shared CAS", async () => {
+  const f = await fixture(false, acceptedHttpSelection()),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let visited = false;
+  f.afterStart(async (execution) => {
+    await f.composition.publishAcceptedServing(execution);
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+    expect(await f.sql.query("SELECT retention FROM tf_v2_container_revisions")).toEqual([
+      { retention: "serving" },
+    ]);
+    expect(startedObservations(f)).toBe(6);
+    // A new explicit observation may recheck the same serving generation, but
+    // cannot re-START, re-OPEN or increment the original publication epoch.
+    await f.composition.publishAcceptedServing(execution);
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+    expect(startedObservations(f)).toBe(10);
+    expect(raw.calls).toHaveLength(2);
+    expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(
+      1,
+    );
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    if (f.failures[0]) throw f.failures[0];
+    expect(visited).toBe(true);
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("accepted OCI serving publisher rejects genuine unstarted allocation before HTTP or publication", async () => {
+  const f = await fixture(false, { ...acceptedHttpSelection(), nativeMode: "retire-pending" }),
+    raw = acceptedRawHttp();
+  let visited = false;
+  f.beforeStart(async (execution) => {
+    const before = f.nativeCounts();
+    await expect(f.composition.publishAcceptedServing(execution)).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(before);
+    expect(raw.calls).toEqual([]);
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    if (f.failures[0]) throw f.failures[0];
+    expect(visited).toBe(true);
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: null, runtime_epoch: 0 }]);
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([]);
+  } finally {
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("accepted OCI serving publisher reasserts actual original native after the HTTP exchange", async () => {
+  const f = await fixture(false, { ...acceptedHttpSelection(), nativeObservationFaultAt: 4 }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let visited = false;
+  f.afterStart(async (execution) => {
+    await expect(f.composition.publishAcceptedServing(execution)).rejects.toThrow();
+    expect(raw.calls).toHaveLength(1);
+    expect(startedObservations(f)).toBe(4);
+    visited = true;
+  });
+  try {
+    await f.create();
+    await f.engine.runNext();
+    if (f.failures[0]) throw f.failures[0];
+    expect(visited).toBe(true);
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: null, runtime_epoch: 0 }]);
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("accepted OCI serving publisher rejects foreign constructor custody inside genuine current execution and lease", async () => {
+  const f = await fixture(false, acceptedHttpSelection()),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let visited = false;
+  f.afterStart(async (execution) => {
+    const foreign = createDockerContainerCoreOwner({
+      sql: f.sql,
+      clock: () => new Date(),
+      installationId: "synthetic-oci-installation",
+      backendId: "synthetic-oci-backend",
+      targetKey: "synthetic-oci-target",
+      configuredInputs: f.configuredInputs,
+    });
+    await foreign.withExecution(execution, async () => {
+      const accepted = await foreign.readAcceptedExecution(execution);
+      const current = accepted.retained.find(
+        ({ record }) => record.intent.policy.generation === accepted.generation,
+      );
+      if (!current) throw new Error("genuine current retained row absent");
+      await foreign.owner.withAuthority(current.record, "reconcile", async (held) => {
+        expect(await held.stillCurrent()).toBe(true);
+        const before = f.nativeCounts();
+        await expect(
+          foreign.publishAcceptedOciServing(current.record, Object.freeze({}), held.revocation),
+        ).rejects.toThrow();
+        expect(f.nativeCounts()).toEqual(before);
+        expect(raw.calls).toEqual([]);
+        visited = true;
+      });
+    });
+    // The same actual execution remains eligible for its ORIGINAL producer.
+    await f.composition.publishAcceptedServing(execution);
+    expect(raw.calls).toHaveLength(1);
+  });
+  try {
+    await f.create();
+    await f.engine.runNext();
+    if (f.failures[0]) throw f.failures[0];
+    expect(visited).toBe(true);
+    expect(await f.sql.query("SELECT serving_generation FROM tf_v2_container_instances")).toEqual([
+      { serving_generation: 1 },
+    ]);
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+for (const boundary of ["before-CAS", "after-CAS"] as const) {
+  for (const action of ["cancel", "close"] as const) {
+    test(`accepted OCI serving publisher ${boundary} ${action} retains actual SQL effects without positive return or replay`, async () => {
+      const f = await fixture(false, acceptedHttpSelection()),
+        raw = acceptedRawHttp();
+      const cancel = new AbortController();
+      let visited = false,
+        changed = false,
+        joined = false;
+      let closing: Promise<void> | undefined;
+      let restore = () => {};
+      raw.onEnd(() => {
+        raw.reply();
+        raw.join();
+        joined = true;
+      });
+      f.afterStart(async (execution) => {
+        const originalQuery = f.sql.query.bind(f.sql),
+          originalBatch = f.sql.batch.bind(f.sql);
+        const revoke = () => {
+          if (visited) return;
+          visited = true;
+          if (action === "cancel") cancel.abort();
+          else {
+            closing = f.composition.close();
+            void closing.catch(() => undefined);
+          }
+        };
+        const query = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+          const rows = await originalQuery(statement, params);
+          if (
+            boundary === "before-CAS" &&
+            joined &&
+            startedObservations(f) === 4 &&
+            statement.startsWith("SELECT attempt,create_claim_id,native_id,state,")
+          ) {
+            // Actual unchanged private Sql result crosses the await boundary.
+            await Promise.resolve();
+            revoke();
+          }
+          return rows;
+        });
+        const batch = spyOn(f.sql, "batch").mockImplementation(async (statements) => {
+          const rows = await originalBatch(statements);
+          if (
+            statements.some(({ sql }) =>
+              sql.startsWith("UPDATE tf_v2_container_instances SET serving_generation="),
+            )
+          ) {
+            changed = rows.some(({ changes }) => changes === 1);
+            if (boundary === "after-CAS" && changed) {
+              await Promise.resolve();
+              revoke();
+            }
+          }
+          return rows;
+        });
+        restore = () => {
+          query.mockRestore();
+          batch.mockRestore();
+        };
+        await expect(
+          f.composition.publishAcceptedServing(execution, cancel.signal),
+        ).rejects.toThrow();
+        expect(visited).toBe(true);
+        expect(changed).toBe(boundary === "after-CAS");
+        expect(raw.calls).toHaveLength(1);
+        expect(
+          await originalQuery(
+            "SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances",
+          ),
+        ).toEqual([
+          boundary === "after-CAS"
+            ? { serving_generation: 1, runtime_epoch: 1 }
+            : { serving_generation: null, runtime_epoch: 0 },
+        ]);
+      });
+      try {
+        await f.create();
+        expect((await f.engine.runNext())?.effect).not.toBe("complete");
+        if (f.failures[0]) throw f.failures[0];
+        expect(visited).toBe(true);
+        expect(
+          f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1"),
+        ).toHaveLength(1);
+        if (closing) await expect(closing).rejects.toThrow("custody_retained");
+      } finally {
+        restore();
+        raw.join();
+        raw.restore();
+        await expect(f.close()).rejects.toThrow("custody_retained");
+      }
+    });
+  }
+}
+
+for (const action of ["cancel", "close"] as const) {
+  test(`accepted OCI serving publisher final shared current ${action} refuses CAS after revocation in original Sql await`, async () => {
+    const f = await fixture(false, acceptedHttpSelection()),
+      raw = acceptedRawHttp(),
+      cancel = new AbortController();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let enter = () => {};
+    const reached = new Promise<void>((resolve) => {
+      enter = resolve;
+    });
+    let closing: Promise<void> | undefined;
+    let visited = false,
+      changed = false,
+      finalLoads = 0,
+      configuredReads = 0;
+    let restore = () => {};
+    raw.onEnd(() => {
+      raw.reply();
+      raw.join();
+    });
+    f.afterStart(async (execution) => {
+      const originalQuery = f.sql.query.bind(f.sql),
+        originalBatch = f.sql.batch.bind(f.sql);
+      const query = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+        const rows = await originalQuery(statement, params);
+        if (startedObservations(f) === 5) {
+          if (statement.includes(" FROM tf_v2_container_instances i JOIN ")) finalLoads++;
+          // After the second original native verification, load #1 is its own
+          // current guard. Load #2 is the shared helper's FINAL current await.
+          // Its second configured read is load's last Sql await, with actual
+          // unchanged rows. No fake lease/owner/START/CAS result is supplied.
+          if (
+            finalLoads === 2 &&
+            statement.startsWith("SELECT material.key_id, material.nonce, material.ciphertext") &&
+            ++configuredReads === 2
+          ) {
+            enter();
+            await gate;
+          }
+        }
+        return rows;
+      });
+      const batch = spyOn(f.sql, "batch").mockImplementation(async (statements) => {
+        const rows = await originalBatch(statements);
+        if (
+          statements.some(({ sql }) =>
+            sql.startsWith("UPDATE tf_v2_container_instances SET serving_generation="),
+          )
+        )
+          changed ||= rows.some(({ changes }) => changes === 1);
+        return rows;
+      });
+      restore = () => {
+        query.mockRestore();
+        batch.mockRestore();
+      };
+      const publishing = f.composition.publishAcceptedServing(execution, cancel.signal);
+      await Promise.race([
+        reached,
+        publishing.then(() => {
+          throw new Error("original final shared current Sql await was not reached");
+        }),
+      ]);
+      expect(finalLoads).toBe(2);
+      expect(configuredReads).toBe(2);
+      expect(startedObservations(f)).toBe(5);
+      if (action === "cancel") cancel.abort();
+      else {
+        closing = f.composition.close();
+        void closing.catch(() => undefined);
+      }
+      release();
+      await expect(publishing).rejects.toThrow();
+      expect(changed).toBe(false);
+      expect(
+        await originalQuery(
+          "SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances",
+        ),
+      ).toEqual([{ serving_generation: null, runtime_epoch: 0 }]);
+      expect(raw.calls).toHaveLength(1);
+      visited = true;
+    });
+    try {
+      await f.create();
+      expect((await f.engine.runNext())?.effect).not.toBe("complete");
+      if (f.failures[0]) throw f.failures[0];
+      expect(visited).toBe(true);
+      expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(
+        1,
+      );
+      expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+        { state: "running" },
+      ]);
+      if (closing) await expect(closing).rejects.toThrow("custody_retained");
+    } finally {
+      release();
+      restore();
+      raw.join();
+      raw.restore();
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
