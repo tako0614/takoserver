@@ -209,6 +209,54 @@ static bool gd_script(const char *base, char *script, size_t capacity, size_t *l
   *length = used; return true;
 }
 
+/* Independent source observations. A single global-stat reply reports all
+ * allocated conntrack objects in this netns, including objects absent from the
+ * confirmed-hash DUMP. It is not atomic with the earlier check transaction and
+ * never proves packet, socket, queue, offload or kernel-profile retirement. */
+typedef struct {
+  bool done, failed;
+  uint32_t allocated, maximum;
+} gd_stats;
+static bool gd_stats_feed(gd_stats *result, const unsigned char *bytes, size_t size,
+                          bool truncated, uint32_t sender_port, uint32_t sender_groups,
+                          uint32_t sequence, uint32_t port) {
+  struct nlmsghdr header; struct nfgenmsg gen;
+  if (result->done || result->failed || truncated || sender_port || sender_groups || !sequence || !port ||
+      size < sizeof(header) + sizeof(gen)) goto bad;
+  memcpy(&header, bytes, sizeof(header));
+  if (header.nlmsg_type != ((NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET_STATS) ||
+      header.nlmsg_flags != NLM_F_MULTI || header.nlmsg_seq != sequence || header.nlmsg_pid != port ||
+      header.nlmsg_len < sizeof(header) + sizeof(gen) || size != NLMSG_ALIGN((size_t)header.nlmsg_len)) goto bad;
+  memcpy(&gen, bytes + sizeof(header), sizeof(gen));
+  if (gen.nfgen_family != AF_UNSPEC || gen.version != NFNETLINK_V0 || gen.res_id) goto bad;
+  gd_attr fields[CTA_STATS_GLOBAL_MAX + 1] = {0};
+  if (!gd_attrs(bytes + sizeof(header) + sizeof(gen), header.nlmsg_len - sizeof(header) - sizeof(gen),
+                fields, CTA_STATS_GLOBAL_MAX) ||
+      !gd_leaf(fields[CTA_STATS_GLOBAL_ENTRIES], 4) || !gd_leaf(fields[CTA_STATS_GLOBAL_MAX_ENTRIES], 4)) goto bad;
+  uint32_t allocated, maximum;
+  memcpy(&allocated, fields[CTA_STATS_GLOBAL_ENTRIES].value, sizeof(allocated));
+  memcpy(&maximum, fields[CTA_STATS_GLOBAL_MAX_ENTRIES].value, sizeof(maximum));
+  result->allocated = ntohl(allocated); result->maximum = ntohl(maximum);
+  result->done = true; return true;
+bad:
+  result->failed = true; return false;
+}
+static bool gd_probe_script(const char *base, char *script, size_t capacity, size_t *length) {
+  /* Use the same selected table-name validator without changing its frozen
+   * fence builder. These validation bytes are never sent to a native process. */
+  char validation[4096]; size_t ignored;
+  if (!gd_script(base, validation, sizeof(validation), &ignored)) return false;
+  int size = snprintf(script, capacity, "create table inet %s_drain_probe\n", base);
+  if (size < 0 || (size_t)size >= capacity) return false;
+  *length = (size_t)size; return true;
+}
+/* Local attempt bookkeeping only; the genuine original owner/currentness and
+ * armed guest/fence checks remain mandatory at the native call site. */
+static bool gd_probe_consume(bool *attempted) {
+  if (*attempted) return false;
+  *attempted = true; return true;
+}
+
 #ifndef TAKOS_DRAIN_PARSER_ONLY
 /* Fixed-rule projection. Refuse additional tables/chains/rules/expressions;
  * nft metadata/handles are allowed but never used as authority. */
@@ -433,6 +481,65 @@ static bool guest_drain_read(void) {
   if (!gd_collect(AF_INET, 1, &v4, until) || !gd_collect(AF_INET6, 2, &v6, until) || !gd_read_fence(until) || !gd_current(until))
     return refusal("drain_flow_collection_unavailable");
   return gd_reply("docker-guest-flow-snapshot@1", &v4, &v6, until);
+}
+
+static bool guest_drain_probe_attempted;
+static bool gd_collect_stats(gd_stats *result, int64_t until) {
+  int fd = gd_socket(until); if (fd < 0) return false;
+  struct sockaddr_nl local = {0}; socklen_t local_size = sizeof(local);
+  bool ok = gd_current(until) && !getsockname(fd, (struct sockaddr *)&local, &local_size) &&
+    local_size == sizeof(local) && local.nl_family == AF_NETLINK && local.nl_pid && !local.nl_groups && gd_current(until);
+  struct { struct nlmsghdr header; struct nfgenmsg gen; } request = {
+    .header = {.nlmsg_len = sizeof(request), .nlmsg_type = (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_GET_STATS,
+      .nlmsg_flags = NLM_F_REQUEST, .nlmsg_seq = 3, .nlmsg_pid = local.nl_pid},
+    .gen = {.nfgen_family = AF_UNSPEC, .version = NFNETLINK_V0, .res_id = 0}};
+  struct sockaddr_nl kernel = {.nl_family = AF_NETLINK};
+  ok = ok && gd_current(until) && sendto(fd, &request, sizeof(request), MSG_DONTWAIT,
+    (struct sockaddr *)&kernel, sizeof(kernel)) == sizeof(request) && gd_current(until);
+  unsigned char bytes[4096];
+  if (ok) {
+    ok = gd_current(until) && wait_io(fd, POLLIN, until) && gd_current(until);
+    if (ok) {
+      struct sockaddr_nl sender = {0}; struct iovec iov = {.iov_base = bytes, .iov_len = sizeof(bytes)};
+      struct msghdr message = {.msg_name = &sender, .msg_namelen = sizeof(sender), .msg_iov = &iov, .msg_iovlen = 1};
+      ssize_t size = recvmsg(fd, &message, MSG_DONTWAIT);
+      ok = gd_current(until) && size > 0 && message.msg_namelen == sizeof(sender) && sender.nl_family == AF_NETLINK &&
+        !message.msg_flags && gd_stats_feed(result, bytes, (size_t)(size > 0 ? size : 0), false,
+          sender.nl_pid, sender.nl_groups, 3, local.nl_pid);
+    }
+  }
+  close(fd); return ok && result->done && !result->failed && gd_current(until);
+}
+static bool guest_drain_probe(void) {
+  int64_t until = clock_ms() + IO_MS;
+  if (!native_mode || !guest_mode || quarantine_control || !guest_fail_closed || !guest_watch_armed ||
+      !guest_drain_fenced || guest_drain_probe_attempted || !gd_current(until) || !gd_read_fence(until))
+    return refusal("drain_probe_refused");
+  char script[160]; size_t length = 0;
+  if (!gd_probe_script(table_name, script, sizeof(script), &length) || !gd_current(until))
+    return refusal("drain_probe_refused");
+  /* Consume before the first raw temporary-table effect. A lost ACK, timeout,
+   * cancellation, failed stats/readback or reply never permits another probe.
+   * The already existing drain attempt also keeps resume/NFTAPPLY forbidden. */
+  if (!gd_probe_consume(&guest_drain_probe_attempted)) return refusal("drain_probe_refused");
+  char *argv[] = {(char *)nft_binary, "--check", "-f", "-", NULL}; unsigned char *bytes = NULL; size_t size = 0;
+  bool ok = gd_current(until) && capture_native(argv, script, length, &bytes, &size) && !size && gd_current(until);
+  free(bytes);
+  gd_stats stats = {0};
+  if (!ok || !gd_read_fence(until) || !gd_collect_stats(&stats, until) || !gd_read_fence(until) || !gd_current(until))
+    return refusal("drain_probe_outcome_unknown");
+  /* Probe success is only the pinned executable's observed exit. Even where
+   * upstream abort waits for RCU, kernel provenance and complete packet/flow
+   * lifetime are unqualified. No state transition or terminal grant exists. */
+  char body[896];
+  int used = snprintf(body, sizeof(body),
+    "{\"kind\":\"docker-guest-drain-primitives@1\",\"nativeId\":\"%s\",\"namespaceDevice\":\"%llu\","
+    "\"namespaceInode\":\"%llu\",\"fenceTable\":\"%s_drain\",\"barrier\":\"unproven\","
+    "\"probe\":\"nonempty-nft-check-completed\",\"kernelRcu\":\"unqualified\",\"atomicity\":\"sequential\","
+    "\"allocatedEntries\":%u,\"maxEntries\":%u}", selected_native_id,
+    (unsigned long long)guest_namespace_stat.st_dev, (unsigned long long)guest_namespace_stat.st_ino,
+    table_name, stats.allocated, stats.maximum);
+  return used > 0 && (size_t)used < sizeof(body) && gd_current(until) ? reply(0, body, (size_t)used) : refusal("drain_probe_outcome_unknown");
 }
 #endif
 #endif

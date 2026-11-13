@@ -33,6 +33,31 @@ export interface DockerPhysicalGuestFlowSnapshot {
 }
 const guestDrainReaders = new WeakMap<object, () => Promise<DockerPhysicalGuestFlowSnapshot>>();
 
+/** Sequential source observations, never a qualified packet or socket barrier.
+ * The maximum is the kernel global limit, not available container capacity. */
+export interface DockerPhysicalGuestDrainPrimitives {
+  readonly kind: "docker-guest-drain-primitives@1";
+  readonly nativeId: string;
+  readonly namespaceDevice: string;
+  readonly namespaceInode: string;
+  readonly fenceTable: string;
+  readonly barrier: "unproven";
+  readonly probe: "nonempty-nft-check-completed";
+  readonly kernelRcu: "unqualified";
+  readonly atomicity: "sequential";
+  readonly allocatedEntries: number;
+  readonly maxEntries: number;
+}
+const guestDrainProbes = new WeakMap<object, () => Promise<DockerPhysicalGuestDrainPrimitives>>();
+
+export function probeDockerPhysicalGuestDrain(
+  original: object,
+): Promise<DockerPhysicalGuestDrainPrimitives> {
+  const probe = guestDrainProbes.get(original);
+  if (!probe) return Promise.reject(new Error("docker_physical_session_unavailable"));
+  return probe();
+}
+
 /** Only an original process closure can access its bound drain channel. A
  * copied metadata object or a caller's method-shaped port cannot enter it. */
 export function observeDockerPhysicalGuestDrain(
@@ -300,7 +325,7 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
     const metadata = Object.freeze({ ...hello });
     let drainAttempted = false,
       drainFenced = false;
-    const drainIdentity = (bytes: Buffer, kind: string, flow: boolean) => {
+    const drainIdentity = (bytes: Buffer, kind: string, flow: boolean | "primitives") => {
       const value = parseStrictJson(bytes, LIMIT);
       const keys = [
         "kind",
@@ -309,7 +334,11 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
         "namespaceInode",
         "fenceTable",
         "barrier",
-        ...(flow ? ["tcp4", "udp4", "tcp6", "udp6"] : []),
+        ...(flow === "primitives"
+          ? ["probe", "kernelRcu", "atomicity", "allocatedEntries", "maxEntries"]
+          : flow
+            ? ["tcp4", "udp4", "tcp6", "udp6"]
+            : []),
       ];
       if (
         !isJsonObject(value) ||
@@ -586,6 +615,52 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
           udp4,
           tcp6,
           udp6,
+        });
+      });
+      let probeAttempted = false;
+      guestDrainProbes.set(process, async () => {
+        if (probeAttempted) return fail();
+        // Spend before even preparing the original fence. Unknown preparation,
+        // check, stats or final-currentness outcomes never retry this attempt.
+        probeAttempted = true;
+        const original = await observeDockerPhysicalGuestDrain(process);
+        await request("CURRENT");
+        const value = drainIdentity(
+          await request("DRAINPROBE"),
+          "docker-guest-drain-primitives@1",
+          "primitives",
+        );
+        if (
+          value.probe !== "nonempty-nft-check-completed" ||
+          value.kernelRcu !== "unqualified" ||
+          value.atomicity !== "sequential"
+        )
+          return fail();
+        const uint32 = (input: unknown): number => {
+          if (
+            typeof input !== "number" ||
+            !Number.isInteger(input) ||
+            input < 0 ||
+            input > 0xffffffff
+          )
+            return fail();
+          return input;
+        };
+        const allocatedEntries = uint32(value.allocatedEntries),
+          maxEntries = uint32(value.maxEntries);
+        await request("CURRENT");
+        return Object.freeze({
+          kind: "docker-guest-drain-primitives@1",
+          nativeId: original.nativeId,
+          namespaceDevice: original.namespaceDevice,
+          namespaceInode: original.namespaceInode,
+          fenceTable: original.fenceTable,
+          barrier: "unproven",
+          probe: "nonempty-nft-check-completed",
+          kernelRcu: "unqualified",
+          atomicity: "sequential",
+          allocatedEntries,
+          maxEntries,
         });
       });
     }

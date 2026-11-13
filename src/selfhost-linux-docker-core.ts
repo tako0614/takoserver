@@ -7,6 +7,7 @@ import {
 import type { DockerContainerAcceptedExecution } from "./providers/docker-container-core-owner.ts";
 import {
   createDockerHttpRevisionRuntime,
+  type DockerHttpRevision,
   type DockerHttpRevisionOptions,
 } from "./providers/docker-http-revision.ts";
 import {
@@ -14,6 +15,7 @@ import {
   type LinuxDockerCorePreparationOptions,
   type LinuxDockerCoreRuntimeOptions,
 } from "./providers/linux-docker-core-runtime.ts";
+import type { DockerPhysicalGuestDrainPrimitives } from "./providers/linux-docker-physical-session.ts";
 import type { LinuxDockerRuntimePreparation } from "./providers/linux-docker-runtime-preparation.ts";
 import type { V2HostAcceptance } from "./takoform-v2/host-acceptance.ts";
 import type { V2Execution } from "./takoform-v2/types.ts";
@@ -51,6 +53,11 @@ export interface SelfhostLinuxDockerCore {
   ): Promise<T>;
   /** Remove only original retained generations under their accepted UPDATE/DELETE. */
   retireAccepted(execution: V2Execution, signal?: AbortSignal): Promise<void>;
+  /** Observe all original retained generations without granting removal. */
+  observeRetainedFlowPrimitives(
+    execution: V2Execution,
+    signal?: AbortSignal,
+  ): Promise<readonly DockerPhysicalGuestDrainPrimitives[]>;
   close(): Promise<void>;
 }
 
@@ -155,11 +162,140 @@ export function createSelfhostLinuxDockerCore(input: {
   });
   const revisions = new Map<string, Omit<SelfhostLinuxDockerAcceptedRevision, "accepted">>();
   const scopes = new Set<Promise<unknown>>();
+  const retainedCancellation = new Set<AbortController>();
   let closed = false;
   let closing: Promise<void> | undefined;
   const assertOpen = () => {
     if (closed) throw new SelfhostLinuxDockerCoreError("closed");
   };
+  function withRetained<T>(
+    execution: V2Execution,
+    signal: AbortSignal | undefined,
+    work: (
+      revision: Omit<SelfhostLinuxDockerAcceptedRevision, "accepted">,
+      request: DockerHttpRevision,
+      nativeId: string,
+      key: string,
+    ) => Promise<T>,
+  ): Promise<T[]> {
+    assertOpen();
+    const assertRemovalOpen = () => {
+      assertOpen();
+      if (signal !== undefined && (!(signal instanceof AbortSignal) || signal.aborted))
+        throw new SelfhostLinuxDockerCoreError("retirement_cancelled");
+    };
+    assertRemovalOpen();
+    const running = Promise.resolve().then(() => {
+      assertRemovalOpen();
+      return core.owner.withExecution(execution, async () => {
+        const accepted = await core.owner.readAcceptedExecution(execution);
+        if (accepted.action !== "update" && accepted.action !== "delete")
+          throw new SelfhostLinuxDockerCoreError("retirement_not_accepted");
+        const policyDigest = await canonicalDigest({
+          installationId,
+          backendId,
+          targetKey,
+          runtimeOptions,
+          dockerOptions,
+        });
+        const retained = accepted.retained.filter(
+          ({ record }) => record.intent.policy.generation < accepted.generation,
+        );
+        // Validate every retained projection before any native IO. Current Host
+        // settings cannot reconstruct an older, differently configured owner.
+        const requests = retained.map(({ record, spec }) => {
+          const { intent } = record;
+          if (
+            intent.installationId !== installationId ||
+            intent.installationId !== accepted.installationId ||
+            intent.resourceUid !== accepted.resourceUid ||
+            intent.incarnationId !== accepted.incarnationId ||
+            intent.policy.tenantRef !== accepted.principal
+          )
+            throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+          if (intent.policy.policyDigest !== policyDigest)
+            throw new SelfhostLinuxDockerCoreError("retained_policy_unavailable");
+          if (record.state === "pending" || record.nativeId === null)
+            throw new SelfhostLinuxDockerCoreError("retained_native_identity_unknown");
+          const { image, httpPort, healthPath, environment = {} } = spec;
+          if (
+            typeof image !== "string" ||
+            typeof httpPort !== "number" ||
+            typeof healthPath !== "string" ||
+            !isJsonObject(environment)
+          )
+            throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+          const publicEnvironment: Record<string, string> = {};
+          for (const [name, value] of Object.entries(environment)) {
+            if (typeof value !== "string")
+              throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+            publicEnvironment[name] = value;
+          }
+          return {
+            record,
+            nativeId: record.nativeId,
+            request: {
+              resourceUid: intent.resourceUid,
+              incarnationId: intent.incarnationId,
+              revision: intent.revision,
+              image,
+              port: httpPort,
+              healthPath,
+              environment: publicEnvironment,
+              memoryBytes: dockerOptions.maxMemoryBytes,
+              nanoCpus: dockerOptions.maxNanoCpus,
+            },
+          };
+        });
+        const results: T[] = [];
+        for (const { record, nativeId, request } of requests) {
+          assertRemovalOpen();
+          const { intent } = record;
+          const key = canonicalJson([
+            intent.resourceUid,
+            intent.policy.generation,
+            intent.revision,
+          ]);
+          let revision = revisions.get(key);
+          if (!revision) {
+            const runtime = core.createRuntime({
+              ...runtimeOptions,
+              policy: intent.policy,
+              requiredSecretNames: intent.requiredSecretNames,
+            });
+            revision = Object.freeze({
+              runtime,
+              docker: Object.freeze(
+                createDockerHttpRevisionRuntime({
+                  ...dockerOptions,
+                  installationId,
+                  socketPath: runtimeOptions.process.socketPath,
+                  dnsServers: runtime.dnsServers,
+                  runtimePreparation: runtime,
+                }),
+              ),
+            });
+            revisions.set(key, revision);
+          }
+          // Original custody still decides whether this old generation is
+          // actually removable; a current execution is no remove grant.
+          results.push(await work(revision, request, nativeId, key));
+          assertRemovalOpen();
+        }
+        return results;
+      });
+    });
+    scopes.add(running);
+    void running.then(
+      () => {
+        scopes.delete(running);
+      },
+      () => {
+        scopes.delete(running);
+      },
+    );
+    return running;
+  }
   return Object.freeze({
     acceptance: core.owner.acceptance,
     configuredInputs: Object.freeze({
@@ -229,125 +365,36 @@ export function createSelfhostLinuxDockerCore(input: {
       return running;
     },
     async retireAccepted(execution: V2Execution, signal?: AbortSignal): Promise<void> {
-      assertOpen();
-      const assertRemovalOpen = () => {
-        assertOpen();
-        if (signal !== undefined && (!(signal instanceof AbortSignal) || signal.aborted))
-          throw new SelfhostLinuxDockerCoreError("retirement_cancelled");
-      };
-      assertRemovalOpen();
-      const running = Promise.resolve().then(() => {
-        assertRemovalOpen();
-        return core.owner.withExecution(execution, async () => {
-          const accepted = await core.owner.readAcceptedExecution(execution);
-          if (accepted.action !== "update" && accepted.action !== "delete")
-            throw new SelfhostLinuxDockerCoreError("retirement_not_accepted");
-          const policyDigest = await canonicalDigest({
-            installationId,
-            backendId,
-            targetKey,
-            runtimeOptions,
-            dockerOptions,
-          });
-          const retained = accepted.retained.filter(
-            ({ record }) => record.intent.policy.generation < accepted.generation,
-          );
-          // Validate every retained projection before any native IO. Current Host
-          // settings cannot reconstruct an older, differently configured owner.
-          const requests = retained.map(({ record, spec }) => {
-            const { intent } = record;
-            if (
-              intent.installationId !== installationId ||
-              intent.installationId !== accepted.installationId ||
-              intent.resourceUid !== accepted.resourceUid ||
-              intent.incarnationId !== accepted.incarnationId ||
-              intent.policy.tenantRef !== accepted.principal
-            )
-              throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
-            if (intent.policy.policyDigest !== policyDigest)
-              throw new SelfhostLinuxDockerCoreError("retained_policy_unavailable");
-            if (record.state === "pending" || record.nativeId === null)
-              throw new SelfhostLinuxDockerCoreError("retained_native_identity_unknown");
-            const { image, httpPort, healthPath, environment = {} } = spec;
-            if (
-              typeof image !== "string" ||
-              typeof httpPort !== "number" ||
-              typeof healthPath !== "string" ||
-              !isJsonObject(environment)
-            )
-              throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
-            const publicEnvironment: Record<string, string> = {};
-            for (const [name, value] of Object.entries(environment)) {
-              if (typeof value !== "string")
-                throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
-              publicEnvironment[name] = value;
-            }
-            return {
-              record,
-              nativeId: record.nativeId,
-              request: {
-                resourceUid: intent.resourceUid,
-                incarnationId: intent.incarnationId,
-                revision: intent.revision,
-                image,
-                port: httpPort,
-                healthPath,
-                environment: publicEnvironment,
-                memoryBytes: dockerOptions.maxMemoryBytes,
-                nanoCpus: dockerOptions.maxNanoCpus,
-              },
-            };
-          });
-          for (const { record, nativeId, request } of requests) {
-            assertRemovalOpen();
-            const { intent } = record;
-            const key = canonicalJson([
-              intent.resourceUid,
-              intent.policy.generation,
-              intent.revision,
-            ]);
-            let revision = revisions.get(key);
-            if (!revision) {
-              const runtime = core.createRuntime({
-                ...runtimeOptions,
-                policy: intent.policy,
-                requiredSecretNames: intent.requiredSecretNames,
-              });
-              revision = Object.freeze({
-                runtime,
-                docker: Object.freeze(
-                  createDockerHttpRevisionRuntime({
-                    ...dockerOptions,
-                    installationId,
-                    socketPath: runtimeOptions.process.socketPath,
-                    dnsServers: runtime.dnsServers,
-                    runtimePreparation: runtime,
-                  }),
-                ),
-              });
-              revisions.set(key, revision);
-            }
-            // Original custody still decides whether this old generation is
-            // actually removable; a current execution is no remove grant.
-            await revision.docker.remove(request, nativeId, signal);
-            await revision.runtime.close();
-            revisions.delete(key);
-          }
-        });
+      await withRetained(execution, signal, async (revision, request, nativeId, key) => {
+        await revision.docker.remove(request, nativeId, signal);
+        await revision.runtime.close();
+        revisions.delete(key);
       });
-      scopes.add(running);
-      void running.then(
-        () => {
-          scopes.delete(running);
-        },
-        () => {
-          scopes.delete(running);
-        },
+    },
+    observeRetainedFlowPrimitives(
+      execution: V2Execution,
+      signal?: AbortSignal,
+    ): Promise<readonly DockerPhysicalGuestDrainPrimitives[]> {
+      assertOpen();
+      if (signal !== undefined && (!(signal instanceof AbortSignal) || signal.aborted))
+        throw new SelfhostLinuxDockerCoreError("retirement_cancelled");
+      const cancellation = new AbortController();
+      const abort = () => cancellation.abort();
+      signal?.addEventListener("abort", abort, { once: true });
+      retainedCancellation.add(cancellation);
+      const running = withRetained(execution, cancellation.signal, (revision, request, nativeId) =>
+        revision.docker.observeRetainedFlowPrimitives(request, nativeId, cancellation.signal),
       );
-      return running;
+      return running
+        .then((observed) => Object.freeze(observed))
+        .finally(() => {
+          retainedCancellation.delete(cancellation);
+          signal?.removeEventListener("abort", abort);
+        });
     },
     close(): Promise<void> {
       closed = true;
+      for (const cancellation of retainedCancellation) cancellation.abort();
       closing ??= (async () => {
         // Caller outcomes remain with their original promises. A failed scope
         // still has to settle before its runtime or backing Sql can be closed.

@@ -676,6 +676,8 @@ int main(int argc, char **argv) {
       ok = guest_drain_begin();
     else if (!strcmp(request, "DRAINREAD") && !*argument && !length)
       ok = guest_drain_read();
+    else if (!strcmp(request, "DRAINPROBE") && !*argument && !length)
+      ok = guest_drain_probe();
     else if (!strcmp(request, "HOSTINVENTORY") && !*argument && !length)
       ok = host_inventory_reply();
     else if (!strcmp(request, "KEEPGUEST") && !*argument && !length)

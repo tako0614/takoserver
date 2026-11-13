@@ -19,7 +19,7 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
-import type { V2Execution } from "../src/takoform-v2/types.ts";
+import type { V2BackendResult, V2Execution } from "../src/takoform-v2/types.ts";
 import { engineDouble } from "./helpers/docker-container-configured-owner-snapshot.ts";
 import { SOURCE_SELECTION } from "./helpers/docker-container-configured-source-selection.ts";
 import { createRawLinuxDockerStdio } from "./helpers/linux-docker-raw-stdio.ts";
@@ -231,6 +231,13 @@ async function fixture(fault: "helper-open" | "health-response" = "helper-open")
     ),
   );
   const executions: V2Execution[] = [];
+  let observeResult:
+    | ((
+        execution: V2Execution,
+        original: SelfhostLinuxDockerContainerBackend,
+        result: V2BackendResult,
+      ) => Promise<void>)
+    | undefined;
   const bindEngine = (candidate: SelfhostLinuxDockerContainerBackend) => {
     const backend = candidate.retainedForm.backend;
     return createTakoformV2Engine(
@@ -246,11 +253,25 @@ async function fixture(fault: "helper-open" | "health-response" = "helper-open")
               ...backend,
               execute(execution: V2Execution) {
                 executions.push(execution);
-                return backend.execute(execution);
+                const running = backend.execute(execution);
+                const observer = observeResult;
+                return observer
+                  ? running.then(async (result) => {
+                      await observer(execution, candidate, result);
+                      return result;
+                    })
+                  : running;
               },
               reconcile(execution: V2Execution) {
                 executions.push(execution);
-                return backend.reconcile(execution);
+                const running = backend.reconcile(execution);
+                const observer = observeResult;
+                return observer
+                  ? running.then(async (result) => {
+                      await observer(execution, candidate, result);
+                      return result;
+                    })
+                  : running;
               },
             },
           },
@@ -280,6 +301,12 @@ async function fixture(fault: "helper-open" | "health-response" = "helper-open")
     },
     get backend() {
       return composition.retainedForm.backend;
+    },
+    get composition() {
+      return composition;
+    },
+    observeResults(observer: typeof observeResult) {
+      observeResult = observer;
     },
     rawRequests: () => rawRequests,
     failedUpdateOpens: () => failedUpdateOpens,
@@ -527,6 +554,120 @@ test("running UPDATE reconstruction resumes the original closed lifetime without
     expect(f.docker.calls.filter(({ method }) => method === "DELETE")).toHaveLength(0);
     expect(f.docker.containers.size).toBe(2);
     expect(f.healthRequests()).toBe(3);
+  } finally {
+    await f.close();
+  }
+});
+
+test("accepted old-generation owner observes native drain primitives before settlement and rejects foreign or stale execution", async () => {
+  const f = await fixture("health-response");
+  try {
+    const created = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: created.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    const updated = await f.update(created.resourceUid);
+    expect(await f.engine.runNext()).toMatchObject({
+      id: updated.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    await f.reconstruct();
+    let acceptedExecution: V2Execution | undefined;
+    let observationFailure: unknown;
+    let observed:
+      | Awaited<ReturnType<SelfhostLinuxDockerContainerBackend["observeRetainedFlowPrimitives"]>>
+      | undefined;
+    const probes = () =>
+      f.physical.nativeCommands.filter(({ operation }) => operation === "DRAINPROBE");
+    f.observeResults(async (execution, original, result) => {
+      try {
+        if (execution.operationId !== updated.id || result.kind !== "complete") return;
+        expect(
+          await f.sql.query(
+            "SELECT desired_generation,serving_generation FROM tf_v2_container_instances",
+          ),
+        ).toEqual([{ desired_generation: 2, serving_generation: 2 }]);
+        expect(
+          await f.sql.query("SELECT status FROM tf_v2_operations WHERE id=?", [updated.id]),
+        ).toEqual([{ status: "reconciling" }]);
+        // These are negative copies of the actual executing object. No positive
+        // owner/runtime/accepted native snapshot is supplied by the test.
+        await expect(
+          original.observeRetainedFlowPrimitives({
+            ...execution,
+            principal: "synthetic-foreign-parent",
+          }),
+        ).rejects.toThrow();
+        await expect(
+          original.observeRetainedFlowPrimitives({
+            ...execution,
+            targetKey: "synthetic-foreign-target",
+          }),
+        ).rejects.toThrow();
+        expect(probes()).toHaveLength(0);
+        // The SDK itself retains the original accepted UPDATE/remove owner,
+        // old policy/runtime and exact native snapshot from session.inspect().
+        observed = await original.observeRetainedFlowPrimitives(execution);
+        acceptedExecution = execution;
+      } catch (error: unknown) {
+        observationFailure = error;
+        throw error;
+      }
+    });
+    const retried = await f.retry(updated.id);
+    if (observationFailure !== undefined) throw observationFailure;
+    expect(retried).toMatchObject({
+      id: updated.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    f.observeResults(undefined);
+    if (!acceptedExecution || !observed) throw new Error("original accepted probe not reached");
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({
+      kind: "docker-guest-drain-primitives@1",
+      nativeId: "1".repeat(64),
+      fenceTable: `takos_cx_${"1".repeat(32)}_drain`,
+      barrier: "unproven",
+      probe: "nonempty-nft-check-completed",
+      kernelRcu: "unqualified",
+      atomicity: "sequential",
+      allocatedEntries: 7,
+      maxEntries: 65536,
+    });
+    expect(probes()).toHaveLength(1);
+    expect(probes()[0]?.nativeId).toBe("1".repeat(64));
+    // Reusing the original object after engine settlement cannot renew its
+    // lease, replay the primitive, or authorize another native observation.
+    const oldNativeCommands = () =>
+      f.physical.nativeCommands.filter(({ nativeId }) => nativeId === "1".repeat(64));
+    const beforeStaleNativeCommands = oldNativeCommands().length;
+    await expect(f.composition.observeRetainedFlowPrimitives(acceptedExecution)).rejects.toThrow();
+    expect(oldNativeCommands()).toHaveLength(beforeStaleNativeCommands);
+    expect(probes()).toHaveLength(1);
+    expect(
+      await f.sql.query(
+        "SELECT generation,retention FROM tf_v2_container_revisions ORDER BY generation",
+      ),
+    ).toEqual([
+      { generation: 1, retention: "draining" },
+      { generation: 2, retention: "serving" },
+    ]);
+    expect(
+      await f.sql.query(
+        "SELECT generation,native_id,state FROM tf_v2_container_create_claims ORDER BY generation",
+      ),
+    ).toEqual([
+      { generation: 1, native_id: "1".repeat(64), state: "bound" },
+      { generation: 2, native_id: "2".repeat(64), state: "bound" },
+    ]);
+    expect(f.physical.starts()).toBe(2);
+    expect(f.docker.creates()).toHaveLength(2);
+    expect(f.docker.calls.filter(({ method }) => method === "DELETE")).toHaveLength(0);
+    expect(f.docker.containers.size).toBe(2);
   } finally {
     await f.close();
   }

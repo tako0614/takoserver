@@ -25,10 +25,12 @@ import {
 } from "./linux-docker-guest-egress.ts";
 import {
   type DockerPhysicalContainerInspection,
+  type DockerPhysicalGuestDrainPrimitives,
   type DockerPhysicalGuestFlowSnapshot,
   type DockerPhysicalProcessOptions,
   observeDockerPhysicalGuestDrain,
   openDockerPhysicalProcess,
+  probeDockerPhysicalGuestDrain,
 } from "./linux-docker-physical-session.ts";
 
 export interface LinuxDockerPhysicalOwnerPort extends DockerPhysicalOwnerPort {
@@ -967,6 +969,21 @@ export class LinuxDockerRuntimePreparation {
     identity: DockerContainerNativeIdentity,
     signal?: AbortSignal,
   ): Promise<DockerPhysicalGuestFlowSnapshot> {
+    return this.#observeRetained(identity, signal, observeDockerPhysicalGuestDrain);
+  }
+  /** Source primitives retain the same original remove scope and lifetime.
+   * Neither successful checking nor zero allocated objects grants retirement. */
+  observeRetainedFlowPrimitives(
+    identity: DockerContainerNativeIdentity,
+    signal?: AbortSignal,
+  ): Promise<DockerPhysicalGuestDrainPrimitives> {
+    return this.#observeRetained(identity, signal, probeDockerPhysicalGuestDrain);
+  }
+  #observeRetained<T>(
+    identity: DockerContainerNativeIdentity,
+    signal: AbortSignal | undefined,
+    read: (physical: Physical) => Promise<T>,
+  ): Promise<T> {
     if (this.#closed || (signal !== undefined && !(signal instanceof AbortSignal)))
       return Promise.reject(new Error("linux_docker_runtime_preparation_unavailable"));
     const native = nativeSnapshot(identity);
@@ -983,7 +1000,7 @@ export class LinuxDockerRuntimePreparation {
       return this.#owner.withAuthority(record, "remove", async (held) => {
         held.revocation.addEventListener("abort", abort, { once: true });
         let physical: Physical | undefined;
-        let observed: DockerPhysicalGuestFlowSnapshot | undefined;
+        let observed: T | undefined;
         const guard = async () => {
           if (
             this.#closed ||
@@ -1010,7 +1027,7 @@ export class LinuxDockerRuntimePreparation {
           )
             return fail();
           await guard();
-          observed = await observeDockerPhysicalGuestDrain(physical);
+          observed = await read(physical);
           await guard();
         } finally {
           held.revocation.removeEventListener("abort", abort);

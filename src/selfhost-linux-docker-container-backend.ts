@@ -7,6 +7,7 @@ import {
 } from "./providers/docker-container-configured-inputs.ts";
 import type { DockerContainerAcceptedExecution } from "./providers/docker-container-core-owner.ts";
 import type { DockerHttpRevision } from "./providers/docker-http-revision.ts";
+import type { DockerPhysicalGuestDrainPrimitives } from "./providers/linux-docker-physical-session.ts";
 import {
   createSelfhostLinuxDockerCore,
   type SelfhostLinuxDockerCoreSelection,
@@ -19,6 +20,11 @@ export interface SelfhostLinuxDockerContainerBackend {
   /** Internal candidate only; this creator does not register public Form support. */
   readonly retainedForm: V2Form;
   readonly acceptance: V2HostAcceptance;
+  /** Host-internal observation only; not a public Form or a retirement grant. */
+  observeRetainedFlowPrimitives(
+    execution: V2Execution,
+    signal?: AbortSignal,
+  ): Promise<readonly DockerPhysicalGuestDrainPrimitives[]>;
   close(): Promise<void>;
 }
 
@@ -158,6 +164,7 @@ export function createSelfhostLinuxDockerContainerBackend(input: {
     formUrl: V2_CONTAINER_F2_FORM,
     retainedForm: form,
     acceptance: core.acceptance,
+    observeRetainedFlowPrimitives: core.observeRetainedFlowPrimitives,
     close: core.close,
   });
 }

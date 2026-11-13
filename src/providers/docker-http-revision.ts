@@ -15,6 +15,7 @@ import {
   DockerContainerRuntimePreparation,
   DockerContainerRuntimePreparationError,
 } from "./docker-container-runtime-preparation.ts";
+import type { DockerPhysicalGuestDrainPrimitives } from "./linux-docker-physical-session.ts";
 import { LinuxDockerRuntimePreparation } from "./linux-docker-runtime-preparation.ts";
 
 /** Host-private execution input, not a new Form or an externalServices slot. */
@@ -816,6 +817,42 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
             creationObservation(target, session, ips),
           )
         : observation(target);
+    },
+    /** Read source primitives under the original retained remove session. This
+     * never stops/removes the container or qualifies the observation as drained. */
+    async observeRetainedFlowPrimitives(
+      input: DockerHttpRevision,
+      expectedNativeId: string,
+      signal?: AbortSignal,
+    ): Promise<DockerPhysicalGuestDrainPrimitives> {
+      if (
+        !linuxPreparation ||
+        !custody ||
+        !/^[a-f0-9]{64}$/u.test(expectedNativeId) ||
+        (signal !== undefined && !(signal instanceof AbortSignal))
+      )
+        throw new DockerHttpRevisionError("invalid_request");
+      if (signal?.aborted) throw new DockerHttpRevisionError("unavailable");
+      const target = await desired(input);
+      return withCreation(
+        target,
+        "remove",
+        async (session) => {
+          if (session.record.nativeId !== expectedNativeId)
+            throw new DockerHttpRevisionError("conflict");
+          const current = await session.inspect();
+          if (!current || current.native.nativeId !== expectedNativeId)
+            throw new DockerHttpRevisionError("unavailable");
+          await session.guard();
+          const observed = await linuxPreparation.observeRetainedFlowPrimitives(
+            current.native,
+            session.signal,
+          );
+          await session.guard();
+          return observed;
+        },
+        signal,
+      );
     },
     /**
      * Deferred retirement supplies the native ID it observed before draining.

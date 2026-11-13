@@ -181,6 +181,7 @@ export function createRawLinuxDockerStdio(input: {
   const errors: string[] = [];
   const children = new Set<EventEmitter>();
   const guestTables = new Map<string, string>();
+  const drainTables = new Set<string>();
   let bridgeInstalled = false;
   let attached = false;
   let starts = 0;
@@ -224,6 +225,9 @@ export function createRawLinuxDockerStdio(input: {
     const stdout = new EventEmitter();
     let ended = false;
     let armed = false;
+    let drainAttempted = false,
+      drainFenced = false,
+      probeAttempted = false;
     const finish = () => {
       if (ended) return;
       ended = true;
@@ -279,6 +283,7 @@ export function createRawLinuxDockerStdio(input: {
         return "";
       }
       if (operation === "RESUMEGUEST") {
+        if (drainAttempted) throw new Error("raw drain is monotonic");
         const parsed: unknown = JSON.parse(guestTables.get(table) ?? "null");
         if (!isJsonObject(parsed) || !Array.isArray(parsed.nftables))
           throw new Error("raw lifetime absent");
@@ -294,6 +299,51 @@ export function createRawLinuxDockerStdio(input: {
         armed = true;
         guestTables.set(table, JSON.stringify({ nftables: kept }));
         return "";
+      }
+      if (["DRAINBEGIN", "DRAINREAD", "DRAINPROBE"].includes(operation)) {
+        if (kind !== "container" || !guestFailClosed || !armed || nativeId === undefined)
+          throw new Error("raw drain scope unavailable");
+        const [, current] = container(nativeId);
+        if (!isJsonObject(current.State) || current.State.Running !== true)
+          throw new Error("raw drain requires original running native object");
+        const identity = {
+          nativeId,
+          namespaceDevice: "4",
+          namespaceInode: String(200 + identityPrefix),
+          fenceTable: `${table}_drain`,
+          barrier: "unproven",
+        };
+        if (operation === "DRAINBEGIN") {
+          if (drainAttempted) throw new Error("raw drain attempt consumed");
+          drainAttempted = true;
+          if (drainTables.has(table)) throw new Error("raw drain table already exists");
+          drainTables.add(table);
+          drainFenced = true;
+          return JSON.stringify({ kind: "docker-guest-drain-fence@1", ...identity });
+        }
+        if (!drainFenced || !drainTables.has(table)) throw new Error("raw drain fence absent");
+        if (operation === "DRAINREAD")
+          return JSON.stringify({
+            kind: "docker-guest-flow-snapshot@1",
+            ...identity,
+            tcp4: 2,
+            udp4: 1,
+            tcp6: 3,
+            udp6: 1,
+          });
+        if (probeAttempted) throw new Error("raw drain probe attempt consumed");
+        probeAttempted = true;
+        // Synthetic kernel statistics at the raw framed stdio boundary only.
+        // Nonzero values and the three qualification limits never grant drain.
+        return JSON.stringify({
+          kind: "docker-guest-drain-primitives@1",
+          ...identity,
+          probe: "nonempty-nft-check-completed",
+          kernelRcu: "unqualified",
+          atomicity: "sequential",
+          allocatedEntries: 7,
+          maxEntries: 65536,
+        });
       }
       if (operation === "NETWORK") {
         const body = JSON.stringify(network());
@@ -316,6 +366,7 @@ export function createRawLinuxDockerStdio(input: {
         return "";
       }
       if (operation === "NFTAPPLY") {
+        if (drainAttempted) throw new Error("raw drain is monotonic");
         const script = text.slice(operation.length + 1);
         guestTables.set(table, JSON.stringify(nftJson(script)));
         if (guestFailClosed) armed = true;

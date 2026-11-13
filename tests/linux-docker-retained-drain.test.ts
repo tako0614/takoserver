@@ -11,9 +11,11 @@ import type { Sql } from "../src/ports.ts";
 import type { DockerContainerNativeIdentity } from "../src/providers/docker-container-runtime-preparation.ts";
 import { createLinuxDockerCoreRuntime } from "../src/providers/linux-docker-core-runtime.ts";
 import {
+  type DockerPhysicalGuestDrainPrimitives,
   type DockerPhysicalProcessOptions,
   observeDockerPhysicalGuestDrain,
   openDockerPhysicalProcess,
+  probeDockerPhysicalGuestDrain,
 } from "../src/providers/linux-docker-physical-session.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
@@ -38,6 +40,22 @@ const flow = () => ({
   tcp6: 0,
   udp6: 0,
 });
+const primitives = (): DockerPhysicalGuestDrainPrimitives => ({
+  kind: "docker-guest-drain-primitives@1",
+  ...identity,
+  barrier: "unproven",
+  probe: "nonempty-nft-check-completed",
+  kernelRcu: "unqualified",
+  atomicity: "sequential",
+  allocatedEntries: 7,
+  maxEntries: 65536,
+});
+const drainReply = (command: string) =>
+  command === "DRAINBEGIN"
+    ? { kind: "docker-guest-drain-fence@1", ...identity }
+    : command === "DRAINPROBE"
+      ? primitives()
+      : flow();
 function options(signal = new AbortController().signal): DockerPhysicalProcessOptions {
   return {
     helper: "/synthetic/not-executed/helper",
@@ -397,5 +415,125 @@ test("original Core refusal and runtime close retain the full first SQL scope be
     await runtime.close();
     raw.restore();
     database.close();
+  }
+});
+
+test("DRAINPROBE retains original process provenance and never promotes counts into a barrier", async () => {
+  for (const allocatedEntries of [0, 70000]) {
+    const raw = rawStdio(async (command) => ({
+      body: JSON.stringify(
+        command === "DRAINPROBE" ? { ...primitives(), allocatedEntries } : drainReply(command),
+      ),
+    }));
+    let physical: Awaited<ReturnType<typeof openDockerPhysicalProcess>> | undefined;
+    try {
+      await expect(
+        probeDockerPhysicalGuestDrain({ probeDockerPhysicalGuestDrain }),
+      ).rejects.toThrow();
+      expect(raw.opened()).toBe(0);
+      physical = await openDockerPhysicalProcess(options());
+      await expect(probeDockerPhysicalGuestDrain({ ...physical })).rejects.toThrow();
+      const observed = await probeDockerPhysicalGuestDrain(physical);
+      expect(observed).toEqual({ ...primitives(), allocatedEntries });
+      expect(Object.isFrozen(observed)).toBe(true);
+      expect(Object.hasOwn(observed, "drained")).toBe(false);
+      await expect(probeDockerPhysicalGuestDrain(physical)).rejects.toThrow();
+      await expect(physical.resumeGuestLifetime()).rejects.toThrow();
+      expect(raw.commands.filter((x) => x === "DRAINBEGIN")).toHaveLength(1);
+      expect(raw.commands.filter((x) => x === "DRAINPROBE")).toHaveLength(1);
+      expect(raw.commands.includes("RESUMEGUEST")).toBe(false);
+    } finally {
+      await physical?.close();
+      raw.restore();
+    }
+  }
+});
+
+test("DRAINPROBE rejects malformed provenance, qualification, counts and closed JSON without replay", async () => {
+  const malformed = [
+    { ...primitives(), kind: "docker-guest-flow-snapshot@1" },
+    { ...primitives(), nativeId: "c".repeat(64) },
+    { ...primitives(), namespaceDevice: "5" },
+    { ...primitives(), namespaceInode: "201" },
+    { ...primitives(), fenceTable: "foreign" },
+    { ...primitives(), barrier: "drained" },
+    { ...primitives(), probe: "empty-check" },
+    { ...primitives(), kernelRcu: "qualified" },
+    { ...primitives(), atomicity: "atomic" },
+    { ...primitives(), allocatedEntries: -1 },
+    { ...primitives(), allocatedEntries: 0.5 },
+    { ...primitives(), allocatedEntries: 4294967296 },
+    { ...primitives(), maxEntries: -1 },
+    { ...primitives(), maxEntries: 0.5 },
+    { ...primitives(), maxEntries: 4294967296 },
+    { ...primitives(), maxEntries: undefined },
+    { ...primitives(), drained: true },
+  ].map((value) => JSON.stringify(value));
+  malformed.push(
+    JSON.stringify(primitives()).replace(
+      '"allocatedEntries":7',
+      '"allocatedEntries":0,"allocatedEntries":7',
+    ),
+  );
+  for (const body of malformed) {
+    const raw = rawStdio(async (command) => ({
+      body: command === "DRAINPROBE" ? body : JSON.stringify(drainReply(command)),
+    }));
+    const physical = await openDockerPhysicalProcess(options());
+    try {
+      await expect(probeDockerPhysicalGuestDrain(physical)).rejects.toThrow();
+      await expect(probeDockerPhysicalGuestDrain(physical)).rejects.toThrow();
+      expect(raw.commands.filter((x) => x === "DRAINPROBE")).toHaveLength(1);
+    } finally {
+      await physical.close();
+      raw.restore();
+    }
+  }
+});
+
+test("DRAINPROBE consumes unknown fence and probe acknowledgements before retry can resend", async () => {
+  for (const failed of ["DRAINBEGIN", "DRAINPROBE"]) {
+    const raw = rawStdio(async (command) =>
+      command === failed
+        ? { body: "synthetic unknown acknowledgement", status: 1 }
+        : { body: JSON.stringify(drainReply(command)) },
+    );
+    const physical = await openDockerPhysicalProcess(options());
+    try {
+      await expect(probeDockerPhysicalGuestDrain(physical)).rejects.toThrow();
+      await expect(probeDockerPhysicalGuestDrain(physical)).rejects.toThrow();
+      expect(raw.commands.filter((x) => x === failed)).toHaveLength(1);
+      if (failed === "DRAINBEGIN") expect(raw.commands.includes("DRAINPROBE")).toBe(false);
+      expect(raw.commands.includes("RESUMEGUEST")).toBe(false);
+    } finally {
+      await physical.close();
+      raw.restore();
+    }
+  }
+});
+
+test("DRAINPROBE cancellation joins the original child while a reply is pending", async () => {
+  const entered = deferred(),
+    release = deferred();
+  const raw = rawStdio(async (command) => {
+    if (command === "DRAINPROBE") {
+      entered.resolve();
+      await release.promise;
+    }
+    return { body: JSON.stringify(drainReply(command)) };
+  });
+  const cancellation = new AbortController();
+  const physical = await openDockerPhysicalProcess(options(cancellation.signal));
+  try {
+    const running = probeDockerPhysicalGuestDrain(physical);
+    await entered.promise;
+    cancellation.abort();
+    await expect(running).rejects.toThrow();
+    await expect(probeDockerPhysicalGuestDrain(physical)).rejects.toThrow();
+    expect(raw.commands.filter((x) => x === "DRAINPROBE")).toHaveLength(1);
+  } finally {
+    release.resolve();
+    await physical.close();
+    raw.restore();
   }
 });
