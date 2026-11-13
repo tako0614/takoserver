@@ -28,6 +28,12 @@ import {
   snapshotLinuxOciEgressLimits,
 } from "./linux-oci-egress-policy.ts";
 import {
+  LINUX_OCI_HOST_TOPOLOGY_FILE,
+  type LinuxOciHostTopology,
+  serializeLinuxOciHostTopology,
+  snapshotLinuxOciHostTopology,
+} from "./linux-oci-host-topology.ts";
+import {
   createLinuxOciPhysicalSession,
   type LinuxOciInitReapedObservation,
   type LinuxOciNamespaceLifetimeObservation,
@@ -221,6 +227,9 @@ export interface LinuxOciOwnedBundleOptions extends DockerContainerCoreOwnerOpti
   /** Optional explicit Host data for the closed-birth DROP producer only.
    * It neither changes accepted policyDigest nor supplies admission authority. */
   readonly egressLimits?: LinuxOciEgressLimits;
+  /** Expected Host data only. The original native birth/controller must obtain
+   * and match actual interface, namespace, address and route facts. */
+  readonly hostTopology?: LinuxOciHostTopology;
 }
 
 export interface LinuxOciArtifactReceipt {
@@ -469,6 +478,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     selectedEgressLimits === undefined
       ? undefined
       : snapshotLinuxOciEgressLimits(selectedEgressLimits);
+  const selectedHostTopology = options.hostTopology;
+  const hostTopology =
+    selectedHostTopology === undefined
+      ? undefined
+      : snapshotLinuxOciHostTopology(selectedHostTopology);
+  if (hostTopology !== undefined && egressLimits === undefined)
+    return fail("host_topology_requires_egress");
   const core = createDockerContainerCoreOwner(options);
   if (!options.configuredInputs) return fail("configured_inputs");
   const configured = createDockerContainerConfiguredInputs({
@@ -789,6 +805,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                       await writeFile(
                         join(allocationRoot, LINUX_OCI_EGRESS_POLICY_FILE),
                         serializeLinuxOciEgressPolicy(receipt, record, egressLimits),
+                        { flag: "wx", mode: 0o600 },
+                      );
+                      await heldGuard();
+                    }
+                    if (hostTopology !== undefined) {
+                      await writeFile(
+                        join(allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE),
+                        serializeLinuxOciHostTopology(receipt, record, hostTopology),
                         { flag: "wx", mode: 0o600 },
                       );
                       await heldGuard();

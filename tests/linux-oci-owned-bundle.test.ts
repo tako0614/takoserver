@@ -23,6 +23,11 @@ import {
   snapshotLinuxOciEgressLimits,
 } from "../src/providers/linux-oci-egress-policy.ts";
 import {
+  LINUX_OCI_HOST_TOPOLOGY_FILE,
+  type LinuxOciHostTopology,
+  snapshotLinuxOciHostTopology,
+} from "../src/providers/linux-oci-host-topology.ts";
+import {
   createLinuxOciOwnedBundle,
   type LinuxOciBorrowedBundle,
   type LinuxOciOwnedBundleOptions,
@@ -79,6 +84,7 @@ async function fixture(
     readonly noPhysicalBinary?: boolean;
     readonly namespaceMode?: "success" | "retained" | "foreign" | "unknown";
     readonly egressLimits?: LinuxOciEgressLimits;
+    readonly hostTopology?: LinuxOciHostTopology;
     readonly outboundInternet?: boolean;
     readonly viaHostCreator?: boolean;
     readonly configuredKey?: "sql" | "selection" | "owner";
@@ -207,6 +213,7 @@ async function fixture(
       nanoCpus: 500000000,
       pidsLimit: 128,
       ...(adversarial.egressLimits === undefined ? {} : { egressLimits: adversarial.egressLimits }),
+      ...(adversarial.hostTopology === undefined ? {} : { hostTopology: adversarial.hostTopology }),
       images: Object.assign(
         {
           limits,
@@ -2199,4 +2206,180 @@ test("accepted OCI egress Host limits reject unknown fields and accessors withou
   await expect(fixture(false, { egressLimits: extra })).rejects.toThrow(
     "linux_oci_egress_policy_invalid",
   );
+});
+
+function syntheticTopology() {
+  // Selection data only: no actual interface, route or native observation.
+  return {
+    interfaceName: "uplink0",
+    interfaceIndex: 7,
+    interfaceMac: "02:10:20:30:40:50",
+    ipv4Address: "192.0.2.10/24",
+    ipv4Gateway: "192.0.2.1",
+    ipv6Address: "2001:db8:1::10/64",
+    ipv6Gateway: "fe80::1",
+    peerIpv4Host: "10.240.0.2",
+    peerIpv4Guest: "10.240.0.3",
+    peerIpv6Host: "fd60:1234::2",
+    peerIpv6Guest: "fd60:1234::3",
+  };
+}
+
+test("accepted OCI topology binds snapshotted Host selection to the original artifact without native facts", async () => {
+  const selected = syntheticTopology(),
+    expected = { ...selected };
+  const f = await fixture(false, {
+    hostTopology: selected,
+    egressLimits: { maxConnections: 9, packetLimitBytes: 65536 },
+    viaHostCreator: true,
+  });
+  selected.interfaceIndex++;
+  selected.peerIpv4Guest = "10.240.0.4";
+  let visited = false;
+  f.onLoan(async (_execution, signal, bundle) => {
+    await bundle.guard();
+    const receipt = await readFile(join(bundle.allocationRoot, ".tako-oci-artifact.json"), "utf8");
+    const file = join(bundle.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE),
+      text = await readFile(file, "utf8"),
+      metadata: unknown = JSON.parse(text);
+    if (!isJsonObject(metadata)) throw new Error("original topology selection absent");
+    expect(Object.keys(metadata)).toEqual(["kind", "artifact", "topology"]);
+    expect(metadata.kind).toBe("linux-oci-owned-topology@1");
+    expect(JSON.stringify(metadata.artifact)).toBe(receipt);
+    expect(metadata.topology).toEqual(expected);
+    expect(text).toBe(JSON.stringify(metadata));
+    const stat = await lstat(file);
+    expect(stat.isFile()).toBe(true);
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.mode & 0o777).toBe(0o600);
+    expect(stat.nlink).toBe(1);
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("original host uid unavailable");
+    expect(stat.uid).toBe(uid);
+    expect(signal.aborted).toBe(false);
+    await bundle.guard();
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(visited).toBe(true);
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+    expect(await f.sql.query("SELECT state,native_id FROM tf_v2_container_create_claims")).toEqual([
+      { state: "pending", native_id: null },
+    ]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_container_start_attempts")).toEqual([
+      { n: 0 },
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("accepted OCI topology absent selection leaves policy-only original allocation and no native link", async () => {
+  const f = await fixture(false, { egressLimits: { maxConnections: 0, packetLimitBytes: 0 } });
+  let visited = false;
+  f.onLoan(async (_execution, _signal, bundle) => {
+    expect((await readdir(bundle.allocationRoot)).sort()).toEqual([
+      ".tako-oci-artifact.json",
+      LINUX_OCI_EGRESS_POLICY_FILE,
+      "rootfs",
+    ]);
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(visited).toBe(true);
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+  } finally {
+    await f.close();
+  }
+});
+
+test("accepted OCI topology requires explicit safe data and the original closed-birth policy selection", async () => {
+  let reads = 0;
+  for (const invalid of [
+    {},
+    { ...syntheticTopology(), interfaceIndex: 0 },
+    { ...syntheticTopology(), interfaceName: "lo" },
+    { ...syntheticTopology(), interfaceMac: "01:10:20:30:40:50" },
+    { ...syntheticTopology(), ipv4Address: "192.0.2.0/24" },
+    { ...syntheticTopology(), ipv4Gateway: "198.51.100.1" },
+    { ...syntheticTopology(), ipv6Address: "2001:DB8:1::10/64" },
+    { ...syntheticTopology(), ipv6Gateway: "2001:db8:2::1" },
+    { ...syntheticTopology(), peerIpv4Guest: "10.240.0.4" },
+    { ...syntheticTopology(), peerIpv4Host: "192.0.2.2", peerIpv4Guest: "192.0.2.3" },
+    { ...syntheticTopology(), peerIpv6Guest: "fd60:1234::4" },
+    { ...syntheticTopology(), peerIpv6Host: "2001:db8:2::2", peerIpv6Guest: "2001:db8:2::3" },
+    { ...syntheticTopology(), owner: {} },
+    Object.assign(Object.create({ inherited: true }), syntheticTopology()),
+    Object.defineProperty(syntheticTopology(), "interfaceName", {
+      enumerable: true,
+      get() {
+        reads++;
+        return "uplink0";
+      },
+    }),
+  ])
+    expect(() => snapshotLinuxOciHostTopology(invalid)).toThrow("linux_oci_host_topology_invalid");
+  expect(reads).toBe(0);
+  const snapshot = snapshotLinuxOciHostTopology(syntheticTopology());
+  expect(Object.isFrozen(snapshot)).toBe(true);
+  expect(snapshot).toEqual(syntheticTopology());
+  await expect(
+    fixture(false, { hostTopology: syntheticTopology(), viaHostCreator: true }),
+  ).rejects.toThrow("linux_oci_owned_bundle_host_topology_requires_egress");
+});
+
+test("accepted OCI topology close revokes the loan, retains the claimed allocation and joins private staging", async () => {
+  const f = await fixture(false, {
+    hostTopology: syntheticTopology(),
+    egressLimits: { maxConnections: 9, packetLimitBytes: 65536 },
+    viaHostCreator: true,
+  });
+  let allocation: string | undefined, closing: Promise<void> | undefined;
+  f.onLoan(async (_execution, signal, bundle) => {
+    allocation = bundle.allocationRoot;
+    expect((await lstat(join(allocation, LINUX_OCI_HOST_TOPOLOGY_FILE))).isFile()).toBe(true);
+    closing = f.composition.close();
+    void closing.catch(() => undefined);
+    expect(signal.aborted).toBe(true);
+    await expect(bundle.guard()).rejects.toThrow();
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    await closing;
+    if (allocation === undefined) throw new Error("original topology loan was not reached");
+    expect(f.failures).toHaveLength(1);
+    expect((await lstat(allocation)).isDirectory()).toBe(true);
+    expect((await readdir(allocation)).sort()).toEqual([
+      ".tako-oci-artifact.json",
+      LINUX_OCI_EGRESS_POLICY_FILE,
+      LINUX_OCI_HOST_TOPOLOGY_FILE,
+      "rootfs",
+    ]);
+    expect(
+      (await readdir(f.artifactRoot)).filter((name) => name.startsWith(".oci-stage-")),
+    ).toEqual([]);
+    expect(await f.sql.query("SELECT state,native_id FROM tf_v2_container_create_claims")).toEqual([
+      { state: "pending", native_id: null },
+    ]);
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+  } finally {
+    await f.close();
+  }
+});
+
+test("accepted OCI topology rejects zero-network uplink selections before original ownership", () => {
+  for (const [ipv4Address, ipv4Gateway] of [
+    ["0.1.2.3/24", "0.1.2.1"],
+    ["0.2.0.1/16", "0.2.0.2"],
+  ])
+    expect(() =>
+      snapshotLinuxOciHostTopology({ ...syntheticTopology(), ipv4Address, ipv4Gateway }),
+    ).toThrow("linux_oci_host_topology_invalid");
 });
