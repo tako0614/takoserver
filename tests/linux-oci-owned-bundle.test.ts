@@ -50,7 +50,10 @@ async function fixture(
       | "foreign-id"
       | "closed-before-ack"
       | "mutated-execution"
-      | "closed-during-spawn";
+      | "closed-during-spawn"
+      | "start"
+      | "start-foreign-id"
+      | "start-mutated";
     readonly noPhysicalBinary?: boolean;
     readonly configuredKey?: "sql" | "selection" | "owner";
   } = {},
@@ -218,6 +221,7 @@ async function fixture(
         void nativeClosing.catch(() => undefined);
       }
       let created = false;
+      let nativeId: string | undefined;
       const child = new EventEmitter();
       const stdout = new PassThrough(),
         stderr = new PassThrough();
@@ -258,10 +262,40 @@ async function fixture(
                 if (!accepted) throw new Error("original execution absent");
                 accepted.principal = "synthetic-foreign";
               }
+              nativeId = request.claimId;
               reply({
                 kind: "linux-oci-created-stopped@1",
                 nativeId:
                   adversarial.nativeMode === "foreign-id" ? "f".repeat(64) : request.claimId,
+                namespaceDevice: 4,
+                namespaceInode: 55,
+                barrier: "unproven",
+              });
+            } else if (
+              request.kind === "linux-oci-observe-stopped@1" ||
+              request.kind === "linux-oci-start@1" ||
+              request.kind === "linux-oci-observe-started@1"
+            ) {
+              if (!nativeId) throw new Error("raw original stopped identity absent");
+              if (
+                request.kind === "linux-oci-start@1" &&
+                adversarial.nativeMode === "start-mutated"
+              ) {
+                if (!accepted) throw new Error("original execution absent");
+                accepted.principal = "synthetic-foreign";
+              }
+              reply({
+                kind:
+                  request.kind === "linux-oci-observe-stopped@1"
+                    ? "linux-oci-stopped-observation@1"
+                    : request.kind === "linux-oci-start@1"
+                      ? "linux-oci-started@1"
+                      : "linux-oci-started-observation@1",
+                nativeId:
+                  request.kind === "linux-oci-start@1" &&
+                  adversarial.nativeMode === "start-foreign-id"
+                    ? "f".repeat(64)
+                    : nativeId,
                 namespaceDevice: 4,
                 namespaceInode: 55,
                 barrier: "unproven",
@@ -342,12 +376,20 @@ async function fixture(
   let beforeLoan: ((execution: V2Execution) => Promise<void>) | undefined;
   const failures: unknown[] = [];
   const stopped: unknown[] = [];
+  const started: unknown[] = [];
+  let beforeStart: ((execution: V2Execution) => Promise<void>) | undefined;
+  let afterStart: ((execution: V2Execution) => Promise<void>) | undefined;
   const dispatch = async (execution: V2Execution): Promise<V2BackendResult> => {
     accepted = execution;
     try {
       await beforeLoan?.(execution);
       if (adversarial.nativeMode !== undefined) {
         stopped.push(await composition.createAcceptedStopped(execution));
+        if (adversarial.nativeMode.startsWith("start")) {
+          await beforeStart?.(execution);
+          started.push(await composition.startAccepted(execution));
+          await afterStart?.(execution);
+        }
         return { kind: "continue" };
       }
       await composition.withAcceptedBundle(execution, async (bundle) => {
@@ -436,6 +478,13 @@ async function fixture(
     failures,
     artifactRoot,
     stopped,
+    started,
+    beforeStart(callback: typeof beforeStart) {
+      beforeStart = callback;
+    },
+    afterStart(callback: typeof afterStart) {
+      afterStart = callback;
+    },
     nativeCounts: () => ({ processes: nativeProcesses, requests: [...nativeRequests] }),
     nativeExits: () => nativeExits,
     nativeClosing: () => nativeClosing,
@@ -867,5 +916,132 @@ test("close joins a helper registered during raw spawn reentry before returning 
     expect(result?.effect).not.toBe("complete");
   } finally {
     await f.close();
+  }
+});
+
+test("accepted OCI START uses the original bound child, current scope and SQL attempt without replay or publication", async () => {
+  const f = await fixture(false, { nativeMode: "start" });
+  f.beforeStart(async (execution) => {
+    const before = f.nativeCounts();
+    for (const changed of [
+      { principal: "synthetic-foreign" },
+      { backendId: "synthetic-foreign" },
+      { targetKey: "synthetic-foreign" },
+    ])
+      await expect(f.composition.startAccepted({ ...execution, ...changed })).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(before);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_container_start_attempts")).toEqual([
+      { n: 0 },
+    ]);
+  });
+  f.afterStart(async (execution) => {
+    const before = f.nativeCounts();
+    await expect(f.composition.startAccepted(execution)).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(before);
+  });
+  try {
+    await f.create();
+    const result = await f.engine.runNext();
+    expect(f.failures).toEqual([]);
+    expect(f.started).toHaveLength(1);
+    const rows = await f.sql.query(
+      "SELECT q.claim_id,q.native_id,q.state,s.attempt,s.state AS start_state FROM tf_v2_container_create_claims q JOIN tf_v2_container_start_attempts s USING(resource_uid,generation)",
+    );
+    expect(rows).toHaveLength(1);
+    const row = rows[0];
+    if (!row) throw new Error("original bound claim absent");
+    expect(row.native_id).toBe(row.claim_id);
+    expect(row).toMatchObject({ state: "bound", attempt: 1, start_state: "pending" });
+    expect(f.started[0]).toEqual({
+      kind: "linux-oci-started-observation@1",
+      nativeId: row.native_id,
+      namespaceDevice: 4,
+      namespaceInode: 55,
+      barrier: "unproven",
+    });
+    expect(f.nativeCounts()).toEqual({
+      processes: 1,
+      requests: [
+        "linux-oci-create-stopped@1",
+        "linux-oci-observe-stopped@1",
+        "linux-oci-start@1",
+        "linux-oci-observe-started@1",
+      ],
+    });
+    expect(f.counts()).toEqual({ reads: 2, unpacks: 1, uses: 0 });
+    expect(await f.sql.query("SELECT serving_generation FROM tf_v2_container_instances")).toEqual([
+      { serving_generation: null },
+    ]);
+    expect(result?.effect).not.toBe("complete");
+    const execution = f.execution;
+    if (!execution) throw new Error("original execution absent");
+    const before = f.nativeCounts();
+    await expect(f.composition.startAccepted(execution)).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(before);
+  } finally {
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+for (const nativeMode of ["start-foreign-id", "start-mutated"] as const) {
+  test(`accepted OCI START ${nativeMode} retains its original one-use UNKNOWN without replay`, async () => {
+    const f = await fixture(false, { nativeMode });
+    try {
+      await f.create();
+      const result = await f.engine.runNext();
+      expect(f.failures).toHaveLength(1);
+      expect(f.started).toEqual([]);
+      expect(await f.sql.query("SELECT state FROM tf_v2_container_create_claims")).toEqual([
+        { state: "bound" },
+      ]);
+      expect(
+        await f.sql.query(
+          "SELECT attempt,state,confirmed_running_at_ms FROM tf_v2_container_start_attempts",
+        ),
+      ).toEqual([{ attempt: 1, state: "pending", confirmed_running_at_ms: null }]);
+      expect(f.nativeCounts()).toEqual({
+        processes: 1,
+        requests: [
+          "linux-oci-create-stopped@1",
+          "linux-oci-observe-stopped@1",
+          "linux-oci-start@1",
+        ],
+      });
+      expect(await f.sql.query("SELECT serving_generation FROM tf_v2_container_instances")).toEqual(
+        [{ serving_generation: null }],
+      );
+      expect(result?.effect).not.toBe("complete");
+      const execution = f.execution;
+      if (!execution) throw new Error("original execution absent");
+      const before = f.nativeCounts();
+      await expect(f.composition.startAccepted(execution)).rejects.toThrow();
+      expect(f.nativeCounts()).toEqual(before);
+    } finally {
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+test("accepted OCI START after close refuses before consuming the original SQL attempt or sending START", async () => {
+  const f = await fixture(false, { nativeMode: "start" });
+  let closing: Promise<void> | undefined;
+  f.beforeStart(async () => {
+    closing = f.composition.close();
+    void closing.catch(() => undefined);
+  });
+  try {
+    await f.create();
+    const result = await f.engine.runNext();
+    expect(f.failures).toHaveLength(1);
+    expect(f.started).toEqual([]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_container_start_attempts")).toEqual([
+      { n: 0 },
+    ]);
+    expect(f.nativeCounts().requests.filter((x) => x === "linux-oci-start@1")).toEqual([]);
+    expect(result?.effect).not.toBe("complete");
+    if (!closing) throw new Error("original close absent");
+    await expect(closing).rejects.toThrow("custody_retained");
+  } finally {
+    await expect(f.close()).rejects.toThrow("custody_retained");
   }
 });

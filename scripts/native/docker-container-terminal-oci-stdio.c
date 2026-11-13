@@ -13,7 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Dedicated persistent original owner. No START/DELETE, mode flag, caller
+/* Dedicated persistent original owner. No DELETE, mode flag, caller
  * namespace or detached guardian. Only private root-owned stdio is accepted.
  * A born unknown/closed owner stays in this SAME process with its exact FDs. */
 static volatile sig_atomic_t interrupted;
@@ -135,6 +135,23 @@ static int ocip_observed(const char *kind, struct tns_oci_owner *owner) {
   return ocip_reply(bytes) < 0 ? -2 : 0; /* Lost reply is never followed by a retry frame. */
 }
 
+static int ocip_started(const char *kind, struct tns_oci_owner *owner, int begin) {
+  struct tns_oci_started observation;
+  int result = begin ? tns_oci_start(owner, &observation) :
+                       tns_oci_observe_started(owner, &observation);
+  if (result < 0) return -1;
+  if (!observation.namespace_device || !observation.namespace_inode ||
+      observation.namespace_device > UINT64_C(9007199254740991) ||
+      observation.namespace_inode > UINT64_C(9007199254740991)) { errno = EOVERFLOW; return -1; }
+  char bytes[384];
+  int n = snprintf(bytes, sizeof(bytes),
+    "{\"kind\":\"%s\",\"nativeId\":\"%s\",\"namespaceDevice\":%" PRIu64
+    ",\"namespaceInode\":%" PRIu64 ",\"barrier\":\"unproven\"}",
+    kind, observation.native_id, observation.namespace_device, observation.namespace_inode);
+  if (n < 0 || (size_t)n >= sizeof(bytes)) { errno = EOVERFLOW; return -1; }
+  return ocip_reply(bytes) < 0 ? -2 : 0;
+}
+
 static _Noreturn void ocip_retain(struct tns_oci_owner **owner) {
   /* Protocol is gone; retain this original process, no fork/detach/rebind.
    * SIGCHLD can finish outstanding owned joins. Signals only request another
@@ -208,6 +225,14 @@ int main(int argc, char **argv) {
     } else if (!result && !interrupted && request->kind == TNS_OCIP_OBSERVE && owner && !sealed) {
       stage = "observe";
       result = ocip_observed("linux-oci-stopped-observation@1", owner);
+      if (result < 0) failure = errno ? errno : EPROTO;
+    } else if (!result && !interrupted && request->kind == TNS_OCIP_START && owner && !sealed) {
+      stage = "start";
+      result = ocip_started("linux-oci-started@1", owner, 1);
+      if (result < 0) failure = errno ? errno : EPROTO;
+    } else if (!result && !interrupted && request->kind == TNS_OCIP_OBSERVE_STARTED && owner && !sealed) {
+      stage = "observe-started";
+      result = ocip_started("linux-oci-started-observation@1", owner, 0);
       if (result < 0) failure = errno ? errno : EPROTO;
     } else if (!result && request->kind == TNS_OCIP_CANCEL) {
       sealed = 1; int cleanup_error = ocip_cleanup(&owner);

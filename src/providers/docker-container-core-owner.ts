@@ -100,6 +100,13 @@ export interface DockerContainerCoreOwner {
     requiredSecretNames: readonly string[],
   ): ReturnType<typeof createDockerContainerCreateCustody>;
   readAcceptedExecution(original: V2Execution): Promise<DockerContainerAcceptedExecution>;
+  /** Consume the ORIGINAL one-use START ledger for an already bound accepted
+   * record under this owner's live reconcile authority. This records only the
+   * attempt; it grants no admission, physical result, running or serving state.
+   */
+  claimAcceptedStart(
+    record: DockerContainerCreateRecord,
+  ): Promise<"claimed" | "already-claimed" | "unknown">;
   withExecution<T>(execution: V2Execution, work: () => Promise<T>): Promise<T>;
 }
 export interface DockerContainerAcceptedExecution {
@@ -1232,7 +1239,15 @@ export function createDockerContainerCoreOwner(
     if (!(await current(lease))) return fail();
     return { ...loaded, lease };
   }
-  async function startState(loaded: Awaited<ReturnType<typeof boundNative>>) {
+  type BoundStart = Pick<Awaited<ReturnType<typeof boundNative>>, "intent" | "proof" | "record">;
+  async function boundStartRecord(input: DockerContainerCreateRecord): Promise<BoundStart> {
+    if (input.state !== "bound" || !hex(input.nativeId)) return fail();
+    const loaded = await load(input.intent);
+    const saved = sameRecord(input, record(loaded.intent, loaded.proof));
+    if (saved.state !== "bound" || saved.nativeId !== input.nativeId) return fail();
+    return { ...loaded, record: saved };
+  }
+  async function startState(loaded: BoundStart) {
     const rows = await sql.query(
       "SELECT resource_uid,generation,attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
       [loaded.intent.resourceUid, loaded.intent.policy.generation],
@@ -1246,7 +1261,7 @@ export function createDockerContainerCoreOwner(
       row.generation !== loaded.intent.policy.generation ||
       row.attempt !== 1 ||
       row.create_claim_id !== loaded.record.claimId ||
-      row.native_id !== loaded.native.nativeId ||
+      row.native_id !== loaded.record.nativeId ||
       typeof claimedAt !== "number" ||
       !Number.isSafeInteger(claimedAt) ||
       claimedAt < 0
@@ -1276,22 +1291,62 @@ export function createDockerContainerCoreOwner(
       return "claimed" as const;
     return "unknown" as const;
   }
-  async function samePendingAnchor(
-    loaded: Awaited<ReturnType<typeof boundNative>>,
-    claimedAt: number,
-  ) {
+  async function samePendingAnchor(loaded: BoundStart, claimedAt: number) {
     const rows = await sql.query(
       "SELECT attempt FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=? AND attempt=1 AND create_claim_id=? AND native_id=? AND state='pending' AND claimed_at_ms=? AND confirmed_running_at_ms IS NULL AND confirmed_exited_at_ms IS NULL",
       [
         loaded.intent.resourceUid,
         loaded.intent.policy.generation,
         loaded.record.claimId,
-        loaded.native.nativeId,
+        loaded.record.nativeId,
         claimedAt,
       ],
     );
     return rows.length === 1 && rows[0]?.attempt === 1;
   }
+  async function claimBoundStart(
+    loaded: BoundStart,
+    lease: Lease,
+  ): Promise<"claimed" | "already-claimed" | "unknown"> {
+    if (
+      !usable(loaded.proof, "reconcile") ||
+      loaded.proof.i_desired_generation !== loaded.intent.policy.generation
+    )
+      return fail();
+    const previous = await startState(loaded);
+    if (previous !== "unclaimed") return previous === "claimed" ? "already-claimed" : "unknown";
+    const guard = fence(loaded.proof);
+    const claimedAt = now();
+    if (!(await current(lease))) return fail();
+    const write = await sql.run(
+      "INSERT INTO tf_v2_container_start_attempts(resource_uid,generation,attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms) SELECT ?,?,1,?,?,'pending',?,NULL,NULL WHERE " +
+        guard.sql +
+        " AND NOT EXISTS (SELECT 1 FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?)",
+      [
+        loaded.intent.resourceUid,
+        loaded.intent.policy.generation,
+        loaded.record.claimId,
+        loaded.record.nativeId,
+        claimedAt,
+        ...guard.params,
+        loaded.intent.resourceUid,
+        loaded.intent.policy.generation,
+      ],
+    );
+    if (write.changes !== 0 && write.changes !== 1) return fail();
+    if (!(await current(lease))) return fail();
+    const after = await boundStartRecord(loaded.record);
+    if (
+      write.changes !== 1 ||
+      !(await samePendingAnchor(after, claimedAt)) ||
+      !(await current(lease))
+    )
+      return "unknown";
+    // Pending is the durable, consumed pipeline anchor. This result authorizes
+    // only this successful insertion's one pipeline; recovery never repeats it.
+    return "claimed";
+  }
+
   async function memberRecords(
     input: DockerContainerCreateRecord,
     native: DockerContainerNativeIdentity,
@@ -1490,43 +1545,7 @@ export function createDockerContainerCoreOwner(
     async claimStart(native, policy) {
       const loaded = await boundNative(native, policy);
       const lease = await activeRecord(loaded.record, "reconcile");
-      if (
-        !usable(loaded.proof, "reconcile") ||
-        loaded.proof.i_desired_generation !== loaded.intent.policy.generation
-      )
-        return fail();
-      const previous = await startState(loaded);
-      if (previous !== "unclaimed") return previous === "claimed" ? "already-claimed" : "unknown";
-      const guard = fence(loaded.proof);
-      const claimedAt = now();
-      if (!(await current(lease))) return fail();
-      const write = await sql.run(
-        "INSERT INTO tf_v2_container_start_attempts(resource_uid,generation,attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms) SELECT ?,?,1,?,?,'pending',?,NULL,NULL WHERE " +
-          guard.sql +
-          " AND NOT EXISTS (SELECT 1 FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?)",
-        [
-          loaded.intent.resourceUid,
-          loaded.intent.policy.generation,
-          loaded.record.claimId,
-          loaded.native.nativeId,
-          claimedAt,
-          ...guard.params,
-          loaded.intent.resourceUid,
-          loaded.intent.policy.generation,
-        ],
-      );
-      if (write.changes !== 0 && write.changes !== 1) return fail();
-      if (!(await current(lease))) return fail();
-      const after = await boundNative(loaded.native, loaded.intent.policy);
-      if (
-        write.changes !== 1 ||
-        !(await samePendingAnchor(after, claimedAt)) ||
-        !(await current(lease))
-      )
-        return "unknown";
-      // Pending is the durable, consumed pipeline anchor. This result authorizes
-      // only this successful insertion's one pipeline; recovery never repeats it.
-      return "claimed";
+      return claimBoundStart(loaded, lease);
     },
     async assertNetworkAllocation(input, native, policy, phase) {
       await allocation(input, native, policy, phase);
@@ -2000,6 +2019,46 @@ export function createDockerContainerCoreOwner(
     },
   });
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
+    async claimAcceptedStart(input: DockerContainerCreateRecord) {
+      // Snapshot data before the first await. Accessors or a later caller edit
+      // cannot switch the record between the original lease and Sql checks.
+      if (
+        !own(input, ["claimId", "intent", "nativeId", "state"]) ||
+        !hex(input.claimId) ||
+        !hex(input.nativeId) ||
+        input.state !== "bound"
+      )
+        return fail();
+      const captured = Object.freeze({
+        claimId: input.claimId,
+        intent: intentSnapshot(input.intent),
+        nativeId: input.nativeId,
+        state: "bound" as const,
+      });
+      // A bound DTO is insufficient: the SAME original owner must currently hold
+      // this accepted claim's reconcile lease and its current Sql snapshot.
+      const lease = await activeRecord(captured, "reconcile");
+      const loaded = await boundStartRecord(captured);
+      const selected = [...executions].filter(
+        (scope) =>
+          scope.operationId === loaded.proof.a_operation_id &&
+          scope.resourceUid === loaded.intent.resourceUid &&
+          scope.generation === loaded.intent.policy.generation,
+      );
+      if (selected.length !== 1) return fail();
+      const scope = selected[0];
+      if (!scope) return fail();
+      // This API is for the accepted execution path. A durable record/fresh
+      // authority lease alone cannot consume START outside its real execution.
+      await assertExecution(scope.execution);
+      const result = await claimBoundStart(loaded, lease);
+      await assertExecution(scope.execution);
+      // The final Sql await can outlive the original authority callback.
+      // Recheck local ownership synchronously; no further await opens a gap.
+      if (!lease.active || lease.controller.signal.aborted || !leases.has(lease)) return fail();
+      executionScope(scope.execution);
+      return result;
+    },
     async readAcceptedExecution(execution: V2Execution): Promise<DockerContainerAcceptedExecution> {
       await assertExecution(execution);
       const deleting = execution.action === "delete";

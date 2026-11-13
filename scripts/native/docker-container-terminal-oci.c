@@ -24,7 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Actual producer library; no START/delete/admission/retirement operation.
+/* Actual CREATE/START producer library; no admission/delete/retirement grant.
  * The persistent original helper must retain this private owner after return,
  * including UNKNOWN. Native execution and runtime provenance are unqualified.
  * Caller must serialize this owner and exclusively reap its command child. */
@@ -36,6 +36,10 @@ struct tns_oci_owner {
   int kill_attempted;
   int invalid;
   int config_created;
+  unsigned int start_attempt;
+  int start_joined, start_ok, start_kill_attempted;
+  int start_pidfd, stopped_exe;
+  pid_t start_pid, controller_pid;
   int root, rootfs, receipt, runtime, bundle, state, network, command_pidfd;
   int init_pidfd, init_proc;
   pid_t command_pid;
@@ -43,6 +47,7 @@ struct tns_oci_owner {
   struct tns_identity identity;
   struct stat runtime_identity;
   struct stat rootfs_identity;
+  struct stat config_identity;
   char id[65];
   char rootpath[96], netpath[96], bundlepath[96], statepath[96], pidpath[128];
   char receipt_bytes[8192];
@@ -217,7 +222,10 @@ static int oci_init_executable(struct tns_oci_owner *o, int fd) {
   return 0;
 }
 
-static _Noreturn void oci_command_child(struct tns_oci_owner *o, pid_t creator) {
+enum oci_command_kind { OCI_COMMAND_CREATE, OCI_COMMAND_START };
+
+static _Noreturn void oci_command_child(struct tns_oci_owner *o, pid_t creator,
+                                         enum oci_command_kind kind) {
   if (oci_not_canceled() < 0) _exit(125);
   int executable = fcntl(o->runtime, F_DUPFD_CLOEXEC, 4);
   if (executable < 0 || dup3(executable, 3, O_CLOEXEC) < 0 ||
@@ -230,8 +238,13 @@ static _Noreturn void oci_command_child(struct tns_oci_owner *o, pid_t creator) 
       dup2(null, 1) != 1 || dup2(null, 2) != 2 ||
       fcntl(0, F_SETFD, 0) < 0 || prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 ||
       getppid() != creator) _exit(125);
-  char *const args[] = {"runc", "--root", o->statepath, "create", "--bundle",
-                       o->bundlepath, "--pid-file", o->pidpath, o->id, NULL};
+  char *const create_args[] = {"runc", "--root", o->statepath, "create", "--bundle",
+                              o->bundlepath, "--pid-file", o->pidpath, o->id, NULL};
+  char *const start_args[] = {"runc", "--root", o->statepath, "start", o->id, NULL};
+  char *const *args;
+  if (kind == OCI_COMMAND_CREATE) args = create_args;
+  else if (kind == OCI_COMMAND_START) args = start_args;
+  else _exit(125);
   char *const environment[] = {"PATH=/usr/sbin:/usr/bin:/sbin:/bin", NULL};
   umask(077);
   syscall(SYS_execveat, 3, "", args, environment, AT_EMPTY_PATH);
@@ -283,8 +296,137 @@ static int oci_pin_init(struct tns_oci_owner *o) {
   return oci_poll_alive(o->init_pidfd);
 }
 
+static int oci_join_start_command(struct tns_oci_owner *o, int milliseconds) {
+  if (!o->start_pid || o->start_joined) return 0;
+  struct pollfd p = {.fd = o->start_pidfd, .events = POLLIN};
+  int n = poll(&p, 1, milliseconds);
+  if (n < 0) return -1;
+  if (!n) { errno = ETIMEDOUT; return -1; }
+  if (p.revents != POLLIN) { errno = EPROTO; return -1; }
+  siginfo_t info; memset(&info, 0, sizeof(info));
+  if (waitid(P_PIDFD, (id_t)o->start_pidfd, &info, WEXITED | WNOHANG) < 0)
+    return -1;
+  if (info.si_pid != o->start_pid ||
+      (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED &&
+       info.si_code != CLD_DUMPED)) { errno = EPROTO; return -1; }
+  o->start_joined = 1;
+  o->start_ok = info.si_code == CLD_EXITED && info.si_status == 0;
+  return 0;
+}
+
+static int oci_stop_start_command(struct tns_oci_owner *o) {
+  if (o->controller_pid != getpid()) { errno = EPERM; return -1; }
+  if (o->start_pid && !o->start_joined && !o->start_kill_attempted) {
+    o->start_kill_attempted = 1;
+    if (syscall(SYS_pidfd_send_signal, o->start_pidfd, SIGKILL, NULL, 0) < 0 &&
+        errno != ESRCH) return -1;
+  }
+  return oci_join_start_command(o, 1000);
+}
+
+static int oci_start_inputs(struct tns_oci_owner *o) {
+  if (o->controller_pid != getpid() || geteuid() != 0) { errno = EPERM; return -1; }
+  if (oci_not_canceled() < 0 || oci_inputs(o) < 0 || !o->config_created ||
+      oci_owned(o->bundle, 1, 0700) < 0 || oci_owned(o->state, 1, 0700) < 0)
+    return -1;
+  struct stat held, named;
+  if (fstat(o->bundle, &held) < 0 ||
+      fstatat(o->root, "bundle", &named, AT_SYMLINK_NOFOLLOW) < 0 ||
+      !oci_same(&held, &named) || fstat(o->state, &held) < 0 ||
+      fstatat(o->root, "runtime-state", &named, AT_SYMLINK_NOFOLLOW) < 0 ||
+      !oci_same(&held, &named)) { errno = ESTALE; return -1; }
+  int fd = openat(o->bundle, "config.json", O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return -1;
+  int ok = oci_owned(fd, 0, 0600) == 0 && fstat(fd, &held) == 0 &&
+           held.st_nlink == 1 && oci_same(&held, &o->config_identity) &&
+           held.st_size == o->config_identity.st_size &&
+           held.st_mtim.tv_sec == o->config_identity.st_mtim.tv_sec &&
+           held.st_mtim.tv_nsec == o->config_identity.st_mtim.tv_nsec &&
+           held.st_ctim.tv_sec == o->config_identity.st_ctim.tv_sec &&
+           held.st_ctim.tv_nsec == o->config_identity.st_ctim.tv_nsec;
+  close(fd);
+  if (!ok) { errno = ESTALE; return -1; }
+  return oci_not_canceled();
+}
+
+static int oci_init_namespace_current(struct tns_oci_owner *o) {
+  if (oci_poll_alive(o->init_pidfd) < 0) return -1;
+  int fd = openat(o->init_proc, "ns/net", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  struct stat st; struct statfs fs;
+  int ok = fstat(fd, &st) == 0 && fstatfs(fd, &fs) == 0 &&
+           (unsigned long)fs.f_type == (unsigned long)NSFS_MAGIC &&
+           ioctl(fd, NS_GET_NSTYPE) == CLONE_NEWNET &&
+           (uint64_t)st.st_dev == o->identity.device &&
+           (uint64_t)st.st_ino == o->identity.inode;
+  close(fd);
+  if (!ok) { errno = ESTALE; return -1; }
+  return oci_poll_alive(o->init_pidfd);
+}
+
+int tns_oci_observe_started(struct tns_oci_owner *o, struct tns_oci_started *started) {
+  if (!o || !started || o->invalid || !o->start_attempt || !o->start_joined ||
+      !o->start_ok || o->stopped_exe < 0) { errno = EINVAL; return -1; }
+  struct tns_identity birth;
+  if (oci_start_inputs(o) < 0 || tns_owner_observe(o->birth, &birth) < 0 ||
+      !tns_identity_equal(&birth, &o->identity) || oci_init_namespace_current(o) < 0)
+    goto fail;
+  int fd = openat(o->init_proc, "exe", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) goto fail;
+  struct stat original, actual;
+  int ok = fstat(o->stopped_exe, &original) == 0 && fstat(fd, &actual) == 0 &&
+           S_ISREG(actual.st_mode) && !oci_same(&original, &actual);
+  close(fd);
+  /* runc's FIFO ACK can precede execve. Same executable is UNKNOWN, never
+   * evidence that the image process has executed. No delay/replay repairs it. */
+  if (!ok) { errno = ESTALE; goto fail; }
+  if (oci_init_namespace_current(o) < 0 || tns_owner_observe(o->birth, &birth) < 0 ||
+      !tns_identity_equal(&birth, &o->identity) || oci_start_inputs(o) < 0)
+    goto fail;
+  memcpy(started->native_id, o->id, sizeof(started->native_id));
+  started->namespace_device = o->identity.device;
+  started->namespace_inode = o->identity.inode;
+  return 0;
+fail:
+  o->invalid = 1;
+  return -1;
+}
+
+int tns_oci_start(struct tns_oci_owner *o, struct tns_oci_started *started) {
+  if (!o || !started) { errno = EINVAL; return -1; }
+  if (o->start_attempt) { errno = EALREADY; return -1; }
+  if (o->invalid) { errno = EINVAL; return -1; }
+  struct tns_oci_created stopped;
+  if (oci_start_inputs(o) < 0 || tns_oci_observe(o, &stopped) < 0 ||
+      o->stopped_exe < 0 || oci_not_canceled() < 0) goto fail;
+  if (tns_oci_once(&o->start_attempt) < 0) { errno = EALREADY; goto fail; }
+  int64_t now = oci_now(); if (now < 0) goto fail;
+  struct clone_args args; memset(&args, 0, sizeof(args));
+  args.flags = CLONE_PIDFD | CLONE_CLEAR_SIGHAND;
+  args.pidfd = (uint64_t)(uintptr_t)&o->start_pidfd;
+  args.exit_signal = SIGCHLD;
+  long child = syscall(SYS_clone3, &args, sizeof(args));
+  if (!child) oci_command_child(o, o->controller_pid, OCI_COMMAND_START);
+  if (child < 0) goto fail;
+  o->start_pid = (pid_t)child;
+  if (oci_not_canceled() < 0) goto fail;
+  int64_t elapsed = oci_now();
+  if (elapsed < now || elapsed - now >= 10000) { errno = ETIMEDOUT; goto fail; }
+  if (oci_join_start_command(o, 10000 - (int)(elapsed - now)) < 0) goto fail;
+  if (!o->start_ok) { errno = EPROTO; goto fail; }
+  return tns_oci_observe_started(o, started);
+fail: {
+  int saved = errno ? errno : EPROTO;
+  o->invalid = 1;
+  if (oci_stop_start_command(o) < 0) return -1;
+  errno = saved;
+  return -1;
+  }
+}
+
 int tns_oci_observe(struct tns_oci_owner *o, struct tns_oci_created *created) {
-  if (!o || !created || o->invalid || !o->command_joined || !o->command_ok) {
+  if (!o || !created || o->invalid || o->start_attempt ||
+      !o->command_joined || !o->command_ok) {
     errno = EINVAL; return -1;
   }
   if (oci_not_canceled() < 0 || oci_inputs(o) < 0 || oci_poll_alive(o->init_pidfd) < 0) goto fail;
@@ -304,6 +446,14 @@ int tns_oci_observe(struct tns_oci_owner *o, struct tns_oci_created *created) {
   fd = openat(o->init_proc, "exe", O_RDONLY | O_CLOEXEC);
   if (fd < 0) goto fail;
   ok = oci_init_executable(o, fd) == 0;
+  struct stat held, current;
+  if (ok && o->stopped_exe >= 0)
+    ok = fstat(o->stopped_exe, &held) == 0 && fstat(fd, &current) == 0 &&
+         oci_same(&held, &current);
+  if (ok && o->stopped_exe < 0) {
+    o->stopped_exe = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+    ok = o->stopped_exe >= 0;
+  }
   close(fd);
   if (!ok || oci_poll_alive(o->init_pidfd) < 0) { errno = ESTALE; goto fail; }
   memcpy(created->native_id, o->id, sizeof(created->native_id));
@@ -322,6 +472,8 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   if (!o) return -1;
   o->root = o->rootfs = o->receipt = o->runtime = o->bundle = o->state = -1;
   o->network = o->command_pidfd = o->init_pidfd = o->init_proc = -1;
+  o->start_pidfd = o->stopped_exe = -1;
+  o->controller_pid = getpid();
   *slot = o;
   if (tns_oci_once(&o->attempt) < 0 || tns_oci_data(options) < 0 ||
       tns_oci_metadata(options) < 0 || geteuid() != 0) { errno = EINVAL; goto fail; }
@@ -372,7 +524,8 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
     fd = openat(o->bundle, "config.json", O_WRONLY | O_CREAT | O_EXCL |
                                 O_NOFOLLOW | O_CLOEXEC, 0600);
   int written = fd >= 0 && oci_owned(fd, 0, 0600) == 0 &&
-                write(fd, config, json.used) == (ssize_t)json.used && fsync(fd) == 0;
+                write(fd, config, json.used) == (ssize_t)json.used && fsync(fd) == 0 &&
+                fstat(fd, &o->config_identity) == 0;
   if (fd >= 0) o->config_created = 1;
   int e = errno;
   explicit_bzero(config, TNS_OCI_MAX_JSON); free(config);
@@ -388,7 +541,7 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   args.exit_signal = SIGCHLD;
   pid_t creator = getpid();
   long child = syscall(SYS_clone3, &args, sizeof(args));
-  if (!child) oci_command_child(o, creator);
+  if (!child) oci_command_child(o, creator, OCI_COMMAND_CREATE);
   if (child < 0) goto fail;
   o->command_pid = (pid_t)child;
   if (oci_not_canceled() < 0) goto fail;
@@ -418,6 +571,7 @@ int tns_oci_cancel(struct tns_oci_owner *o) {
         errno != ESRCH) return -1;
   }
   if (oci_join_command(o, 1000) < 0) return -1;
+  if (oci_stop_start_command(o) < 0) return -1;
   /* The init may exist even after an unknown CREATE. Keep namespace/runtime
    * state and original secret config private; this API cannot retire it. */
   return 0;
@@ -439,7 +593,8 @@ int tns_oci_release_uncreated(struct tns_oci_owner **slot) {
   if (o->birth && tns_owner_close(&o->birth) < 0) return -1;
   if (o->config_created && unlinkat(o->bundle, "config.json", 0) < 0) return -1;
   int *fds[] = {&o->root, &o->rootfs, &o->receipt, &o->runtime, &o->bundle,
-                &o->state, &o->network, &o->command_pidfd, &o->init_pidfd, &o->init_proc};
+                &o->state, &o->network, &o->command_pidfd, &o->init_pidfd, &o->init_proc,
+                &o->start_pidfd, &o->stopped_exe};
   for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); ++i) {
     if (*fds[i] >= 0) { close(*fds[i]); *fds[i] = -1; }
   }

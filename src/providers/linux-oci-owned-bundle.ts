@@ -7,6 +7,7 @@ import type { V2Execution } from "../takoform-v2/types.ts";
 import { createDockerContainerConfiguredInputs } from "./docker-container-configured-inputs.ts";
 import {
   createDockerContainerCoreOwner,
+  type DockerContainerAcceptedExecution,
   type DockerContainerCoreOwnerOptions,
 } from "./docker-container-core-owner.ts";
 import type {
@@ -22,6 +23,7 @@ import {
 import {
   createLinuxOciPhysicalSession,
   type LinuxOciPhysicalSession,
+  type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
 } from "./linux-oci-physical-session.ts";
 
@@ -315,6 +317,23 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     cleanupFailed = false;
   let closing: Promise<void> | undefined;
   let originalSettlement: Promise<void> | undefined;
+  async function acceptedPolicy(accepted: DockerContainerAcceptedExecution) {
+    return {
+      tenantRef: accepted.principal,
+      generation: accepted.generation,
+      outboundInternet: accepted.outboundInternet,
+      policyDigest: await canonicalDigest({
+        installationId: accepted.installationId,
+        backendId: accepted.backendId,
+        targetKey: accepted.targetKey,
+        umociBinary,
+        memoryBytes,
+        nanoCpus,
+        pidsLimit,
+        ...(physicalBinary === undefined ? {} : { physicalBinary }),
+      }),
+    };
+  }
   const artifact = Object.freeze({
     acceptance: core.acceptance,
     configuredInputs: Object.freeze({
@@ -344,21 +363,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             incarnation: accepted.incarnationId,
             revision: accepted.revision,
           });
-          const policy = {
-            tenantRef: accepted.principal,
-            generation: accepted.generation,
-            outboundInternet: accepted.outboundInternet,
-            policyDigest: await canonicalDigest({
-              installationId: accepted.installationId,
-              backendId: accepted.backendId,
-              targetKey: accepted.targetKey,
-              umociBinary,
-              memoryBytes,
-              nanoCpus,
-              pidsLimit,
-              ...(physicalBinary === undefined ? {} : { physicalBinary }),
-            }),
-          };
+          const policy = await acceptedPolicy(accepted);
           const intent: DockerContainerCreateIntent = {
             installationId: accepted.installationId,
             resourceUid: accepted.resourceUid,
@@ -668,6 +673,109 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         await bundle.guard();
         return observation;
       });
+    },
+    /** Start only this constructor's actual bound private OCI child. The
+     * factual result grants no admission, serving publication or completion. */
+    startAccepted(execution: V2Execution): Promise<LinuxOciStartedObservation> {
+      if (closed) return Promise.reject(new Error("linux_oci_owned_bundle_closed"));
+      if (physicalBinary === undefined)
+        return Promise.reject(new Error("linux_oci_owned_bundle_physical_not_configured"));
+      const cancel = new AbortController();
+      cancellation.add(cancel);
+      const timer = setTimeout(() => cancel.abort(), timeout);
+      const running = Promise.resolve().then(() =>
+        core.withExecution(execution, async () => {
+          const accepted = await core.readAcceptedExecution(execution);
+          if (accepted.action === "delete") return fail("not_create");
+          const current = accepted.retained.find(
+            ({ record }) => record.intent.policy.generation === accepted.generation,
+          );
+          if (
+            !current ||
+            current.record.state !== "bound" ||
+            current.record.nativeId === null ||
+            current.removedAtMs !== null
+          )
+            return fail("retained_native_unknown");
+          const { record } = current;
+          const nativeId = nativeBindings.get(record.claimId);
+          const session = nativeSessions.get(record.claimId);
+          if (
+            !session ||
+            nativeId === undefined ||
+            nativeId !== record.nativeId ||
+            record.intent.installationId !== accepted.installationId ||
+            record.intent.resourceUid !== accepted.resourceUid ||
+            record.intent.incarnationId !== accepted.incarnationId ||
+            record.intent.revision !== accepted.revision ||
+            canonicalJson(record.intent.policy) !== canonicalJson(await acceptedPolicy(accepted)) ||
+            canonicalJson(record.intent.requiredSecretNames) !==
+              canonicalJson(accepted.requiredSecretNames)
+          )
+            return fail("retained_native_unknown");
+          return core.owner.withAuthority(record, "reconcile", async (held) =>
+            held.withEnvironment(async (_values, signal) => {
+              const loan = new AbortController();
+              const abort = () => loan.abort();
+              signal.addEventListener("abort", abort, { once: true });
+              cancel.signal.addEventListener("abort", abort, { once: true });
+              if (signal.aborted || cancel.signal.aborted) abort();
+              const guard = async () => {
+                if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                  return fail("revoked");
+                const fresh = await core.readAcceptedExecution(execution);
+                const retained = fresh.retained.find(
+                  ({ record: saved }) => saved.claimId === record.claimId,
+                );
+                if (
+                  closed ||
+                  loan.signal.aborted ||
+                  fresh.generation !== accepted.generation ||
+                  fresh.incarnationId !== accepted.incarnationId ||
+                  fresh.revision !== accepted.revision ||
+                  !retained ||
+                  retained.removedAtMs !== null ||
+                  canonicalJson(retained.record) !== canonicalJson(record) ||
+                  nativeSessions.get(record.claimId) !== session ||
+                  nativeBindings.get(record.claimId) !== nativeId
+                )
+                  return fail("revoked");
+              };
+              try {
+                await guard();
+                const stopped = await session.observeStopped(loan.signal);
+                if (stopped.nativeId !== nativeId) return fail("retained_native_unknown");
+                await guard();
+                const claim = await core.claimAcceptedStart(record);
+                if (claim !== "claimed") return fail("retained_start_unknown");
+                await guard();
+                const started = await session.startStopped(loan.signal);
+                if (started.nativeId !== nativeId) return fail("retained_native_unknown");
+                await guard();
+                const fresh = await session.observeStarted(loan.signal);
+                if (fresh.nativeId !== nativeId) return fail("retained_native_unknown");
+                await guard();
+                return fresh;
+              } finally {
+                loan.abort();
+                signal.removeEventListener("abort", abort);
+                cancel.signal.removeEventListener("abort", abort);
+              }
+            }),
+          );
+        }),
+      );
+      // Register before the original first Sql await. Original close cancels and
+      // joins this exact scope before collecting and closing private sessions.
+      scopes.add(running);
+      void running
+        .finally(() => {
+          clearTimeout(timer);
+          cancellation.delete(cancel);
+          scopes.delete(running);
+        })
+        .catch(() => undefined);
+      return running;
     },
     close(): Promise<void> {
       const joined = artifact.close();

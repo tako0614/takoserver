@@ -37,12 +37,24 @@ struct tns_oci_created {
   uint64_t namespace_device;
   uint64_t namespace_inode;
 };
+struct tns_oci_started {
+  char native_id[65];
+  uint64_t namespace_device;
+  uint64_t namespace_inode;
+};
 
 /* One-use, including unknown failure. Rootfs/runtime verification precedes the
- * internally owned fresh namespace and exact runc CREATE. No START exists. */
+ * internally owned fresh namespace and exact runc CREATE. */
 int tns_oci_create(const struct tns_oci_options *options,
                     struct tns_oci_owner **slot);
 int tns_oci_observe(struct tns_oci_owner *owner, struct tns_oci_created *created);
+/* Same original owner only, one attempt before spawn. Success is an observed
+ * executable transition of the same live init plus fresh original namespace;
+ * it grants no network admission, serving, terminal or deletion authority.
+ * Unknown/lost ACK consumes the attempt and retains the original owner. */
+int tns_oci_start(struct tns_oci_owner *owner, struct tns_oci_started *started);
+int tns_oci_observe_started(struct tns_oci_owner *owner,
+                              struct tns_oci_started *started);
 /* Cancels/joins the private runtime command. Once runc CREATE was attempted,
  * original custody remains held: this is not a container-delete operation. */
 int tns_oci_cancel(struct tns_oci_owner *owner);

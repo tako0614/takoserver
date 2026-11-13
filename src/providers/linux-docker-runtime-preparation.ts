@@ -141,6 +141,18 @@ export class LinuxDockerRuntimePreparation {
   #drainCancellation = new Set<AbortController>();
   #drainCleanupFailed = false;
   #closed = false;
+  /** Configuration identity only: no acceptance, custody or readiness grant. */
+  static hasCapturedEmptyDns(value: unknown): value is LinuxDockerRuntimePreparation {
+    return (
+      typeof value === "object" &&
+      value !== null &&
+      #options in value &&
+      value.#options !== undefined &&
+      Object.isFrozen(value) &&
+      value.#options.policy.outboundInternet === false &&
+      value.#options.dnsServers.length === 0
+    );
+  }
   constructor(options: LinuxDockerRuntimePreparationOptions) {
     if (
       !options ||

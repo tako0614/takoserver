@@ -72,6 +72,8 @@ export interface DockerHttpRevisionOptions {
   readonly imageAcquisition?: DockerImageAcquisition;
   /** Host-owned ordered numeric resolver override, required for Internet-capable
    * preparation. This pins Engine configuration, not destination permission.
+   * A Linux outbound-false preparation may bind its own explicit empty list;
+   * that list stays an exact Engine/readback pin, rather than an omitted default.
    */
   readonly dnsServers?: readonly string[];
 }
@@ -98,7 +100,12 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     preparation instanceof LinuxDockerRuntimePreparation ? preparation : null;
   const custody = preparation?.createCustody;
   const imageAcquisition = options.imageAcquisition;
-  const dnsServers = dnsSnapshot(options.dnsServers);
+  const dnsServers =
+    LinuxDockerRuntimePreparation.hasCapturedEmptyDns(linuxPreparation) &&
+    Array.isArray(options.dnsServers) &&
+    options.dnsServers.length === 0
+      ? Object.freeze([])
+      : dnsSnapshot(options.dnsServers);
   if (
     !options.socketPath.startsWith("/") ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(options.installationId) ||
