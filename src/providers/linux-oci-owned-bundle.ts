@@ -2,10 +2,12 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse } from "node:path";
-import { canonicalDigest, canonicalJson, isJsonObject } from "../json.ts";
-import type { V2Execution } from "../takoform-v2/types.ts";
+import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "../container-contract.ts";
+import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
+import type { V2BackendResult, V2Execution, V2Form } from "../takoform-v2/types.ts";
 import {
   createDockerContainerConfiguredInputs,
+  validateDockerContainerPrivateInputs,
   validateDockerContainerSpec,
 } from "./docker-container-configured-inputs.ts";
 import {
@@ -478,8 +480,8 @@ async function layoutFromArchive(
 
 /** Prepare a real verified artifact under ORIGINAL accepted/claim/secret custody.
  * No caller rootfs, owner port, native identity, ready/coverage flag or verification
- * callback can replace this producer. This is not a V2 backend or public support;
- * the next native consumer must use these borrowed bytes in this held callback. */
+ * callback can replace this producer. Its internal Form uses this same creator;
+ * public support and ordinary Node entry activation remain separate choices. */
 export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const selectedEgressLimits = options.egressLimits;
   const egressLimits =
@@ -1157,7 +1159,148 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       return closing;
     },
   });
-  return Object.freeze({
+  // The normal backend closes over this ORIGINAL creator. Its execution input
+  // selects no owner, native session, health callback or publication receipt.
+  async function dispatch(
+    execution: V2Execution,
+    mode: "execute" | "reconcile",
+  ): Promise<V2BackendResult> {
+    const unknown = (): V2BackendResult => ({ kind: "unknown" });
+    if (closed) return unknown();
+    const cancel = new AbortController();
+    cancellation.add(cancel);
+    const timer = setTimeout(() => cancel.abort(), timeout);
+    const local = () => {
+      if (closed || cancel.signal.aborted) return fail("revoked");
+    };
+    const running = Promise.resolve().then(async (): Promise<V2BackendResult> => {
+      local();
+      // Do not nest a second active execution around original creator methods.
+      // Each stage enters its own original scope and rereads actual acceptance.
+      const accepted = await core.withExecution(execution, () =>
+        core.readAcceptedExecution(execution),
+      );
+      local();
+      if (accepted.action === "delete") {
+        await creator.releaseRetainedNamespaces(execution, cancel.signal);
+        local();
+        // Namespace release is factual cleanup. Full lifetime retirement and
+        // the original removed CAS are not supplied by this backend yet.
+        return unknown();
+      }
+      const current = accepted.retained.find(
+        ({ record }) => record.intent.policy.generation === accepted.generation,
+      );
+      if (!current) {
+        // A reconcile lease cannot infer that an earlier send cannot arrive.
+        // Original CREATE and START run only on this first unsent dispatch.
+        if (mode !== "execute") return unknown();
+        await creator.createAcceptedStopped(execution);
+        local();
+        await creator.startAccepted(execution);
+        local();
+      } else if (
+        current.removedAtMs !== null ||
+        current.record.state !== "bound" ||
+        current.record.nativeId === null ||
+        !nativeSessions.has(current.record.claimId) ||
+        nativeBindings.get(current.record.claimId) !== current.record.nativeId
+      )
+        return unknown();
+      // Existing/pending claims never send CREATE or START. Only this private
+      // creator's actual running attempt can pass the original HTTP publisher.
+      await creator.publishAcceptedServing(execution, cancel.signal);
+      local();
+      const result = await core.withExecution(execution, async (): Promise<V2BackendResult> => {
+        const fresh = await core.readAcceptedExecution(execution);
+        const serving = fresh.retained.find(
+          ({ record }) => record.intent.policy.generation === fresh.generation,
+        );
+        if (
+          fresh.action === "delete" ||
+          fresh.servingConfirmedAtMs === null ||
+          !serving ||
+          serving.removedAtMs !== null ||
+          serving.record.state !== "bound" ||
+          serving.record.nativeId === null ||
+          serving.record.intent.incarnationId !== fresh.incarnationId ||
+          serving.record.intent.revision !== fresh.revision ||
+          !nativeSessions.has(serving.record.claimId) ||
+          nativeBindings.get(serving.record.claimId) !== serving.record.nativeId ||
+          typeof fresh.spec.image !== "string"
+        )
+          return unknown();
+        // readAcceptedExecution additionally requires the matching actual
+        // running START row whenever this generation is published as serving.
+        local();
+        const fields = CONTAINER_CONTRACT.fields;
+        return {
+          kind: "complete",
+          observed: {
+            [fields.ready]: true,
+            [fields.servingGeneration]: fresh.generation,
+            [fields.imageDigest]: fresh.spec.image.slice(fresh.spec.image.lastIndexOf("@") + 1),
+          },
+          output: {},
+        };
+      });
+      local();
+      return result;
+    });
+    scopes.add(running);
+    void running
+      .finally(() => {
+        clearTimeout(timer);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+      })
+      .catch(() => undefined);
+    try {
+      const result = await running;
+      local();
+      return result;
+    } catch {
+      return unknown();
+    }
+  }
+  const validate = (spec: JsonObject) => {
+    validateDockerContainerSpec(spec);
+  };
+  const retainedForm: V2Form = Object.freeze({
+    validateCreate: validate,
+    validateUpdate(_previous: JsonObject, spec: JsonObject) {
+      validate(spec);
+    },
+    privateInputs: Object.freeze({
+      validateCreate(spec: JsonObject, values: V2Execution["privateInputs"]) {
+        validateDockerContainerPrivateInputs(
+          validateDockerContainerSpec(spec).requiredSensitiveVars,
+          values,
+        );
+      },
+      validateUpdate(
+        _previous: JsonObject,
+        spec: JsonObject,
+        values: V2Execution["privateInputs"],
+      ) {
+        const names = validateDockerContainerSpec(spec).requiredSensitiveVars;
+        if (values !== undefined) validateDockerContainerPrivateInputs(names, values);
+      },
+      prepareCreate: configured.prepareCreate,
+      prepareUpdate: configured.prepareUpdate,
+    }),
+    rejectDeleteWhileReferenced: true,
+    backend: Object.freeze({
+      id: options.backendId,
+      targetKey: options.targetKey,
+      execute: (execution: V2Execution) => dispatch(execution, "execute"),
+      reconcile: (execution: V2Execution) => dispatch(execution, "reconcile"),
+    }),
+  });
+  const creator = Object.freeze({
+    /** Internal normal Form only; no registration or Node entry activation. */
+    formUrl: V2_CONTAINER_F2_FORM,
+    retainedForm,
     acceptance: artifact.acceptance,
     configuredInputs: artifact.configuredInputs,
     withAcceptedBundle: artifact.withAcceptedBundle,
@@ -1551,4 +1694,5 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       return nativeClosing;
     },
   });
+  return creator;
 }

@@ -42,6 +42,7 @@ import {
   LINUX_OCI_SERVICE_POLICY_FILE,
   serializeLinuxOciServicePolicy,
 } from "../src/providers/linux-oci-service-policy.ts";
+import { createSelfhostLinuxOciContainerBackend } from "../src/selfhost-linux-oci-container-backend.ts";
 import { createSelfhostLinuxOciCore } from "../src/selfhost-linux-oci-core.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
@@ -89,12 +90,14 @@ async function fixture(
       | "retire-pending";
     readonly noPhysicalBinary?: boolean;
     readonly nativeObservationFaultAt?: number;
+    readonly nativeObservationRefusalAt?: number;
     readonly changingSql?: boolean;
     readonly namespaceMode?: "success" | "retained" | "foreign" | "unknown";
     readonly egressLimits?: LinuxOciEgressLimits;
     readonly hostTopology?: LinuxOciHostTopology;
     readonly outboundInternet?: boolean;
     readonly viaHostCreator?: boolean;
+    readonly normalBackend?: boolean;
     readonly configuredKey?: "sql" | "selection" | "owner";
   } = {},
 ) {
@@ -192,6 +195,9 @@ async function fixture(
       },
     });
   const artifactDigests: string[] = [];
+  let normalTime = Date.now();
+  const normalClock = () => new Date(normalTime);
+  let recreateNormal: (() => ReturnType<typeof createSelfhostLinuxOciContainerBackend>) | undefined;
   const compose = (
     options: LinuxOciOwnedBundleOptions & {
       readonly configuredInputs: NonNullable<LinuxOciOwnedBundleOptions["configuredInputs"]>;
@@ -210,6 +216,11 @@ async function fixture(
         },
       });
     }
+    if (adversarial.normalBackend) {
+      const { sql, clock, ...selection } = options;
+      recreateNormal = () => createSelfhostLinuxOciContainerBackend({ sql, clock, selection });
+      return createSelfhostLinuxOciContainerBackend({ sql, clock, selection });
+    }
     if (!adversarial.viaHostCreator) return createLinuxOciOwnedBundle(options);
     const { sql, clock, ...selection } = options;
     const selected = createSelfhostLinuxOciCore({ sql, clock, selection });
@@ -220,7 +231,7 @@ async function fixture(
   try {
     composition = compose({
       sql,
-      clock: () => new Date(),
+      clock: adversarial.normalBackend ? normalClock : () => new Date(),
       installationId: "synthetic-oci-installation",
       backendId: "synthetic-oci-backend",
       targetKey: "synthetic-oci-target",
@@ -349,6 +360,20 @@ async function fixture(
             ) {
               if (!nativeId) throw new Error("raw original stopped identity absent");
               if (request.kind === "linux-oci-observe-started@1") nativeStartedObservations++;
+              if (
+                request.kind === "linux-oci-observe-started@1" &&
+                adversarial.nativeObservationRefusalAt === nativeStartedObservations
+              ) {
+                reply({
+                  kind: "linux-oci-refused@1",
+                  stage: "observe-started",
+                  errno: 5,
+                  custody: "retained",
+                  barrier: "unproven",
+                });
+                done();
+                return;
+              }
               if (
                 (request.kind === "linux-oci-start@1" &&
                   adversarial.nativeMode === "start-mutated") ||
@@ -635,6 +660,22 @@ async function fixture(
       return { kind: "unknown" };
     }
   };
+  const normalEngine = (backend: ReturnType<typeof createLinuxOciOwnedBundle>) =>
+    createTakoformV2Engine(
+      {
+        sql,
+        now: normalClock,
+        authorize: async () => true,
+        replayWindowSeconds: 3600,
+        privateInputCustody: {
+          transfer: { current: { id: "synthetic-oci-transfer", key } },
+          comparison: { current: { id: "synthetic-oci-comparison", key: comparison } },
+          transferTtlSeconds: 300,
+        },
+        forms: { [V2_CONTAINER_F2_FORM]: backend.retainedForm },
+      },
+      backend.acceptance,
+    );
   const engine = createTakoformV2Engine(
     {
       sql,
@@ -677,6 +718,9 @@ async function fixture(
           },
         },
       },
+      ...(adversarial.normalBackend
+        ? { now: normalClock, forms: { [V2_CONTAINER_F2_FORM]: composition.retainedForm } }
+        : {}),
     },
     composition.acceptance,
   );
@@ -686,6 +730,14 @@ async function fixture(
     engine,
     composition,
     configuredInputs,
+    advanceNormalClock(milliseconds: number) {
+      normalTime += milliseconds;
+    },
+    reconstructNormal() {
+      if (!recreateNormal) throw new Error("normal backend mode absent");
+      const original = recreateNormal();
+      return { engine: normalEngine(original), close: original.close };
+    },
     physicalBinary,
     recordedCreate(): LinuxOciCreateStoppedRequest {
       const data = originalCreate;
@@ -3264,3 +3316,254 @@ for (const action of ["cancel", "close"] as const) {
     }
   });
 }
+
+test("normal OCI backend completes genuine accepted CREATE only after original START HTTP publisher and fresh serving read", async () => {
+  const f = await fixture(false, { ...acceptedHttpSelection(), normalBackend: true }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    const resources = await f.sql.query("SELECT observed_json FROM tf_v2_resources");
+    const saved = resources[0]?.observed_json;
+    if (typeof saved !== "string") throw new Error("original observed row absent");
+    const fields = CONTAINER_CONTRACT.fields;
+    expect(JSON.parse(saved)).toEqual({
+      [fields.ready]: true,
+      [fields.servingGeneration]: 1,
+      [fields.imageDigest]: f.acceptedDigest,
+    });
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+    expect(f.nativeCounts().processes).toBe(1);
+    expect(
+      f.nativeCounts().requests.filter((kind) => kind === "linux-oci-create-stopped@1"),
+    ).toHaveLength(1);
+    expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(
+      1,
+    );
+    expect(raw.calls).toHaveLength(1);
+    expect(f.counts().unpacks).toBe(1);
+    expect(f.recordedCreate().env).toEqual([
+      "BASE=image",
+      "MODE=synthetic-public",
+      "SECRET=synthetic-loan",
+    ]);
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("normal OCI backend reconciles the original running child after retained refusal and rejects a fresh foreign creator without IO", async () => {
+  const f = await fixture(false, {
+      ...acceptedHttpSelection(),
+      normalBackend: true,
+      nativeObservationRefusalAt: 6,
+    }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let reconstructed: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    // This is the actual successful publisher CAS before its last native read
+    // refused. No accepted, START, serving or Operation row is hand-written.
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+    const before = f.nativeCounts();
+    reconstructed = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    expect(await reconstructed.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(f.nativeCounts()).toEqual(before);
+    expect(raw.calls).toHaveLength(1);
+    // A new genuine engine lease over the ORIGINAL private controller can
+    // observe and finish without another CREATE, START or publication epoch.
+    f.advanceNormalClock(61_000);
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    expect(f.nativeCounts().processes).toBe(1);
+    expect(
+      f.nativeCounts().requests.filter((kind) => kind === "linux-oci-create-stopped@1"),
+    ).toHaveLength(1);
+    expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(
+      1,
+    );
+    expect(raw.calls).toHaveLength(2);
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+  } finally {
+    await reconstructed?.close();
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+for (const nativeMode of ["foreign-id", "start-foreign-id"] as const) {
+  test(`normal OCI backend retains ${nativeMode} uncertainty without replaying CREATE or pending START on reconcile`, async () => {
+    const f = await fixture(false, { ...acceptedHttpSelection(), normalBackend: true, nativeMode }),
+      raw = acceptedRawHttp();
+    try {
+      const accepted = await f.create();
+      expect(await f.engine.runNext()).toMatchObject({
+        id: accepted.id,
+        status: "reconciling",
+        effect: "unknown",
+      });
+      const before = f.nativeCounts();
+      f.advanceNormalClock(61_000);
+      expect(await f.engine.runNext()).toMatchObject({
+        id: accepted.id,
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(f.nativeCounts()).toEqual(before);
+      expect(raw.calls).toEqual([]);
+      expect(
+        await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+      ).toEqual([{ serving_generation: null, runtime_epoch: 0 }]);
+      expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual(
+        nativeMode === "foreign-id" ? [] : [{ state: "pending" }],
+      );
+      expect(
+        f.nativeCounts().requests.filter((kind) => kind === "linux-oci-create-stopped@1"),
+      ).toHaveLength(1);
+      expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(
+        nativeMode === "foreign-id" ? 0 : 1,
+      );
+    } finally {
+      raw.restore();
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+test("normal OCI backend preserves genuine accepted DELETE cleanup as noncomplete without a terminal lifetime producer", async () => {
+  const f = await fixture(false, {
+      ...acceptedHttpSelection(),
+      normalBackend: true,
+      namespaceMode: "success",
+    }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+    const deletion = await f.engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "exited" },
+    ]);
+    expect(
+      await f.sql.query("SELECT state,removed_at_ms FROM tf_v2_container_create_claims"),
+    ).toEqual([{ state: "bound", removed_at_ms: null }]);
+    expect(
+      f.nativeCounts().requests.filter((kind) => kind === "linux-oci-stop-init@1"),
+    ).toHaveLength(1);
+    expect(
+      f.nativeCounts().requests.filter((kind) => kind === "linux-oci-join-init@1"),
+    ).toHaveLength(1);
+    expect(
+      f.nativeCounts().requests.filter((kind) => kind === "linux-oci-release-namespace@1"),
+    ).toHaveLength(1);
+    expect(raw.calls).toHaveLength(1);
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("normal OCI backend close during final original serving read refuses completion and retains the matched SQL publication", async () => {
+  const f = await fixture(false, { ...acceptedHttpSelection(), normalBackend: true }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  const originalQuery = f.sql.query.bind(f.sql);
+  let finalReads = 0;
+  let closing: Promise<void> | undefined;
+  const query = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+    const rows = await originalQuery(statement, params);
+    if (
+      startedObservations(f) === 6 &&
+      statement.startsWith("SELECT attempt,create_claim_id,native_id,state,") &&
+      ++finalReads === 3
+    ) {
+      // Original publisher's final verify and its final accepted guard precede
+      // this distinct normal backend serving read. Keep the real rows intact.
+      await Promise.resolve();
+      closing = f.composition.close();
+      void closing.catch(() => undefined);
+    }
+    return rows;
+  });
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(finalReads).toBe(3);
+    expect(closing).toBeDefined();
+    if (closing) await expect(closing).rejects.toThrow("custody_retained");
+    expect(
+      await originalQuery("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+    expect(await originalQuery("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+    expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(
+      1,
+    );
+    expect(raw.calls).toHaveLength(1);
+  } finally {
+    query.mockRestore();
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
