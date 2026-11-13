@@ -48,6 +48,9 @@ struct tns_oci_owner {
   pid_t start_pid, controller_pid, init_pid;
   int parent_pidns, init_pidns, init_custody, init_joined;
   unsigned int init_stop_attempt;
+  unsigned int namespace_release_attempt;
+  int namespace_release_dispatched;
+  int namespace_loan_close_unknown;
   struct stat parent_pidns_identity, init_pidns_identity;
   int root, rootfs, receipt, runtime, bundle, state, network, command_pidfd;
   int init_pidfd, init_proc;
@@ -774,4 +777,76 @@ int tns_oci_release_uncreated(struct tns_oci_owner **slot) {
   }
   explicit_bzero(o, sizeof(*o)); free(o); *slot = NULL;
   return 0;
+}
+
+/* Cleanup currentness deliberately ignores generic cancel/invalid latches;
+ * the genuine original consuming init wait and held objects remain mandatory. */
+static int oci_namespace_release_current(struct tns_oci_owner *o) {
+  if (!o->init_joined || !o->init_custody || !o->init_stop_attempt ||
+      !o->command_pid || !o->command_joined || !o->command_ok ||
+      (o->start_pid && !o->start_joined)) { errno = EINVAL; return -1; }
+  if (oci_held_inputs(o) < 0 || oci_init_held_current(o) < 0) return -1;
+  return 0;
+}
+
+int tns_oci_observe_namespace_lifetime(struct tns_oci_owner *o,
+                                        struct tns_oci_namespace_lifetime *lifetime) {
+  if (!o || !lifetime || !o->namespace_release_attempt) { errno = EINVAL; return -1; }
+  if (oci_namespace_release_current(o) < 0) return -1;
+  struct tns_lifetime observed;
+  if (tns_owner_observe_lifetime(o->birth, &observed) < 0 ||
+      !tns_identity_equal(&observed.identity, &o->identity)) {
+    if (!errno) errno = ESTALE;
+    return -1;
+  }
+  if (oci_namespace_release_current(o) < 0) return -1;
+  memcpy(lifetime->native_id, o->id, sizeof(lifetime->native_id));
+  lifetime->lifetime = observed;
+  return 0;
+}
+
+static int oci_namespace_release_progress(struct tns_oci_owner *o,
+                                             struct tns_oci_namespace_lifetime *lifetime) {
+  if (oci_namespace_release_current(o) < 0) return -1;
+  struct tns_lifetime before;
+  if (tns_owner_observe_lifetime(o->birth, &before) < 0 ||
+      !tns_identity_equal(&before.identity, &o->identity)) {
+    if (!errno) errno = ESTALE;
+    return -1;
+  }
+  if (o->network >= 0) {
+    struct stat st; struct statfs fs;
+    if (fstat(o->network, &st) < 0 || fstatfs(o->network, &fs) < 0 ||
+        (unsigned long)fs.f_type != (unsigned long)NSFS_MAGIC ||
+        ioctl(o->network, NS_GET_NSTYPE) != CLONE_NEWNET ||
+        (uint64_t)st.st_dev != o->identity.device || (uint64_t)st.st_ino != o->identity.inode) {
+      if (!errno) errno = ESTALE;
+      return -1;
+    }
+    int fd = o->network; o->network = -1; /* Attempted close, never a caller FD. */
+    if (close(fd) < 0) { o->namespace_loan_close_unknown = 1; return -1; }
+  }
+  struct tns_lifetime released;
+  int result;
+  if (!o->namespace_release_dispatched) {
+    o->namespace_release_dispatched = 1; /* Real dispatch, never a readback ACK. */
+    result = tns_owner_release_namespace(o->birth, &released);
+  } else result = tns_owner_continue_namespace_release(o->birth, &released);
+  if (result < 0) return -1;
+  if (o->namespace_loan_close_unknown) { errno = EUCLEAN; return -1; }
+  return tns_oci_observe_namespace_lifetime(o, lifetime);
+}
+
+int tns_oci_release_namespace(struct tns_oci_owner *o,
+                                struct tns_oci_namespace_lifetime *lifetime) {
+  if (!o || !lifetime) { errno = EINVAL; return -1; }
+  if (tns_oci_once(&o->namespace_release_attempt) < 0) { errno = EALREADY; return -1; }
+  o->invalid = 1;
+  return oci_namespace_release_progress(o, lifetime);
+}
+
+int tns_oci_continue_namespace_release(struct tns_oci_owner *o,
+                                         struct tns_oci_namespace_lifetime *lifetime) {
+  if (!o || !lifetime || !o->namespace_release_attempt) { errno = EINVAL; return -1; }
+  return oci_namespace_release_progress(o, lifetime);
 }

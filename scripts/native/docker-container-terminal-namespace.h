@@ -29,6 +29,29 @@ int tns_owner_stop_custodian(struct tns_owner *owner);
 /* Bounded join. Failure retains the handle for a subsequent close/join only. */
 int tns_owner_close(struct tns_owner **slot);
 
+/* Factual snapshot of this original retained kernel ledger only. Even
+ * net_gone plus zero counts is not complete flow coverage/terminal authority. */
+struct tns_lifetime {
+  struct tns_identity identity;
+  uint64_t net_cookie;
+  uint64_t full_ip_sockets, requests, timewait, packet_groups;
+  uint32_t born, release_attempted, reference_released, net_gone, poisoned;
+};
+/* Private OCI composition only, after its original init has actually been
+ * reaped. One attempt, original custodian joined before own NSFS/device-ref
+ * release. Failure retains the same owner/ledger FD; never replay RELEASE. */
+int tns_owner_release_namespace(struct tns_owner *owner,
+                                  struct tns_lifetime *lifetime);
+/* Continue only this previously started release's unperformed phases. Never
+ * resend a custodian signal, reclose an attempted FD or replay a sent ioctl.
+ * A previous close error stays unknown: later progress cannot clear it. */
+int tns_owner_continue_namespace_release(struct tns_owner *owner,
+                                           struct tns_lifetime *lifetime);
+/* Read the same original ledger, including after an unknown release return.
+ * Accepts no target/PID/nsFD and does not release, wait, grant or free. */
+int tns_owner_observe_lifetime(struct tns_owner *owner,
+                                 struct tns_lifetime *lifetime);
+
 /* Closed internal byte protocol, shared with portable decoder tests.
  * A decoded message is not authority: the constructor verifies its own held
  * pidfd, proc directory, NSFS descriptor, namespace type and actual identity. */

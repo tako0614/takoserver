@@ -1,6 +1,8 @@
 #ifndef DOCKER_CONTAINER_TERMINAL_OCI_H
 #define DOCKER_CONTAINER_TERMINAL_OCI_H
 
+#include "docker-container-terminal-namespace.h"
+
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -79,6 +81,25 @@ void tns_oci_note_cancel(void);
 int tns_oci_close_transport(struct tns_oci_owner *owner);
 /* Only a proved never-spawned runtime attempt can release this object. */
 int tns_oci_release_uncreated(struct tns_oci_owner **slot);
+
+struct tns_oci_namespace_lifetime {
+  char native_id[65];
+  struct tns_lifetime lifetime;
+};
+/* Actual init_joined custody is mandatory. Release only this original owner's
+ * loan/custodian/namespace reference; keep kernel ledger/runtime/config and
+ * opaque owner. No netGone/count/ACK grants network terminal or deletion. */
+int tns_oci_release_namespace(struct tns_oci_owner *owner,
+                                struct tns_oci_namespace_lifetime *lifetime);
+/* Only an existing release attempt may continue its recorded unperformed
+ * phases. A previous close UNKNOWN stays retained even after later progress;
+ * sent kernel RELEASE is never retried. No new owner or target is accepted. */
+int tns_oci_continue_namespace_release(struct tns_oci_owner *owner,
+                                         struct tns_oci_namespace_lifetime *lifetime);
+/* Read-only factual same-owner ledger after the release attempt, including
+ * unknown ACK. Never resend RELEASE or infer complete lifecycle/serving. */
+int tns_oci_observe_namespace_lifetime(struct tns_oci_owner *owner,
+                                        struct tns_oci_namespace_lifetime *lifetime);
 
 /* Pure closed data primitives; none is an owner or physical result. */
 #define TNS_OCI_MAX_JSON 1048576u

@@ -34,8 +34,15 @@ import {
   DockerContainerRuntimePreparation,
 } from "./docker-container-runtime-preparation.ts";
 import { LinuxDockerRuntimePreparation } from "./linux-docker-runtime-preparation.ts";
-import { observeOriginalLinuxOciOwnedRunning } from "./linux-oci-owned-bundle.ts";
-import type { LinuxOciStartedObservation } from "./linux-oci-physical-session.ts";
+import {
+  observeOriginalLinuxOciOwnedInitReaped,
+  observeOriginalLinuxOciOwnedRunning,
+  stopOriginalLinuxOciOwnedInit,
+} from "./linux-oci-owned-bundle.ts";
+import type {
+  LinuxOciInitReapedObservation,
+  LinuxOciStartedObservation,
+} from "./linux-oci-physical-session.ts";
 
 export interface DockerPhysicalCoreOwnerPort extends DockerContainerCreateOwnerPort {
   publishServing(
@@ -117,6 +124,14 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciStartedObservation>;
+  /** Stop/reap only an original retained init under the accepted UPDATE/DELETE
+   * and original remove lease; records exit, never network terminal/deletion. */
+  stopRetainedInit(
+    execution: V2Execution,
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciInitReapedObservation>;
   withExecution<T>(execution: V2Execution, work: () => Promise<T>): Promise<T>;
 }
 export interface DockerContainerAcceptedExecution {
@@ -1444,6 +1459,92 @@ export function createDockerContainerCoreOwner(
     return "confirmed";
   }
 
+  async function confirmBoundStopped(
+    loaded: BoundStart,
+    lease: Lease,
+  ): Promise<"unclaimed" | "confirmed"> {
+    const { intent, proof, record: saved } = loaded;
+    const nativeId = saved.nativeId;
+    if (!hex(nativeId)) return fail();
+    const attemptSql =
+      "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?";
+    const attemptParams = [intent.resourceUid, intent.policy.generation];
+    const attempts = await sql.query(attemptSql, attemptParams);
+    // Never started: there is no attempt to end, and confirmRemoved's own fence applies.
+    if (attempts.length === 0) return "unclaimed";
+    const attempt = attempts[0];
+    if (attempts.length !== 1 || !attempt) return fail();
+    const claimedAt = attempt.claimed_at_ms;
+    const runningAt = attempt.confirmed_running_at_ms;
+    if (
+      attempt.attempt !== 1 ||
+      attempt.create_claim_id !== saved.claimId ||
+      attempt.native_id !== nativeId ||
+      typeof claimedAt !== "number" ||
+      !Number.isSafeInteger(claimedAt) ||
+      claimedAt < 0
+    )
+      return fail();
+    if (attempt.state === "exited") {
+      // A previously recorded exit of this exact attempt: idempotent, no write.
+      const exitedAt = attempt.confirmed_exited_at_ms;
+      if (
+        typeof runningAt !== "number" ||
+        typeof exitedAt !== "number" ||
+        !Number.isSafeInteger(runningAt) ||
+        !Number.isSafeInteger(exitedAt) ||
+        runningAt < claimedAt ||
+        exitedAt < runningAt
+      )
+        return fail();
+      return "confirmed";
+    }
+    // A never-confirmed (pending) attempt has no schema-legal exit: it stays refused.
+    if (
+      attempt.state !== "running" ||
+      typeof runningAt !== "number" ||
+      !Number.isSafeInteger(runningAt) ||
+      runningAt < claimedAt ||
+      attempt.confirmed_exited_at_ms !== null
+    )
+      return fail();
+    const exitedAt = Math.max(runningAt, now());
+    const guard = fence(proof);
+    if (!lease.active || lease.controller.signal.aborted) return fail();
+    const write = await sql.run(
+      "UPDATE tf_v2_container_start_attempts SET state='exited',confirmed_exited_at_ms=? WHERE resource_uid=? AND generation=? AND attempt=1 AND create_claim_id=? AND native_id=? AND state='running' AND claimed_at_ms=? AND confirmed_running_at_ms=? AND confirmed_exited_at_ms IS NULL AND " +
+        guard.sql,
+      [
+        exitedAt,
+        intent.resourceUid,
+        intent.policy.generation,
+        saved.claimId,
+        nativeId,
+        claimedAt,
+        runningAt,
+        ...guard.params,
+      ],
+    );
+    if (write.changes !== 1) return fail();
+    const after = await load(intent);
+    const still = sameRecord(saved, record(after.intent, after.proof));
+    const rows = await sql.query(attemptSql, attemptParams);
+    const written = rows[0];
+    if (
+      still.nativeId !== nativeId ||
+      still.state !== "bound" ||
+      rows.length !== 1 ||
+      !written ||
+      written.state !== "exited" ||
+      written.native_id !== nativeId ||
+      written.confirmed_running_at_ms !== runningAt ||
+      written.confirmed_exited_at_ms !== exitedAt ||
+      !(await current(lease))
+    )
+      return fail();
+    return "confirmed";
+  }
+
   async function memberRecords(
     input: DockerContainerCreateRecord,
     native: DockerContainerNativeIdentity,
@@ -1934,82 +2035,7 @@ export function createDockerContainerCoreOwner(
         native.revisionLabel !== intent.revisionLabel
       )
         return fail();
-      const attemptSql =
-        "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?";
-      const attemptParams = [intent.resourceUid, intent.policy.generation];
-      const attempts = await sql.query(attemptSql, attemptParams);
-      // Never started: there is no attempt to end, and confirmRemoved's own fence applies.
-      if (attempts.length === 0) return;
-      const attempt = attempts[0];
-      if (attempts.length !== 1 || !attempt) return fail();
-      const claimedAt = attempt.claimed_at_ms;
-      const runningAt = attempt.confirmed_running_at_ms;
-      if (
-        attempt.attempt !== 1 ||
-        attempt.create_claim_id !== saved.claimId ||
-        attempt.native_id !== native.nativeId ||
-        typeof claimedAt !== "number" ||
-        !Number.isSafeInteger(claimedAt) ||
-        claimedAt < 0
-      )
-        return fail();
-      if (attempt.state === "exited") {
-        // A previously recorded exit of this exact attempt: idempotent, no write.
-        const exitedAt = attempt.confirmed_exited_at_ms;
-        if (
-          typeof runningAt !== "number" ||
-          typeof exitedAt !== "number" ||
-          !Number.isSafeInteger(runningAt) ||
-          !Number.isSafeInteger(exitedAt) ||
-          runningAt < claimedAt ||
-          exitedAt < runningAt
-        )
-          return fail();
-        return;
-      }
-      // A never-confirmed (pending) attempt has no schema-legal exit: it stays refused.
-      if (
-        attempt.state !== "running" ||
-        typeof runningAt !== "number" ||
-        !Number.isSafeInteger(runningAt) ||
-        runningAt < claimedAt ||
-        attempt.confirmed_exited_at_ms !== null
-      )
-        return fail();
-      const exitedAt = Math.max(runningAt, now());
-      const guard = fence(proof);
-      if (!lease.active || lease.controller.signal.aborted) return fail();
-      const write = await sql.run(
-        "UPDATE tf_v2_container_start_attempts SET state='exited',confirmed_exited_at_ms=? WHERE resource_uid=? AND generation=? AND attempt=1 AND create_claim_id=? AND native_id=? AND state='running' AND claimed_at_ms=? AND confirmed_running_at_ms=? AND confirmed_exited_at_ms IS NULL AND " +
-          guard.sql,
-        [
-          exitedAt,
-          intent.resourceUid,
-          intent.policy.generation,
-          saved.claimId,
-          native.nativeId,
-          claimedAt,
-          runningAt,
-          ...guard.params,
-        ],
-      );
-      if (write.changes !== 1) return fail();
-      const after = await load(intent);
-      const still = sameRecord(input, record(after.intent, after.proof));
-      const rows = await sql.query(attemptSql, attemptParams);
-      const written = rows[0];
-      if (
-        still.nativeId !== native.nativeId ||
-        still.state !== "bound" ||
-        rows.length !== 1 ||
-        !written ||
-        written.state !== "exited" ||
-        written.native_id !== native.nativeId ||
-        written.confirmed_running_at_ms !== runningAt ||
-        written.confirmed_exited_at_ms !== exitedAt ||
-        !(await current(lease))
-      )
-        return fail();
+      await confirmBoundStopped({ intent, proof, record: saved }, lease);
     },
     async confirmRemoved(input, nativeId) {
       if (!hex(nativeId)) return fail();
@@ -2129,6 +2155,69 @@ export function createDockerContainerCoreOwner(
       if (signal.aborted || !lease.active || lease.controller.signal.aborted || !leases.has(lease))
         return fail();
       executionScope(scope.execution);
+      return observation;
+    },
+    async stopRetainedInit(execution, input, originalCustody, signal) {
+      if (
+        !own(input, ["claimId", "intent", "nativeId", "state"]) ||
+        !hex(input.claimId) ||
+        !hex(input.nativeId) ||
+        input.state !== "bound" ||
+        signal.aborted
+      )
+        return fail();
+      const captured = Object.freeze({
+        claimId: input.claimId,
+        intent: intentSnapshot(input.intent),
+        nativeId: input.nativeId,
+        state: "bound" as const,
+      });
+      const accepted = await result.readAcceptedExecution(execution);
+      if (accepted.action !== "update" && accepted.action !== "delete") return fail();
+      const retained = accepted.retained.find(
+        ({ record: saved }) => saved.claimId === captured.claimId,
+      );
+      if (
+        !retained ||
+        retained.removedAtMs !== null ||
+        captured.intent.policy.generation >= accepted.generation ||
+        canonicalJson(retained.record) !== canonicalJson(captured)
+      )
+        return fail();
+      // A current desired/serving generation is not removable. Keep the exact
+      // original remove eligibility and accepted-state fence before any STOP.
+      const lease = await activeRecord(captured, "remove");
+      const loaded = await boundStartRecord(captured);
+      if (!usable(loaded.proof, "remove")) return fail();
+      const guard = async () => {
+        await assertExecution(execution);
+        if (
+          signal.aborted ||
+          !(await current(lease)) ||
+          !lease.active ||
+          lease.controller.signal.aborted ||
+          !leases.has(lease)
+        )
+          return fail();
+        executionScope(execution);
+      };
+      await guard();
+      await stopOriginalLinuxOciOwnedInit(originalCustody, result, captured, signal);
+      await guard();
+      // A STOP reply alone is not the observation recorded below. JOIN reads
+      // the SAME original consuming-reap fact, without another signal/effect.
+      const observation = await observeOriginalLinuxOciOwnedInitReaped(
+        originalCustody,
+        result,
+        captured,
+        signal,
+      );
+      await guard();
+      if ((await confirmBoundStopped(loaded, lease)) !== "confirmed") return fail();
+      await assertExecution(execution);
+      if (signal.aborted || !lease.active || lease.controller.signal.aborted || !leases.has(lease))
+        return fail();
+      executionScope(execution);
       return observation;
     },
     async readAcceptedExecution(execution: V2Execution): Promise<DockerContainerAcceptedExecution> {

@@ -395,3 +395,16 @@ int main(void) {
   printf("actual OCI PIDNS/init pin-stop-reap + closed parser raw model: %lu checks\n", checks);
   return 0;
 }
+
+/* New unexercised boundary in this unchanged cohort: never fabricate a result. */
+int tns_owner_release_namespace(struct tns_owner *owner, struct tns_lifetime *lifetime) {
+  (void)owner; (void)lifetime; abort();
+}
+int tns_owner_observe_lifetime(struct tns_owner *owner, struct tns_lifetime *lifetime) {
+  (void)owner; (void)lifetime; abort();
+}
+
+/* Unexercised continuation boundary in this cohort: never fabricate progress. */
+int tns_owner_continue_namespace_release(struct tns_owner *owner, struct tns_lifetime *lifetime) {
+  (void)owner; (void)lifetime; abort();
+}

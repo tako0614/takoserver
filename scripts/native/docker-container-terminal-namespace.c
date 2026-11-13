@@ -51,6 +51,10 @@ struct tns_owner {
   int status;
   int kill_attempted;
   int namespace_loaned;
+  int namespace_release_attempted;
+  int kernel_release_attempted;
+  int namespace_close_unknown;
+  uint32_t lifetime_seen;
   struct tns_identity creator;
   struct tns_identity identity;
 };
@@ -471,4 +475,118 @@ int tns_owner_close(struct tns_owner **slot) {
   free(owner);
   *slot = NULL;
   return 0;
+}
+
+int tns_owner_observe_lifetime(struct tns_owner *owner,
+                                 struct tns_lifetime *lifetime) {
+  if (!owner || !lifetime || !owner->kernel_attempted || !owner->kernel_cookie ||
+      (owner->phase != TNS_HELD && owner->phase != TNS_CLOSING)) {
+    errno = EINVAL; return -1;
+  }
+  if (tns_device_current(owner) < 0) return -1;
+  struct tako_terminal_lifetime_observation actual;
+  memset(&actual, 0, sizeof(actual));
+  int result = ioctl(owner->kernel_fd, TAKO_TERMINAL_LIFETIME, &actual);
+  if (result < 0) return -1; /* One read; no EINTR/unknown-read replay. */
+  if (result || actual.reserved || actual.born != 1 || actual.release_attempted > 1 ||
+      actual.reference_released > 1 || actual.net_gone > 1 || actual.poisoned > 1 ||
+      (actual.reference_released && !actual.release_attempted) ||
+      (actual.net_gone && !actual.release_attempted) ||
+      (actual.release_attempted && !owner->kernel_release_attempted) ||
+      (actual.net_gone && owner->netfd >= 0) ||
+      !tns_kernel_identity_matches(&owner->creator, &owner->identity,
+                                   actual.net_cookie, actual.namespace_inum,
+                                   owner->kernel_cookie)) { errno = EPROTO; return -1; }
+  uint32_t flags = actual.release_attempted | (actual.reference_released << 1) |
+                   (actual.net_gone << 2) | (actual.poisoned << 3);
+  if ((flags & owner->lifetime_seen) != owner->lifetime_seen ||
+      tns_device_current(owner) < 0) { errno = ESTALE; return -1; }
+  owner->lifetime_seen = flags;
+  struct tns_lifetime observed = {
+    .identity = owner->identity, .net_cookie = actual.net_cookie,
+    .full_ip_sockets = actual.full_ip_sockets, .requests = actual.requests,
+    .timewait = actual.timewait, .packet_groups = actual.packet_groups,
+    .born = actual.born, .release_attempted = actual.release_attempted,
+    .reference_released = actual.reference_released, .net_gone = actual.net_gone,
+    .poisoned = actual.poisoned
+  };
+  *lifetime = observed;
+  return 0;
+}
+
+/* The held NSFS may already have had a close attempted. In that phase use
+ * the SAME original creator-bound ledger/cookie, preserving original sealed,
+ * poisoned and full-sock consistency refusal; no observation creates a phase. */
+static int tns_release_ledger_current(struct tns_owner *owner) {
+  if (owner->netfd >= 0) return tns_kernel_observe(owner);
+  if (!owner->namespace_release_attempted || owner->phase != TNS_CLOSING ||
+      owner->child != 0 || owner->kernel_release_attempted || !owner->kernel_cookie) {
+    errno = EINVAL; return -1;
+  }
+  if (tns_device_current(owner) < 0) return -1;
+  struct tako_terminal_observation actual;
+  memset(&actual, 0, sizeof(actual));
+  int result = ioctl(owner->kernel_fd, TAKO_TERMINAL_OBSERVE, &actual);
+  if (result < 0) return -1;
+  if (result || !tns_kernel_identity_matches(&owner->creator, &owner->identity,
+                                             actual.net_cookie, actual.namespace_inum,
+                                             owner->kernel_cookie) ||
+      !tns_kernel_counts_consistent(actual.full_ip_sockets, actual.allocations,
+                                    actual.releases, actual.sealed, actual.poisoned) ||
+      tns_device_current(owner) < 0) { errno = ESTALE; return -1; }
+  return 0;
+}
+
+static int tns_namespace_release_progress(struct tns_owner *owner,
+                                            struct tns_lifetime *lifetime) {
+  if (owner->kernel_release_attempted) { errno = EALREADY; return -1; }
+  struct tns_lifetime before;
+  if (tns_release_ledger_current(owner) < 0 ||
+      tns_owner_observe_lifetime(owner, &before) < 0) return -1;
+  /* The unchanged join consumes no second signal after its original attempt;
+   * child becomes zero only after its actual matched consuming PIDFD wait. */
+  if (tns_owner_stop_custodian(owner) < 0 || owner->child != 0) return -1;
+  if (owner->netfd >= 0) {
+    struct tns_identity held;
+    if (tns_kernel_observe(owner) < 0 || tns_fd_identity(owner->netfd, &held) < 0 ||
+        !tns_identity_equal(&held, &owner->identity) || tns_device_current(owner) < 0) {
+      if (!errno) errno = ESTALE;
+      return -1;
+    }
+    int fd = owner->netfd;
+    owner->netfd = -1; /* Attempt fact, never proof of release on close error. */
+    if (close(fd) < 0) { owner->namespace_close_unknown = 1; return -1; }
+  }
+  if (tns_release_ledger_current(owner) < 0 ||
+      tns_owner_observe_lifetime(owner, &before) < 0) return -1;
+  owner->kernel_release_attempted = 1; /* Consume before the sole raw ioctl. */
+  int result = ioctl(owner->kernel_fd, TAKO_TERMINAL_RELEASE_NAMESPACE, 0UL);
+  if (result < 0) return -1; /* Sent UNKNOWN is never retransmitted. */
+  if (result) { errno = EPROTO; return -1; }
+  struct tns_lifetime observed;
+  if (tns_owner_observe_lifetime(owner, &observed) < 0) return -1;
+  if (owner->namespace_close_unknown) { errno = EUCLEAN; return -1; }
+  *lifetime = observed;
+  return 0;
+}
+
+int tns_owner_release_namespace(struct tns_owner *owner,
+                                  struct tns_lifetime *lifetime) {
+  if (!owner || !lifetime || !owner->namespace_loaned ||
+      (owner->phase != TNS_HELD && owner->phase != TNS_CLOSING)) {
+    errno = EINVAL; return -1;
+  }
+  if (owner->namespace_release_attempted) { errno = EALREADY; return -1; }
+  owner->namespace_release_attempted = 1;
+  if (tns_phase_close(&owner->phase) < 0) { errno = EPROTO; return -1; }
+  return tns_namespace_release_progress(owner, lifetime);
+}
+
+int tns_owner_continue_namespace_release(struct tns_owner *owner,
+                                           struct tns_lifetime *lifetime) {
+  if (!owner || !lifetime || !owner->namespace_release_attempted ||
+      !owner->namespace_loaned || owner->phase != TNS_CLOSING) {
+    errno = EINVAL; return -1;
+  }
+  return tns_namespace_release_progress(owner, lifetime);
 }

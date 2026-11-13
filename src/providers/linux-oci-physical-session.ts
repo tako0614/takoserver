@@ -52,6 +52,17 @@ export interface LinuxOciStartedObservation {
   readonly namespaceInode: number;
   readonly barrier: "unproven";
 }
+/** Actual consuming init-reap fact from the SAME original child/PIDNS.
+ * Task reaping never grants network lifetime completion or runtime deletion. */
+export interface LinuxOciInitReapedObservation {
+  readonly kind: "linux-oci-init-reaped@1" | "linux-oci-init-reaped-observation@1";
+  readonly nativeId: string;
+  readonly namespaceDevice: number;
+  readonly namespaceInode: number;
+  readonly pidNamespaceDevice: number;
+  readonly pidNamespaceInode: number;
+  readonly barrier: "unproven";
+}
 export interface LinuxOciCancelObservation {
   readonly kind: "linux-oci-cancel-observation@1";
   readonly stage: "cancel";
@@ -68,6 +79,8 @@ interface Refusal {
     | "observe"
     | "start"
     | "observe-started"
+    | "stop-init"
+    | "join-init"
     | "cancel";
   readonly errno: number;
   readonly custody: "released-uncreated" | "retained";
@@ -76,9 +89,17 @@ interface Refusal {
 type Reply =
   | LinuxOciStoppedObservation
   | LinuxOciStartedObservation
+  | LinuxOciInitReapedObservation
   | LinuxOciCancelObservation
   | Refusal;
-type Operation = "create" | "observe" | "start" | "observe-started" | "cancel";
+type Operation =
+  | "create"
+  | "observe"
+  | "start"
+  | "observe-started"
+  | "stop-init"
+  | "join-init"
+  | "cancel";
 interface Pending {
   readonly operation: Operation;
   readonly resolve: (reply: Reply) => void;
@@ -194,7 +215,13 @@ function project(request: LinuxOciCreateStoppedRequest) {
     if (equals < 1 || keys.has(key)) throw failure("request");
     keys.add(key);
   }
-  return { kind: "linux-oci-create-stopped@1", ...data, claimId: data.claimId, args, env };
+  return {
+    kind: "linux-oci-create-stopped@1",
+    ...data,
+    claimId: data.claimId,
+    args,
+    env,
+  };
 }
 
 function parseReply(body: Buffer): Reply {
@@ -223,6 +250,28 @@ function parseReply(body: Buffer): Reply {
       barrier: "unproven",
     };
   } else if (
+    value.kind === "linux-oci-init-reaped@1" ||
+    value.kind === "linux-oci-init-reaped-observation@1"
+  ) {
+    if (
+      typeof value.nativeId !== "string" ||
+      !CLAIM.test(value.nativeId) ||
+      !integer(value.namespaceDevice, 1) ||
+      !integer(value.namespaceInode, 1) ||
+      !integer(value.pidNamespaceDevice, 1) ||
+      !integer(value.pidNamespaceInode, 1)
+    )
+      throw failure();
+    reply = {
+      kind: value.kind,
+      nativeId: value.nativeId,
+      namespaceDevice: value.namespaceDevice,
+      namespaceInode: value.namespaceInode,
+      pidNamespaceDevice: value.pidNamespaceDevice,
+      pidNamespaceInode: value.pidNamespaceInode,
+      barrier: "unproven",
+    };
+  } else if (
     value.kind === "linux-oci-refused@1" ||
     value.kind === "linux-oci-cancel-observation@1"
   ) {
@@ -248,6 +297,8 @@ function parseReply(body: Buffer): Reply {
         value.stage !== "observe" &&
         value.stage !== "start" &&
         value.stage !== "observe-started" &&
+        value.stage !== "stop-init" &&
+        value.stage !== "join-init" &&
         value.stage !== "cancel"
       )
         throw failure();
@@ -315,6 +366,9 @@ export class LinuxOciPhysicalSession {
   #createSent = false;
   #startAttempted = false;
   #startSent = false;
+  #initStopAttempted = false;
+  #initStopSent = false;
+  #initIdentity: LinuxOciInitReapedObservation | undefined;
   #claim: string | undefined;
   #identity: LinuxOciStoppedObservation | undefined;
   #mustRetain = false;
@@ -326,7 +380,10 @@ export class LinuxOciPhysicalSession {
   #closePromise: Promise<void> | undefined;
   readonly #exitWaiters = new Set<() => void>();
 
-  constructor(options: { readonly binary: string; readonly timeoutMs?: number }) {
+  constructor(options: {
+    readonly binary: string;
+    readonly timeoutMs?: number;
+  }) {
     this.#timeout = options.timeoutMs ?? 20_000;
     if (!integer(this.#timeout, 1, 60_000)) throw failure();
     this.#assertBinary = ownedExecutable(options.binary);
@@ -374,7 +431,13 @@ export class LinuxOciPhysicalSession {
   }
 
   async observeStopped(signal: AbortSignal): Promise<LinuxOciStoppedObservation> {
-    if (!this.#identity || this.#startAttempted || this.#admissionClosed || signal.aborted)
+    if (
+      !this.#identity ||
+      this.#startAttempted ||
+      this.#initStopAttempted ||
+      this.#admissionClosed ||
+      signal.aborted
+    )
       throw failure();
     const reply = await this.#request("observe", { kind: "linux-oci-observe-stopped@1" }, signal);
     if (this.#admissionClosed || !this.#usable || reply.kind !== "linux-oci-stopped-observation@1")
@@ -384,7 +447,14 @@ export class LinuxOciPhysicalSession {
 
   async startStopped(signal: AbortSignal): Promise<LinuxOciStartedObservation> {
     if (this.#startAttempted) throw failure("one_use");
-    if (!this.#identity || this.#admissionClosed || this.#pending || !this.#usable) throw failure();
+    if (
+      !this.#identity ||
+      this.#initStopAttempted ||
+      this.#admissionClosed ||
+      this.#pending ||
+      !this.#usable
+    )
+      throw failure();
     this.#startAttempted = true;
     if (signal.aborted) throw failure();
     const reply = await this.#request("start", { kind: "linux-oci-start@1" }, signal);
@@ -394,7 +464,13 @@ export class LinuxOciPhysicalSession {
   }
 
   async observeStarted(signal: AbortSignal): Promise<LinuxOciStartedObservation> {
-    if (!this.#identity || !this.#startSent || this.#admissionClosed || signal.aborted)
+    if (
+      !this.#identity ||
+      !this.#startSent ||
+      this.#initStopAttempted ||
+      this.#admissionClosed ||
+      signal.aborted
+    )
       throw failure();
     const reply = await this.#request(
       "observe-started",
@@ -406,11 +482,49 @@ export class LinuxOciPhysicalSession {
     return reply;
   }
 
+  /** One original-init signal attempt. Only an exact-operation retained
+   * refusal permits same child JOIN; frame/request refusal, abort, timeout,
+   * and broken framing never resynchronize this stream.
+   * The existing default response budget is 20 seconds (explicit timeoutMs
+   * still overrides it). C JOIN polls for 10 seconds plus synchronous checks
+   * and a separate frame-write deadline; no end-to-end bound is inferred. */
+  async stopInit(signal: AbortSignal): Promise<LinuxOciInitReapedObservation> {
+    if (this.#initStopAttempted) throw failure("one_use");
+    if (!this.#identity || this.#admissionClosed || this.#pending || !this.#usable) throw failure();
+    this.#initStopAttempted = true;
+    if (signal.aborted) throw failure();
+    const reply = await this.#request("stop-init", { kind: "linux-oci-stop-init@1" }, signal);
+    if (
+      signal.aborted ||
+      this.#admissionClosed ||
+      !this.#usable ||
+      reply.kind !== "linux-oci-init-reaped@1"
+    )
+      throw failure();
+    return reply;
+  }
+
+  async joinInit(signal: AbortSignal): Promise<LinuxOciInitReapedObservation> {
+    if (!this.#identity || !this.#initStopSent || this.#admissionClosed || signal.aborted)
+      throw failure();
+    const reply = await this.#request("join-init", { kind: "linux-oci-join-init@1" }, signal);
+    if (
+      signal.aborted ||
+      this.#admissionClosed ||
+      !this.#usable ||
+      reply.kind !== "linux-oci-init-reaped-observation@1"
+    )
+      throw failure();
+    return reply;
+  }
+
   cancel(): Promise<LinuxOciCancelObservation> {
     this.#admissionClosed = true;
     this.#cancelPromise ??= (async () => {
       await this.#pending?.done;
-      const reply = await this.#request("cancel", { kind: "linux-oci-cancel@1" });
+      const reply = await this.#request("cancel", {
+        kind: "linux-oci-cancel@1",
+      });
       this.#child.stdin.end();
       if (reply.kind !== "linux-oci-cancel-observation@1") throw failure();
       return reply;
@@ -482,7 +596,13 @@ export class LinuxOciPhysicalSession {
       const reply = parseReply(this.#buffer.subarray(4));
       const operation = this.#pending.operation;
       if (reply.kind === "linux-oci-refused@1") {
-        if (reply.stage !== "frame" && reply.stage !== "request" && reply.stage !== operation)
+        if (operation === "stop-init" || operation === "join-init") {
+          if (reply.stage !== operation || reply.custody !== "retained") throw failure();
+        } else if (
+          reply.stage !== "frame" &&
+          reply.stage !== "request" &&
+          reply.stage !== operation
+        )
           throw failure();
       } else if (
         reply.kind !==
@@ -494,7 +614,11 @@ export class LinuxOciPhysicalSession {
               ? "linux-oci-started@1"
               : operation === "observe-started"
                 ? "linux-oci-started-observation@1"
-                : "linux-oci-cancel-observation@1")
+                : operation === "stop-init"
+                  ? "linux-oci-init-reaped@1"
+                  : operation === "join-init"
+                    ? "linux-oci-init-reaped-observation@1"
+                    : "linux-oci-cancel-observation@1")
       )
         throw failure();
       if ("nativeId" in reply) {
@@ -505,6 +629,16 @@ export class LinuxOciPhysicalSession {
               reply.namespaceInode !== this.#identity.namespaceInode))
         )
           throw failure();
+        if ("pidNamespaceDevice" in reply) {
+          if (
+            !this.#initStopSent ||
+            (this.#initIdentity &&
+              (reply.pidNamespaceDevice !== this.#initIdentity.pidNamespaceDevice ||
+                reply.pidNamespaceInode !== this.#initIdentity.pidNamespaceInode))
+          )
+            throw failure();
+          this.#initIdentity = reply;
+        }
         if (operation === "create") {
           // The operation-kind check above already refused every other kind.
           // Repeat that same closed fact so TypeScript narrows this union.
@@ -538,7 +672,16 @@ export class LinuxOciPhysicalSession {
       });
       const abort = () => this.#break();
       const timer = setTimeout(abort, this.#timeout);
-      this.#pending = { operation, resolve, reject, done, finish, abort, timer, signal };
+      this.#pending = {
+        operation,
+        resolve,
+        reject,
+        done,
+        finish,
+        abort,
+        timer,
+        signal,
+      };
       signal?.addEventListener("abort", abort, { once: true });
       if (signal?.aborted) {
         this.#settle(undefined);
@@ -548,6 +691,7 @@ export class LinuxOciPhysicalSession {
         this.#assertBinary();
         if (operation === "create") this.#createSent = true;
         if (operation === "start") this.#startSent = true;
+        if (operation === "stop-init") this.#initStopSent = true;
         this.#child.stdin.write(frame, (error) => {
           if (error) this.#break();
         });
