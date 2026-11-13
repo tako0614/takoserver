@@ -111,7 +111,8 @@ import {
   observeSelfhostBackgroundPasses,
   SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
 } from "./selfhost-health-signals.ts";
-import { createSelfhostLinuxDockerCore } from "./selfhost-linux-docker-core.ts";
+import type { SelfhostLinuxDockerCoreSelection } from "./selfhost-linux-docker-core.ts";
+import { createSelfhostLinuxDockerNodeComposition } from "./selfhost-linux-docker-node-composition.ts";
 import {
   formatSelfhostListenAddress,
   parseSelfhostListenHost,
@@ -717,9 +718,12 @@ const objects =
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
 // F2 requires an explicit operator-code selection on this exact Sql. The legacy
-// Docker environment selects only its existing zero-only bootstrap. No F2 Form
-// is advertised until accepted dispatch, retained retirement and raw usage are composed.
-const selfhostLinuxDockerCore = createSelfhostLinuxDockerCore({ sql, clock, selection: undefined });
+// Docker environment selects only its existing zero-only bootstrap. The candidate
+// remains retained-only, with no public support or realized activation here.
+const selfhostLinuxDockerSelection: SelfhostLinuxDockerCoreSelection | undefined = undefined;
+let selfhostLinuxDockerNode:
+  | ReturnType<typeof createSelfhostLinuxDockerNodeComposition>
+  | undefined;
 // Native startup and the application share these exact canonical ledgers.
 const resourceStores = createAppResourceStoreBundle(sql, clock);
 const edge = await buildEdgeForms();
@@ -1485,7 +1489,7 @@ async function closeBeforePublicIngress(): Promise<void> {
     workerdShutdown: () => workerd.shutdown(),
     mayCloseDependents: () => true,
     v2WorkerSuspend: async () => {
-      await selfhostLinuxDockerCore?.close();
+      await selfhostLinuxDockerNode?.close();
       await v2WorkerComposition.closeScheduledHost();
       await v2QueueScheduler?.close();
       await v2WorkerComposition.closeWorkflowHost();
@@ -1545,6 +1549,13 @@ try {
       ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
       : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
     : undefined;
+  selfhostLinuxDockerNode = createSelfhostLinuxDockerNodeComposition({
+    sql,
+    clock,
+    selection: selfhostLinuxDockerSelection,
+    formSelectionFactory: v2FormSelectionFactory,
+    privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
+  });
   app = buildApp({
     sql,
     resourceStores,
@@ -1559,17 +1570,11 @@ try {
         ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
         : unconfigured),
     v2: takoformV2Config,
-    ...(selfhostLinuxDockerCore
-      ? { v2ContainerHostAcceptance: selfhostLinuxDockerCore.acceptance }
-      : {}),
+    ...selfhostLinuxDockerNode.appPorts,
     ...(billingConfig ? { billingConfig } : {}),
     hostedPaidFreeExclusion: Boolean(hostedPricing),
     ...(hostedBilling ? { hostedBilling } : {}),
     v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
-    ...(v2FormSelectionFactory ? { v2FormSelectionFactory } : {}),
-    ...(v2FormSelectionFactory && runtimeInputKeyAuthority
-      ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
-      : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
     ...(payment.events ? { paymentEvents: payment.events } : {}),
     ...((hostedBilling || payment.events) && identityPublicKeyJwk
@@ -1728,7 +1733,7 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
         workerdShutdown: () => workerd.shutdown(),
         mayCloseDependents: () => shutdownClean,
         v2WorkerSuspend: async () => {
-          await selfhostLinuxDockerCore?.close();
+          await selfhostLinuxDockerNode?.close();
           await v2WorkerComposition.closeScheduledHost();
           await v2QueueScheduler?.close();
           await v2WorkerComposition.closeWorkflowHost();
