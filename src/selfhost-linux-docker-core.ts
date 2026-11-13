@@ -1,4 +1,4 @@
-import { canonicalDigest, canonicalJson } from "./json.ts";
+import { canonicalDigest, canonicalJson, isJsonObject } from "./json.ts";
 import type { Clock, Sql } from "./ports.ts";
 import {
   createDockerContainerConfiguredInputs,
@@ -49,11 +49,23 @@ export interface SelfhostLinuxDockerCore {
     execution: V2Execution,
     work: (revision: SelfhostLinuxDockerAcceptedRevision) => Promise<T>,
   ): Promise<T>;
+  /** Remove only original retained generations under their accepted UPDATE/DELETE. */
+  retireAccepted(execution: V2Execution, signal?: AbortSignal): Promise<void>;
   close(): Promise<void>;
 }
 
 export class SelfhostLinuxDockerCoreError extends Error {
-  constructor(readonly code: "invalid_selection" | "closed" | "retained_delete_not_composed") {
+  constructor(
+    readonly code:
+      | "invalid_selection"
+      | "closed"
+      | "retained_delete_not_composed"
+      | "retirement_not_accepted"
+      | "retirement_cancelled"
+      | "retained_scope_unavailable"
+      | "retained_policy_unavailable"
+      | "retained_native_identity_unknown",
+  ) {
     super(`selfhost_linux_docker_core_${code}`);
     this.name = "SelfhostLinuxDockerCoreError";
   }
@@ -78,7 +90,7 @@ function dataKeys(input: object, allowed: readonly string[]): void {
 
 /** Construct after the real Sql, before buildApp. This owns the original
  * acceptance, configured-input hooks and per-accepted-generation runtime graph.
- * It supplies no public Form, usage producer, retirement policy or complete result;
+ * It supplies no public Form, usage producer, traffic-drain decision or complete result;
  * those unfinished compositions cannot be replaced by a caller's ready DTO.
  * Construction and the disabled branch perform no native IO.
  */
@@ -203,6 +215,124 @@ export function createSelfhostLinuxDockerCore(input: {
             revisions.set(key, revision);
           }
           return work(Object.freeze({ accepted, ...revision }));
+        });
+      });
+      scopes.add(running);
+      void running.then(
+        () => {
+          scopes.delete(running);
+        },
+        () => {
+          scopes.delete(running);
+        },
+      );
+      return running;
+    },
+    async retireAccepted(execution: V2Execution, signal?: AbortSignal): Promise<void> {
+      assertOpen();
+      const assertRemovalOpen = () => {
+        assertOpen();
+        if (signal !== undefined && (!(signal instanceof AbortSignal) || signal.aborted))
+          throw new SelfhostLinuxDockerCoreError("retirement_cancelled");
+      };
+      assertRemovalOpen();
+      const running = Promise.resolve().then(() => {
+        assertRemovalOpen();
+        return core.owner.withExecution(execution, async () => {
+          const accepted = await core.owner.readAcceptedExecution(execution);
+          if (accepted.action !== "update" && accepted.action !== "delete")
+            throw new SelfhostLinuxDockerCoreError("retirement_not_accepted");
+          const policyDigest = await canonicalDigest({
+            installationId,
+            backendId,
+            targetKey,
+            runtimeOptions,
+            dockerOptions,
+          });
+          const retained = accepted.retained.filter(
+            ({ record }) => record.intent.policy.generation < accepted.generation,
+          );
+          // Validate every retained projection before any native IO. Current Host
+          // settings cannot reconstruct an older, differently configured owner.
+          const requests = retained.map(({ record, spec }) => {
+            const { intent } = record;
+            if (
+              intent.installationId !== installationId ||
+              intent.installationId !== accepted.installationId ||
+              intent.resourceUid !== accepted.resourceUid ||
+              intent.incarnationId !== accepted.incarnationId ||
+              intent.policy.tenantRef !== accepted.principal
+            )
+              throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+            if (intent.policy.policyDigest !== policyDigest)
+              throw new SelfhostLinuxDockerCoreError("retained_policy_unavailable");
+            if (record.state === "pending" || record.nativeId === null)
+              throw new SelfhostLinuxDockerCoreError("retained_native_identity_unknown");
+            const { image, httpPort, healthPath, environment = {} } = spec;
+            if (
+              typeof image !== "string" ||
+              typeof httpPort !== "number" ||
+              typeof healthPath !== "string" ||
+              !isJsonObject(environment)
+            )
+              throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+            const publicEnvironment: Record<string, string> = {};
+            for (const [name, value] of Object.entries(environment)) {
+              if (typeof value !== "string")
+                throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+              publicEnvironment[name] = value;
+            }
+            return {
+              record,
+              nativeId: record.nativeId,
+              request: {
+                resourceUid: intent.resourceUid,
+                incarnationId: intent.incarnationId,
+                revision: intent.revision,
+                image,
+                port: httpPort,
+                healthPath,
+                environment: publicEnvironment,
+                memoryBytes: dockerOptions.maxMemoryBytes,
+                nanoCpus: dockerOptions.maxNanoCpus,
+              },
+            };
+          });
+          for (const { record, nativeId, request } of requests) {
+            assertRemovalOpen();
+            const { intent } = record;
+            const key = canonicalJson([
+              intent.resourceUid,
+              intent.policy.generation,
+              intent.revision,
+            ]);
+            let revision = revisions.get(key);
+            if (!revision) {
+              const runtime = core.createRuntime({
+                ...runtimeOptions,
+                policy: intent.policy,
+                requiredSecretNames: intent.requiredSecretNames,
+              });
+              revision = Object.freeze({
+                runtime,
+                docker: Object.freeze(
+                  createDockerHttpRevisionRuntime({
+                    ...dockerOptions,
+                    installationId,
+                    socketPath: runtimeOptions.process.socketPath,
+                    dnsServers: runtime.dnsServers,
+                    runtimePreparation: runtime,
+                  }),
+                ),
+              });
+              revisions.set(key, revision);
+            }
+            // Original custody still decides whether this old generation is
+            // actually removable; a current execution is no remove grant.
+            await revision.docker.remove(request, nativeId, signal);
+            await revision.runtime.close();
+            revisions.delete(key);
+          }
         });
       });
       scopes.add(running);
