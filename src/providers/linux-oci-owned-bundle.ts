@@ -22,6 +22,12 @@ import {
   withDockerRetainedImageArchive,
 } from "./docker-container-image-supplier.ts";
 import {
+  LINUX_OCI_EGRESS_POLICY_FILE,
+  type LinuxOciEgressLimits,
+  serializeLinuxOciEgressPolicy,
+  snapshotLinuxOciEgressLimits,
+} from "./linux-oci-egress-policy.ts";
+import {
   createLinuxOciPhysicalSession,
   type LinuxOciInitReapedObservation,
   type LinuxOciNamespaceLifetimeObservation,
@@ -212,6 +218,9 @@ export interface LinuxOciOwnedBundleOptions extends DockerContainerCoreOwnerOpti
   readonly memoryBytes: number;
   readonly nanoCpus: number;
   readonly pidsLimit: number;
+  /** Optional explicit Host data for the closed-birth DROP producer only.
+   * It neither changes accepted policyDigest nor supplies admission authority. */
+  readonly egressLimits?: LinuxOciEgressLimits;
 }
 
 export interface LinuxOciArtifactReceipt {
@@ -455,6 +464,11 @@ async function layoutFromArchive(
  * callback can replace this producer. This is not a V2 backend or public support;
  * the next native consumer must use these borrowed bytes in this held callback. */
 export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
+  const selectedEgressLimits = options.egressLimits;
+  const egressLimits =
+    selectedEgressLimits === undefined
+      ? undefined
+      : snapshotLinuxOciEgressLimits(selectedEgressLimits);
   const core = createDockerContainerCoreOwner(options);
   if (!options.configuredInputs) return fail("configured_inputs");
   const configured = createDockerContainerConfiguredInputs({
@@ -768,6 +782,17 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                   };
                   return held.withEnvironment(async (secrets, signal) => {
                     await heldGuard();
+                    if (egressLimits !== undefined) {
+                      // Original accepted record/digest are preserved. Limits
+                      // are separately snapshotted Host data, not an authority
+                      // replacement. The actual C owner still keeps birth shut.
+                      await writeFile(
+                        join(allocationRoot, LINUX_OCI_EGRESS_POLICY_FILE),
+                        serializeLinuxOciEgressPolicy(receipt, record, egressLimits),
+                        { flag: "wx", mode: 0o600 },
+                      );
+                      await heldGuard();
+                    }
                     const loan = new AbortController();
                     const abort = () => loan.abort();
                     signal.addEventListener("abort", abort, { once: true });

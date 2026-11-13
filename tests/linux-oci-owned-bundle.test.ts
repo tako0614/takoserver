@@ -4,7 +4,7 @@ import * as childProcess from "node:child_process";
 import { spawn as importedSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
@@ -17,11 +17,21 @@ import {
 } from "../src/providers/docker-container-configured-inputs.ts";
 import { createDockerContainerCoreOwner } from "../src/providers/docker-container-core-owner.ts";
 import type { DockerImageSupplyLimits } from "../src/providers/docker-container-image-supplier.ts";
-import { createLinuxOciOwnedBundle } from "../src/providers/linux-oci-owned-bundle.ts";
+import {
+  LINUX_OCI_EGRESS_POLICY_FILE,
+  type LinuxOciEgressLimits,
+  snapshotLinuxOciEgressLimits,
+} from "../src/providers/linux-oci-egress-policy.ts";
+import {
+  createLinuxOciOwnedBundle,
+  type LinuxOciBorrowedBundle,
+  type LinuxOciOwnedBundleOptions,
+} from "../src/providers/linux-oci-owned-bundle.ts";
 import {
   createLinuxOciPhysicalSession,
   type LinuxOciCreateStoppedRequest,
 } from "../src/providers/linux-oci-physical-session.ts";
+import { createSelfhostLinuxOciCore } from "../src/selfhost-linux-oci-core.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
@@ -68,6 +78,9 @@ async function fixture(
       | "retire-pending";
     readonly noPhysicalBinary?: boolean;
     readonly namespaceMode?: "success" | "retained" | "foreign" | "unknown";
+    readonly egressLimits?: LinuxOciEgressLimits;
+    readonly outboundInternet?: boolean;
+    readonly viaHostCreator?: boolean;
     readonly configuredKey?: "sql" | "selection" | "owner";
   } = {},
 ) {
@@ -165,9 +178,20 @@ async function fixture(
       },
     });
   const artifactDigests: string[] = [];
+  const compose = (
+    options: LinuxOciOwnedBundleOptions & {
+      readonly configuredInputs: NonNullable<LinuxOciOwnedBundleOptions["configuredInputs"]>;
+    },
+  ) => {
+    if (!adversarial.viaHostCreator) return createLinuxOciOwnedBundle(options);
+    const { sql, clock, ...selection } = options;
+    const selected = createSelfhostLinuxOciCore({ sql, clock, selection });
+    if (!selected) throw new Error("original Host-selected OCI creator absent");
+    return selected;
+  };
   let composition: ReturnType<typeof createLinuxOciOwnedBundle>;
   try {
-    composition = createLinuxOciOwnedBundle({
+    composition = compose({
       sql,
       clock: () => new Date(),
       installationId: "synthetic-oci-installation",
@@ -182,6 +206,7 @@ async function fixture(
       memoryBytes: 268435456,
       nanoCpus: 500000000,
       pidsLimit: 128,
+      ...(adversarial.egressLimits === undefined ? {} : { egressLimits: adversarial.egressLimits }),
       images: Object.assign(
         {
           limits,
@@ -482,7 +507,13 @@ async function fixture(
   }) as unknown as typeof childProcess.spawn);
   if (!Object.is(importedSpawn, raw)) throw new Error("raw child interception unavailable");
   let accepted: V2Execution | undefined;
-  let duringLoan: ((execution: V2Execution, signal: AbortSignal) => Promise<void>) | undefined;
+  let duringLoan:
+    | ((
+        execution: V2Execution,
+        signal: AbortSignal,
+        bundle: LinuxOciBorrowedBundle,
+      ) => Promise<void>)
+    | undefined;
   let beforeLoan: ((execution: V2Execution) => Promise<void>) | undefined;
   const failures: unknown[] = [];
   const stopped: unknown[] = [];
@@ -564,7 +595,7 @@ async function fixture(
         expect(
           await readFile(join(bundle.allocationRoot, "rootfs", "synthetic-file"), "utf8"),
         ).toBe("verified-image-model");
-        await duringLoan?.(execution, bundle.signal);
+        await duringLoan?.(execution, bundle.signal, bundle);
       });
       // A real bounded artifact step, never native CREATE/START/completion.
       return { kind: "continue" };
@@ -726,7 +757,7 @@ async function fixture(
             [fields.workloadRevision]: "1".repeat(64),
             [fields.environment]: { MODE: "synthetic-public" },
             [fields.requiredSensitiveVars]: ["SECRET"],
-            [fields.outboundInternet]: true,
+            [fields.outboundInternet]: adversarial.outboundInternet ?? true,
           },
           privateInputs: { SECRET: "synthetic-loan" },
         },
@@ -2052,3 +2083,120 @@ for (const boundary of [2, 3] as const) {
     });
   }
 }
+
+for (const outboundInternet of [false, true]) {
+  test(`accepted OCI egress metadata preserves the actual accepted outbound=${outboundInternet} policy and isolated Host limits`, async () => {
+    const selected = { maxConnections: 9, packetLimitBytes: 65536 };
+    const f = await fixture(false, {
+      egressLimits: selected,
+      outboundInternet,
+      viaHostCreator: !outboundInternet,
+    });
+    selected.maxConnections = 65535;
+    selected.packetLimitBytes = Number.MAX_SAFE_INTEGER;
+    let visited = false;
+    f.onLoan(async (_execution, signal, bundle) => {
+      await bundle.guard();
+      expect(signal.aborted).toBe(false);
+      const receipt = await readFile(
+        join(bundle.allocationRoot, ".tako-oci-artifact.json"),
+        "utf8",
+      );
+      const text = await readFile(
+        join(bundle.allocationRoot, LINUX_OCI_EGRESS_POLICY_FILE),
+        "utf8",
+      );
+      const metadata: unknown = JSON.parse(text);
+      if (!isJsonObject(metadata)) throw new Error("original egress metadata absent");
+      expect(Object.keys(metadata)).toEqual(["kind", "artifact", "policy", "limits"]);
+      expect(metadata.kind).toBe("linux-oci-owned-egress@1");
+      expect(JSON.stringify(metadata.artifact)).toBe(receipt);
+      expect(metadata.policy).toEqual({
+        tenantRef: bundle.record.intent.policy.tenantRef,
+        generation: bundle.record.intent.policy.generation,
+        policyDigest: bundle.record.intent.policy.policyDigest,
+        outboundInternet: bundle.record.intent.policy.outboundInternet,
+      });
+      expect(bundle.record.intent.policy.tenantRef).toBe("synthetic-oci-parent");
+      expect(bundle.record.intent.policy.generation).toBe(1);
+      expect(bundle.record.intent.policy.outboundInternet).toBe(outboundInternet);
+      expect(metadata.limits).toEqual({ maxConnections: 9, packetLimitBytes: 65536 });
+      expect(text).toBe(JSON.stringify(metadata));
+      const stat = await lstat(join(bundle.allocationRoot, LINUX_OCI_EGRESS_POLICY_FILE));
+      expect(stat.isFile()).toBe(true);
+      expect(stat.isSymbolicLink()).toBe(false);
+      expect(stat.mode & 0o777).toBe(0o600);
+      expect(stat.nlink).toBe(1);
+      const owner = process.getuid?.();
+      if (owner === undefined) throw new Error("original host uid unavailable");
+      expect(stat.uid).toBe(owner);
+      await bundle.guard();
+      visited = true;
+    });
+    try {
+      await f.create();
+      const result = await f.engine.runNext();
+      expect(f.failures).toEqual([]);
+      expect(visited).toBe(true);
+      expect(f.counts()).toEqual({ reads: 2, unpacks: 1, uses: 1 });
+      expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+      expect(
+        await f.sql.query("SELECT state,native_id FROM tf_v2_container_create_claims"),
+      ).toEqual([{ state: "pending", native_id: null }]);
+      expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_container_start_attempts")).toEqual(
+        [{ n: 0 }],
+      );
+      expect(result?.effect).not.toBe("complete");
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+test("accepted OCI egress absent Host limits leaves the original private artifact without policy file or native installation", async () => {
+  const f = await fixture();
+  let visited = false;
+  f.onLoan(async (_execution, _signal, bundle) => {
+    const files = await readdir(bundle.allocationRoot);
+    expect(files.sort()).toEqual([".tako-oci-artifact.json", "rootfs"]);
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(visited).toBe(true);
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+  } finally {
+    await f.close();
+  }
+});
+
+test("accepted OCI egress Host limits reject unknown fields and accessors without inventing accepted policy", async () => {
+  let reads = 0;
+  for (const invalid of [
+    { maxConnections: 1 },
+    { maxConnections: -1, packetLimitBytes: 1 },
+    { maxConnections: 65536, packetLimitBytes: 1 },
+    { maxConnections: 1, packetLimitBytes: Number.MAX_SAFE_INTEGER + 1 },
+    { maxConnections: 1, packetLimitBytes: 1.5 },
+    { maxConnections: 1, packetLimitBytes: 1, tenantRef: "synthetic-foreign" },
+    Object.create({ maxConnections: 1, packetLimitBytes: 1 }),
+    Object.defineProperty({ packetLimitBytes: 1 }, "maxConnections", {
+      enumerable: true,
+      get() {
+        reads++;
+        return 1;
+      },
+    }),
+  ])
+    expect(() => snapshotLinuxOciEgressLimits(invalid)).toThrow("linux_oci_egress_policy_invalid");
+  expect(reads).toBe(0);
+  const zero = snapshotLinuxOciEgressLimits({ maxConnections: 0, packetLimitBytes: 0 });
+  expect(zero).toEqual({ maxConnections: 0, packetLimitBytes: 0 });
+  expect(Object.isFrozen(zero)).toBe(true);
+  const extra = { maxConnections: 1, packetLimitBytes: 1, outboundInternet: true };
+  await expect(fixture(false, { egressLimits: extra })).rejects.toThrow(
+    "linux_oci_egress_policy_invalid",
+  );
+});
