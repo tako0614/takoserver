@@ -1,0 +1,23 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] refuse owned single-verdict edits before CT and skb mutation
+
+Against v6.12 with the retained tako_terminal base and NFQUEUE admission piece.
+Uses the actual dequeued entry and existing predicate/cleanup only.
+Config-off/unowned behavior stays unchanged. No terminal/grant or build claim.
+
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -1435,6 +1435,12 @@
+ 	entry = find_dequeue_entry(queue, ntohl(vhdr->id));
+ 	if (entry == NULL)
+ 		return -ENOENT;
++
++	/* Refuse this real entry before CT or packet edits from the verdict. */
++	if (unlikely(tako_terminal_block(entry->state.net, entry->state.pf))) {
++		nfqnl_reinject(entry, NF_DROP);
++		return 0;
++	}
+ 
+ 	/* rcu lock already held from nfnl->call_rcu. */
+ 	nfnl_ct = rcu_dereference(nfnl_ct_hook);

@@ -1,0 +1,103 @@
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -4811,8 +4811,12 @@
+ void tako_terminal_skb_poison(const struct sk_buff *skb);
+ void tako_terminal_skb_copy(struct sk_buff *dst, const struct sk_buff *src);
+ void tako_terminal_skb_reset(struct sk_buff *skb);
++/* Preserve only original ledger refs; never overwrite protocol extensions. */
++void tako_terminal_skb_merge(struct sk_buff *to, const struct sk_buff *from);
+ #else
+ static inline void tako_terminal_skb_set_owner(struct sk_buff *skb, struct net *net) {}
++static inline void tako_terminal_skb_merge(struct sk_buff *to,
++					const struct sk_buff *from) {}
+ #endif
+ 
+ /* Actual destruction, or a transfer that has already retained all origins. */
+@@ -4900,6 +4904,8 @@
+ #else
+ struct net;
+ static inline void tako_terminal_skb_set_owner(struct sk_buff *skb, struct net *net) {}
++static inline void tako_terminal_skb_merge(struct sk_buff *to,
++					const struct sk_buff *from) {}
+ static inline void skb_ext_put_final(struct sk_buff *skb) {}
+ static inline void skb_ext_put(struct sk_buff *skb) {}
+ static inline void skb_ext_reset(struct sk_buff *skb) {}
+diff --git a/net/core/gro.c b/net/core/gro.c
+--- a/net/core/gro.c
++++ b/net/core/gro.c
+@@ -127,6 +127,11 @@
+ 	lp = NAPI_GRO_CB(p)->last;
+ 	pinfo = skb_shinfo(lp);
+ 
++	/* Retain before the first payload splice. The donor header can be freed
++	 * or reused before this aggregate and its actual last payload skb die.
++	 */
++	tako_terminal_skb_merge(p, skb);
++
+ 	if (headlen <= offset) {
+ 		skb_frag_t *frag;
+ 		skb_frag_t *frag2;
+@@ -136,6 +141,8 @@
+ 		if (nr_frags > MAX_SKB_FRAGS)
+ 			goto merge;
+ 
++		if (lp != p)
++			tako_terminal_skb_merge(lp, skb);
+ 		offset -= headlen;
+ 		pinfo->nr_frags = nr_frags;
+ 		skbinfo->nr_frags = 0;
+@@ -173,6 +180,8 @@
+ 			       (unsigned char *)page_address(page) +
+ 			       offset;
+ 
++		if (lp != p)
++			tako_terminal_skb_merge(lp, skb);
+ 		pinfo->nr_frags = nr_frags + 1 + skbinfo->nr_frags;
+ 
+ 		skb_frag_fill_page_desc(frag, page, first_offset, first_size);
+@@ -231,6 +240,10 @@
+ 	if (unlikely(p->len + skb->len >= 65536))
+ 		return -E2BIG;
+ 
++	/* The attached header retains its own group; the aggregate also needs
++	 * the original history before a later copy/segmentation can detach it.
++	 */
++	tako_terminal_skb_merge(p, skb);
+ 	if (NAPI_GRO_CB(p)->last == p)
+ 		skb_shinfo(p)->frag_list = skb;
+ 	else
+@@ -662,7 +675,8 @@
+ 		skb_orphan(skb);
+ 		skb_ext_reset(skb);
+ 		nf_reset_ct(skb);
+-		skb->slow_gro = 0;
++		/* Private reset may retain an original owner extension. */
++		skb->slow_gro = skb_has_extensions(skb);
+ 	}
+ 
+ 	napi->skb = skb;
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -7166,6 +7166,20 @@
+ }
+ EXPORT_SYMBOL_GPL(tako_terminal_skb_set_owner);
+ 
++/* GRO holds both skb headers while the payload is still on from. Clone
++ * its genuine opaque refs before restore can allocate/COW destination storage.
++ * The existing restore poisons any origin it cannot retain before unwind.
++ */
++void tako_terminal_skb_merge(struct sk_buff *to, const struct sk_buff *from)
++{
++	struct tako_terminal_skb_refs held = {0};
++
++	if (to == from)
++		return;
++	tako_skb_snapshot(from, &held);
++	tako_skb_restore(to, &held);
++}
++
+ void tako_terminal_skb_copy(struct sk_buff *dst, const struct sk_buff *src)
+ {
+ 	struct tako_terminal_skb_refs held = {0};

@@ -1,0 +1,546 @@
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -4775,6 +4775,9 @@
+ #if IS_ENABLED(CONFIG_MCTP_FLOWS)
+ 	SKB_EXT_MCTP,
+ #endif
++#ifdef CONFIG_TAKO_TERMINAL
++	SKB_EXT_TAKO_TERMINAL,
++#endif
+ 	SKB_EXT_NUM, /* must be last */
+ };
+ 
+@@ -4802,10 +4805,30 @@
+ void __skb_ext_del(struct sk_buff *skb, enum skb_ext_id id);
+ void __skb_ext_put(struct skb_ext *ext);
+ 
+-static inline void skb_ext_put(struct sk_buff *skb)
++struct net;
++#ifdef CONFIG_TAKO_TERMINAL
++void tako_terminal_skb_set_owner(struct sk_buff *skb, struct net *net);
++void tako_terminal_skb_poison(const struct sk_buff *skb);
++void tako_terminal_skb_copy(struct sk_buff *dst, const struct sk_buff *src);
++void tako_terminal_skb_reset(struct sk_buff *skb);
++#else
++static inline void tako_terminal_skb_set_owner(struct sk_buff *skb, struct net *net) {}
++#endif
++
++/* Actual destruction, or a transfer that has already retained all origins. */
++static inline void skb_ext_put_final(struct sk_buff *skb)
+ {
+ 	if (skb->active_extensions)
+ 		__skb_ext_put(skb->extensions);
++}
++
++/* Unknown early detachment is tracking loss, never a useful zero. */
++static inline void skb_ext_put(struct sk_buff *skb)
++{
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_terminal_skb_poison(skb);
++#endif
++	skb_ext_put_final(skb);
+ }
+ 
+ static inline void __skb_ext_copy(struct sk_buff *dst,
+@@ -4823,8 +4846,12 @@
+ 
+ static inline void skb_ext_copy(struct sk_buff *dst, const struct sk_buff *src)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_terminal_skb_copy(dst, src);
++#else
+ 	skb_ext_put(dst);
+ 	__skb_ext_copy(dst, src);
++#endif
+ }
+ 
+ static inline bool __skb_ext_exist(const struct skb_ext *ext, enum skb_ext_id i)
+@@ -4856,10 +4883,14 @@
+ 
+ static inline void skb_ext_reset(struct sk_buff *skb)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_terminal_skb_reset(skb);
++#else
+ 	if (unlikely(skb->active_extensions)) {
+ 		__skb_ext_put(skb->extensions);
+ 		skb->active_extensions = 0;
+ 	}
++#endif
+ }
+ 
+ static inline bool skb_has_extensions(struct sk_buff *skb)
+@@ -4867,6 +4898,9 @@
+ 	return unlikely(skb->active_extensions);
+ }
+ #else
++struct net;
++static inline void tako_terminal_skb_set_owner(struct sk_buff *skb, struct net *net) {}
++static inline void skb_ext_put_final(struct sk_buff *skb) {}
+ static inline void skb_ext_put(struct sk_buff *skb) {}
+ static inline void skb_ext_reset(struct sk_buff *skb) {}
+ static inline void skb_ext_del(struct sk_buff *skb, int unused) {}
+diff --git a/include/linux/tako_terminal_skb_state.h b/include/linux/tako_terminal_skb_state.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/tako_terminal_skb_state.h
+@@ -0,0 +1,110 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef TAKO_TERMINAL_KERNEL_SKB_STATE_H
++#define TAKO_TERMINAL_KERNEL_SKB_STATE_H
++
++/* Exact bytes embedded as include/linux/tako_terminal_skb_state.h in the
++ * companion v6.12 patch. API declarations must precede this header. These
++ * are already-held opaque original ledger refs, never namespace authority.
++ * A fixed bound fails closed by poisoning the owner that cannot be retained.
++ */
++#define TAKO_TERMINAL_SKB_OWNERS 4
++
++struct tako_terminal_skb_refs {
++	struct tako_terminal_owner *owners[TAKO_TERMINAL_SKB_OWNERS];
++};
++
++/* Consume one genuine reservation; duplicate reservations are safe unwind. */
++static inline void tako_terminal_skb_refs_take(
++	struct tako_terminal_skb_refs *refs, struct tako_terminal_owner *owner)
++{
++	unsigned int i, empty = TAKO_TERMINAL_SKB_OWNERS;
++
++	if (!owner)
++		return;
++	for (i = 0; i < TAKO_TERMINAL_SKB_OWNERS; i++) {
++		if (refs->owners[i] == owner) {
++			tako_terminal_packet_put(owner);
++			return;
++		}
++		if (!refs->owners[i] && empty == TAKO_TERMINAL_SKB_OWNERS)
++			empty = i;
++	}
++	if (empty < TAKO_TERMINAL_SKB_OWNERS) {
++		refs->owners[empty] = owner;
++		return;
++	}
++	/* Tracking loss precedes the unwind put, permanently refusing useful 0. */
++	tako_terminal_packet_poison(owner);
++	tako_terminal_packet_put(owner);
++}
++
++/* dst is zero-initialized. Reserve before any fallible group allocation. */
++static inline void tako_terminal_skb_refs_clone(
++	struct tako_terminal_skb_refs *dst,
++	const struct tako_terminal_skb_refs *src)
++{
++	unsigned int i;
++
++	for (i = 0; i < TAKO_TERMINAL_SKB_OWNERS; i++) {
++		struct tako_terminal_owner *owner = src->owners[i];
++		struct tako_terminal_owner *held;
++
++		if (!owner)
++			continue;
++		held = tako_terminal_packet_clone(owner);
++		if (!held)
++			tako_terminal_packet_poison(owner);
++		tako_terminal_skb_refs_take(dst, held);
++	}
++}
++
++static inline void tako_terminal_skb_refs_poison(
++	const struct tako_terminal_skb_refs *refs)
++{
++	unsigned int i;
++
++	for (i = 0; i < TAKO_TERMINAL_SKB_OWNERS; i++)
++		if (refs->owners[i])
++			tako_terminal_packet_poison(refs->owners[i]);
++}
++
++/* Only after the actual extension group free, or failed allocation unwind. */
++static inline void tako_terminal_skb_refs_put(struct tako_terminal_skb_refs *refs)
++{
++	unsigned int i;
++
++	for (i = 0; i < TAKO_TERMINAL_SKB_OWNERS; i++) {
++		struct tako_terminal_owner *owner = refs->owners[i];
++
++		refs->owners[i] = 0;
++		if (owner)
++			tako_terminal_packet_put(owner);
++	}
++}
++
++/* Move held reservations, retaining other origins on the live destination. */
++static inline void tako_terminal_skb_refs_merge(
++	struct tako_terminal_skb_refs *dst, struct tako_terminal_skb_refs *held)
++{
++	unsigned int i;
++
++	for (i = 0; i < TAKO_TERMINAL_SKB_OWNERS; i++) {
++		struct tako_terminal_owner *owner = held->owners[i];
++
++		held->owners[i] = 0;
++		tako_terminal_skb_refs_take(dst, owner);
++	}
++}
++
++static inline int tako_terminal_skb_refs_any(
++	const struct tako_terminal_skb_refs *refs)
++{
++	unsigned int i;
++
++	for (i = 0; i < TAKO_TERMINAL_SKB_OWNERS; i++)
++		if (refs->owners[i])
++			return 1;
++	return 0;
++}
++
++#endif
+diff --git a/include/net/sock.h b/include/net/sock.h
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -2323,6 +2323,9 @@
+  */
+ static inline void skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
+ {
++	/* Kernel sockets need not hold an active net reference. */
++	if (sk->sk_net_refcnt)
++		tako_terminal_skb_set_owner(skb, sock_net(sk));
+ 	skb_orphan(skb);
+ 	skb->sk = sk;
+ 	skb->destructor = sock_rfree;
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -28,6 +28,7 @@
+ 
+ config TAKO_TERMINAL
+ 	bool "Experimental targeted fresh-netns birth ownership"
++	select SKB_EXTENSIONS
+ 	depends on NET_NS && INET && IPV6 && NETFILTER && PROC_FS
+ 	default n
+ 	help
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -52,6 +52,15 @@
+ #include <linux/string.h>
+ #include <linux/skbuff.h>
+ #include <linux/skbuff_ref.h>
++#ifdef CONFIG_TAKO_TERMINAL
++#include <linux/tako_terminal.h>
++#include <linux/tako_terminal_skb_state.h>
++
++static void tako_skb_snapshot(const struct sk_buff *skb,
++			      struct tako_terminal_skb_refs *held);
++static void tako_skb_restore(struct sk_buff *skb,
++			     struct tako_terminal_skb_refs *held);
++#endif
+ #include <linux/splice.h>
+ #include <linux/cache.h>
+ #include <linux/rtnetlink.h>
+@@ -1169,7 +1178,7 @@
+ 	kmem_cache_free(net_hotdata.skbuff_fclone_cache, fclones);
+ }
+ 
+-void skb_release_head_state(struct sk_buff *skb)
++static void __skb_release_head_state(struct sk_buff *skb, bool final)
+ {
+ 	skb_dst_drop(skb);
+ 	if (skb->destructor) {
+@@ -1179,13 +1188,24 @@
+ #if IS_ENABLED(CONFIG_NF_CONNTRACK)
+ 	nf_conntrack_put(skb_nfct(skb));
+ #endif
+-	skb_ext_put(skb);
++	if (final)
++		skb_ext_put_final(skb);
++	else
++		skb_ext_put(skb);
++}
++
++/* Public head detachment may be followed by reuse (e.g. GSO). Until those
++ * producer transfers are qualified, poison rather than silently lose origin.
++ */
++void skb_release_head_state(struct sk_buff *skb)
++{
++	__skb_release_head_state(skb, false);
+ }
+ 
+ /* Free everything but the sk_buff shell. */
+ static void skb_release_all(struct sk_buff *skb, enum skb_drop_reason reason)
+ {
+-	skb_release_head_state(skb);
++	__skb_release_head_state(skb, true);
+ 	if (likely(skb->head))
+ 		skb_release_data(skb, reason);
+ }
+@@ -1486,7 +1506,7 @@
+ 	if (unlikely(skb->slow_gro)) {
+ 		nf_reset_ct(skb);
+ 		skb_dst_drop(skb);
+-		skb_ext_put(skb);
++		skb_ext_put_final(skb);
+ 		skb_orphan(skb);
+ 		skb->slow_gro = 0;
+ 	}
+@@ -1646,8 +1666,19 @@
+  */
+ struct sk_buff *skb_morph(struct sk_buff *dst, struct sk_buff *src)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++
++	if (dst == src)
++		return dst;
++	tako_skb_snapshot(dst, &held);
++#endif
+ 	skb_release_all(dst, SKB_CONSUMED);
+-	return __skb_clone(dst, src);
++	__skb_clone(dst, src);
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_skb_restore(dst, &held);
++#endif
++	return dst;
+ }
+ EXPORT_SYMBOL_GPL(skb_morph);
+ 
+@@ -5044,6 +5075,9 @@
+ #define SKB_EXT_CHUNKSIZEOF(x)	(ALIGN((sizeof(x)), SKB_EXT_ALIGN_VALUE) / SKB_EXT_ALIGN_VALUE)
+ 
+ static const u8 skb_ext_type_len[] = {
++#ifdef CONFIG_TAKO_TERMINAL
++	[SKB_EXT_TAKO_TERMINAL] = SKB_EXT_CHUNKSIZEOF(struct tako_terminal_skb_refs),
++#endif
+ #if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
+ 	[SKB_EXT_BRIDGE_NF] = SKB_EXT_CHUNKSIZEOF(struct nf_bridge_info),
+ #endif
+@@ -5990,7 +6024,7 @@
+ void kfree_skb_partial(struct sk_buff *skb, bool head_stolen)
+ {
+ 	if (head_stolen) {
+-		skb_release_head_state(skb);
++		__skb_release_head_state(skb, true);
+ 		kmem_cache_free(net_hotdata.skbuff_cache, skb);
+ 	} else {
+ 		__kfree_skb(skb);
+@@ -6935,15 +6969,45 @@
+ 					 unsigned int old_active)
+ {
+ 	struct skb_ext *new;
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++#endif
+ 
+ 	if (refcount_read(&old->refcnt) == 1)
+ 		return old;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	if (__skb_ext_exist(old, SKB_EXT_TAKO_TERMINAL)) {
++		tako_terminal_skb_refs_clone(&held,
++			skb_ext_get_ptr(old, SKB_EXT_TAKO_TERMINAL));
++		/* Tagged blobs can retain inactive slots beside the private tag.
++		 * Match their physical final destructor; unowned blobs are unchanged.
++		 */
++#ifdef CONFIG_XFRM
++		if (__skb_ext_exist(old, SKB_EXT_SEC_PATH))
++			old_active |= 1 << SKB_EXT_SEC_PATH;
++#endif
++#ifdef CONFIG_MCTP_FLOWS
++		if (__skb_ext_exist(old, SKB_EXT_MCTP))
++			old_active |= 1 << SKB_EXT_MCTP;
++#endif
++	}
++#endif
+ 	new = kmem_cache_alloc(skbuff_ext_cache, GFP_ATOMIC);
+-	if (!new)
++	if (!new) {
++#ifdef CONFIG_TAKO_TERMINAL
++		/* Allocation failed; old group still retains all original refs. */
++		tako_terminal_skb_refs_put(&held);
++#endif
+ 		return NULL;
++	}
+ 
+ 	memcpy(new, old, old->chunks * SKB_EXT_ALIGN_VALUE);
++#ifdef CONFIG_TAKO_TERMINAL
++	if (__skb_ext_exist(new, SKB_EXT_TAKO_TERMINAL))
++		*(struct tako_terminal_skb_refs *)skb_ext_get_ptr(new,
++			SKB_EXT_TAKO_TERMINAL) = held;
++#endif
+ 	refcount_set(&new->refcnt, 1);
+ 
+ #ifdef CONFIG_XFRM
+@@ -6981,13 +7045,22 @@
+ 		    struct skb_ext *ext)
+ {
+ 	unsigned int newlen, newoff = SKB_EXT_CHUNKSIZEOF(*ext);
+-
+-	skb_ext_put(skb);
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++
++	tako_skb_snapshot(skb, &held);
++#endif
++	skb_ext_put_final(skb);
+ 	newlen = newoff + skb_ext_type_len[id];
+ 	ext->chunks = newlen;
+ 	ext->offset[id] = newoff;
+ 	skb->extensions = ext;
+ 	skb->active_extensions = 1 << id;
++#ifdef CONFIG_TAKO_TERMINAL
++	if (id == SKB_EXT_TAKO_TERMINAL)
++		memset(skb_ext_get_ptr(ext, id), 0, sizeof(held));
++	tako_skb_restore(skb, &held);
++#endif
+ 	return skb_ext_get_ptr(ext, id);
+ }
+ 
+@@ -7032,6 +7105,11 @@
+ 	newlen = newoff + skb_ext_type_len[id];
+ 	new->chunks = newlen;
+ 	new->offset[id] = newoff;
++#ifdef CONFIG_TAKO_TERMINAL
++	if (id == SKB_EXT_TAKO_TERMINAL)
++		memset(skb_ext_get_ptr(new, id), 0,
++		       sizeof(struct tako_terminal_skb_refs));
++#endif
+ set_active:
+ 	skb->slow_gro = 1;
+ 	skb->extensions = new;
+@@ -7040,6 +7118,83 @@
+ }
+ EXPORT_SYMBOL(skb_ext_add);
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++static void tako_skb_snapshot(const struct sk_buff *skb,
++			      struct tako_terminal_skb_refs *held)
++{
++	const struct tako_terminal_skb_refs *refs;
++
++	refs = skb_ext_find(skb, SKB_EXT_TAKO_TERMINAL);
++	if (refs)
++		tako_terminal_skb_refs_clone(held, refs);
++}
++
++static void tako_skb_restore(struct sk_buff *skb,
++			     struct tako_terminal_skb_refs *held)
++{
++	struct tako_terminal_skb_refs *refs;
++
++	if (!tako_terminal_skb_refs_any(held))
++		return;
++	refs = skb_ext_add(skb, SKB_EXT_TAKO_TERMINAL);
++	if (refs) {
++		tako_terminal_skb_refs_merge(refs, held);
++	} else {
++		/* A live packet lost a transfer: poison before its reservation put. */
++		tako_terminal_skb_refs_poison(held);
++		tako_terminal_skb_refs_put(held);
++	}
++}
++
++void tako_terminal_skb_poison(const struct sk_buff *skb)
++{
++	const struct tako_terminal_skb_refs *refs;
++
++	refs = skb_ext_find(skb, SKB_EXT_TAKO_TERMINAL);
++	if (refs)
++		tako_terminal_skb_refs_poison(refs);
++}
++EXPORT_SYMBOL_GPL(tako_terminal_skb_poison);
++
++void tako_terminal_skb_set_owner(struct sk_buff *skb, struct net *net)
++{
++	struct tako_terminal_skb_refs held = {0};
++
++	/* Caller holds the actual socket's net, never a namespace descriptor. */
++	tako_terminal_skb_refs_take(&held, tako_terminal_packet_reserve(net));
++	tako_skb_restore(skb, &held);
++}
++EXPORT_SYMBOL_GPL(tako_terminal_skb_set_owner);
++
++void tako_terminal_skb_copy(struct sk_buff *dst, const struct sk_buff *src)
++{
++	struct tako_terminal_skb_refs held = {0};
++
++	if (dst == src)
++		return;
++	tako_skb_snapshot(dst, &held);
++	skb_ext_put_final(dst);
++	__skb_ext_copy(dst, src);
++	tako_skb_restore(dst, &held);
++}
++EXPORT_SYMBOL_GPL(tako_terminal_skb_copy);
++
++void tako_terminal_skb_reset(struct sk_buff *skb)
++{
++	struct tako_terminal_skb_refs held = {0};
++
++	if (!skb->active_extensions)
++		return;
++	tako_skb_snapshot(skb, &held);
++	skb_ext_put_final(skb);
++	skb->active_extensions = 0;
++	skb->extensions = NULL;
++	/* Rebuild only the private tag: scrubbed protocol metadata stays gone. */
++	tako_skb_restore(skb, &held);
++}
++EXPORT_SYMBOL_GPL(tako_terminal_skb_reset);
++#endif
++
+ #ifdef CONFIG_XFRM
+ static void skb_ext_put_sp(struct sec_path *sp)
+ {
+@@ -7062,6 +7217,11 @@
+ {
+ 	struct skb_ext *ext = skb->extensions;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Generic protocol deletion cannot erase a still-live packet origin. */
++	if (id == SKB_EXT_TAKO_TERMINAL)
++		return;
++#endif
+ 	skb->active_extensions &= ~(1 << id);
+ 	if (skb->active_extensions == 0) {
+ 		skb->extensions = NULL;
+@@ -7080,6 +7240,9 @@
+ 
+ void __skb_ext_put(struct skb_ext *ext)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++#endif
+ 	/* If this is last clone, nothing can increment
+ 	 * it after check passes.  Avoids one atomic op.
+ 	 */
+@@ -7098,7 +7261,16 @@
+ 		skb_ext_put_mctp(skb_ext_get_ptr(ext, SKB_EXT_MCTP));
+ #endif
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	if (__skb_ext_exist(ext, SKB_EXT_TAKO_TERMINAL))
++		held = *(struct tako_terminal_skb_refs *)skb_ext_get_ptr(ext,
++			SKB_EXT_TAKO_TERMINAL);
++#endif
+ 	kmem_cache_free(skbuff_ext_cache, ext);
++#ifdef CONFIG_TAKO_TERMINAL
++	/* No ext memory is accessed after free. This consumes the group's refs. */
++	tako_terminal_skb_refs_put(&held);
++#endif
+ }
+ EXPORT_SYMBOL(__skb_ext_put);
+ #endif /* CONFIG_SKB_EXTENSIONS */
+diff --git a/net/core/sock.c b/net/core/sock.c
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -2614,6 +2614,9 @@
+ 
+ void skb_set_owner_w(struct sk_buff *skb, struct sock *sk)
+ {
++	/* Initial bounded coverage: actual full-socket write ownership only. */
++	if (sk_fullsock(sk) && sk->sk_net_refcnt)
++		tako_terminal_skb_set_owner(skb, sock_net(sk));
+ 	skb_orphan(skb);
+ 	skb->sk = sk;
+ #ifdef CONFIG_INET

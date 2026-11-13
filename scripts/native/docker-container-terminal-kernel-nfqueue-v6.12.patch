@@ -1,0 +1,36 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] refuse owned NFQUEUE admission and saved-index reinjection
+
+Requires the REV3 tako_terminal base (f344f392) and its existing GPL-exported
+owner gate through linux/netfilter.h. No common API or ownership is added.
+This is IPv4/IPv6 admission refusal, not a drain or terminal predicate.
+The current base has no OPEN transition. No kernel build or execution is claimed.
+
+diff --git a/net/netfilter/nf_queue.c b/net/netfilter/nf_queue.c
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@ -161,6 +161,10 @@
+ 	unsigned int route_key_size;
+ 	int status;
+ 
++	/* Direct queue admission must obey the same immutable owner gate. */
++	if (unlikely(tako_terminal_block(state->net, state->pf)))
++		return -EPERM;
++
+ 	/* QUEUE == DROP if no one is waiting, to be safe. */
+ 	qh = rcu_dereference(nf_queue_handler);
+ 	if (!qh)
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -372,6 +372,10 @@
+ static void nfqnl_reinject(struct nf_queue_entry *entry, unsigned int verdict)
+ {
+ 	const struct nf_ct_hook *ct_hook;
++
++	/* Saved-index continuation bypasses nf_hook; deny before CT can steal. */
++	if (unlikely(tako_terminal_block(entry->state.net, entry->state.pf)))
++		verdict = NF_DROP;
+ 
+ 	if (verdict == NF_ACCEPT ||
+ 	    verdict == NF_REPEAT ||
