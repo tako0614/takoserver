@@ -430,6 +430,28 @@ fail:
   return -1;
 }
 
+int tns_owner_observe_creator(struct tns_owner *owner, struct tns_identity *identity) {
+  if (!owner || !identity || owner->phase != TNS_HELD || tns_controller(owner) < 0) {
+    if (!errno) errno = EPERM;
+    return -1;
+  }
+  struct tns_identity before, current, after;
+  if (tns_owner_observe(owner, &before) < 0) return -1;
+  int fd = openat(owner->procroot, "self/ns/net", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) goto fail;
+  int result = tns_fd_identity(fd, &current), saved = errno;
+  if (close(fd) < 0) goto fail;
+  if (result < 0) { errno = saved; goto fail; }
+  if (!tns_identity_equal(&current, &owner->creator) ||
+      tns_identity_equal(&current, &before) || tns_owner_observe(owner, &after) < 0 ||
+      !tns_identity_equal(&before, &after)) { if (!errno) errno = ESTALE; goto fail; }
+  *identity = current;
+  return 0;
+fail:
+  (void)tns_phase_close(&owner->phase);
+  return -1;
+}
+
 int tns_owner_dup_namespace(struct tns_owner *owner) {
   if (!owner || owner->phase != TNS_HELD) { errno = EINVAL; return -1; }
   if (owner->namespace_loaned) { errno = EALREADY; return -1; }

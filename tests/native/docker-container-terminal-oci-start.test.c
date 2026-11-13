@@ -422,3 +422,7 @@ int tns_owner_observe_lifetime(struct tns_owner *owner, struct tns_lifetime *lif
 int tns_owner_continue_namespace_release(struct tns_owner *owner, struct tns_lifetime *lifetime) {
   (void)owner; (void)lifetime; abort();
 }
+
+int tns_owner_observe_creator(struct tns_owner *owner, struct tns_identity *identity) {
+  (void)owner; (void)identity; abort();
+}

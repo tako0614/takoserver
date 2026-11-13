@@ -18,6 +18,10 @@ struct tns_identity {
  * Requires SIGCHLD default disposition and exclusive reaping of this child. */
 int tns_owner_create(struct tns_owner **slot);
 int tns_owner_observe(struct tns_owner *owner, struct tns_identity *identity);
+/* Read ONLY this original controller's actual current namespace and compare
+ * it to the saved pre-birth creator identity, bookended by original guest
+ * custody checks. No namespace/PID/FD/path is accepted or exported. */
+int tns_owner_observe_creator(struct tns_owner *owner, struct tns_identity *identity);
 /* Private OCI composition only: one-use CLOEXEC loan of this actual owner's
  * verified namespace. No namespace/PID/path is accepted. Failure consumes the
  * loan and closes the owner to further observation; no workload is admitted. */
