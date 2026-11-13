@@ -54,6 +54,9 @@ import { card, empty, explain, ICON, icon, mountToasts, openModal, toast } from 
  */
 
 const railOpen = signal(false);
+// The Host may have revoked the old session while its cookie expiry is still
+// in flight. Keep the next UI sign-in behind that response's browser effect.
+const signingOut = signal(false);
 
 function boot(): void {
   syncConsoleLocale();
@@ -76,15 +79,18 @@ function boot(): void {
   observeSessionIdentity((error) => toast(explain(error as Error), "bad"));
 
   effect(() => {
-    const screen = !sessionReady()
-      ? h(
-          "div",
-          { class: "signin", role: "status" },
-          tr("セッションを確認しています…", "Checking your session…"),
-        )
-      : session()
-        ? shell()
-        : signInPage();
+    const screen =
+      !sessionReady() || signingOut()
+        ? h(
+            "div",
+            { class: "signin", role: "status" },
+            signingOut()
+              ? tr("サインアウトしています…", "Signing out…")
+              : tr("セッションを確認しています…", "Checking your session…"),
+          )
+        : session()
+          ? shell()
+          : signInPage();
     view.replaceChildren(screen instanceof Node ? screen : document.createTextNode(""));
   });
 
@@ -237,7 +243,11 @@ function topbar(): Child {
           title: label,
           "aria-label": label,
           onClick: () => {
-            void signOut().catch((error: unknown) => toast(explain(error as Error), "bad"));
+            if (signingOut()) return;
+            signingOut.set(true);
+            void signOut()
+              .catch((error: unknown) => toast(explain(error as Error), "bad"))
+              .finally(() => signingOut.set(false));
           },
         },
         icon(ICON.signOut, 15),
