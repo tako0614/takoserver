@@ -76,4 +76,46 @@ static inline void tako_terminal_state_seal(struct tako_terminal_state *s)
 	s->sealed = 1;
 }
 
+/* Only the original device context may invoke OPEN, under its owner lock.
+ * No observed count/boolean is an admission input. CUT is permanent and
+ * neither transition erases an outstanding object or grants retirement.
+ */
+struct tako_terminal_admission {
+	unsigned int attempted;
+	unsigned int opened;
+	unsigned int cut;
+};
+
+static inline void tako_terminal_admission_init(struct tako_terminal_admission *s)
+{
+	s->attempted = 0;
+	s->opened = 0;
+	s->cut = 0;
+}
+
+static inline int tako_terminal_admission_open(struct tako_terminal_admission *s,
+					      const struct tako_terminal_state *objects)
+{
+	if (s->attempted)
+		return 0;
+	s->attempted = 1;
+	if (s->cut || objects->sealed || objects->poisoned)
+		return 0;
+	s->opened = 1;
+	return 1;
+}
+
+static inline void tako_terminal_admission_cut(struct tako_terminal_admission *s)
+{
+	s->attempted = 1;
+	s->cut = 1;
+	s->opened = 0;
+}
+
+static inline int tako_terminal_admission_blocked(
+	const struct tako_terminal_admission *s, const struct tako_terminal_state *objects)
+{
+	return !s->opened || s->cut || objects->sealed || objects->poisoned;
+}
+
 #endif

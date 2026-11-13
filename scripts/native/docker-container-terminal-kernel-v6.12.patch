@@ -3,10 +3,11 @@ Subject: [SOURCE ONLY v6.12] targeted fresh-netns owner, born-closed NF gate and
 
 Exact upstream: Linux v6.12 (tag), per-file SHA256 receipt UPSTREAM.json.
 No module/kernel build or runtime execution has qualified this patch.
-This first mechanical unit has no gate-open or terminal/grant operation.
-It does not cover request_sock, TIME_WAIT, skb clones/queues, XDP/TC/devices,
-offload or all packet continuations. Current C3/OCI producer is unchanged
-and does NOT invoke this experimental in-tree constructor.
+The original device context has a no-field, one-use OPEN transition. CUT,
+poison, namespace release and file close permanently prohibit reopening.
+No terminal/grant operation exists. This patch alone does not qualify all
+packet/device/offload continuations or packets already past a dispatch gate.
+The OCI caller does not yet invoke OPEN; birth DROP remains installed.
 
 diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
 --- a/include/linux/netfilter.h
@@ -228,7 +229,7 @@ diff --git a/include/linux/tako_terminal_state.h b/include/linux/tako_terminal_s
 new file mode 100644
 --- /dev/null
 +++ b/include/linux/tako_terminal_state.h
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,121 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef TAKO_TERMINAL_KERNEL_STATE_H
 +#define TAKO_TERMINAL_KERNEL_STATE_H
@@ -305,6 +306,48 @@ new file mode 100644
 +{
 +	/* Sealing never prevents counting late kernel allocations or clones. */
 +	s->sealed = 1;
++}
++
++/* Only the original device context may invoke OPEN, under its owner lock.
++ * No observed count/boolean is an admission input. CUT is permanent and
++ * neither transition erases an outstanding object or grants retirement.
++ */
++struct tako_terminal_admission {
++	unsigned int attempted;
++	unsigned int opened;
++	unsigned int cut;
++};
++
++static inline void tako_terminal_admission_init(struct tako_terminal_admission *s)
++{
++	s->attempted = 0;
++	s->opened = 0;
++	s->cut = 0;
++}
++
++static inline int tako_terminal_admission_open(struct tako_terminal_admission *s,
++					      const struct tako_terminal_state *objects)
++{
++	if (s->attempted)
++		return 0;
++	s->attempted = 1;
++	if (s->cut || objects->sealed || objects->poisoned)
++		return 0;
++	s->opened = 1;
++	return 1;
++}
++
++static inline void tako_terminal_admission_cut(struct tako_terminal_admission *s)
++{
++	s->attempted = 1;
++	s->cut = 1;
++	s->opened = 0;
++}
++
++static inline int tako_terminal_admission_blocked(
++	const struct tako_terminal_admission *s, const struct tako_terminal_state *objects)
++{
++	return !s->opened || s->cut || objects->sealed || objects->poisoned;
 +}
 +
 +#endif
@@ -397,7 +440,7 @@ diff --git a/include/uapi/linux/tako_terminal.h b/include/uapi/linux/tako_termin
 new file mode 100644
 --- /dev/null
 +++ b/include/uapi/linux/tako_terminal.h
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,54 @@
 +/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
 +#ifndef _UAPI_LINUX_TAKO_TERMINAL_H
 +#define _UAPI_LINUX_TAKO_TERMINAL_H
@@ -411,10 +454,13 @@ new file mode 100644
 + * The original device open retains the same net even on a lost return.
 + * CUT is monotonic, arg=0, and never opens the birth-deny gate.
 + * full_ip_sockets includes in-flight/failing full-sock reservations.
-+ * No START, OPEN, ADOPT, DELETE, or TERMINAL operation exists in this unit.
++ * OPEN is arg=0, one use, and limited to the original born namespace.
++ * CUT, poison, release and close forbid reopening. No count is a grant.
++ * No START, ADOPT, DELETE, or TERMINAL operation exists in this unit.
 + */
 +#define TAKO_TERMINAL_CREATE _IO(0xb7, 1)
 +#define TAKO_TERMINAL_CUT _IO(0xb7, 2)
++#define TAKO_TERMINAL_OPEN _IO(0xb7, 6)
 +
 +struct tako_terminal_observation {
 +	__u64 net_cookie;
@@ -641,7 +687,7 @@ diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
 new file mode 100644
 --- /dev/null
 +++ b/net/core/tako_terminal.c
-@@ -0,0 +1,539 @@
+@@ -0,0 +1,618 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* Linux v6.12 first mechanical ownership unit. This is NOT a full lifetime
 + * barrier: skb/queues, device/offload continuations,
@@ -681,6 +727,7 @@ new file mode 100644
 +	refcount_t refs; /* original file + net + each reserved object */
 +	spinlock_t lock;
 +	struct tako_terminal_state state;
++	struct tako_terminal_admission admission;
 +	struct tako_terminal_state requests;
 +	struct tako_terminal_state timewait;
 +	struct tako_terminal_state packet_groups;
@@ -942,16 +989,51 @@ new file mode 100644
 +	spin_unlock_irqrestore(&held->lock, flags);
 +}
 +
++/* This concrete field is added together with the netdevice-header definition
++ * by the selected NETDEV patch. It is not a coverage/readiness capability.
++ * Caller holds the original owner lock for every poison/admission read.
++ */
++static bool tako_admission_poisoned(const struct tako_terminal_owner *owner)
++{
++	return owner->state.poisoned || owner->requests.poisoned ||
++		owner->timewait.poisoned || owner->packet_groups.poisoned ||
++#ifdef TAKO_TERMINAL_DEVICE_ORIGINS
++		owner->device_associations.poisoned ||
++#endif
++		owner->lifetime.poisoned;
++}
++
 +bool tako_terminal_block(const struct net *net, u8 pf)
 +{
-+	/* Pointer is immutable from before setup_net to final net_free. The
-+	 * gate has no OPEN transition in this partial source unit. Counts,
-+	 * userspace booleans and ACKs cannot authorize a packet or retirement.
-+	 * Common NF dispatch coverage is not a claim about all device paths.
++	struct tako_terminal_owner *owner = net->tako_terminal;
++	unsigned long flags;
++	bool blocked;
++
++	/* The immutable birth owner is held by this live net. Admission is
++	 * read under the SAME lock as original OPEN/CUT and poison writers.
++	 * This gate is not a join of packets already past the dispatch point,
++	 * nor a coverage claim about every device/offload path.
 +	 */
-+	return net->tako_terminal && (pf == NFPROTO_IPV4 || pf == NFPROTO_IPV6);
++	if (!owner || (pf != NFPROTO_IPV4 && pf != NFPROTO_IPV6))
++		return false;
++	spin_lock_irqsave(&owner->lock, flags);
++	blocked = tako_terminal_admission_blocked(&owner->admission, &owner->state) ||
++		tako_admission_poisoned(owner) ||
++		owner->lifetime.release_attempted || owner->lifetime.reference_released ||
++		owner->lifetime.net_gone;
++	spin_unlock_irqrestore(&owner->lock, flags);
++	return blocked;
 +}
 +EXPORT_SYMBOL_GPL(tako_terminal_block);
++
++static void tako_cut_admission(struct tako_terminal_owner *owner)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_admission_cut(&owner->admission);
++	spin_unlock_irqrestore(&owner->lock, flags);
++}
 +
 +static void tako_seal(struct tako_terminal_owner *owner)
 +{
@@ -960,6 +1042,37 @@ new file mode 100644
 +	spin_lock_irqsave(&owner->lock, flags);
 +	tako_terminal_state_seal(&owner->state);
 +	spin_unlock_irqrestore(&owner->lock, flags);
++}
++
++/* Caller holds the original device context mutex. No namespace/PID/flags or
++ * positive observation is accepted from userspace. The original open owns
++ * both ctx->net and the independent same-owner ledger throughout this call.
++ */
++static int tako_open_admission(struct tako_terminal_file *ctx)
++{
++	struct tako_terminal_owner *owner = ctx->owner;
++	unsigned long flags;
++	int ret = -EUCLEAN;
++
++	if (ctx->creator != task_tgid(current) ||
++	    !ns_capable(&init_user_ns, CAP_SYS_ADMIN) ||
++	    !ns_capable(&init_user_ns, CAP_NET_ADMIN))
++		return -EPERM;
++	if (!owner || !ctx->net || ctx->net->tako_terminal != owner)
++		return -ENODATA;
++	spin_lock_irqsave(&owner->lock, flags);
++	if (!owner->lifetime.born || owner->lifetime.release_attempted ||
++	    owner->lifetime.reference_released || owner->lifetime.net_gone ||
++	    tako_admission_poisoned(owner) ||
++	    !owner->net_cookie || !owner->namespace_inum ||
++	    owner->net_cookie != ctx->net->net_cookie ||
++	    owner->namespace_inum != ctx->net->ns.inum)
++		goto out;
++	ret = tako_terminal_admission_open(&owner->admission, &owner->state) ?
++		0 : -EALREADY;
++out:
++	spin_unlock_irqrestore(&owner->lock, flags);
++	return ret;
 +}
 +
 +static int tako_release_namespace(struct tako_terminal_file *ctx)
@@ -971,6 +1084,7 @@ new file mode 100644
 +	if (!net)
 +		return -EALREADY;
 +	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_admission_cut(&owner->admission);
 +	if (!tako_terminal_lifetime_release_attempt(&owner->lifetime)) {
 +		spin_unlock_irqrestore(&owner->lock, flags);
 +		return -EALREADY;
@@ -1065,6 +1179,7 @@ new file mode 100644
 +		refcount_set(&owner->refs, 1);
 +		spin_lock_init(&owner->lock);
 +		tako_terminal_state_init(&owner->state);
++		tako_terminal_admission_init(&owner->admission);
 +		tako_terminal_state_init(&owner->requests);
 +		tako_terminal_state_init(&owner->timewait);
 +		tako_terminal_state_init(&owner->packet_groups);
@@ -1084,12 +1199,18 @@ new file mode 100644
 +		 * A second CREATE is refused. There is no replacement/adoption.
 +		 */
 +		break;
++	case TAKO_TERMINAL_OPEN:
++		if (arg) { ret = -EINVAL; break; }
++		ret = tako_open_admission(ctx);
++		break;
 +	case TAKO_TERMINAL_CUT:
 +		if (arg) { ret = -EINVAL; break; }
 +		/* CUT before CREATE also consumes the original birth attempt. */
 +		tako_terminal_consume_birth(&ctx->attempted);
-+		if (ctx->owner)
++		if (ctx->owner) {
++			tako_cut_admission(ctx->owner);
 +			tako_seal(ctx->owner);
++		}
 +		ret = 0;
 +		break;
 +	case TAKO_TERMINAL_OBSERVE:
@@ -1152,6 +1273,10 @@ new file mode 100644
 +	/* Closing never grants retirement. Any external net references or
 +	 * object references retain the actual net/ledger naturally.
 +	 */
++	if (ctx->owner) {
++		tako_cut_admission(ctx->owner);
++		tako_seal(ctx->owner);
++	}
 +	if (ctx->net)
 +		tako_release_namespace(ctx);
 +	tako_owner_put(ctx->owner);

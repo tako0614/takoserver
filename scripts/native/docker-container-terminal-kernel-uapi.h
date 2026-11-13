@@ -11,10 +11,13 @@
  * The original device open retains the same net even on a lost return.
  * CUT is monotonic, arg=0, and never opens the birth-deny gate.
  * full_ip_sockets includes in-flight/failing full-sock reservations.
- * No START, OPEN, ADOPT, DELETE, or TERMINAL operation exists in this unit.
+ * OPEN is arg=0, one use, and limited to the original born namespace.
+ * CUT, poison, release and close forbid reopening. No count is a grant.
+ * No START, ADOPT, DELETE, or TERMINAL operation exists in this unit.
  */
 #define TAKO_TERMINAL_CREATE _IO(0xb7, 1)
 #define TAKO_TERMINAL_CUT _IO(0xb7, 2)
+#define TAKO_TERMINAL_OPEN _IO(0xb7, 6)
 
 struct tako_terminal_observation {
 	__u64 net_cookie;
