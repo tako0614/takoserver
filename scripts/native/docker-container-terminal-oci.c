@@ -427,7 +427,7 @@ int tns_oci_close_transport(struct tns_oci_owner *o) {
   if (!o) { errno = EINVAL; return -1; }
   int saved = 0;
   if (tns_oci_cancel(o) < 0) saved = errno;
-  if (o->birth && tns_owner_close(&o->birth) < 0 && !saved) saved = errno;
+  if (o->birth && tns_owner_stop_custodian(o->birth) < 0 && !saved) saved = errno;
   if (saved) { errno = saved; return -1; }
   return 0;
 }

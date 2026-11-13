@@ -22,6 +22,10 @@ int tns_owner_observe(struct tns_owner *owner, struct tns_identity *identity);
  * verified namespace. No namespace/PID/path is accepted. Failure consumes the
  * loan and closes the owner to further observation; no workload is admitted. */
 int tns_owner_dup_namespace(struct tns_owner *owner);
+/* Stop/join ONLY the original custodian and its transport. The same opaque
+ * owner, held kernel device and NSFS descriptors remain in the controller.
+ * No namespace release, terminal predicate or retirement grant is produced. */
+int tns_owner_stop_custodian(struct tns_owner *owner);
 /* Bounded join. Failure retains the handle for a subsequent close/join only. */
 int tns_owner_close(struct tns_owner **slot);
 
@@ -106,6 +110,26 @@ static inline int tns_birth_matches(const struct tns_identity *creator,
          message->kind == TNS_WIRE_CREATED && !message->error &&
          tns_identity_equal(&message->identity, actual) &&
          !tns_identity_equal(creator, actual);
+}
+
+/* Refusal-only checks of actual syscall results in the native producer. A
+ * caller-supplied scalar set cannot create an owner or supply a namespace. */
+static inline int tns_kernel_identity_matches(const struct tns_identity *creator,
+                                              const struct tns_identity *actual,
+                                              uint64_t cookie, uint64_t inode,
+                                              uint64_t expected_cookie) {
+  return creator && actual && creator->device && creator->inode &&
+         actual->device && actual->inode && cookie && inode &&
+         inode == actual->inode && !tns_identity_equal(creator, actual) &&
+         (!expected_cookie || cookie == expected_cookie);
+}
+
+static inline int tns_kernel_counts_consistent(uint64_t live, uint64_t allocations,
+                                               uint64_t releases,
+                                               unsigned int sealed,
+                                               unsigned int poisoned) {
+  return !sealed && !poisoned && allocations >= releases &&
+         allocations - releases == live;
 }
 
 #endif

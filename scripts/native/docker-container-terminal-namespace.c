@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "docker-container-terminal-namespace.h"
+#include "docker-container-terminal-kernel-uapi.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,20 +24,29 @@
 #include <time.h>
 #include <unistd.h>
 
-/* Standalone future OCI-backend primitive. No Docker wiring, workload spawn,
- * namespace export, firewall, kernel lifetime owner, or terminal claim exists.
- * All non-custodian inherited FDs are closed before unshare. Unsupported
- * clone3/pidfd/close_range/NSFS operations refuse; there is no PID fallback. */
+/* Mandatory original kernel birth producer for the stopped OCI stage. The
+ * fixed device creates a NEW owned namespace; there is no stock fallback or
+ * caller namespace/PID/path. Child closes foreign FDs before setns. Kernel
+ * observations are not full packet/queue/offload coverage or a terminal grant.
+ * Unsupported device/clone3/pidfd/close_range/NSFS operations refuse. */
 #define TNS_CREATE_MS 2500
 #define TNS_CLOSE_MS 1000
 
+_Static_assert(sizeof(struct tako_terminal_observation) == 48, "kernel observation ABI");
+_Static_assert(sizeof(struct tako_terminal_lifetime_observation) == 72, "kernel lifetime ABI");
+
 struct tns_owner {
   enum tns_phase phase;
+  pid_t controller_pid;
   pid_t child;
   int pidfd;
   int procroot;
   int procfd;
   int netfd;
+  int kernel_fd;
+  int kernel_attempted;
+  uint64_t kernel_cookie;
+  struct stat device_identity;
   int control;
   int status;
   int kill_attempted;
@@ -85,6 +95,98 @@ static int tns_fd_identity(int fd, struct tns_identity *identity) {
   return 0;
 }
 
+static int tns_private_device(const struct stat *st) {
+  return S_ISCHR(st->st_mode) && st->st_uid == 0 &&
+         (st->st_mode & 0777) == 0600 && st->st_nlink == 1 && st->st_rdev;
+}
+
+static int tns_controller(const struct tns_owner *owner) {
+  if (!owner || owner->controller_pid != getpid()) { errno = EPERM; return -1; }
+  return 0;
+}
+
+static int tns_device_current(struct tns_owner *owner) {
+  struct stat st;
+  if (tns_controller(owner) < 0) return -1;
+  if (fstat(owner->kernel_fd, &st) < 0) return -1;
+  if (!tns_private_device(&st) || st.st_dev != owner->device_identity.st_dev ||
+      st.st_ino != owner->device_identity.st_ino ||
+      st.st_rdev != owner->device_identity.st_rdev) { errno = ESTALE; return -1; }
+  return 0;
+}
+
+static int tns_kernel_observe(struct tns_owner *owner) {
+  struct tako_terminal_observation snapshot;
+  struct tns_identity before, after;
+  if (!owner->kernel_attempted || owner->kernel_fd < 0 || owner->netfd < 0) {
+    errno = EINVAL; return -1;
+  }
+  memset(&snapshot, 0, sizeof(snapshot));
+  if (tns_device_current(owner) < 0 ||
+      tns_fd_identity(owner->netfd, &before) < 0) return -1;
+  int result = ioctl(owner->kernel_fd, TAKO_TERMINAL_OBSERVE, &snapshot);
+  if (result < 0) return -1; /* Interrupted/unknown ioctl is never replayed. */
+  if (result || tns_fd_identity(owner->netfd, &after) < 0) {
+    if (result) errno = EPROTO;
+    return -1;
+  }
+  if (!tns_identity_equal(&before, &after) ||
+      !tns_identity_equal(&owner->identity, &after) ||
+      !tns_kernel_identity_matches(&owner->creator, &after, snapshot.net_cookie,
+                                   snapshot.namespace_inum, owner->kernel_cookie) ||
+      !tns_kernel_counts_consistent(snapshot.full_ip_sockets, snapshot.allocations,
+                                    snapshot.releases, snapshot.sealed,
+                                    snapshot.poisoned) ||
+      tns_device_current(owner) < 0) { errno = ESTALE; return -1; }
+  if (!owner->kernel_cookie) owner->kernel_cookie = snapshot.net_cookie;
+  return 0;
+}
+
+static int tns_safe_parent(int fd) {
+  struct stat st;
+  if (fstat(fd, &st) < 0) return -1;
+  if (!S_ISDIR(st.st_mode) || st.st_uid != 0 || (st.st_mode & 022)) {
+    errno = EPERM; return -1;
+  }
+  return 0;
+}
+
+static int tns_kernel_birth(struct tns_owner *owner) {
+  int root = open("/", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (root < 0) return -1;
+  int dev = -1, result = -1, saved;
+  struct stat named, held;
+  if (tns_safe_parent(root) < 0) goto done;
+  dev = openat(root, "dev", O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (dev < 0 || tns_safe_parent(dev) < 0) goto done;
+  if (fstatat(dev, "tako-terminal", &named, AT_SYMLINK_NOFOLLOW) < 0) goto done;
+  if (!tns_private_device(&named)) { errno = EPERM; goto done; }
+  owner->kernel_fd = openat(dev, "tako-terminal",
+                            O_RDWR | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+  if (owner->kernel_fd < 0 || fstat(owner->kernel_fd, &held) < 0) goto done;
+  if (!tns_private_device(&held) || held.st_dev != named.st_dev ||
+      held.st_ino != named.st_ino || held.st_rdev != named.st_rdev) {
+    errno = ESTALE; goto done;
+  }
+  owner->device_identity = held;
+  if (tns_device_current(owner) < 0) goto done;
+  owner->kernel_attempted = 1; /* original one-use before actual kernel CREATE */
+  owner->netfd = ioctl(owner->kernel_fd, TAKO_TERMINAL_CREATE, 0UL);
+  if (owner->netfd < 0) goto done; /* no EINTR/lost-return retry or stock fallback */
+  int flags = fcntl(owner->netfd, F_GETFD);
+  if (flags < 0) goto done;
+  if (!(flags & FD_CLOEXEC)) { errno = EPROTO; goto done; }
+  if (tns_fd_identity(owner->netfd, &owner->identity) < 0 ||
+      tns_kernel_observe(owner) < 0) goto done;
+  result = 0;
+done:
+  saved = errno;
+  if (dev >= 0) close(dev);
+  close(root);
+  errno = saved;
+  return result;
+}
+
 static void tns_put_u64(unsigned char *p, uint64_t value) {
   for (unsigned int i = 0; i < 8; ++i) {
     p[7 - i] = (unsigned char)value;
@@ -108,12 +210,14 @@ static void tns_child_message(unsigned int error,
   if (write(4, bytes, sizeof(bytes)) != (ssize_t)sizeof(bytes)) _exit(125);
 }
 
-static _Noreturn void tns_child(pid_t expected_parent, int control, int status) {
-  int in = fcntl(control, F_DUPFD_CLOEXEC, 5);
-  int out = fcntl(status, F_DUPFD_CLOEXEC, 5);
-  if (in < 0 || out < 0 || dup3(in, 3, O_CLOEXEC) < 0 ||
-      dup3(out, 4, O_CLOEXEC) < 0) _exit(125);
-  if (syscall(SYS_close_range, 5u, UINT_MAX, 0u) < 0) _exit(125);
+static _Noreturn void tns_child(pid_t expected_parent, int control, int status,
+                                int fresh_namespace) {
+  int in = fcntl(control, F_DUPFD_CLOEXEC, 6);
+  int out = fcntl(status, F_DUPFD_CLOEXEC, 6);
+  int fresh = fcntl(fresh_namespace, F_DUPFD_CLOEXEC, 6);
+  if (in < 0 || out < 0 || fresh < 0 || dup3(in, 3, O_CLOEXEC) < 0 ||
+      dup3(out, 4, O_CLOEXEC) < 0 || dup3(fresh, 5, O_CLOEXEC) < 0) _exit(125);
+  if (syscall(SYS_close_range, 6u, UINT_MAX, 0u) < 0) _exit(125);
   close(0); close(1); close(2);
   if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != expected_parent ||
       prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) _exit(125);
@@ -121,7 +225,8 @@ static _Noreturn void tns_child(pid_t expected_parent, int control, int status) 
   uint64_t go = 0;
   if (poll(&p, 1, TNS_CREATE_MS) != 1 || p.revents != POLLIN ||
       read(3, &go, sizeof(go)) != (ssize_t)sizeof(go) || go != 1) _exit(125);
-  if (unshare(CLONE_NEWNET) < 0) {
+  struct tns_identity target;
+  if (tns_fd_identity(5, &target) < 0 || setns(5, CLONE_NEWNET) < 0) {
     tns_child_message((unsigned int)errno, NULL);
     _exit(125);
   }
@@ -132,6 +237,12 @@ static _Noreturn void tns_child(pid_t expected_parent, int control, int status) 
     tns_child_message(error, NULL);
     _exit(125);
   }
+  if (!tns_identity_equal(&target, &identity)) {
+    tns_child_message(ESTALE, NULL);
+    _exit(125);
+  }
+  close(ns);
+  close(5);
   tns_child_message(0, &identity);
   close(4);
   /* This fixed child never spawns or executes a workload, configures an
@@ -201,10 +312,13 @@ int tns_owner_create(struct tns_owner **slot) {
   struct tns_owner *owner = calloc(1, sizeof(*owner));
   if (!owner) return -1;
   owner->pidfd = owner->procfd = owner->netfd = -1;
+  owner->kernel_fd = -1;
   owner->procroot = -1;
   owner->control = owner->status = -1;
   if (tns_phase_start(&owner->phase) < 0) { free(owner); errno = EPROTO; return -1; }
   *slot = owner; /* One-use before any namespace/process/descriptor effect. */
+  owner->controller_pid = getpid();
+  if (geteuid() != 0) { errno = EPERM; return -1; }
   int64_t now = tns_now();
   if (now < 0) return -1;
   int64_t deadline = now + TNS_CREATE_MS;
@@ -228,6 +342,10 @@ int tns_owner_create(struct tns_owner **slot) {
   int saved = errno;
   close(original);
   if (result < 0) { errno = saved; return -1; }
+  /* Mandatory actual birth ownership before ANY custodian clone or runc.
+   * Missing/unsupported device refuses; kernel allocation has no userspace
+   * hard deadline, so validate the original deadline again before clone. */
+  if (tns_kernel_birth(owner) < 0 || tns_remaining(deadline) < 0) return -1;
   int channel[2];
   if (pipe2(channel, O_CLOEXEC | O_NONBLOCK) < 0) return -1;
   owner->status = channel[0];
@@ -240,7 +358,7 @@ int tns_owner_create(struct tns_owner **slot) {
   args.pidfd = (uint64_t)(uintptr_t)&owner->pidfd;
   args.exit_signal = SIGCHLD;
   long child = syscall(SYS_clone3, &args, sizeof(args));
-  if (child == 0) tns_child(creator, owner->control, channel[1]);
+  if (child == 0) tns_child(creator, owner->control, channel[1], owner->netfd);
   saved = errno;
   close(channel[1]);
   if (child < 0) { errno = saved; return -1; }
@@ -264,9 +382,16 @@ int tns_owner_create(struct tns_owner **slot) {
   if (tns_read_message(owner, deadline, &message) < 0) goto fail;
   if (message.kind == TNS_WIRE_ERROR) { errno = (int)message.error; goto fail; }
   if (tns_alive(owner) < 0) goto fail;
-  owner->netfd = openat(owner->procfd, "ns/net", O_RDONLY | O_CLOEXEC);
-  if (owner->netfd < 0 || tns_fd_identity(owner->netfd, &owner->identity) < 0 ||
-      tns_alive(owner) < 0 || tns_remaining(deadline) < 0) goto fail;
+  int joined = openat(owner->procfd, "ns/net", O_RDONLY | O_CLOEXEC);
+  if (joined < 0) goto fail;
+  struct tns_identity current;
+  result = tns_fd_identity(joined, &current);
+  saved = errno;
+  close(joined);
+  if (result < 0) { errno = saved; goto fail; }
+  if (!tns_identity_equal(&current, &owner->identity)) { errno = ESTALE; goto fail; }
+  if (tns_alive(owner) < 0 || tns_kernel_observe(owner) < 0 ||
+      tns_remaining(deadline) < 0) goto fail;
   if (!tns_birth_matches(&owner->creator, &message, &owner->identity) ||
       tns_phase_hold(&owner->phase) < 0) { errno = EPROTO; goto fail; }
   tns_close_fd(&owner->status);
@@ -282,7 +407,7 @@ fail:
 
 int tns_owner_observe(struct tns_owner *owner, struct tns_identity *identity) {
   if (!owner || !identity || owner->phase != TNS_HELD) { errno = EINVAL; return -1; }
-  if (tns_alive(owner) < 0) goto fail;
+  if (tns_kernel_observe(owner) < 0 || tns_alive(owner) < 0) goto fail;
   struct tns_identity held, current;
   if (tns_fd_identity(owner->netfd, &held) < 0) goto fail;
   int fd = openat(owner->procfd, "ns/net", O_RDONLY | O_CLOEXEC);
@@ -293,7 +418,7 @@ int tns_owner_observe(struct tns_owner *owner, struct tns_identity *identity) {
   if (result < 0) { errno = saved; goto fail; }
   if (!tns_identity_equal(&owner->identity, &held) ||
       !tns_identity_equal(&owner->identity, &current)) { errno = ESTALE; goto fail; }
-  if (tns_alive(owner) < 0) goto fail;
+  if (tns_alive(owner) < 0 || tns_kernel_observe(owner) < 0) goto fail;
   *identity = held;
   return 0;
 fail:
@@ -322,14 +447,24 @@ int tns_owner_dup_namespace(struct tns_owner *owner) {
   return fd;
 }
 
-int tns_owner_close(struct tns_owner **slot) {
-  if (!slot || !*slot) { errno = EINVAL; return -1; }
-  struct tns_owner *owner = *slot;
+int tns_owner_stop_custodian(struct tns_owner *owner) {
+  if (!owner) { errno = EINVAL; return -1; }
+  if (tns_controller(owner) < 0) return -1;
   if (tns_phase_close(&owner->phase) < 0) { errno = EPROTO; return -1; }
   if (tns_join(owner) < 0) return -1;
   tns_close_fd(&owner->status);
   tns_close_fd(&owner->control);
+  /* Keep original kernel/NSFS FDs and private owner, including after a born
+   * runtime loses transport. This does not issue RELEASE_NAMESPACE or free. */
+  return 0;
+}
+
+int tns_owner_close(struct tns_owner **slot) {
+  if (!slot || !*slot) { errno = EINVAL; return -1; }
+  struct tns_owner *owner = *slot;
+  if (tns_owner_stop_custodian(owner) < 0) return -1;
   tns_close_fd(&owner->netfd);
+  tns_close_fd(&owner->kernel_fd);
   tns_close_fd(&owner->procfd);
   tns_close_fd(&owner->procroot);
   tns_close_fd(&owner->pidfd);
