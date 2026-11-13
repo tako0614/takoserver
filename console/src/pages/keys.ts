@@ -41,6 +41,13 @@ interface UnshownKey {
 // Same-tab recovery metadata only: never retain the secret or response object.
 // Reloading the tab drops these notices; the Host's key list remains authoritative.
 const unshownKeys = signal<readonly UnshownKey[]>([]);
+// A roster-page repaint can replace the list while its same-Org modal stays open.
+// Keep one current reload target, guarded by its selected-Organization scope.
+let activeKeyList: {
+  readonly organizationId: string;
+  readonly isCurrent: () => boolean;
+  readonly reload: () => void;
+} | null = null;
 effect(() => {
   const previous = unshownKeys();
   const current = previous.filter((key) => key.isSessionCurrent());
@@ -82,7 +89,25 @@ function rememberUnshownKey(
  */
 export function keysPage(organizationId: string): Child {
   const isPageCurrent = captureSelectedOrganizationScope(organizationId);
+  if (!isPageCurrent()) {
+    return card(
+      null,
+      empty(
+        tr("組織を選択してください", "Choose an organization"),
+        tr(
+          "組織を読み込んで選択してから、キーを管理してください。",
+          "Load and select the organization before managing its keys.",
+        ),
+      ),
+    );
+  }
   const keys = resource(() => api.apiKeys(organizationId));
+  activeKeyList = { organizationId, isCurrent: isPageCurrent, reload: keys.reload };
+  const reload = (): void => {
+    const current = activeKeyList;
+    if (isPageCurrent() && current?.organizationId === organizationId && current.isCurrent())
+      current.reload();
+  };
   // Asked once per page. An already-open dialog follows the answer without
   // replacing the person's inputs; an unreadable document never offers AI.
   const discovery = resource(() => api.hostDiscovery());
@@ -119,9 +144,7 @@ export function keysPage(organizationId: string): Child {
         {
           class: "btn",
           type: "button",
-          onClick: () => {
-            if (isPageCurrent()) keys.reload();
-          },
+          onClick: reload,
         },
         icon(ICON.refresh, 14),
         text(tr("キー一覧を更新", "Refresh keys")),
@@ -131,7 +154,9 @@ export function keysPage(organizationId: string): Child {
         {
           class: "btn btn--primary",
           type: "button",
-          onClick: () => createKey(organizationId, keys.reload, aiAvailable, v2Endpoint()),
+          onClick: () => {
+            if (isPageCurrent()) createKey(organizationId, reload, aiAvailable, v2Endpoint());
+          },
         },
         icon(ICON.plus, 14),
         text(tr("キーを作成", "Create key")),
@@ -192,8 +217,9 @@ export function keysPage(organizationId: string): Child {
           ),
         );
     }),
-    live(() =>
-      whenReady(
+    live(() => {
+      if (!isPageCurrent()) return null;
+      return whenReady(
         keys.get(),
         ({ apiKeys }) =>
           card(
@@ -206,11 +232,11 @@ export function keysPage(organizationId: string): Child {
                     "Create one to manage this organization's Resources over Host API v2 with curl or your own code.",
                   ),
                 )
-              : h("div", { class: "table-scroll" }, table(apiKeys, organizationId, keys.reload)),
+              : h("div", { class: "table-scroll" }, table(apiKeys, organizationId, reload)),
           ),
-        { retry: keys.reload },
-      ),
-    ),
+        { retry: reload },
+      );
+    }),
   );
 }
 
