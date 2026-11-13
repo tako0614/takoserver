@@ -111,6 +111,7 @@ import {
   observeSelfhostBackgroundPasses,
   SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
 } from "./selfhost-health-signals.ts";
+import { createSelfhostLinuxDockerCore } from "./selfhost-linux-docker-core.ts";
 import {
   formatSelfhostListenAddress,
   parseSelfhostListenHost,
@@ -715,6 +716,10 @@ const objects =
     ? createMemoryObjectStore()
     : createFileObjectStore({ root: dataRoot });
 const clock = () => new Date();
+// F2 requires an explicit operator-code selection on this exact Sql. The legacy
+// Docker environment selects only its existing zero-only bootstrap. No F2 Form
+// is advertised until accepted dispatch, retained retirement and raw usage are composed.
+const selfhostLinuxDockerCore = createSelfhostLinuxDockerCore({ sql, clock, selection: undefined });
 // Native startup and the application share these exact canonical ledgers.
 const resourceStores = createAppResourceStoreBundle(sql, clock);
 const edge = await buildEdgeForms();
@@ -1480,6 +1485,7 @@ async function closeBeforePublicIngress(): Promise<void> {
     workerdShutdown: () => workerd.shutdown(),
     mayCloseDependents: () => true,
     v2WorkerSuspend: async () => {
+      await selfhostLinuxDockerCore?.close();
       await v2WorkerComposition.closeScheduledHost();
       await v2QueueScheduler?.close();
       await v2WorkerComposition.closeWorkflowHost();
@@ -1553,6 +1559,9 @@ try {
         ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
         : unconfigured),
     v2: takoformV2Config,
+    ...(selfhostLinuxDockerCore
+      ? { v2ContainerHostAcceptance: selfhostLinuxDockerCore.acceptance }
+      : {}),
     ...(billingConfig ? { billingConfig } : {}),
     hostedPaidFreeExclusion: Boolean(hostedPricing),
     ...(hostedBilling ? { hostedBilling } : {}),
@@ -1719,6 +1728,7 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
         workerdShutdown: () => workerd.shutdown(),
         mayCloseDependents: () => shutdownClean,
         v2WorkerSuspend: async () => {
+          await selfhostLinuxDockerCore?.close();
           await v2WorkerComposition.closeScheduledHost();
           await v2QueueScheduler?.close();
           await v2WorkerComposition.closeWorkflowHost();

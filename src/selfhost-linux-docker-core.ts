@@ -1,0 +1,234 @@
+import { canonicalDigest, canonicalJson } from "./json.ts";
+import type { Clock, Sql } from "./ports.ts";
+import {
+  createDockerContainerConfiguredInputs,
+  type DockerContainerConfiguredInputs,
+} from "./providers/docker-container-configured-inputs.ts";
+import type { DockerContainerAcceptedExecution } from "./providers/docker-container-core-owner.ts";
+import {
+  createDockerHttpRevisionRuntime,
+  type DockerHttpRevisionOptions,
+} from "./providers/docker-http-revision.ts";
+import {
+  createLinuxDockerCoreRuntime,
+  type LinuxDockerCorePreparationOptions,
+  type LinuxDockerCoreRuntimeOptions,
+} from "./providers/linux-docker-core-runtime.ts";
+import type { LinuxDockerRuntimePreparation } from "./providers/linux-docker-runtime-preparation.ts";
+import type { V2HostAcceptance } from "./takoform-v2/host-acceptance.ts";
+import type { V2Execution } from "./takoform-v2/types.ts";
+
+/** Operator code selection, separate from the legacy Docker environment opt-in.
+ * No owner, accepted execution, policy, custody or readiness is configurable.
+ */
+export interface SelfhostLinuxDockerCoreSelection {
+  readonly installationId: string;
+  readonly backendId: string;
+  readonly targetKey: string;
+  readonly configuredInputs: NonNullable<LinuxDockerCoreRuntimeOptions["configuredInputs"]>;
+  readonly runtime: Omit<LinuxDockerCorePreparationOptions, "policy" | "requiredSecretNames">;
+  readonly docker: Pick<
+    DockerHttpRevisionOptions,
+    "network" | "maxMemoryBytes" | "maxNanoCpus" | "pidsLimit" | "timeoutMs"
+  >;
+}
+
+export interface SelfhostLinuxDockerAcceptedRevision {
+  readonly accepted: DockerContainerAcceptedExecution;
+  readonly runtime: LinuxDockerRuntimePreparation;
+  readonly docker: ReturnType<typeof createDockerHttpRevisionRuntime>;
+}
+
+export interface SelfhostLinuxDockerCore {
+  readonly acceptance: V2HostAcceptance;
+  readonly configuredInputs: Pick<
+    DockerContainerConfiguredInputs,
+    "prepareCreate" | "prepareUpdate"
+  >;
+  withAcceptedRevision<T>(
+    execution: V2Execution,
+    work: (revision: SelfhostLinuxDockerAcceptedRevision) => Promise<T>,
+  ): Promise<T>;
+  close(): Promise<void>;
+}
+
+export class SelfhostLinuxDockerCoreError extends Error {
+  constructor(readonly code: "invalid_selection" | "closed" | "retained_delete_not_composed") {
+    super(`selfhost_linux_docker_core_${code}`);
+    this.name = "SelfhostLinuxDockerCoreError";
+  }
+}
+
+function dataKeys(input: object, allowed: readonly string[]): void {
+  if (
+    !input ||
+    (Object.getPrototypeOf(input) !== Object.prototype && Object.getPrototypeOf(input) !== null) ||
+    !Reflect.ownKeys(input).every((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(input, key);
+      return (
+        typeof key === "string" &&
+        allowed.includes(key) &&
+        descriptor?.enumerable &&
+        Object.hasOwn(descriptor, "value")
+      );
+    })
+  )
+    throw new SelfhostLinuxDockerCoreError("invalid_selection");
+}
+
+/** Construct after the real Sql, before buildApp. This owns the original
+ * acceptance, configured-input hooks and per-accepted-generation runtime graph.
+ * It supplies no public Form, usage producer, retirement policy or complete result;
+ * those unfinished compositions cannot be replaced by a caller's ready DTO.
+ * Construction and the disabled branch perform no native IO.
+ */
+export function createSelfhostLinuxDockerCore(input: {
+  readonly sql: Sql;
+  readonly clock: Clock;
+  readonly selection: SelfhostLinuxDockerCoreSelection | undefined;
+}): SelfhostLinuxDockerCore | undefined {
+  const selection = input.selection;
+  if (selection === undefined) return undefined;
+  dataKeys(selection, [
+    "installationId",
+    "backendId",
+    "targetKey",
+    "configuredInputs",
+    "runtime",
+    "docker",
+  ]);
+  dataKeys(selection.runtime, [
+    "process",
+    "host",
+    "dnsServers",
+    "maxConnections",
+    "packetLimitBytes",
+  ]);
+  dataKeys(selection.runtime.process, [
+    "helper",
+    "socketPath",
+    "peerPid",
+    "peerUid",
+    "ipBinary",
+    "nftBinary",
+    "guestNamespaceRoot",
+  ]);
+  dataKeys(selection.runtime.host, ["tcpPorts", "conntrackMark", "deniedDestinations"]);
+  dataKeys(selection.docker, [
+    "network",
+    "maxMemoryBytes",
+    "maxNanoCpus",
+    "pidsLimit",
+    "timeoutMs",
+  ]);
+  if (!selection.configuredInputs) throw new SelfhostLinuxDockerCoreError("invalid_selection");
+  dataKeys(selection.configuredInputs, ["keyring", "maxSecretBytes"]);
+  const { installationId, backendId, targetKey } = selection;
+  const runtimeOptions = structuredClone(selection.runtime);
+  const dockerOptions = structuredClone(selection.docker);
+  const core = createLinuxDockerCoreRuntime({
+    sql: input.sql,
+    clock: input.clock,
+    installationId,
+    backendId,
+    targetKey,
+    configuredInputs: selection.configuredInputs,
+  });
+  const configured = createDockerContainerConfiguredInputs({
+    sql: input.sql,
+    selection: { providerInstallationId: installationId, backendId, targetKey },
+    owner: core.owner,
+    keyring: selection.configuredInputs.keyring,
+    maxSecretBytes: selection.configuredInputs.maxSecretBytes,
+  });
+  const revisions = new Map<string, Omit<SelfhostLinuxDockerAcceptedRevision, "accepted">>();
+  const scopes = new Set<Promise<unknown>>();
+  let closed = false;
+  let closing: Promise<void> | undefined;
+  const assertOpen = () => {
+    if (closed) throw new SelfhostLinuxDockerCoreError("closed");
+  };
+  return Object.freeze({
+    acceptance: core.owner.acceptance,
+    configuredInputs: Object.freeze({
+      prepareCreate: configured.prepareCreate,
+      prepareUpdate: configured.prepareUpdate,
+    }),
+    async withAcceptedRevision<T>(
+      execution: V2Execution,
+      work: (revision: SelfhostLinuxDockerAcceptedRevision) => Promise<T>,
+    ): Promise<T> {
+      assertOpen();
+      // Register before starting the original scope, including its first SQL
+      // await. Shutdown must retain the database until all accepted work settles.
+      const running = Promise.resolve().then(() => {
+        assertOpen();
+        return core.owner.withExecution(execution, async () => {
+          const accepted = await core.owner.readAcceptedExecution(execution);
+          if (accepted.action === "delete")
+            throw new SelfhostLinuxDockerCoreError("retained_delete_not_composed");
+          const policy = {
+            tenantRef: accepted.principal,
+            generation: accepted.generation,
+            outboundInternet: accepted.outboundInternet,
+            policyDigest: await canonicalDigest({
+              installationId,
+              backendId,
+              targetKey,
+              runtimeOptions,
+              dockerOptions,
+            }),
+          };
+          assertOpen();
+          const key = canonicalJson([accepted.resourceUid, accepted.generation, accepted.revision]);
+          let revision = revisions.get(key);
+          if (!revision) {
+            const runtime = core.createRuntime({
+              ...runtimeOptions,
+              policy,
+              requiredSecretNames: accepted.requiredSecretNames,
+            });
+            revision = Object.freeze({
+              runtime,
+              docker: Object.freeze(
+                createDockerHttpRevisionRuntime({
+                  ...dockerOptions,
+                  installationId,
+                  socketPath: runtimeOptions.process.socketPath,
+                  dnsServers: runtime.dnsServers,
+                  runtimePreparation: runtime,
+                }),
+              ),
+            });
+            revisions.set(key, revision);
+          }
+          return work(Object.freeze({ accepted, ...revision }));
+        });
+      });
+      scopes.add(running);
+      void running.then(
+        () => {
+          scopes.delete(running);
+        },
+        () => {
+          scopes.delete(running);
+        },
+      );
+      return running;
+    },
+    close(): Promise<void> {
+      closed = true;
+      closing ??= (async () => {
+        // Caller outcomes remain with their original promises. A failed scope
+        // still has to settle before its runtime or backing Sql can be closed.
+        await Promise.allSettled([...scopes]);
+        const outcomes = await Promise.allSettled(
+          [...revisions.values()].map(({ runtime }) => runtime.close()),
+        );
+        const failed = outcomes.find((outcome) => outcome.status === "rejected");
+        if (failed?.status === "rejected") throw failed.reason;
+      })();
+      return closing;
+    },
+  });
+}
