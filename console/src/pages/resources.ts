@@ -56,6 +56,17 @@ function operationSettled(operation: { readonly status: string }): boolean {
 export function resourcesPage(organizationId: string): Child {
   const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
   const pageRoute = route();
+  if (!isOrganizationCurrent())
+    return card(
+      tr("リソース", "Resources"),
+      empty(
+        tr("組織を選択してください", "Choose an organization"),
+        tr("一覧から組織を選択してください。", "Select an organization from the list."),
+      ),
+    );
+  // Each build of this page follows on its own token. A rebuild (a language
+  // switch, say) takes a new one, so the replaced page stops checking.
+  const followToken = ++followGeneration;
   const isCurrentPage = (): boolean =>
     isOrganizationCurrent() && route() === pageRoute && followToken === followGeneration;
   // Made on the first empty render and reused, so a re-render does not ask the
@@ -70,6 +81,7 @@ export function resourcesPage(organizationId: string): Child {
   const page = resource(() => api.resources(organizationId));
   let pagingGeneration = 0;
   const reloadResources = (): void => {
+    if (!isCurrentPage()) return;
     pagingGeneration += 1;
     additional.set([]);
     continuation.set(null);
@@ -110,9 +122,6 @@ export function resourcesPage(organizationId: string): Child {
   // card does not blink back to its loading state every 1.5 s.
   const latest = signal<ResourceOperation | null>(null);
   let followTimer: ReturnType<typeof setTimeout> | undefined;
-  // Each build of this page follows on its own token. A rebuild (a language
-  // switch, say) takes a new one, so the replaced page stops checking.
-  const followToken = ++followGeneration;
   // Stop once this page has gone: rebuilt, another route, another
   // organization, or no document at all (a test that has finished).
   const stillShown = (): boolean =>
@@ -150,6 +159,7 @@ export function resourcesPage(organizationId: string): Child {
       })
     : null;
   const reload = (): void => {
+    if (!isCurrentPage()) return;
     if (operation) operation.reload();
     else reloadResources();
   };
@@ -221,21 +231,21 @@ export function resourcesPage(organizationId: string): Child {
     );
   };
   const loadMore = async (cursor: string): Promise<void> => {
-    if (loadingMore() || currentOrganization()?.id !== organizationId) return;
+    if (loadingMore() || !isCurrentPage()) return;
     const mine = ++pagingGeneration;
     loadingMore.set(true);
     moreError.set(null);
     try {
       const next = await api.resources(organizationId, { cursor });
-      if (mine !== pagingGeneration || currentOrganization()?.id !== organizationId) return;
+      if (mine !== pagingGeneration || !isCurrentPage()) return;
       additional.update((loaded) => [...loaded, ...next.resources]);
       continuation.set(next.cursor ? { cursor: next.cursor } : {});
     } catch (error) {
-      if (mine === pagingGeneration && currentOrganization()?.id === organizationId) {
+      if (mine === pagingGeneration && isCurrentPage()) {
         moreError.set(error instanceof Error ? error : new Error(String(error)));
       }
     } finally {
-      if (mine === pagingGeneration && currentOrganization()?.id === organizationId) {
+      if (mine === pagingGeneration && isCurrentPage()) {
         loadingMore.set(false);
       }
     }
@@ -388,8 +398,9 @@ export function resourcesPage(organizationId: string): Child {
           ),
         )
       : null,
-    live(() =>
-      whenReady(
+    live(() => {
+      if (!isCurrentPage()) return null;
+      return whenReady(
         page.get(),
         ({ resources, cursor }) => {
           if (currentOrganization()?.id !== organizationId) return null;
@@ -441,9 +452,9 @@ export function resourcesPage(organizationId: string): Child {
             nextCursor ? moreButton(nextCursor) : null,
           );
         },
-        { retry: page.reload },
-      ),
-    ),
+        { retry: reloadResources },
+      );
+    }),
   );
 }
 
