@@ -36,11 +36,14 @@ import {
 import { LinuxDockerRuntimePreparation } from "./linux-docker-runtime-preparation.ts";
 import {
   observeOriginalLinuxOciOwnedInitReaped,
+  observeOriginalLinuxOciOwnedNamespaceLifetime,
   observeOriginalLinuxOciOwnedRunning,
+  releaseOriginalLinuxOciOwnedNamespace,
   stopOriginalLinuxOciOwnedInit,
 } from "./linux-oci-owned-bundle.ts";
 import type {
   LinuxOciInitReapedObservation,
+  LinuxOciNamespaceLifetimeObservation,
   LinuxOciStartedObservation,
 } from "./linux-oci-physical-session.ts";
 
@@ -132,6 +135,21 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciInitReapedObservation>;
+  /** Same original retained custody only; a genuine running attempt is first
+   * reaped through stopRetainedInit. Exited attempts never repeat task IO. */
+  releaseRetainedNamespace(
+    execution: V2Execution,
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciNamespaceLifetimeObservation>;
+  /** Read-only observation requires that exact original attempt already exited. */
+  observeRetainedNamespaceLifetime(
+    execution: V2Execution,
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciNamespaceLifetimeObservation>;
   withExecution<T>(execution: V2Execution, work: () => Promise<T>): Promise<T>;
 }
 export interface DockerContainerAcceptedExecution {
@@ -2065,7 +2083,113 @@ export function createDockerContainerCoreOwner(
       if (removed.nativeId !== nativeId || removed.state !== "removed") return fail();
     },
   });
+  async function retainedNamespace(
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    mode: "release" | "observe",
+  ): Promise<LinuxOciNamespaceLifetimeObservation> {
+    if (
+      !own(input, ["claimId", "intent", "nativeId", "state"]) ||
+      !hex(input.claimId) ||
+      !hex(input.nativeId) ||
+      input.state !== "bound" ||
+      signal.aborted
+    )
+      return fail();
+    const captured = Object.freeze({
+      claimId: input.claimId,
+      intent: intentSnapshot(input.intent),
+      nativeId: input.nativeId,
+      state: "bound" as const,
+    });
+    const accepted = await result.readAcceptedExecution(execution);
+    if (accepted.action !== "update" && accepted.action !== "delete") return fail();
+    const retained = accepted.retained.find(({ record }) => record.claimId === captured.claimId);
+    if (
+      !retained ||
+      retained.removedAtMs !== null ||
+      captured.intent.policy.generation >= accepted.generation ||
+      canonicalJson(retained.record) !== canonicalJson(captured)
+    )
+      return fail();
+    const lease = await activeRecord(captured, "remove");
+    let loaded = await boundStartRecord(captured);
+    if (!usable(loaded.proof, "remove")) return fail();
+    const guard = async () => {
+      await assertExecution(execution);
+      if (
+        signal.aborted ||
+        !(await current(lease)) ||
+        !lease.active ||
+        lease.controller.signal.aborted ||
+        !leases.has(lease)
+      )
+        return fail();
+      executionScope(execution);
+    };
+    const startPhase = async () => {
+      const rows = await sql.query(
+        "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
+        [loaded.intent.resourceUid, loaded.intent.policy.generation],
+      );
+      const row = rows[0];
+      if (rows.length !== 1 || !row) return fail();
+      const claimed = row.claimed_at_ms,
+        running = row.confirmed_running_at_ms,
+        exited = row.confirmed_exited_at_ms;
+      if (
+        row.attempt !== 1 ||
+        row.create_claim_id !== captured.claimId ||
+        row.native_id !== captured.nativeId ||
+        typeof claimed !== "number" ||
+        !Number.isSafeInteger(claimed) ||
+        claimed < 0 ||
+        typeof running !== "number" ||
+        !Number.isSafeInteger(running) ||
+        running < claimed
+      )
+        return fail();
+      if (row.state === "running" && exited === null) return "running";
+      if (
+        row.state === "exited" &&
+        typeof exited === "number" &&
+        Number.isSafeInteger(exited) &&
+        exited >= running
+      )
+        return "exited";
+      return fail();
+    };
+    await guard();
+    const phase = await startPhase();
+    await guard();
+    if (phase === "running") {
+      if (mode === "observe") return fail();
+      // The existing original reap producer owns STOP/JOIN and the exit CAS.
+      // Neither this read nor a namespace snapshot can manufacture an exit.
+      await result.stopRetainedInit(execution, captured, originalCustody, signal);
+      loaded = await boundStartRecord(captured);
+      if ((await startPhase()) !== "exited") return fail();
+      await guard();
+    }
+    const observation = await (mode === "release"
+      ? releaseOriginalLinuxOciOwnedNamespace(originalCustody, result, captured, signal)
+      : observeOriginalLinuxOciOwnedNamespaceLifetime(originalCustody, result, captured, signal));
+    await guard();
+    // No final await after the local execution/lease/cancel fence.
+    if (signal.aborted || !lease.active || lease.controller.signal.aborted || !leases.has(lease))
+      return fail();
+    executionScope(execution);
+    return observation;
+  }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
+    releaseRetainedNamespace(execution, record, originalCustody, signal) {
+      return retainedNamespace(execution, record, originalCustody, signal, "release");
+    },
+    observeRetainedNamespaceLifetime(execution, record, originalCustody, signal) {
+      return retainedNamespace(execution, record, originalCustody, signal, "observe");
+    },
     async claimAcceptedStart(input: DockerContainerCreateRecord) {
       // Snapshot data before the first await. Accessors or a later caller edit
       // cannot switch the record between the original lease and Sql checks.

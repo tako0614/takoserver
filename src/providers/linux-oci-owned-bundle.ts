@@ -24,6 +24,7 @@ import {
 import {
   createLinuxOciPhysicalSession,
   type LinuxOciInitReapedObservation,
+  type LinuxOciNamespaceLifetimeObservation,
   LinuxOciPhysicalSession,
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
@@ -35,6 +36,7 @@ type OriginalOciCustody = {
   readonly bindings: ReadonlyMap<string, string>;
   readonly signal: AbortSignal;
   readonly initStops: Set<string>;
+  readonly namespaceReleases: Set<string>;
 };
 // Populated ONLY inside the real creator below. There is no registration API
 // and its opaque keys are never returned to a caller or serialized.
@@ -42,6 +44,70 @@ const originalOciCustodies = new WeakMap<object, OriginalOciCustody>();
 const observeOriginalOciStarted = LinuxOciPhysicalSession.prototype.observeStarted;
 const stopOriginalOciInit = LinuxOciPhysicalSession.prototype.stopInit;
 const joinOriginalOciInit = LinuxOciPhysicalSession.prototype.joinInit;
+const releaseOriginalOciNamespace = LinuxOciPhysicalSession.prototype.releaseNamespace;
+const continueOriginalOciNamespace = LinuxOciPhysicalSession.prototype.continueNamespaceRelease;
+const readOriginalOciNamespace = LinuxOciPhysicalSession.prototype.observeNamespaceLifetime;
+
+async function originalNamespaceObservation(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+  mode: "release" | "observe",
+): Promise<LinuxOciNamespaceLifetimeObservation> {
+  const custody = originalOciCustodies.get(original);
+  if (
+    !custody ||
+    custody.core !== core ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    !custody.initStops.has(record.claimId)
+  )
+    return fail("retained_native_unknown");
+  const session = custody.sessions.get(record.claimId);
+  const nativeId = custody.bindings.get(record.claimId);
+  if (!session || nativeId === undefined || nativeId !== record.nativeId)
+    return fail("retained_native_unknown");
+  const attempted = custody.namespaceReleases.has(record.claimId);
+  if (mode === "observe" && !attempted) return fail("retained_native_unknown");
+  // This marker orders requests only. The SAME original physical owner decides
+  // which unsent phase may continue and refuses a sent-unknown RELEASE replay.
+  if (mode === "release") custody.namespaceReleases.add(record.claimId);
+  const observe =
+    mode === "observe"
+      ? readOriginalOciNamespace
+      : attempted
+        ? continueOriginalOciNamespace
+        : releaseOriginalOciNamespace;
+  const observation = await observe.call(session, signal);
+  if (
+    custody.signal.aborted ||
+    signal.aborted ||
+    custody.sessions.get(record.claimId) !== session ||
+    custody.bindings.get(record.claimId) !== nativeId ||
+    observation.nativeId !== nativeId
+  )
+    return fail("revoked");
+  return observation;
+}
+
+export function releaseOriginalLinuxOciOwnedNamespace(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+) {
+  return originalNamespaceObservation(original, core, record, signal, "release");
+}
+
+export function observeOriginalLinuxOciOwnedNamespaceLifetime(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+) {
+  return originalNamespaceObservation(original, core, record, signal, "observe");
+}
 
 /** Internal owner/producer bridge. The original creator must have completed
  * its actual CREATE and original bindNative CAS for this exact private key. */
@@ -421,6 +487,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     bindings: nativeBindings,
     signal: nativeLifetime.signal,
     initStops: new Set<string>(),
+    namespaceReleases: new Set<string>(),
   });
   let nativeClosing: Promise<void> | undefined;
   const joinTimeoutMs = Math.min(timeout, 1000);
@@ -448,6 +515,99 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         ...(physicalBinary === undefined ? {} : { physicalBinary }),
       }),
     };
+  }
+  function retainedNamespaceObservations(
+    execution: V2Execution,
+    externalSignal: AbortSignal | undefined,
+    mode: "release" | "observe",
+  ): Promise<readonly LinuxOciNamespaceLifetimeObservation[]> {
+    if (closed) return Promise.reject(new Error("linux_oci_owned_bundle_closed"));
+    if (physicalBinary === undefined)
+      return Promise.reject(new Error("linux_oci_owned_bundle_physical_not_configured"));
+    if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
+      return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
+    const cancel = new AbortController();
+    cancellation.add(cancel);
+    const abort = () => cancel.abort();
+    externalSignal?.addEventListener("abort", abort, { once: true });
+    if (externalSignal?.aborted) abort();
+    const running = Promise.resolve().then(() =>
+      core.withExecution(execution, async () => {
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        const accepted = await core.readAcceptedExecution(execution);
+        if (accepted.action !== "delete" && accepted.action !== "update")
+          return fail("not_retirement");
+        const retained = accepted.retained.filter(
+          ({ record }) => record.intent.policy.generation < accepted.generation,
+        );
+        if (!retained.length) return fail("retained_native_unknown");
+        const expectedPolicy = await acceptedPolicy(accepted);
+        for (const item of retained) {
+          const { record } = item;
+          if (
+            item.removedAtMs !== null ||
+            record.state !== "bound" ||
+            record.nativeId === null ||
+            record.intent.installationId !== accepted.installationId ||
+            record.intent.resourceUid !== accepted.resourceUid ||
+            record.intent.incarnationId !== accepted.incarnationId ||
+            record.intent.policy.tenantRef !== accepted.principal ||
+            record.intent.policy.policyDigest !== expectedPolicy.policyDigest ||
+            !nativeSessions.has(record.claimId) ||
+            nativeBindings.get(record.claimId) !== record.nativeId
+          )
+            return fail("retained_native_unknown");
+        }
+        const observations: LinuxOciNamespaceLifetimeObservation[] = [];
+        for (const { record } of retained) {
+          if (closed || cancel.signal.aborted) return fail("revoked");
+          await core.owner.withAuthority(record, "remove", async (held) => {
+            const loan = new AbortController();
+            const revoke = () => loan.abort();
+            cancel.signal.addEventListener("abort", revoke, { once: true });
+            held.revocation.addEventListener("abort", revoke, { once: true });
+            if (cancel.signal.aborted || held.revocation.aborted) revoke();
+            try {
+              if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+              const observation = await (mode === "release"
+                ? core.releaseRetainedNamespace(
+                    execution,
+                    record,
+                    originalNativeCustody,
+                    loan.signal,
+                  )
+                : core.observeRetainedNamespaceLifetime(
+                    execution,
+                    record,
+                    originalNativeCustody,
+                    loan.signal,
+                  ));
+              if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+              if (closed || loan.signal.aborted) return fail("revoked");
+              observations.push(observation);
+            } finally {
+              loan.abort();
+              cancel.signal.removeEventListener("abort", revoke);
+              held.revocation.removeEventListener("abort", revoke);
+            }
+          });
+          if (closed || cancel.signal.aborted) return fail("revoked");
+        }
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        return Object.freeze(observations);
+      }),
+    );
+    scopes.add(running);
+    void running
+      .finally(() => {
+        externalSignal?.removeEventListener("abort", abort);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+      })
+      .catch(() => undefined);
+    return running;
   }
   const artifact = Object.freeze({
     acceptance: core.acceptance,
@@ -988,6 +1148,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         })
         .catch(() => undefined);
       return running;
+    },
+    /** Factual cleanup only, under the ORIGINAL accepted/remove scope. */
+    releaseRetainedNamespaces(execution: V2Execution, signal?: AbortSignal) {
+      return retainedNamespaceObservations(execution, signal, "release");
+    },
+    /** Reads the same owner after a prior release request; never starts cleanup. */
+    observeRetainedNamespaceLifetimes(execution: V2Execution, signal?: AbortSignal) {
+      return retainedNamespaceObservations(execution, signal, "observe");
     },
     close(): Promise<void> {
       const joined = artifact.close();

@@ -67,6 +67,7 @@ async function fixture(
       | "start-retire-mutated"
       | "retire-pending";
     readonly noPhysicalBinary?: boolean;
+    readonly namespaceMode?: "success" | "retained" | "foreign" | "unknown";
     readonly configuredKey?: "sql" | "selection" | "owner";
   } = {},
 ) {
@@ -361,6 +362,53 @@ async function fixture(
                   barrier: "unproven",
                 });
               }
+            } else if (
+              request.kind === "linux-oci-release-namespace@1" ||
+              request.kind === "linux-oci-continue-namespace-release@1" ||
+              request.kind === "linux-oci-observe-namespace-lifetime@1"
+            ) {
+              if (!nativeId || !adversarial.namespaceMode)
+                throw new Error("original namespace fixture absent");
+              expect(Object.keys(request)).toEqual(["kind"]);
+              if (
+                request.kind === "linux-oci-release-namespace@1" &&
+                adversarial.namespaceMode === "retained"
+              )
+                reply({
+                  kind: "linux-oci-refused@1",
+                  stage: "release-namespace",
+                  errno: 5,
+                  custody: "retained",
+                  barrier: "unproven",
+                });
+              else if (
+                request.kind === "linux-oci-release-namespace@1" &&
+                adversarial.namespaceMode === "unknown"
+              )
+                stdout.end();
+              else
+                reply({
+                  kind:
+                    request.kind === "linux-oci-release-namespace@1"
+                      ? "linux-oci-namespace-release-observation@1"
+                      : request.kind === "linux-oci-continue-namespace-release@1"
+                        ? "linux-oci-namespace-release-continuation@1"
+                        : "linux-oci-namespace-lifetime-observation@1",
+                  nativeId: adversarial.namespaceMode === "foreign" ? "f".repeat(64) : nativeId,
+                  namespaceDevice: 4,
+                  namespaceInode: 55,
+                  netCookie: "18446744073709551615",
+                  fullIpSockets: "2",
+                  requests: "0",
+                  timewait: "1",
+                  packetGroups: "3",
+                  born: 1,
+                  releaseAttempted: 1,
+                  referenceReleased: 1,
+                  netGone: 0,
+                  poisoned: 0,
+                  barrier: "unproven",
+                });
             } else if (request.kind === "linux-oci-cancel@1") {
               reply({
                 kind: "linux-oci-cancel-observation@1",
@@ -440,8 +488,10 @@ async function fixture(
   const stopped: unknown[] = [];
   const started: unknown[] = [];
   const reaped: unknown[] = [];
+  const namespaces: unknown[] = [];
   let retireSignal: AbortSignal | undefined;
   let beforeRetire: ((execution: V2Execution) => Promise<void>) | undefined;
+  let afterRetire: ((execution: V2Execution) => Promise<void>) | undefined;
   let beforeStart: ((execution: V2Execution) => Promise<void>) | undefined;
   let afterStart: ((execution: V2Execution) => Promise<void>) | undefined;
   const dispatch = async (execution: V2Execution): Promise<V2BackendResult> => {
@@ -455,11 +505,17 @@ async function fixture(
             adversarial.nativeMode === "retire-pending")
         ) {
           await beforeRetire?.(execution);
-          reaped.push(
-            ...(await (retireSignal === undefined
-              ? composition.stopRetainedInit(execution)
-              : composition.stopRetainedInit(execution, retireSignal))),
-          );
+          if (adversarial.namespaceMode) {
+            namespaces.push(
+              ...(await composition.releaseRetainedNamespaces(execution, retireSignal)),
+            );
+            await afterRetire?.(execution);
+          } else
+            reaped.push(
+              ...(await (retireSignal === undefined
+                ? composition.stopRetainedInit(execution)
+                : composition.stopRetainedInit(execution, retireSignal))),
+            );
           return { kind: "continue" };
         }
         stopped.push(await composition.createAcceptedStopped(execution));
@@ -618,11 +674,15 @@ async function fixture(
     stopped,
     started,
     reaped,
+    namespaces,
     retireSignal(signal: AbortSignal) {
       retireSignal = signal;
     },
     beforeRetire(callback: typeof beforeRetire) {
       beforeRetire = callback;
+    },
+    afterRetire(callback: typeof afterRetire) {
+      afterRetire = callback;
     },
     beforeStart(callback: typeof beforeStart) {
       beforeStart = callback;
@@ -1697,3 +1757,298 @@ test("the genuine OCI unpack child receives a fresh empty environment without in
     await f.close();
   }
 });
+
+const namespaceKinds: [string, string, string] = [
+  "linux-oci-release-namespace@1",
+  "linux-oci-continue-namespace-release@1",
+  "linux-oci-observe-namespace-lifetime@1",
+];
+async function acceptNamespaceDelete(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.create();
+  expect(await f.engine.runNext()).toMatchObject({ status: "failed", effect: "partial" });
+  const execution = f.execution;
+  if (!execution) throw new Error("original CREATE execution absent");
+  return f.engine.acceptDelete({
+    principal: "synthetic-oci-parent",
+    key: crypto.randomUUID(),
+    uid: execution.resourceUid,
+    expectedGeneration: 1,
+  });
+}
+async function assertNamespaceRetained(f: Awaited<ReturnType<typeof fixture>>) {
+  expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+    { state: "exited" },
+  ]);
+  expect(
+    await f.sql.query("SELECT state,removed_at_ms FROM tf_v2_container_create_claims"),
+  ).toEqual([{ state: "bound", removed_at_ms: null }]);
+  expect(await f.sql.query("SELECT serving_generation FROM tf_v2_container_instances")).toEqual([
+    { serving_generation: null },
+  ]);
+  expect(f.nativeCounts().processes).toBe(1);
+  expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-stop-init@1")).toHaveLength(
+    1,
+  );
+  expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-join-init@1")).toHaveLength(
+    1,
+  );
+}
+
+test("accepted OCI namespace release reaps the original running init, then reads without task replay or deletion", async () => {
+  const f = await fixture(false, { nativeMode: "start-retire", namespaceMode: "success" });
+  f.afterStart(async (execution) => {
+    const before = f.nativeCounts();
+    await expect(f.composition.releaseRetainedNamespaces(execution)).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(before);
+  });
+  f.beforeRetire(async (execution) => {
+    const before = f.nativeCounts();
+    for (const changed of [
+      { principal: "synthetic-foreign" },
+      { backendId: "synthetic-foreign" },
+      { targetKey: "synthetic-foreign" },
+    ])
+      await expect(
+        f.composition.releaseRetainedNamespaces({ ...execution, ...changed }),
+      ).rejects.toThrow();
+    const cancel = new AbortController();
+    cancel.abort();
+    await expect(
+      f.composition.releaseRetainedNamespaces(execution, cancel.signal),
+    ).rejects.toThrow();
+    // A read cannot initiate STOP, JOIN, namespace release or any other cleanup.
+    await expect(f.composition.observeRetainedNamespaceLifetimes(execution)).rejects.toThrow();
+    const foreign = createDockerContainerCoreOwner({
+      sql: f.sql,
+      clock: () => new Date(),
+      installationId: "synthetic-oci-installation",
+      backendId: "synthetic-oci-backend",
+      targetKey: "synthetic-oci-target",
+      configuredInputs: f.configuredInputs,
+    });
+    await foreign.withExecution(execution, async () => {
+      const accepted = await foreign.readAcceptedExecution(execution);
+      const old = accepted.retained.find(({ record }) => record.intent.policy.generation === 1);
+      if (!old) throw new Error("original retained record absent");
+      await foreign.owner.withAuthority(old.record, "remove", async (held) => {
+        // A real same-Sql owner/lease and matching record still lack the creator's private key.
+        await expect(
+          foreign.releaseRetainedNamespace(
+            execution,
+            old.record,
+            Object.freeze({}),
+            held.revocation,
+          ),
+        ).rejects.toThrow();
+      });
+    });
+    expect(f.nativeCounts()).toEqual(before);
+  });
+  let read: unknown;
+  f.afterRetire(async (execution) => {
+    const before = await f.sql.query("SELECT * FROM tf_v2_container_start_attempts");
+    const requests = f.nativeCounts().requests;
+    read = await f.composition.observeRetainedNamespaceLifetimes(execution);
+    expect(await f.sql.query("SELECT * FROM tf_v2_container_start_attempts")).toEqual(before);
+    expect(f.nativeCounts().requests).toEqual([...requests, namespaceKinds[2]]);
+  });
+  try {
+    await acceptNamespaceDelete(f);
+    const result = await f.engine.runNext();
+    expect(f.failures).toEqual([]);
+    expect(f.namespaces).toHaveLength(1);
+    expect(f.namespaces[0]).toMatchObject({
+      kind: "linux-oci-namespace-release-observation@1",
+      fullIpSockets: "2",
+      packetGroups: "3",
+      barrier: "unproven",
+    });
+    expect(read).toMatchObject([{ kind: "linux-oci-namespace-lifetime-observation@1" }]);
+    await assertNamespaceRetained(f);
+    expect(f.nativeCounts().requests.filter((kind) => namespaceKinds.includes(kind))).toEqual([
+      namespaceKinds[0],
+      namespaceKinds[2],
+    ]);
+    expect(result?.effect).not.toBe("complete");
+    const execution = f.execution;
+    if (!execution) throw new Error("original DELETE execution absent");
+    const before = f.nativeCounts();
+    await expect(f.composition.releaseRetainedNamespaces(execution)).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(before);
+  } finally {
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("accepted OCI namespace decoded retained refusal resumes only through the same child's unsent continuation", async () => {
+  const f = await fixture(false, { nativeMode: "start-retire", namespaceMode: "retained" });
+  f.afterRetire(async (execution) => {
+    const snapshot = await f.composition.observeRetainedNamespaceLifetimes(execution);
+    expect(snapshot).toHaveLength(1);
+  });
+  try {
+    const deletion = await acceptNamespaceDelete(f);
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toHaveLength(1);
+    expect(f.namespaces).toEqual([]);
+    await assertNamespaceRetained(f);
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+      [deletion.id],
+    );
+    const result = await f.engine.runNext();
+    expect(f.failures).toHaveLength(1);
+    expect(f.namespaces).toHaveLength(1);
+    expect(f.namespaces[0]).toMatchObject({
+      kind: "linux-oci-namespace-release-continuation@1",
+      barrier: "unproven",
+    });
+    await assertNamespaceRetained(f);
+    expect(f.nativeCounts().requests.filter((kind) => namespaceKinds.includes(kind))).toEqual(
+      namespaceKinds,
+    );
+    expect(result?.effect).not.toBe("complete");
+  } finally {
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+for (const namespaceMode of ["unknown", "foreign"] as const) {
+  test(`accepted OCI namespace ${namespaceMode} keeps the original broken child without RELEASE or STOP replay`, async () => {
+    const f = await fixture(false, { nativeMode: "start-retire", namespaceMode });
+    try {
+      const deletion = await acceptNamespaceDelete(f);
+      await f.engine.runNext();
+      expect(f.failures).toHaveLength(1);
+      expect(f.namespaces).toEqual([]);
+      await assertNamespaceRetained(f);
+      const before = f.nativeCounts();
+      await f.sql.run(
+        "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+        [deletion.id],
+      );
+      expect((await f.engine.runNext())?.effect).not.toBe("complete");
+      expect(f.failures).toHaveLength(2);
+      expect(f.namespaces).toEqual([]);
+      expect(f.nativeCounts()).toEqual(before);
+      await assertNamespaceRetained(f);
+    } finally {
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+for (const phase of ["missing", "pending"] as const) {
+  test(`accepted OCI namespace ${phase} START refuses task and namespace IO before any fabricated exit`, async () => {
+    const f = await fixture(false, { nativeMode: "retire-pending", namespaceMode: "success" });
+    if (phase === "pending") {
+      const storage = createDockerContainerCoreOwner({
+        sql: f.sql,
+        clock: () => new Date(),
+        installationId: "synthetic-oci-installation",
+        backendId: "synthetic-oci-backend",
+        targetKey: "synthetic-oci-target",
+        configuredInputs: f.configuredInputs,
+      });
+      f.beforeStart(async (execution) =>
+        storage.withExecution(execution, async () => {
+          const accepted = await storage.readAcceptedExecution(execution);
+          const current = accepted.retained.find(
+            ({ record }) => record.intent.policy.generation === execution.generation,
+          );
+          if (!current) throw new Error("original CREATE absent");
+          await storage.owner.withAuthority(current.record, "reconcile", async () => {
+            expect(await storage.claimAcceptedStart(current.record)).toBe("claimed");
+          });
+        }),
+      );
+    }
+    try {
+      await acceptNamespaceDelete(f);
+      const before = f.nativeCounts();
+      expect((await f.engine.runNext())?.effect).not.toBe("complete");
+      expect(f.failures).toHaveLength(1);
+      expect(f.namespaces).toEqual([]);
+      expect(f.nativeCounts()).toEqual(before);
+      expect(before.requests).toEqual(["linux-oci-create-stopped@1"]);
+      expect(
+        await f.sql.query(
+          "SELECT state,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts",
+        ),
+      ).toEqual(
+        phase === "missing"
+          ? []
+          : [{ state: "pending", confirmed_running_at_ms: null, confirmed_exited_at_ms: null }],
+      );
+    } finally {
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+for (const boundary of [2, 3] as const) {
+  for (const action of ["cancel", "close"] as const) {
+    test(`accepted OCI namespace final current read ${boundary} ${action} retains facts without returning a cancelled snapshot`, async () => {
+      const f = await fixture(false, { nativeMode: "start-retire", namespaceMode: "success" });
+      const cancel = new AbortController();
+      f.retireSignal(cancel.signal);
+      let entered = () => {},
+        release = () => {};
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let closing: Promise<void> | undefined,
+        restore = () => {},
+        reads = 0;
+      try {
+        await acceptNamespaceDelete(f);
+        const originalQuery = f.sql.query.bind(f.sql);
+        const query = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+          const rows = await originalQuery(statement, params);
+          if (
+            f.nativeCounts().requests.includes(namespaceKinds[0]) &&
+            statement.includes(" FROM tf_v2_container_instances i JOIN ")
+          ) {
+            reads++;
+            if (reads === boundary) {
+              entered();
+              await gate;
+            }
+          }
+          return rows;
+        });
+        restore = () => query.mockRestore();
+        const pass = f.engine.runNext();
+        await Promise.race([
+          reached,
+          pass.then(() => {
+            throw new Error("original namespace final Sql boundary absent");
+          }),
+        ]);
+        expect(reads).toBe(boundary);
+        if (action === "cancel") cancel.abort();
+        else {
+          closing = f.composition.close();
+          void closing.catch(() => undefined);
+        }
+        release();
+        const result = await pass;
+        expect(f.failures).toHaveLength(1);
+        expect(f.namespaces).toEqual([]);
+        await assertNamespaceRetained(f);
+        expect(f.nativeCounts().requests.filter((kind) => namespaceKinds.includes(kind))).toEqual([
+          namespaceKinds[0],
+        ]);
+        expect(result?.effect).not.toBe("complete");
+        if (closing) await expect(closing).rejects.toThrow("custody_retained");
+      } finally {
+        release();
+        restore();
+        await expect(f.close()).rejects.toThrow("custody_retained");
+      }
+    });
+  }
+}
