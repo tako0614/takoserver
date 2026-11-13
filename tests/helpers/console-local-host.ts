@@ -1,4 +1,5 @@
 import { buildApp } from "../../src/app.ts";
+import type { BillingConfig } from "../../src/billing-config.ts";
 import { resolveIdentity } from "../../src/identity-setup.ts";
 import { base64UrlEncode } from "../../src/json.ts";
 import { createMemoryObjectStore } from "../../src/objects-mem.ts";
@@ -166,7 +167,11 @@ export interface LocalConsoleIo {
 }
 
 /** Actual App/auth/signatures; only local browser IO can be delayed by callers. */
-export async function createSignedConsoleHost(consoleOrigin: string, io: LocalConsoleIo = {}) {
+export async function createSignedConsoleHost(
+  consoleOrigin: string,
+  io: LocalConsoleIo = {},
+  billingConfig?: BillingConfig,
+) {
   const origin = "https://api.logout-cookie.test";
   const now = "2026-11-13T00:00:00.000Z";
   const database = migrateSqliteDatabase();
@@ -217,6 +222,7 @@ export async function createSignedConsoleHost(consoleOrigin: string, io: LocalCo
     };
     const app = buildApp({
       sql,
+      ...(billingConfig === undefined ? {} : { billingConfig }),
       objects: createMemoryObjectStore(),
       identity: setup.verifier,
       identityProviders: setup.providers,
