@@ -1,0 +1,69 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] reserve original NF net origin in actual skb before dispatch
+
+Apply after the retained aggregate16 source graph. nf_hook, cond-false and
+list entry paths bind their actual skb to the genuine live caller net before
+any gate or dispatch. Reuse the existing extension origin/COW/dedup/free
+producer. Shared skb headers cannot be safely replaced here: poison the
+actual incoming held owner and preserve the header/older origin reservations.
+No new API, admission grant, net-memory pin, or full async/terminal proof.
+
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -232,6 +232,8 @@
+ #ifdef CONFIG_TAKO_TERMINAL
+ 	/* CUT waits this reader: enter before the admission decision. */
+ 	rcu_read_lock();
++	/* Bind the actual packet before any gate/dispatch/async handoff. */
++	tako_terminal_skb_set_owner(skb, net);
+ #endif
+ 	/* Owned birth gate precedes the no-hooks static-key fast path. */
+ 	if (unlikely(tako_terminal_block(net, pf))) {
+@@ -322,6 +324,10 @@
+ 	struct tako_terminal_owner *held = tako_terminal_packet_reserve(net);
+ 	int ret;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* cond=false still passes this original skb into okfn. */
++	tako_terminal_skb_set_owner(skb, net);
++#endif
+ 	/* cond=false otherwise skips nf_hook completely. */
+ 	if (unlikely(tako_terminal_block(net, pf))) {
+ 		kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
+@@ -363,6 +369,13 @@
+ #ifdef CONFIG_TAKO_TERMINAL
+ 	/* CUT waits this reader: enter before the admission decision. */
+ 	rcu_read_lock();
++	{
++		struct sk_buff *skb;
++
++		/* Preserve each original packet beyond list dispatch/steal. */
++		list_for_each_entry(skb, head, list)
++			tako_terminal_skb_set_owner(skb, net);
++	}
+ #endif
+ 	if (unlikely(tako_terminal_block(net, pf))) {
+ 		struct sk_buff *skb, *next;
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -7253,8 +7253,17 @@
+ {
+ 	struct tako_terminal_skb_refs held = {0};
+ 
+-	/* Caller holds the actual socket's net, never a namespace descriptor. */
++	/* Caller retains this genuine live net, never a namespace descriptor. */
+ 	tako_terminal_skb_refs_take(&held, tako_terminal_packet_reserve(net));
++	/* A shared skb header cannot be mutated by this caller. Refuse useful
++	 * zero for the incoming original owner without replacing the skb.
++	 * Existing extension owners remain held by the unchanged header.
++	 */
++	if (unlikely(skb_shared(skb))) {
++		tako_terminal_skb_refs_poison(&held);
++		tako_terminal_skb_refs_put(&held);
++		return;
++	}
+ 	tako_skb_restore(skb, &held);
+ }
+ EXPORT_SYMBOL_GPL(tako_terminal_skb_set_owner);
