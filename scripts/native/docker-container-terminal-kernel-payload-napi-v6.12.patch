@@ -1,0 +1,77 @@
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1478,44 +1478,73 @@
+ void __napi_kfree_skb(struct sk_buff *skb, enum skb_drop_reason reason)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++
++	tako_skb_snapshot(skb, &held);
++#endif
+ 	skb_release_all(skb, reason);
+ 	napi_skb_cache_put(skb);
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Cache/free may have consumed skb; only saved refs remain accessible. */
++	tako_terminal_skb_refs_put(&held);
++#endif
+ }
+ 
+ void napi_skb_free_stolen_head(struct sk_buff *skb)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++#endif
++
+ 	if (unlikely(skb->slow_gro)) {
++#ifdef CONFIG_TAKO_TERMINAL
++		tako_skb_snapshot(skb, &held);
++#endif
+ 		nf_reset_ct(skb);
+ 		skb_dst_drop(skb);
+ 		skb_ext_put_final(skb);
+ 		skb_orphan(skb);
+ 		skb->slow_gro = 0;
+ 	}
+ 	napi_skb_cache_put(skb);
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_terminal_skb_refs_put(&held);
++#endif
+ }
+ 
+ void napi_consume_skb(struct sk_buff *skb, int budget)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++#endif
++
+ 	/* Zero budget indicate non-NAPI context called us, like netpoll */
+ 	if (unlikely(!budget)) {
+ 		dev_consume_skb_any(skb);
+ 		return;
+ 	}
+ 
+ 	DEBUG_NET_WARN_ON_ONCE(!in_softirq());
+ 
+ 	if (!skb_unref(skb))
+ 		return;
+ 
+ 	/* if reaching here SKB is ready to free */
+ 	trace_consume_skb(skb, __builtin_return_address(0));
+ 
+ 	/* if SKB is a clone, don't handle this case */
+ 	if (skb->fclone != SKB_FCLONE_UNAVAILABLE) {
+ 		__kfree_skb(skb);
+ 		return;
+ 	}
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_skb_snapshot(skb, &held);
++#endif
+ 	skb_release_all(skb, SKB_CONSUMED);
+ 	napi_skb_cache_put(skb);
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_terminal_skb_refs_put(&held);
++#endif
+ }
+ EXPORT_SYMBOL(napi_consume_skb);

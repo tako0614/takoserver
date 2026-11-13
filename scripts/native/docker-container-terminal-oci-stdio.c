@@ -8,6 +8,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -152,6 +153,28 @@ static int ocip_started(const char *kind, struct tns_oci_owner *owner, int begin
   return ocip_reply(bytes) < 0 ? -2 : 0;
 }
 
+static int ocip_init_reaped(const char *kind, struct tns_oci_owner *owner, int stop) {
+  struct tns_oci_init_reaped observation;
+  int result = stop ? tns_oci_stop_init(owner, &observation) :
+                      tns_oci_join_init(owner, &observation);
+  if (result < 0) return -1;
+  uint64_t identities[] = {observation.namespace_device, observation.namespace_inode,
+    observation.pid_namespace_device, observation.pid_namespace_inode};
+  for (size_t i = 0; i < sizeof(identities) / sizeof(identities[0]); ++i)
+    if (!identities[i] || identities[i] > UINT64_C(9007199254740991)) {
+      errno = EOVERFLOW; return -1;
+    }
+  char bytes[512];
+  int n = snprintf(bytes, sizeof(bytes),
+    "{\"kind\":\"%s\",\"nativeId\":\"%s\",\"namespaceDevice\":%" PRIu64
+    ",\"namespaceInode\":%" PRIu64 ",\"pidNamespaceDevice\":%" PRIu64
+    ",\"pidNamespaceInode\":%" PRIu64 ",\"barrier\":\"unproven\"}",
+    kind, observation.native_id, observation.namespace_device, observation.namespace_inode,
+    observation.pid_namespace_device, observation.pid_namespace_inode);
+  if (n < 0 || (size_t)n >= sizeof(bytes)) { errno = EOVERFLOW; return -1; }
+  return ocip_reply(bytes) < 0 ? -2 : 0;
+}
+
 static _Noreturn void ocip_retain(struct tns_oci_owner **owner) {
   /* Protocol is gone; retain this original process, no fork/detach/rebind.
    * SIGCHLD can finish outstanding owned joins. Signals only request another
@@ -192,6 +215,12 @@ int main(int argc, char **argv) {
   action.sa_handler = ocip_interrupt;
   if (sigaction(SIGTERM, &action, NULL) < 0 || sigaction(SIGINT, &action, NULL) < 0)
     return 77;
+  /* This dedicated single-thread owner exclusively waits its exact children. */
+  action.sa_handler = SIG_DFL;
+  int subreaper = 0;
+  if (sigaction(SIGCHLD, &action, NULL) < 0 ||
+      prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) < 0 ||
+      prctl(PR_GET_CHILD_SUBREAPER, &subreaper, 0, 0, 0) < 0 || subreaper != 1) return 77;
   sigset_t controls; sigemptyset(&controls);
   sigaddset(&controls, SIGTERM); sigaddset(&controls, SIGINT); sigaddset(&controls, SIGCHLD);
   if (sigprocmask(SIG_UNBLOCK, &controls, NULL) < 0) return 77;
@@ -234,6 +263,15 @@ int main(int argc, char **argv) {
       stage = "observe-started";
       result = ocip_started("linux-oci-started-observation@1", owner, 0);
       if (result < 0) failure = errno ? errno : EPROTO;
+    } else if (!result && !interrupted && request->kind == TNS_OCIP_STOP_INIT && owner && !sealed) {
+      stage = "stop-init";
+      result = ocip_init_reaped("linux-oci-init-reaped@1", owner, 1);
+      if (result < 0) failure = errno ? errno : EPROTO;
+    } else if (!result && !interrupted && request->kind == TNS_OCIP_JOIN_INIT && owner) {
+      /* A failed STOP seals CREATE/START but may only rejoin this original init. */
+      stage = "join-init";
+      result = ocip_init_reaped("linux-oci-init-reaped-observation@1", owner, 0);
+      if (result < 0) failure = errno ? errno : EPROTO;
     } else if (!result && request->kind == TNS_OCIP_CANCEL) {
       sealed = 1; int cleanup_error = ocip_cleanup(&owner);
       interrupted = 0;
@@ -251,7 +289,12 @@ int main(int argc, char **argv) {
     explicit_bzero(request, sizeof(*request)); free(request);
     if (result == -2) break;
     if (result < 0) {
-      sealed = 1; (void)ocip_cleanup(&owner);
+      sealed = 1;
+      if (!strcmp(stage, "stop-init") || !strcmp(stage, "join-init")) {
+        /* Preserve the live birth custodian so an unknown STOP can only rejoin
+         * this same init. EOF/CANCEL retains the original close semantics. */
+        if (owner) (void)tns_oci_cancel(owner);
+      } else (void)ocip_cleanup(&owner);
       interrupted = 0;
       if (ocip_error("linux-oci-refused@1", stage, failure, owner) < 0) break;
     }

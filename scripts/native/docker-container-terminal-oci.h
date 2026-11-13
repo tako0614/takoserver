@@ -37,6 +37,11 @@ struct tns_oci_created {
   uint64_t namespace_device;
   uint64_t namespace_inode;
 };
+struct tns_oci_init_reaped {
+  char native_id[65];
+  uint64_t namespace_device, namespace_inode;
+  uint64_t pid_namespace_device, pid_namespace_inode;
+};
 struct tns_oci_started {
   char native_id[65];
   uint64_t namespace_device;
@@ -55,6 +60,15 @@ int tns_oci_observe(struct tns_oci_owner *owner, struct tns_oci_created *created
 int tns_oci_start(struct tns_oci_owner *owner, struct tns_oci_started *started);
 int tns_oci_observe_started(struct tns_oci_owner *owner,
                               struct tns_oci_started *started);
+/* Dedicated single-thread subreaper, default SIGCHLD and exclusive exact-child
+ * reaping are required before CREATE; the library never changes caller state.
+ * STOP consumes one original-init SIGKILL attempt. JOIN can only join/reap that
+ * same pinned init after the attempt, including UNKNOWN; it never resends.
+ * Reaped is a task/PIDNS fact, never network terminal/delete authority. */
+int tns_oci_stop_init(struct tns_oci_owner *owner,
+                        struct tns_oci_init_reaped *reaped);
+int tns_oci_join_init(struct tns_oci_owner *owner,
+                        struct tns_oci_init_reaped *reaped);
 /* Cancels/joins the private runtime command. Once runc CREATE was attempted,
  * original custody remains held: this is not a container-delete operation. */
 int tns_oci_cancel(struct tns_oci_owner *owner);

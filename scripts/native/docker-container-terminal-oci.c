@@ -24,6 +24,12 @@
 #include <time.h>
 #include <unistd.h>
 
+/* Linux v6.12 NSFS translates the actual namespace's init into this caller's
+ * PID namespace. Older/unsupported kernels refuse; there is no text fallback. */
+#ifndef NS_GET_PID_FROM_PIDNS
+#define NS_GET_PID_FROM_PIDNS _IOR(NSIO, 0x6, int)
+#endif
+
 /* Actual CREATE/START producer library; no admission/delete/retirement grant.
  * The persistent original helper must retain this private owner after return,
  * including UNKNOWN. Native execution and runtime provenance are unqualified.
@@ -39,7 +45,10 @@ struct tns_oci_owner {
   unsigned int start_attempt;
   int start_joined, start_ok, start_kill_attempted;
   int start_pidfd, stopped_exe;
-  pid_t start_pid, controller_pid;
+  pid_t start_pid, controller_pid, init_pid;
+  int parent_pidns, init_pidns, init_custody, init_joined;
+  unsigned int init_stop_attempt;
+  struct stat parent_pidns_identity, init_pidns_identity;
   int root, rootfs, receipt, runtime, bundle, state, network, command_pidfd;
   int init_pidfd, init_proc;
   pid_t command_pid;
@@ -282,6 +291,7 @@ static int oci_pin_init(struct tns_oci_owner *o) {
   if (n < 0) { errno = e; return -1; }
   int pid = tns_oci_pid(text, (size_t)n);
   if (pid < 0) { errno = EPROTO; return -1; }
+  o->init_pid = (pid_t)pid;
   o->init_pidfd = (int)syscall(SYS_pidfd_open, pid, 0);
   if (oci_poll_alive(o->init_pidfd) < 0) return -1;
   char path[64]; int length = snprintf(path, sizeof(path), "/proc/%d", pid);
@@ -324,9 +334,9 @@ static int oci_stop_start_command(struct tns_oci_owner *o) {
   return oci_join_start_command(o, 1000);
 }
 
-static int oci_start_inputs(struct tns_oci_owner *o) {
+static int oci_held_inputs(struct tns_oci_owner *o) {
   if (o->controller_pid != getpid() || geteuid() != 0) { errno = EPERM; return -1; }
-  if (oci_not_canceled() < 0 || oci_inputs(o) < 0 || !o->config_created ||
+  if (oci_inputs(o) < 0 || !o->config_created ||
       oci_owned(o->bundle, 1, 0700) < 0 || oci_owned(o->state, 1, 0700) < 0)
     return -1;
   struct stat held, named;
@@ -346,6 +356,12 @@ static int oci_start_inputs(struct tns_oci_owner *o) {
            held.st_ctim.tv_nsec == o->config_identity.st_ctim.tv_nsec;
   close(fd);
   if (!ok) { errno = ESTALE; return -1; }
+  return 0;
+}
+
+static int oci_start_inputs(struct tns_oci_owner *o) {
+  if (oci_not_canceled() < 0) return -1;
+  if (oci_held_inputs(o) < 0) return -1;
   return oci_not_canceled();
 }
 
@@ -364,12 +380,165 @@ static int oci_init_namespace_current(struct tns_oci_owner *o) {
   return oci_poll_alive(o->init_pidfd);
 }
 
+/* The dedicated helper owns this state before CREATE. No inherited SIG_IGN,
+ * SA_NOCLDWAIT or arbitrary caller process-state mutation may fake waitability. */
+static int oci_reaper_current(void) {
+  int reaper = 0; struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  if (prctl(PR_GET_CHILD_SUBREAPER, &reaper, 0, 0, 0) < 0 ||
+      sigaction(SIGCHLD, NULL, &action) < 0) return -1;
+  if (reaper != 1 || action.sa_handler != SIG_DFL || (action.sa_flags & SA_NOCLDWAIT)) {
+    errno = EPERM; return -1;
+  }
+  return 0;
+}
+
+static int oci_pidns_stat(int fd, struct stat *st) {
+  struct statfs fs;
+  if (fstat(fd, st) < 0 || fstatfs(fd, &fs) < 0) return -1;
+  if ((unsigned long)fs.f_type != (unsigned long)NSFS_MAGIC ||
+      ioctl(fd, NS_GET_NSTYPE) != CLONE_NEWPID) { errno = ESTALE; return -1; }
+  return 0;
+}
+
+static int oci_parent_pidns_current(struct tns_oci_owner *o) {
+  if (o->controller_pid != getpid() || geteuid() != 0) { errno = EPERM; return -1; }
+  if (oci_reaper_current() < 0) return -1;
+  struct stat held, actual;
+  if (oci_pidns_stat(o->parent_pidns, &held) < 0 ||
+      !oci_same(&held, &o->parent_pidns_identity)) { errno = ESTALE; return -1; }
+  const char *paths[] = {"/proc/self/ns/pid", "/proc/self/ns/pid_for_children"};
+  for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+    int fd = open(paths[i], O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    int ok = oci_pidns_stat(fd, &actual) == 0 && oci_same(&held, &actual);
+    close(fd);
+    if (!ok) { errno = ESTALE; return -1; }
+  }
+  return 0;
+}
+
+static int oci_init_held_current(struct tns_oci_owner *o) {
+  struct stat held, parent;
+  if (oci_parent_pidns_current(o) < 0 || oci_pidns_stat(o->init_pidns, &held) < 0 ||
+      !oci_same(&held, &o->init_pidns_identity) ||
+      oci_same(&held, &o->parent_pidns_identity)) { errno = ESTALE; return -1; }
+  int fd = ioctl(o->init_pidns, NS_GET_PARENT);
+  if (fd < 0) return -1;
+  int ok = oci_pidns_stat(fd, &parent) == 0 &&
+           oci_same(&parent, &o->parent_pidns_identity);
+  close(fd);
+  if (!ok) { errno = ESTALE; return -1; }
+  return 0;
+}
+
+/* Returns 0 for a genuinely waitable live child and 1 for the exact exited
+ * child, without reaping either. ECHILD is never evidence of prior cleanup. */
+static int oci_peek_init(struct tns_oci_owner *o, siginfo_t *info) {
+  memset(info, 0, sizeof(*info));
+  if (waitid(P_PIDFD, (id_t)o->init_pidfd, info, WEXITED | WNOHANG | WNOWAIT) < 0)
+    return -1;
+  if (!info->si_pid) {
+    if (info->si_code || info->si_status || info->si_signo) { errno = EPROTO; return -1; }
+    return 0;
+  }
+  if (info->si_pid != o->init_pid ||
+      (info->si_code != CLD_EXITED && info->si_code != CLD_KILLED &&
+       info->si_code != CLD_DUMPED) ||
+      (info->si_code == CLD_EXITED ? info->si_status < 0 || info->si_status > 255 :
+                                   info->si_status <= 0 || info->si_status >= NSIG)) {
+    errno = EPROTO; return -1;
+  }
+  return 1;
+}
+
+static int oci_private_init_current(struct tns_oci_owner *o) {
+  if (oci_init_held_current(o) < 0 || oci_poll_alive(o->init_pidfd) < 0) return -1;
+  int fd = openat(o->init_proc, "ns/pid", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  struct stat st;
+  int ok = oci_pidns_stat(fd, &st) == 0 && oci_same(&st, &o->init_pidns_identity) &&
+           ioctl(fd, NS_GET_PID_FROM_PIDNS, 1) == o->init_pid;
+  close(fd);
+  if (!ok) { errno = ESTALE; return -1; }
+  siginfo_t info;
+  int state = oci_peek_init(o, &info);
+  if (state < 0) return -1;
+  if (state) { errno = ESRCH; return -1; }
+  return oci_init_namespace_current(o);
+}
+
+static int oci_pin_pidns(struct tns_oci_owner *o) {
+  if (oci_parent_pidns_current(o) < 0 || oci_poll_alive(o->init_pidfd) < 0) return -1;
+  o->init_pidns = openat(o->init_proc, "ns/pid", O_RDONLY | O_CLOEXEC);
+  if (o->init_pidns < 0 || oci_pidns_stat(o->init_pidns, &o->init_pidns_identity) < 0 ||
+      oci_private_init_current(o) < 0) return -1;
+  o->init_custody = 1;
+  return 0;
+}
+
+static int oci_reap_owner_current(struct tns_oci_owner *o) {
+  if (!o->init_custody || o->init_pid <= 0 || o->init_pidfd < 0 ||
+      !o->command_pid || !o->command_joined || !o->command_ok) {
+    errno = EINVAL; return -1;
+  }
+  struct tns_identity birth;
+  if (oci_held_inputs(o) < 0 || oci_init_held_current(o) < 0 ||
+      tns_owner_observe(o->birth, &birth) < 0) return -1;
+  if (!tns_identity_equal(&birth, &o->identity)) { errno = ESTALE; return -1; }
+  return 0;
+}
+
+int tns_oci_join_init(struct tns_oci_owner *o, struct tns_oci_init_reaped *reaped) {
+  if (!o || !reaped || !o->init_stop_attempt) { errno = EINVAL; return -1; }
+  if (oci_reap_owner_current(o) < 0) return -1;
+  if (!o->init_joined) {
+    struct pollfd p = {.fd = o->init_pidfd, .events = POLLIN};
+    int n = poll(&p, 1, 10000);
+    if (n < 0) return -1;
+    if (!n) { errno = ETIMEDOUT; return -1; }
+    if (p.revents != POLLIN) { errno = EPROTO; return -1; }
+    siginfo_t before, actual;
+    int state = oci_peek_init(o, &before);
+    if (state < 0) return -1;
+    if (!state) { errno = EPROTO; return -1; }
+    memset(&actual, 0, sizeof(actual));
+    if (waitid(P_PIDFD, (id_t)o->init_pidfd, &actual, WEXITED | WNOHANG) < 0) return -1;
+    if (actual.si_pid != before.si_pid || actual.si_code != before.si_code ||
+        actual.si_status != before.si_status) { errno = EPROTO; return -1; }
+    o->init_joined = 1; /* Actual consuming wait only; keep this fact on late error. */
+  }
+  if (oci_reap_owner_current(o) < 0) return -1;
+  memcpy(reaped->native_id, o->id, sizeof(reaped->native_id));
+  reaped->namespace_device = o->identity.device;
+  reaped->namespace_inode = o->identity.inode;
+  reaped->pid_namespace_device = (uint64_t)o->init_pidns_identity.st_dev;
+  reaped->pid_namespace_inode = (uint64_t)o->init_pidns_identity.st_ino;
+  return 0;
+}
+
+int tns_oci_stop_init(struct tns_oci_owner *o, struct tns_oci_init_reaped *reaped) {
+  if (!o || !reaped) { errno = EINVAL; return -1; }
+  if (tns_oci_once(&o->init_stop_attempt) < 0) { errno = EALREADY; return -1; }
+  o->invalid = 1; /* STOP can never resume CREATE/START, including unknown failure. */
+  if (oci_reap_owner_current(o) < 0) return -1;
+  siginfo_t info;
+  int state = oci_peek_init(o, &info);
+  if (state < 0) return -1;
+  if (!state) {
+    if (oci_private_init_current(o) < 0 || oci_reap_owner_current(o) < 0) return -1;
+    if (syscall(SYS_pidfd_send_signal, o->init_pidfd, SIGKILL, NULL, 0) < 0 &&
+        errno != ESRCH) return -1;
+  }
+  return tns_oci_join_init(o, reaped);
+}
+
 int tns_oci_observe_started(struct tns_oci_owner *o, struct tns_oci_started *started) {
   if (!o || !started || o->invalid || !o->start_attempt || !o->start_joined ||
-      !o->start_ok || o->stopped_exe < 0) { errno = EINVAL; return -1; }
+      !o->start_ok || o->stopped_exe < 0 || !o->init_custody) { errno = EINVAL; return -1; }
   struct tns_identity birth;
   if (oci_start_inputs(o) < 0 || tns_owner_observe(o->birth, &birth) < 0 ||
-      !tns_identity_equal(&birth, &o->identity) || oci_init_namespace_current(o) < 0)
+      !tns_identity_equal(&birth, &o->identity) || oci_private_init_current(o) < 0)
     goto fail;
   int fd = openat(o->init_proc, "exe", O_RDONLY | O_CLOEXEC);
   if (fd < 0) goto fail;
@@ -380,7 +549,7 @@ int tns_oci_observe_started(struct tns_oci_owner *o, struct tns_oci_started *sta
   /* runc's FIFO ACK can precede execve. Same executable is UNKNOWN, never
    * evidence that the image process has executed. No delay/replay repairs it. */
   if (!ok) { errno = ESTALE; goto fail; }
-  if (oci_init_namespace_current(o) < 0 || tns_owner_observe(o->birth, &birth) < 0 ||
+  if (oci_private_init_current(o) < 0 || tns_owner_observe(o->birth, &birth) < 0 ||
       !tns_identity_equal(&birth, &o->identity) || oci_start_inputs(o) < 0)
     goto fail;
   memcpy(started->native_id, o->id, sizeof(started->native_id));
@@ -426,10 +595,10 @@ fail: {
 
 int tns_oci_observe(struct tns_oci_owner *o, struct tns_oci_created *created) {
   if (!o || !created || o->invalid || o->start_attempt ||
-      !o->command_joined || !o->command_ok) {
+      !o->command_joined || !o->command_ok || !o->init_custody) {
     errno = EINVAL; return -1;
   }
-  if (oci_not_canceled() < 0 || oci_inputs(o) < 0 || oci_poll_alive(o->init_pidfd) < 0) goto fail;
+  if (oci_not_canceled() < 0 || oci_inputs(o) < 0 || oci_private_init_current(o) < 0) goto fail;
   struct tns_identity birth;
   if (tns_owner_observe(o->birth, &birth) < 0 ||
       !tns_identity_equal(&birth, &o->identity)) goto fail;
@@ -472,7 +641,7 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   if (!o) return -1;
   o->root = o->rootfs = o->receipt = o->runtime = o->bundle = o->state = -1;
   o->network = o->command_pidfd = o->init_pidfd = o->init_proc = -1;
-  o->start_pidfd = o->stopped_exe = -1;
+  o->start_pidfd = o->stopped_exe = o->parent_pidns = o->init_pidns = -1;
   o->controller_pid = getpid();
   *slot = o;
   if (tns_oci_once(&o->attempt) < 0 || tns_oci_data(options) < 0 ||
@@ -497,6 +666,11 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   if (receipt.failed) { errno = EOVERFLOW; goto fail; }
   o->receipt_size = receipt.used;
   if (oci_not_canceled() < 0 || oci_inputs(o) < 0) goto fail;
+  /* Real dedicated subreaper/default SIGCHLD must precede namespace/runtime effects. */
+  if (oci_reaper_current() < 0) goto fail;
+  o->parent_pidns = open("/proc/self/ns/pid", O_RDONLY | O_CLOEXEC);
+  if (o->parent_pidns < 0 || oci_pidns_stat(o->parent_pidns, &o->parent_pidns_identity) < 0 ||
+      oci_parent_pidns_current(o) < 0) goto fail;
   /* Mandatory ownership and cancellation checks BEFORE fresh namespace. */
   if (tns_owner_create(&o->birth) < 0) goto fail;
   if (oci_not_canceled() < 0) goto fail;
@@ -549,7 +723,7 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   if (elapsed < 0 || elapsed - now >= 10000) { errno = ETIMEDOUT; goto fail; }
   if (oci_join_command(o, 10000 - (int)(elapsed - now)) < 0 || !o->command_ok)
     goto fail;
-  if (oci_pin_init(o) < 0) goto fail;
+  if (oci_pin_init(o) < 0 || oci_pin_pidns(o) < 0) goto fail;
   struct tns_oci_created observed;
   if (tns_oci_observe(o, &observed) < 0) goto fail;
   return 0;
@@ -594,7 +768,7 @@ int tns_oci_release_uncreated(struct tns_oci_owner **slot) {
   if (o->config_created && unlinkat(o->bundle, "config.json", 0) < 0) return -1;
   int *fds[] = {&o->root, &o->rootfs, &o->receipt, &o->runtime, &o->bundle,
                 &o->state, &o->network, &o->command_pidfd, &o->init_pidfd, &o->init_proc,
-                &o->start_pidfd, &o->stopped_exe};
+                &o->start_pidfd, &o->stopped_exe, &o->parent_pidns, &o->init_pidns};
   for (size_t i = 0; i < sizeof(fds) / sizeof(fds[0]); ++i) {
     if (*fds[i] >= 0) { close(*fds[i]); *fds[i] = -1; }
   }

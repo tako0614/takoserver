@@ -38,6 +38,8 @@ static int raw_fstatfs(int fd, struct statfs *out);
 static int raw_ioctl(int fd, unsigned long request, ...);
 static int raw_poll(struct pollfd *p, nfds_t count, int timeout);
 static int raw_waitid(idtype_t type, id_t id, siginfo_t *out, int flags);
+static int raw_prctl(int option, ...);
+static int raw_sigaction(int number, const struct sigaction *in, struct sigaction *out);
 static int raw_clock_gettime(clockid_t id, struct timespec *out);
 static pid_t raw_getpid(void);
 static uid_t raw_geteuid(void);
@@ -59,6 +61,8 @@ static int raw_fsync(int fd);
 #define ioctl raw_ioctl
 #define poll raw_poll
 #define waitid raw_waitid
+#define prctl raw_prctl
+#define sigaction(...) raw_sigaction(__VA_ARGS__)
 #define clock_gettime raw_clock_gettime
 #define getpid raw_getpid
 #define geteuid raw_geteuid
@@ -80,6 +84,8 @@ static int raw_fsync(int fd);
 #undef ioctl
 #undef poll
 #undef waitid
+#undef prctl
+#undef sigaction
 #undef clock_gettime
 #undef getpid
 #undef geteuid
@@ -92,7 +98,8 @@ static int raw_fsync(int fd);
 
 enum { ROOT = 10, ROOTFS, RECEIPT, RUNTIME, BUNDLE, STATE, NETWORK,
        CREATE_PIDFD, INIT_PIDFD, INIT_PROC, STOPPED_EXE, START_PIDFD,
-       CONFIG = 30, NETNS, EXE };
+       CONFIG = 30, NETNS, EXE, PARENT_PIDNS = 40, PRIVATE_PIDNS,
+       SELF_PIDNS, CHILDREN_PIDNS, PARENT_OF_INIT };
 enum fault { NONE, WRONG_CONTROLLER, NOT_ROOT, CONFIG_CHANGED, BUNDLE_CHANGED,
   BIRTH_CHANGED, CLONE_FAILED, TIMED_OUT, POLL_TIMED_OUT, POLL_INTERRUPTED,
   WAIT_WRONG_PID, WAIT_LOST, CHILD_FAILED, CHILD_KILLED, SAME_EXE,
@@ -102,6 +109,7 @@ struct raw_model {
   enum fault fault;
   unsigned int clones, kills, joins, polls, birth_reads, net_reads, stops;
   int64_t milliseconds;
+  unsigned int config_reads, cancel_at_config_read;
 };
 static struct raw_model model;
 static unsigned long checks;
@@ -122,11 +130,14 @@ static void metadata(int fd, struct stat *out) {
     out->st_ino = (ino_t)(model.clones && model.fault != SAME_EXE ? 9001 : 1020);
   }
   if (fd == NETNS) { out->st_dev = 5; out->st_ino = 77; }
+  if (fd >= PARENT_PIDNS && fd <= PARENT_OF_INIT) {
+    out->st_dev = 8; out->st_ino = (ino_t)(fd == PRIVATE_PIDNS ? 3000 : 2000);
+  }
 }
 
 static void initialize(struct tns_oci_owner *o, enum fault fault) {
   memset(o, 0, sizeof(*o));
-  model = (struct raw_model){.owner = o, .fault = fault, .milliseconds = 1000};
+  model = (struct raw_model){.owner = o, .fault = NONE, .milliseconds = 1000};
   oci_cancel_requested = 0;
   o->attempt = o->command_attempt = 1;
   o->command_pid = 8000; o->command_joined = o->command_ok = 1;
@@ -135,12 +146,18 @@ static void initialize(struct tns_oci_owner *o, enum fault fault) {
   o->command_pidfd = CREATE_PIDFD; o->init_pidfd = INIT_PIDFD;
   o->init_proc = INIT_PROC; o->stopped_exe = STOPPED_EXE; o->start_pidfd = -1;
   o->controller_pid = 1000; o->config_created = 1;
+  o->init_pid = 7000; o->parent_pidns = PARENT_PIDNS; o->init_pidns = -1;
+  metadata(PARENT_PIDNS, &o->parent_pidns_identity);
   o->birth = (struct tns_owner *)(uintptr_t)1;
   o->identity = (struct tns_identity){.device = 5, .inode = 77};
   metadata(RUNTIME, &o->runtime_identity); metadata(ROOTFS, &o->rootfs_identity);
   metadata(CONFIG, &o->config_identity);
   memcpy(o->receipt_bytes, "fixture", 7); o->receipt_size = 7;
   memset(o->id, 'a', 64); o->id[64] = 0;
+  /* Obtain the mandatory pin through the actual new source under the valid
+   * closed syscall model before applying each unchanged START fault case. */
+  CHECK(oci_pin_pidns(o) == 0 && o->init_custody);
+  model.fault = fault;
 }
 
 static long raw_syscall(long number, ...) {
@@ -164,6 +181,16 @@ static long raw_syscall(long number, ...) {
   CHECK(model.owner->start_kill_attempted == 1);
   model.kills++; va_end(ap); return 0;
 }
+static int raw_prctl(int option, ...) {
+  CHECK(option == PR_GET_CHILD_SUBREAPER);
+  va_list ap; va_start(ap, option); int *out = va_arg(ap, int *); va_end(ap);
+  *out = 1; /* Valid dedicated-helper boundary, refusal cases live in PIDNS test. */
+  return 0;
+}
+static int raw_sigaction(int number, const struct sigaction *in, struct sigaction *out) {
+  CHECK(number == SIGCHLD && !in && out);
+  memset(out, 0, sizeof(*out)); out->sa_handler = SIG_DFL; return 0;
+}
 static pid_t raw_getpid(void) { return model.fault == WRONG_CONTROLLER ? 1001 : 1000; }
 static uid_t raw_geteuid(void) { return model.fault == NOT_ROOT ? 1u : 0u; }
 static int raw_clock_gettime(clockid_t id, struct timespec *out) {
@@ -173,11 +200,13 @@ static int raw_clock_gettime(clockid_t id, struct timespec *out) {
   return 0;
 }
 static int raw_fstat(int fd, struct stat *out) {
-  CHECK(fd >= ROOT && fd <= EXE);
+  CHECK(fd >= ROOT && fd <= PARENT_OF_INIT);
   if (fd == STOPPED_EXE && model.clones && model.fault == EXE_STAT_LOST) {
     errno = EIO; return -1;
   }
   metadata(fd, out);
+  if (fd == CONFIG && ++model.config_reads == model.cancel_at_config_read)
+    tns_oci_note_cancel(); /* Cancellation from the final actual FS-read boundary. */
   if (fd == CONFIG && (model.fault == CONFIG_CHANGED ||
       (model.clones && model.fault == LATE_CONFIG))) out->st_ino++;
   if (fd == NETNS && model.clones && model.fault == NET_CHANGED) out->st_ino++;
@@ -196,19 +225,32 @@ static int raw_openat(int dir, const char *path, int flags, ...) {
   if (dir == BUNDLE) { CHECK(!strcmp(path, "config.json")); return CONFIG; }
   CHECK(dir == INIT_PROC);
   if (!strcmp(path, "ns/net")) { model.net_reads++; return NETNS; }
+  if (!strcmp(path, "ns/pid")) return PRIVATE_PIDNS;
   CHECK(!strcmp(path, "exe"));
   if (model.clones && model.fault == EXE_UNREADABLE) { errno = EACCES; return -1; }
   return EXE;
 }
-static int raw_close(int fd) { CHECK(fd == CONFIG || fd == NETNS || fd == EXE); return 0; }
+static int raw_close(int fd) {
+  CHECK(fd == CONFIG || fd == NETNS || fd == EXE || fd == PRIVATE_PIDNS ||
+        fd == SELF_PIDNS || fd == CHILDREN_PIDNS || fd == PARENT_OF_INIT);
+  return 0;
+}
 static int raw_fcntl(int fd, int command, ...) {
   CHECK(fd == EXE && command == F_DUPFD_CLOEXEC); return STOPPED_EXE;
 }
 static int raw_fstatfs(int fd, struct statfs *out) {
-  CHECK(fd == NETNS); memset(out, 0, sizeof(*out)); out->f_type = (long)NSFS_MAGIC; return 0;
+  CHECK(fd == NETNS || (fd >= PARENT_PIDNS && fd <= PARENT_OF_INIT));
+  memset(out, 0, sizeof(*out)); out->f_type = (long)NSFS_MAGIC; return 0;
 }
 static int raw_ioctl(int fd, unsigned long request, ...) {
-  CHECK(fd == NETNS && request == NS_GET_NSTYPE); return CLONE_NEWNET;
+  if (fd == NETNS) { CHECK(request == NS_GET_NSTYPE); return CLONE_NEWNET; }
+  CHECK(fd >= PARENT_PIDNS && fd <= PARENT_OF_INIT);
+  if (request == NS_GET_NSTYPE) return CLONE_NEWPID;
+  CHECK(fd == PRIVATE_PIDNS);
+  if (request == NS_GET_PARENT) return PARENT_OF_INIT;
+  CHECK(request == NS_GET_PID_FROM_PIDNS);
+  va_list ap; va_start(ap, request); CHECK(va_arg(ap, int) == 1); va_end(ap);
+  return 7000;
 }
 static ssize_t raw_pread(int fd, void *out, size_t count, off_t offset) {
   const char *bytes = fd == RECEIPT ? "fixture" : "\177ELF";
@@ -232,7 +274,13 @@ static int raw_poll(struct pollfd *p, nfds_t count, int timeout) {
   p->revents = POLLIN; return 1;
 }
 static int raw_waitid(idtype_t type, id_t id, siginfo_t *out, int flags) {
-  CHECK(type == P_PIDFD && id == START_PIDFD); CHECK(flags == (WEXITED | WNOHANG));
+  CHECK(type == P_PIDFD);
+  if (id == INIT_PIDFD) {
+    CHECK(flags == (WEXITED | WNOHANG | WNOWAIT));
+    CHECK(model.owner->init_pid == 7000 && model.owner->parent_pidns == PARENT_PIDNS);
+    return 0; /* Pure live/waitable init; all refusal variants have new tests. */
+  }
+  CHECK(id == START_PIDFD); CHECK(flags == (WEXITED | WNOHANG));
   model.joins++;
   if (model.fault == WAIT_LOST) { errno = ECHILD; return -1; }
   out->si_pid = model.fault == WAIT_WRONG_PID && model.joins == 1 ? 9001 : 9000;
@@ -253,7 +301,11 @@ int tns_owner_stop_custodian(struct tns_owner *owner) {
 int tns_owner_create(struct tns_owner **owner) { (void)owner; abort(); }
 int tns_owner_dup_namespace(struct tns_owner *owner) { (void)owner; abort(); }
 int tns_owner_close(struct tns_owner **owner) { (void)owner; abort(); }
-static int raw_open(const char *path, int flags, ...) { (void)path; (void)flags; abort(); }
+static int raw_open(const char *path, int flags, ...) {
+  CHECK((flags & O_CLOEXEC) != 0);
+  if (!strcmp(path, "/proc/self/ns/pid")) return SELF_PIDNS;
+  CHECK(!strcmp(path, "/proc/self/ns/pid_for_children")); return CHILDREN_PIDNS;
+}
 static ssize_t raw_read(int fd, void *out, size_t count) { (void)fd; (void)out; (void)count; abort(); }
 static ssize_t raw_write(int fd, const void *out, size_t count) { (void)fd; (void)out; (void)count; abort(); }
 static int raw_mkdirat(int fd, const char *path, mode_t mode) { (void)fd; (void)path; (void)mode; abort(); }
@@ -329,7 +381,30 @@ static void parser_cases(void) {
   }
 }
 
-int main(void) {
+static int late_cancel_cases(void) {
+  struct tns_oci_owner owner; struct tns_oci_started started;
+  initialize(&owner, NONE); model.cancel_at_config_read = 6;
+  int result = tns_oci_start(&owner, &started);
+  int start_error = errno;
+  int first = result < 0 && start_error == ECANCELED && owner.invalid &&
+              model.config_reads == 6 && oci_cancel_requested && model.clones == 1;
+  printf("late-cancel actual START: result=%d errno=%d configReads=%u refused=%d\n",
+         result, start_error, model.config_reads, first);
+  initialize(&owner, NONE);
+  owner.start_attempt = 1; owner.start_joined = owner.start_ok = 1;
+  model.clones = 1; model.cancel_at_config_read = 4;
+  result = tns_oci_observe_started(&owner, &started);
+  int observe_error = errno;
+  int second = result < 0 && observe_error == ECANCELED && owner.invalid &&
+               model.config_reads == 4 && oci_cancel_requested && model.clones == 1;
+  printf("late-cancel actual observeStarted: result=%d errno=%d configReads=%u refused=%d\n",
+         result, observe_error, model.config_reads, second);
+  printf("late-cancel selected actual-body raw model: %lu boundary checks\n", checks);
+  return first && second ? 0 : 1;
+}
+int main(int argc, char **argv) {
+  if (argc == 2 && !strcmp(argv[1], "--late-cancel")) return late_cancel_cases();
+  if (argc != 1) return 2;
   start_cases(); parser_cases();
   printf("actual OCI START body + closed parser raw model: %lu checks\n", checks);
   return 0;

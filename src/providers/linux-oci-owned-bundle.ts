@@ -8,6 +8,7 @@ import { createDockerContainerConfiguredInputs } from "./docker-container-config
 import {
   createDockerContainerCoreOwner,
   type DockerContainerAcceptedExecution,
+  type DockerContainerCoreOwner,
   type DockerContainerCoreOwnerOptions,
 } from "./docker-container-core-owner.ts";
 import type {
@@ -22,10 +23,48 @@ import {
 } from "./docker-container-image-supplier.ts";
 import {
   createLinuxOciPhysicalSession,
-  type LinuxOciPhysicalSession,
+  LinuxOciPhysicalSession,
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
 } from "./linux-oci-physical-session.ts";
+
+type OriginalOciCustody = {
+  readonly core: DockerContainerCoreOwner;
+  readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
+  readonly bindings: ReadonlyMap<string, string>;
+  readonly signal: AbortSignal;
+};
+// Populated ONLY inside the real creator below. There is no registration API
+// and its opaque keys are never returned to a caller or serialized.
+const originalOciCustodies = new WeakMap<object, OriginalOciCustody>();
+const observeOriginalOciStarted = LinuxOciPhysicalSession.prototype.observeStarted;
+
+/** Internal owner/producer bridge. The original creator must have completed
+ * its actual CREATE and original bindNative CAS for this exact private key. */
+export async function observeOriginalLinuxOciOwnedRunning(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+): Promise<LinuxOciStartedObservation> {
+  const custody = originalOciCustodies.get(original);
+  if (!custody || custody.core !== core || custody.signal.aborted || signal.aborted)
+    return fail("retained_native_unknown");
+  const session = custody.sessions.get(record.claimId);
+  const nativeId = custody.bindings.get(record.claimId);
+  if (!session || nativeId === undefined || nativeId !== record.nativeId)
+    return fail("retained_native_unknown");
+  const observed = await observeOriginalOciStarted.call(session, signal);
+  if (
+    custody.signal.aborted ||
+    signal.aborted ||
+    custody.sessions.get(record.claimId) !== session ||
+    custody.bindings.get(record.claimId) !== nativeId ||
+    observed.nativeId !== nativeId
+  )
+    return fail("revoked");
+  return observed;
+}
 
 export interface LinuxOciOwnedBundleOptions extends DockerContainerCoreOwnerOptions {
   /** Existing private Host spool. No caller rootfs or namespace is accepted. */
@@ -307,6 +346,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     return fail("invalid_request");
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
+  const originalNativeCustody = Object.freeze({});
+  const nativeLifetime = new AbortController();
+  originalOciCustodies.set(originalNativeCustody, {
+    core,
+    sessions: nativeSessions,
+    bindings: nativeBindings,
+    signal: nativeLifetime.signal,
+  });
   let nativeClosing: Promise<void> | undefined;
   const joinTimeoutMs = Math.min(timeout, 1000);
   const children = new Map<string, ChildProcess>(),
@@ -577,6 +624,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     close(): Promise<void> {
       if (!closing) {
         closed = true;
+        nativeLifetime.abort();
         for (const cancel of cancellation) cancel.abort();
         // Every rejoin waits this SAME original work, never another attempt.
         // The timeout below ends only this caller's wait, not ownership.
@@ -752,7 +800,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                 const started = await session.startStopped(loan.signal);
                 if (started.nativeId !== nativeId) return fail("retained_native_unknown");
                 await guard();
-                const fresh = await session.observeStarted(loan.signal);
+                const fresh = await core.confirmAcceptedRunning(
+                  record,
+                  originalNativeCustody,
+                  loan.signal,
+                );
                 if (fresh.nativeId !== nativeId) return fail("retained_native_unknown");
                 await guard();
                 return fresh;

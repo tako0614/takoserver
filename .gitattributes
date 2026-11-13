@@ -12,3 +12,4 @@ scripts/native/docker-container-terminal-kernel-nfqueue-verdict-v6.12.patch -whi
 scripts/native/docker-container-terminal-kernel-nfqueue-batch-v6.12.patch -whitespace
 scripts/native/docker-container-terminal-kernel-payload-bulk-v6.12.patch -whitespace
 scripts/native/docker-container-terminal-kernel-coalesce-v6.12.patch -whitespace
+scripts/native/docker-container-terminal-kernel-payload-napi-v6.12.patch -whitespace

@@ -13,7 +13,8 @@ static inline int tns_ocip_private_fifo(mode_t mode, uid_t owner) {
 
 /* A closed parser for private IO, never a namespace or admission capability. */
 enum tns_ocip_kind { TNS_OCIP_CREATE = 1, TNS_OCIP_OBSERVE = 2, TNS_OCIP_CANCEL = 3,
-                     TNS_OCIP_START = 4, TNS_OCIP_OBSERVE_STARTED = 5 };
+                     TNS_OCIP_START = 4, TNS_OCIP_OBSERVE_STARTED = 5,
+                     TNS_OCIP_STOP_INIT = 6, TNS_OCIP_JOIN_INIT = 7 };
 struct tns_ocip_request {
   enum tns_ocip_kind kind;
   struct tns_oci_options options;
@@ -175,6 +176,8 @@ static inline int tns_ocip_decode(unsigned char *data, size_t size,
         else if (!strcmp(s, "linux-oci-cancel@1")) request->kind = TNS_OCIP_CANCEL;
         else if (!strcmp(s, "linux-oci-start@1")) request->kind = TNS_OCIP_START;
         else if (!strcmp(s, "linux-oci-observe-started@1")) request->kind = TNS_OCIP_OBSERVE_STARTED;
+        else if (!strcmp(s, "linux-oci-stop-init@1")) request->kind = TNS_OCIP_STOP_INIT;
+        else if (!strcmp(s, "linux-oci-join-init@1")) request->kind = TNS_OCIP_JOIN_INIT;
         else return -1;
       } else if (field == 1) request->options.allocation_root = s;
       else if (field == 2) request->options.claim_id = s;
