@@ -19,7 +19,13 @@ struct oci_policy_limits { uint64_t generation, connections, bytes;
 struct oci_policy_network { unsigned char address[16];
  unsigned int family, prefix;
  };
+struct oci_policy_runtime {
+  int pidfd,incoming,outgoing;
+  pid_t pid;
+  unsigned int attempted,wait_attempted,joined,ok,killed,close_unknown;
+};
 struct oci_policy_owner {
+  struct oci_policy_runtime *runtime;
   struct tns_oci_owner *original;
   struct oci_uplink_owner *uplink;
   struct oci_policy_service service;
@@ -750,11 +756,139 @@ static int oci_policy_install(struct oci_policy_owner *p){
 done:free(output);
 return result;
 }
+/* A fresh read-only command has separate custody from all three install slots.
+ * Only an entirely observed, joined and closed read may retire this record.
+ * Any failed/unknown read stays on this original owner; it is never replayed. */
+static int oci_policy_runtime_close_fd(struct oci_policy_runtime *r,int *slot) {
+  if (*slot < 0) return 0;
+  int fd = *slot; *slot = -1;
+  if (close(fd) < 0) { r->close_unknown = 1; return -1; }
+  return 0;
+}
+static int oci_policy_runtime_join(struct oci_policy_runtime *r,int timeout) {
+  if (!r->pid || r->joined) return 0;
+  if (r->wait_attempted) { errno = EUCLEAN; return -1; }
+  struct pollfd fd = {.fd=r->pidfd,.events=POLLIN};
+  int n = poll(&fd,1,timeout);
+  if (n != 1 || fd.revents != POLLIN) {
+    if (!errno) errno = n ? EPROTO : ETIMEDOUT;
+    return -1;
+  }
+  siginfo_t info; memset(&info,0,sizeof(info));
+  r->wait_attempted = 1;
+  if (waitid(P_PIDFD,(id_t)r->pidfd,&info,WEXITED|WNOHANG) < 0 ||
+      info.si_pid != r->pid ||
+      (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED && info.si_code != CLD_DUMPED)) {
+    if (!errno) errno = EPROTO;
+    return -1;
+  }
+  r->joined = 1;
+  r->ok = info.si_code == CLD_EXITED && !info.si_status;
+  return 0;
+}
+static int oci_policy_runtime_stop(struct oci_policy_owner *p) {
+  if (!p || !p->runtime) return 0;
+  if (!p->original || p->original->controller_pid != getpid()) { errno = EPERM; return -1; }
+  struct oci_policy_runtime *r = p->runtime;
+  int saved = 0;
+  if (r->pid && !r->joined && !r->killed) {
+    r->killed = 1;
+    if (syscall(SYS_pidfd_send_signal,r->pidfd,SIGKILL,NULL,0) < 0 && errno != ESRCH)
+      saved = errno;
+  }
+  if (oci_policy_runtime_join(r,1000) < 0 && !saved) saved = errno ? errno : EPROTO;
+  if (oci_policy_runtime_close_fd(r,&r->incoming) < 0 && !saved) saved = errno;
+  if (oci_policy_runtime_close_fd(r,&r->outgoing) < 0 && !saved) saved = errno;
+  if (r->joined && oci_policy_runtime_close_fd(r,&r->pidfd) < 0 && !saved) saved = errno;
+  if (r->close_unknown && !saved) saved = EUCLEAN;
+  if (saved) { errno = saved; return -1; }
+  return 0;
+}
+static int oci_policy_runtime_facts(struct oci_policy_owner *p) {
+  if (oci_policy_original(p) < 0 || !p->verified ||
+      oci_uplink_config_readback(p->uplink) < 0 || oci_policy_inventory_same(p) < 0)
+    return -1;
+  for (int side=0;side<2;side++)
+    if (oci_policy_neighbor_read(p,side,AF_INET) < 0 ||
+        oci_policy_neighbor_read(p,side,AF_INET6) < 0) return -1;
+  return oci_policy_original(p);
+}
+static int oci_policy_runtime_read(struct oci_policy_owner *p,int64_t deadline,
+                                   char *output,size_t *used) {
+  struct oci_policy_runtime *r = p->runtime;
+  if (!r || tns_oci_once(&r->attempted) < 0 || oci_policy_original(p) < 0 ||
+      !p->uplink->lock_held || oci_egress_left(deadline) < 0) return -1;
+  int in[2],out[2];
+  if (pipe2(in,O_CLOEXEC|O_NONBLOCK) < 0) return -1;
+  r->incoming = in[1];
+  if (pipe2(out,O_CLOEXEC|O_NONBLOCK) < 0) {
+    (void)oci_policy_runtime_close_fd(r,&in[0]);
+    return -1;
+  }
+  r->outgoing = out[0];
+  struct clone_args args; memset(&args,0,sizeof(args));
+  args.flags = CLONE_PIDFD|CLONE_CLEAR_SIGHAND;
+  args.exit_signal = SIGCHLD;
+  args.pidfd = (uint64_t)(uintptr_t)&r->pidfd;
+  long child = syscall(SYS_clone3,&args,sizeof(args));
+  if (!child) oci_policy_child(p,2,in[0],out[1]);
+  if (child > 0) r->pid = (pid_t)child;
+  int failed = oci_policy_runtime_close_fd(r,&in[0]) < 0;
+  if (oci_policy_runtime_close_fd(r,&out[1]) < 0) failed = 1;
+  if (child < 0 || failed || oci_policy_original(p) < 0 ||
+      oci_policy_runtime_close_fd(r,&r->incoming) < 0) return -1;
+  *used = 0;
+  for (;;) {
+    int left = oci_egress_left(deadline);
+    struct pollfd fd = {.fd=r->outgoing,.events=POLLIN};
+    if (left < 0 || oci_not_canceled() < 0 || poll(&fd,1,left) != 1 ||
+        (fd.revents != POLLIN && fd.revents != POLLHUP && fd.revents != (POLLIN|POLLHUP))) return -1;
+    ssize_t n = read(r->outgoing,output+*used,OCI_POLICY_JSON_MAX-*used);
+    if (n < 0) return -1;
+    if (!n) break;
+    *used += (size_t)n;
+    if (*used == OCI_POLICY_JSON_MAX) { errno = EOVERFLOW; return -1; }
+  }
+  if (oci_policy_runtime_close_fd(r,&r->outgoing) < 0) return -1;
+  int left = oci_egress_left(deadline);
+  if (left < 0 || oci_policy_runtime_join(r,left) < 0 || !r->ok ||
+      oci_policy_original(p) < 0 || oci_policy_readback(p,output,*used) < 0) return -1;
+  return 0;
+}
+static int oci_policy_runtime_current(struct tns_oci_owner *o) {
+  if (!o || !o->policy) return 0; /* Preserve the original no-policy behavior. */
+  struct oci_policy_owner *p = o->policy;
+  if (p->original != o || p->runtime || !p->verified) { errno = EUCLEAN; return -1; }
+  struct oci_policy_runtime *r = calloc(1,sizeof(*r));
+  if (!r) return -1;
+  r->pidfd = r->incoming = r->outgoing = -1;
+  p->runtime = r;
+  char *output = malloc(OCI_POLICY_JSON_MAX);
+  if (!output) return -1;
+  size_t used = 0;
+  int result = -1;
+  if (oci_policy_original(p) < 0 || oci_uplink_lock(p->uplink) < 0 ||
+      oci_policy_runtime_facts(p) < 0) goto done;
+  int64_t now = oci_now();
+  if (now < 0 || oci_policy_runtime_read(p,now+10000,output,&used) < 0 ||
+      oci_policy_runtime_facts(p) < 0 || oci_not_canceled() < 0 ||
+      oci_policy_runtime_close_fd(r,&r->pidfd) < 0 || r->close_unknown ||
+      oci_uplink_unlock(p->uplink) < 0) goto done;
+  explicit_bzero(r,sizeof(*r)); free(r); p->runtime = NULL;
+  result = 0;
+done:
+  free(output);
+  /* Failures deliberately leave the original child/FD/lock record retained.
+   * Cancel/close may stop and join it, but cannot turn that read into success. */
+  return result;
+}
+
 static int oci_policy_stop(struct oci_policy_owner *p){
   if(!p)return 0;
   if(!p->original || p->original->controller_pid!=getpid()){errno=EPERM;
   return -1;
   }int saved=0;
+  if(oci_policy_runtime_stop(p)<0)saved=errno?errno:EPROTO;
   for(unsigned int i=0;i<3;i++){
     if(p->pid[i] && !p->joined[i] && !p->killed[i]){p->killed[i]=1;
     if(syscall(SYS_pidfd_send_signal,p->pidfd[i],SIGKILL,NULL,0)<0 && errno!=ESRCH && !saved)saved=errno;
@@ -774,6 +908,15 @@ static int oci_policy_close(struct oci_policy_owner **slot){
   struct oci_policy_owner *p=*slot;
   struct tns_oci_owner *o=p->original;
   if(!o || o->controller_pid!=getpid() || (o->command_pid && (!o->init_joined || !o->init_custody || !o->init_stop_attempt || !o->command_joined || !o->command_ok || (o->start_pid && !o->start_joined))) || oci_policy_stop(p)<0)return -1;
+  /* Only this existing original uncreated/actually-init-joined cleanup gate
+   * may retire a failed read record. It never qualifies a runtime observation
+   * or permits another read. Unknown consuming wait/close remains retained. */
+  if(p->runtime){
+    struct oci_policy_runtime *r=p->runtime;
+    if((r->pid && !r->joined) || r->pidfd>=0 || r->incoming>=0 ||
+        r->outgoing>=0 || r->close_unknown){errno=EUCLEAN;return -1;}
+    explicit_bzero(r,sizeof(*r));free(r);p->runtime=NULL;
+  }
   if((p->pid[1] && !p->verified) || p->close_unknown){errno=EUCLEAN;
   return -1;
   }

@@ -84,6 +84,7 @@ struct tns_oci_owner {
 static int oci_egress_current(struct tns_oci_owner *o);
 static int oci_uplink_current(struct tns_oci_owner *o);
 static int oci_policy_current(struct tns_oci_owner *o);
+static int oci_policy_runtime_current(struct tns_oci_owner *o);
 
 static volatile sig_atomic_t oci_cancel_requested;
 
@@ -390,6 +391,7 @@ static int oci_held_inputs(struct tns_oci_owner *o) {
 static int oci_start_inputs(struct tns_oci_owner *o) {
   if (oci_not_canceled() < 0) return -1;
   if (oci_held_inputs(o) < 0) return -1;
+  if (oci_policy_runtime_current(o) < 0) return -1;
   return oci_not_canceled();
 }
 
