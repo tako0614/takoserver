@@ -64,9 +64,26 @@ export function billingPage(organizationId: string): Child {
   const isRouteCurrent = () => route() === openedRoute;
   const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
   const isPageCurrent = () => isRouteCurrent() && isOrganizationCurrent();
-  const wallet = resource(() => api.wallet(organizationId));
-  const usageSummary = resource(() => api.usageSummary(organizationId));
-  const hostedSubscription = resource(() => api.subscription(organizationId));
+  if (!isPageCurrent())
+    return card(
+      tr("使用量と請求", "Usage & billing"),
+      empty(
+        tr("組織を選択してください", "Choose an organization"),
+        tr("一覧から組織を選択してください。", "Select an organization from the list."),
+      ),
+    );
+  const scopedRead = <Value>(load: () => Promise<Value>): Resource<Value> => {
+    const read = resource(load);
+    return {
+      get: () => (isPageCurrent() ? read.get() : { state: "loading" }),
+      reload: () => {
+        if (isPageCurrent()) read.reload();
+      },
+    };
+  };
+  const wallet = scopedRead(() => api.wallet(organizationId));
+  const usageSummary = scopedRead(() => api.usageSummary(organizationId));
+  const hostedSubscription = scopedRead(() => api.subscription(organizationId));
   const workspaceUsage = createWorkspaceUsageController({
     organizationId,
     api,
