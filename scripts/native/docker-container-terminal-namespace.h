@@ -65,6 +65,18 @@ int tns_owner_continue_namespace_release(struct tns_owner *owner,
 int tns_owner_observe_lifetime(struct tns_owner *owner,
                                  struct tns_lifetime *lifetime);
 
+/* Original tracked-owner destruction only. BEGIN requires this same owner's
+ * original custodian joined/own namespace reference released with no unknown
+ * close, and caches real identity/release facts before its sole no-field ioctl.
+ * Sent UNKNOWN is never re-BEGINed. READ performs exactly one same-FD no-field
+ * observation per call, including after unknown BEGIN; pending/error retains
+ * the same handle. No old OBSERVE/LIFETIME is used after BEGIN. BEGIN zero is
+ * only acknowledged handoff. READ zero is only actual tracked-owner destruction,
+ * never full-flow/Core retirement authority.
+ * Caller serializes and retains the original opaque owner on every result. */
+int tns_owner_begin_tracked_join(struct tns_owner *owner);
+int tns_owner_read_tracked_join(struct tns_owner *owner);
+
 /* Closed internal byte protocol, shared with portable decoder tests.
  * A decoded message is not authority: the constructor verifies its own held
  * pidfd, proc directory, NSFS descriptor, namespace type and actual identity. */

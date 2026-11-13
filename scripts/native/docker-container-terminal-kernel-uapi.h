@@ -51,4 +51,10 @@ struct tako_terminal_lifetime_observation {
 };
 #define TAKO_TERMINAL_LIFETIME _IOR(0xb7, 5, struct tako_terminal_lifetime_observation)
 
+/* Original-file tracked-owner destruction only, never traffic retirement.
+ * No inputs, target, flags or result DTO: arg must be zero for both.
+ */
+#define TAKO_TERMINAL_OWNER_JOIN_BEGIN _IO(0xb7, 7)
+#define TAKO_TERMINAL_OWNER_JOIN_READ  _IO(0xb7, 8)
+
 #endif

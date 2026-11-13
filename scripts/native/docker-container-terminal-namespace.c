@@ -56,6 +56,8 @@ struct tns_owner {
   int kernel_release_attempted;
   int namespace_close_unknown;
   uint32_t lifetime_seen;
+  unsigned int tracked_join_attempted;
+  struct tns_lifetime tracked_join_before;
   struct tns_identity creator;
   struct tns_identity identity;
 };
@@ -685,4 +687,64 @@ int tns_owner_continue_namespace_release(struct tns_owner *owner,
     errno = EINVAL; return -1;
   }
   return tns_namespace_release_progress(owner, lifetime);
+}
+
+
+/* The original opaque controller has already completed its namespace-release
+ * phases. These are original operation facts, not a caller-provided target or
+ * a count/coverage predicate. No attempted/unknown close is retried here. */
+static int tns_tracked_join_inputs(struct tns_owner *owner) {
+  if (!owner) { errno = EINVAL; return -1; }
+  if (tns_controller(owner) < 0) return -1;
+  if (owner->phase != TNS_CLOSING || !owner->namespace_loaned ||
+      !owner->namespace_release_attempted || !owner->kernel_release_attempted ||
+      owner->child != 0 || owner->netfd >= 0 || owner->control >= 0 ||
+      owner->status >= 0 || !owner->cut_attempted || !owner->cut_confirmed ||
+      !owner->kernel_attempted || owner->kernel_fd < 0 ||
+      !owner->kernel_cookie || owner->namespace_close_unknown) {
+    errno = EUCLEAN; return -1;
+  }
+  return tns_device_current(owner);
+}
+
+int tns_owner_begin_tracked_join(struct tns_owner *owner) {
+  if (!owner) { errno = EINVAL; return -1; }
+  if (tns_controller(owner) < 0) return -1;
+  if (owner->tracked_join_attempted) { errno = EALREADY; return -1; }
+  if (tns_tracked_join_inputs(owner) < 0) return -1;
+  struct tns_lifetime before;
+  /* The last identity/release read MUST precede BEGIN. Successful BEGIN
+   * drops ctx->owner, so old OBSERVE/LIFETIME cannot gate later JOIN_READ. */
+  if (tns_owner_observe_lifetime(owner, &before) < 0) return -1;
+  if (before.born != 1 || before.release_attempted != 1 ||
+      before.reference_released != 1 || before.poisoned ||
+      !tns_identity_equal(&before.identity, &owner->identity) ||
+      before.net_cookie != owner->kernel_cookie ||
+      tns_tracked_join_inputs(owner) < 0) {
+    if (!errno) errno = EUCLEAN;
+    return -1;
+  }
+  owner->tracked_join_before = before;
+  owner->tracked_join_attempted = 1; /* Before the only original-fd handoff. */
+  int result = ioctl(owner->kernel_fd, TAKO_TERMINAL_OWNER_JOIN_BEGIN, 0UL);
+  if (result < 0) return -1; /* Sent UNKNOWN is not replayed, even after READ. */
+  if (result) { errno = EPROTO; return -1; }
+  /* ACK only describes the handoff. It is never tracked destruction. */
+  return tns_tracked_join_inputs(owner);
+}
+
+int tns_owner_read_tracked_join(struct tns_owner *owner) {
+  if (!owner || !owner->tracked_join_attempted) { errno = EINVAL; return -1; }
+  if (tns_tracked_join_inputs(owner) < 0) return -1;
+  const struct tns_lifetime *before = &owner->tracked_join_before;
+  if (before->born != 1 || before->release_attempted != 1 ||
+      before->reference_released != 1 || before->poisoned ||
+      !tns_identity_equal(&before->identity, &owner->identity) ||
+      before->net_cookie != owner->kernel_cookie) { errno = ESTALE; return -1; }
+  /* Exactly one read per call, only the same original device context. No
+   * OBSERVE/LIFETIME, hidden retry, count inference or effect continuation. */
+  int result = ioctl(owner->kernel_fd, TAKO_TERMINAL_OWNER_JOIN_READ, 0UL);
+  if (result < 0) return -1;
+  if (result) { errno = EPROTO; return -1; }
+  return tns_tracked_join_inputs(owner); /* Effect fact only, never terminal. */
 }
