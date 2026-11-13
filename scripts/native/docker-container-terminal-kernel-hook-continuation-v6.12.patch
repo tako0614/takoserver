@@ -1,0 +1,73 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] retain original ledger across synchronous netfilter continuation
+
+Apply after base e92d9c69 and CUT-sync 9532ade1. The original NF_HOOK and
+NF_HOOK_COND caller must genuinely retain live net memory through reserve.
+Save that immutable owner's independent packet ledger ref until the real
+callback/drop/dispatch returns, even when skb was freed inside the callback.
+This neither waits all callbacks from CUT nor retains their asynchronous
+queues/GRO/offload descendants. No count/ACK/terminal authority is added.
+
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -316,16 +316,24 @@
+ 	     int (*okfn)(struct net *, struct sock *, struct sk_buff *),
+ 	     bool cond)
+ {
++	/* Caller retains a genuine live net through this original reservation.
++	 * The independent ledger survives skb disposal inside okfn.
++	 */
++	struct tako_terminal_owner *held = tako_terminal_packet_reserve(net);
+ 	int ret;
+ 
+ 	/* cond=false otherwise skips nf_hook completely. */
+ 	if (unlikely(tako_terminal_block(net, pf))) {
+ 		kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
+-		return -EPERM;
++		ret = -EPERM;
++		goto out;
+ 	}
+ 	if (!cond ||
+ 	    ((ret = nf_hook(pf, hook, net, sk, skb, in, out, okfn)) == 1))
+ 		ret = okfn(net, sk, skb);
++out:
++	/* Never dereference skb/net after the actual callback returns. */
++	tako_terminal_packet_put(held);
+ 	return ret;
+ }
+ 
+@@ -334,9 +342,14 @@
+ 	struct net_device *in, struct net_device *out,
+ 	int (*okfn)(struct net *, struct sock *, struct sk_buff *))
+ {
++	/* Hold the original ledger across the synchronous continuation; the
++	 * callback may consume skb and its own net/socket references.
++	 */
++	struct tako_terminal_owner *held = tako_terminal_packet_reserve(net);
+ 	int ret = nf_hook(pf, hook, net, sk, skb, in, out, okfn);
+ 	if (ret == 1)
+ 		ret = okfn(net, sk, skb);
++	tako_terminal_packet_put(held);
+ 	return ret;
+ }
+ 
+diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
+--- a/net/core/tako_terminal.c
++++ b/net/core/tako_terminal.c
+@@ -274,6 +274,7 @@
+ 		tako_aux_get(owner, &owner->packet_groups);
+ 	return owner;
+ }
++EXPORT_SYMBOL_GPL(tako_terminal_packet_reserve);
+ 
+ struct tako_terminal_owner *tako_terminal_packet_clone(struct tako_terminal_owner *held)
+ {
+@@ -287,6 +288,7 @@
+ 	if (held)
+ 		tako_aux_put(held, &held->packet_groups);
+ }
++EXPORT_SYMBOL_GPL(tako_terminal_packet_put);
+ 
+ void tako_terminal_packet_poison(struct tako_terminal_owner *held)
+ {
