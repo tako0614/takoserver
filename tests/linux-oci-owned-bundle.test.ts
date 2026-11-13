@@ -5,6 +5,8 @@ import { spawn as importedSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import * as http from "node:http";
+import { request as importedRequest } from "node:http";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
@@ -86,6 +88,8 @@ async function fixture(
       | "start-retire-mutated"
       | "retire-pending";
     readonly noPhysicalBinary?: boolean;
+    readonly nativeObservationFaultAt?: number;
+    readonly changingSql?: boolean;
     readonly namespaceMode?: "success" | "retained" | "foreign" | "unknown";
     readonly egressLimits?: LinuxOciEgressLimits;
     readonly hostTopology?: LinuxOciHostTopology;
@@ -193,6 +197,19 @@ async function fixture(
       readonly configuredInputs: NonNullable<LinuxOciOwnedBundleOptions["configuredInputs"]>;
     },
   ) => {
+    if (adversarial.changingSql) {
+      let reads = 0;
+      const originalSql = options.sql;
+      const otherPort = createSqliteSql(database);
+      Object.defineProperty(options, "sql", {
+        enumerable: true,
+        get() {
+          // Original Core and configured-input source see the true port. The
+          // later health-only capture must independently prove same identity.
+          return ++reads < 3 ? originalSql : otherPort;
+        },
+      });
+    }
     if (!adversarial.viaHostCreator) return createLinuxOciOwnedBundle(options);
     const { sql, clock, ...selection } = options;
     const selected = createSelfhostLinuxOciCore({ sql, clock, selection });
@@ -250,7 +267,8 @@ async function fixture(
     throw error;
   }
   let nativeProcesses = 0,
-    nativeExits = 0;
+    nativeExits = 0,
+    nativeStartedObservations = 0;
   const nativeRequests: string[] = [];
   let originalCreate: JsonObject | undefined;
   let nativeClosing: Promise<void> | undefined;
@@ -330,6 +348,7 @@ async function fixture(
               request.kind === "linux-oci-observe-started@1"
             ) {
               if (!nativeId) throw new Error("raw original stopped identity absent");
+              if (request.kind === "linux-oci-observe-started@1") nativeStartedObservations++;
               if (
                 (request.kind === "linux-oci-start@1" &&
                   adversarial.nativeMode === "start-mutated") ||
@@ -350,7 +369,8 @@ async function fixture(
                   (request.kind === "linux-oci-start@1" &&
                     adversarial.nativeMode === "start-foreign-id") ||
                   (request.kind === "linux-oci-observe-started@1" &&
-                    adversarial.nativeMode === "start-observation-foreign-id")
+                    (adversarial.nativeMode === "start-observation-foreign-id" ||
+                      adversarial.nativeObservationFaultAt === nativeStartedObservations))
                     ? "f".repeat(64)
                     : nativeId,
                 namespaceDevice: 4,
@@ -2537,4 +2557,348 @@ test("accepted OCI service is absent without explicit Host topology selection", 
   } finally {
     await f.close();
   }
+});
+
+// Raw HTTP/stdio facts model transport only. The selected-policy C admission
+// producer is a separate source dependency; these cases certify no OPEN,
+// actual network path, all-flow coverage, serving or operation completion.
+function acceptedRawHttp() {
+  const request = new EventEmitter(),
+    response = new EventEmitter();
+  const calls: unknown[] = [];
+  let ends = 0,
+    requestDestroy = 0,
+    responseDestroy = 0;
+  let onEnd = () => {};
+  Object.assign(request, {
+    end() {
+      ends++;
+      onEnd();
+      return request;
+    },
+    destroy() {
+      requestDestroy++;
+      return request;
+    },
+  });
+  Object.assign(response, {
+    statusCode: 204,
+    destroy() {
+      responseDestroy++;
+      return response;
+    },
+  });
+  // Cast only the raw Node overload boundary, never an owner/probe/guard.
+  const raw = spyOn(http, "request").mockImplementation(((options: unknown) => {
+    calls.push(options);
+    return request;
+  }) as unknown as typeof http.request);
+  if (!Object.is(importedRequest, raw)) throw new Error("raw HTTP interception absent");
+  return {
+    calls,
+    request,
+    response,
+    counts: () => ({ ends, requestDestroy, responseDestroy }),
+    onEnd(callback: () => void) {
+      onEnd = callback;
+    },
+    reply() {
+      request.emit("response", response);
+    },
+    join() {
+      response.emit("close");
+      request.emit("close");
+    },
+    restore() {
+      raw.mockRestore();
+    },
+  };
+}
+function acceptedHttpSelection() {
+  return {
+    nativeMode: "start" as const,
+    hostTopology: syntheticTopology(),
+    egressLimits: { maxConnections: 9, packetLimitBytes: 65536 },
+  };
+}
+const startedObservations = (f: Awaited<ReturnType<typeof fixture>>) =>
+  f.nativeCounts().requests.filter((kind) => kind === "linux-oci-observe-started@1").length;
+
+test("accepted OCI HTTP uses the original running allocation and fixed GET bookends without publishing", async () => {
+  const f = await fixture(false, acceptedHttpSelection());
+  const raw = acceptedRawHttp();
+  let visited = false;
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  f.afterStart(async (execution) => {
+    expect(startedObservations(f)).toBe(1);
+    const before = await f.sql.query("SELECT * FROM tf_v2_container_start_attempts");
+    const result = await f.composition.observeAcceptedHttpHealth(execution);
+    expect(result).toEqual({ nativeId: f.recordedCreate().claimId, statusCode: 204 });
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(await f.sql.query("SELECT * FROM tf_v2_container_start_attempts")).toEqual(before);
+    expect(startedObservations(f)).toBe(3);
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    if (f.failures[0]) throw f.failures[0];
+    expect(visited).toBe(true);
+    expect(raw.calls).toEqual([
+      {
+        protocol: "http:",
+        hostname: "10.240.0.3",
+        family: 4,
+        port: 8080,
+        path: "/health",
+        method: "GET",
+        agent: false,
+        maxHeaderSize: 8192,
+        headers: { Connection: "close" },
+      },
+    ]);
+    expect(raw.counts()).toEqual({ ends: 1, requestDestroy: 1, responseDestroy: 1 });
+    expect(f.nativeCounts().requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(
+      1,
+    );
+    expect(await f.sql.query("SELECT serving_generation FROM tf_v2_container_instances")).toEqual([
+      { serving_generation: null },
+    ]);
+    const execution = f.execution;
+    if (!execution) throw new Error("original execution absent");
+    const counts = f.nativeCounts();
+    await expect(f.composition.observeAcceptedHttpHealth(execution)).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(counts);
+    expect(raw.calls).toHaveLength(1);
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("accepted OCI HTTP rejects foreign execution before IO and preserves the actual original execution", async () => {
+  const f = await fixture(false, acceptedHttpSelection()),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let visited = false;
+  f.afterStart(async (execution) => {
+    const counts = f.nativeCounts();
+    await expect(
+      f.composition.observeAcceptedHttpHealth({ ...execution, principal: "foreign" }),
+    ).rejects.toThrow();
+    expect(f.nativeCounts()).toEqual(counts);
+    expect(raw.calls).toEqual([]);
+    expect((await f.composition.observeAcceptedHttpHealth(execution)).statusCode).toBe(204);
+    visited = true;
+  });
+  try {
+    await f.create();
+    await f.engine.runNext();
+    if (f.failures[0]) throw f.failures[0];
+    expect(visited).toBe(true);
+    expect(raw.calls).toHaveLength(1);
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+for (const mode of ["unconfigured", "pending"] as const) {
+  test(`accepted OCI HTTP rejects ${mode} before native observation or HTTP`, async () => {
+    const f = await fixture(
+      false,
+      mode === "pending"
+        ? { ...acceptedHttpSelection(), nativeMode: "retire-pending" }
+        : { nativeMode: "start" },
+    );
+    const raw = acceptedRawHttp();
+    let visited = false;
+    const check = async (execution: V2Execution) => {
+      const before = f.nativeCounts();
+      await expect(f.composition.observeAcceptedHttpHealth(execution)).rejects.toThrow();
+      expect(f.nativeCounts()).toEqual(before);
+      expect(raw.calls).toEqual([]);
+      visited = true;
+    };
+    if (mode === "pending") f.beforeStart(check);
+    else f.afterStart(check);
+    try {
+      await f.create();
+      await f.engine.runNext();
+      if (f.failures[0]) throw f.failures[0];
+      expect(visited).toBe(true);
+      expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual(
+        mode === "pending" ? [] : [{ state: "running" }],
+      );
+    } finally {
+      raw.restore();
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+for (const faultAt of [2, 3]) {
+  test(`accepted OCI HTTP refuses foreign native bookend ${faultAt} from the same original transport`, async () => {
+    const f = await fixture(false, {
+      ...acceptedHttpSelection(),
+      nativeObservationFaultAt: faultAt,
+    });
+    const raw = acceptedRawHttp();
+    raw.onEnd(() => {
+      raw.reply();
+      raw.join();
+    });
+    let visited = false;
+    f.afterStart(async (execution) => {
+      await expect(f.composition.observeAcceptedHttpHealth(execution)).rejects.toThrow();
+      expect(raw.calls).toHaveLength(faultAt === 2 ? 0 : 1);
+      expect(startedObservations(f)).toBe(faultAt);
+      visited = true;
+    });
+    try {
+      await f.create();
+      await f.engine.runNext();
+      if (f.failures[0]) throw f.failures[0];
+      expect(visited).toBe(true);
+      expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+        { state: "running" },
+      ]);
+    } finally {
+      raw.join();
+      raw.restore();
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+for (const boundary of ["running-read", "outer-lease"] as const) {
+  for (const action of ["cancel", "close"] as const) {
+    test(`accepted OCI HTTP ${boundary} ${action} after real Sql read refuses a positive observation`, async () => {
+      const f = await fixture(false, acceptedHttpSelection()),
+        raw = acceptedRawHttp();
+      const cancel = new AbortController();
+      let reached = false,
+        healthReadbacks = 0,
+        joined = false;
+      let closing: Promise<void> | undefined;
+      let restore = () => {};
+      raw.onEnd(() => {
+        raw.reply();
+        raw.join();
+        joined = true;
+      });
+      f.afterStart(async (execution) => {
+        const query = f.sql.query.bind(f.sql);
+        const mock = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+          const rows = await query(statement, params);
+          if (joined && statement.startsWith("SELECT attempt,create_claim_id,native_id,state,"))
+            healthReadbacks++;
+          const target =
+            joined &&
+            !reached &&
+            (boundary === "running-read"
+              ? healthReadbacks === 2 &&
+                statement.startsWith("SELECT attempt,create_claim_id,native_id,state,")
+              : healthReadbacks === 2 &&
+                statement.includes(" FROM tf_v2_container_instances i JOIN "));
+          if (target) {
+            reached = true;
+            // Same actual unchanged rows; only their await is extended. The
+            // producer/START state and original currentness result stay real.
+            await Promise.resolve();
+            if (action === "cancel") cancel.abort();
+            else {
+              closing = f.composition.close();
+              void closing.catch(() => undefined);
+            }
+          }
+          return rows;
+        });
+        restore = () => mock.mockRestore();
+        await expect(
+          f.composition.observeAcceptedHttpHealth(execution, cancel.signal),
+        ).rejects.toThrow();
+        expect(reached).toBe(true);
+        expect(raw.calls).toHaveLength(1);
+        expect(startedObservations(f)).toBe(3);
+        expect(await query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+          { state: "running" },
+        ]);
+      });
+      try {
+        await f.create();
+        await f.engine.runNext();
+        if (f.failures[0]) throw f.failures[0];
+        expect(reached).toBe(true);
+        expect(raw.counts().ends).toBe(1);
+        if (closing) await expect(closing).rejects.toThrow("custody_retained");
+      } finally {
+        restore();
+        raw.join();
+        raw.restore();
+        await expect(f.close()).rejects.toThrow("custody_retained");
+      }
+    });
+  }
+}
+
+test("accepted OCI HTTP retains an unjoined original request through close without a replacement GET", async () => {
+  const f = await fixture(false, acceptedHttpSelection()),
+    raw = acceptedRawHttp();
+  const cancel = new AbortController();
+  let visited = false;
+  raw.onEnd(() => {
+    raw.reply();
+    cancel.abort();
+  });
+  f.afterStart(async (execution) => {
+    await expect(
+      f.composition.observeAcceptedHttpHealth(execution, cancel.signal),
+    ).rejects.toThrow();
+    expect(raw.counts()).toEqual({ ends: 1, requestDestroy: 1, responseDestroy: 1 });
+    const before = f.nativeCounts();
+    await expect(f.composition.observeAcceptedHttpHealth(execution)).rejects.toThrow(
+      "Container configured inputs unavailable",
+    );
+    expect(f.nativeCounts()).toEqual(before);
+    expect(raw.calls).toHaveLength(1);
+    visited = true;
+  });
+  try {
+    await f.create();
+    await f.engine.runNext();
+    if (f.failures[0]) throw f.failures[0];
+    expect(visited).toBe(true);
+    await expect(f.composition.close()).rejects.toThrow("custody_retained");
+    expect(raw.calls).toHaveLength(1);
+    raw.join();
+    await expect(f.composition.close()).rejects.toThrow("custody_retained");
+    expect(raw.counts()).toEqual({ ends: 1, requestDestroy: 1, responseDestroy: 1 });
+    // HTTP actually joins late. The distinct born native owner still retains
+    // custody, so this is not whole-owner/DB shutdown or terminal success.
+  } finally {
+    raw.join();
+    raw.restore();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+}, 10_000);
+
+test("accepted OCI HTTP rejects a later Sql-port substitution before artifact or native IO", async () => {
+  // Both are actual SqliteSql ports for the same disposable private database.
+  // Neither is a callback/factory/row stub; original owner identity decides.
+  await expect(
+    fixture(false, { changingSql: true }).then(async (f) => {
+      expect(f.counts()).toEqual({ reads: 0, unpacks: 0, uses: 0 });
+      expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+      await f.close();
+    }),
+  ).rejects.toThrow("Sql");
 });

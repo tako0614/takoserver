@@ -412,3 +412,9 @@ int tns_owner_continue_namespace_release(struct tns_owner *owner, struct tns_lif
 int tns_owner_observe_creator(struct tns_owner *owner, struct tns_identity *identity) {
   (void)owner; (void)identity; abort();
 }
+
+/* Link-only compatibility for the new mandatory original admission ABI.
+ * These older raw models do not implement it and must never fake success. */
+int tns_owner_open_admission(struct tns_owner *owner) { (void)owner; abort(); }
+int tns_owner_cut_admission(struct tns_owner *owner) { (void)owner; abort(); }
+int tns_owner_admission_current(struct tns_owner *owner) { (void)owner; abort(); }

@@ -18,6 +18,15 @@ struct tns_identity {
  * Requires SIGCHLD default disposition and exclusive reaping of this child. */
 int tns_owner_create(struct tns_owner **slot);
 int tns_owner_observe(struct tns_owner *owner, struct tns_identity *identity);
+/* Original no-field admission effects, consumed once on the held device open.
+ * OPEN raw0 is not serving/current/terminal authority. CUT is permanent; a
+ * lost response is retained and never resent. Only an actual same-owner sealed
+ * readback permits existing identity/cleanup observations after CUT. */
+int tns_owner_open_admission(struct tns_owner *owner);
+int tns_owner_cut_admission(struct tns_owner *owner);
+/* Fresh same-owner uncut identity observation after its original OPEN effect;
+ * still not serving/packet-barrier/terminal authority. */
+int tns_owner_admission_current(struct tns_owner *owner);
 /* Read ONLY this original controller's actual current namespace and compare
  * it to the saved pre-birth creator identity, bookended by original guest
  * custody checks. No namespace/PID/FD/path is accepted or exported. */

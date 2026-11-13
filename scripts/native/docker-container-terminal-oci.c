@@ -36,9 +36,13 @@
  * Caller must serialize this owner and exclusively reap its command child. */
 struct oci_uplink_owner;
 struct oci_policy_owner;
+struct oci_admission_owner;
 struct tns_oci_owner {
   struct oci_uplink_owner *uplink;
   struct oci_policy_owner *policy;
+  struct oci_admission_owner *admission;
+  unsigned int admission_attempt;
+  int admission_ruleset_reads;
   unsigned int attempt;
   unsigned int command_attempt;
   int command_joined;
@@ -85,6 +89,11 @@ static int oci_egress_current(struct tns_oci_owner *o);
 static int oci_uplink_current(struct tns_oci_owner *o);
 static int oci_policy_current(struct tns_oci_owner *o);
 static int oci_policy_runtime_current(struct tns_oci_owner *o);
+static int oci_admission_open(struct tns_oci_owner *o);
+static int oci_admission_observable(struct tns_oci_owner *o);
+static int oci_admission_cut(struct tns_oci_owner *o);
+static int oci_admission_stop(struct tns_oci_owner *o);
+static int oci_admission_close(struct tns_oci_owner *o);
 
 static volatile sig_atomic_t oci_cancel_requested;
 
@@ -391,6 +400,7 @@ static int oci_held_inputs(struct tns_oci_owner *o) {
 static int oci_start_inputs(struct tns_oci_owner *o) {
   if (oci_not_canceled() < 0) return -1;
   if (oci_held_inputs(o) < 0) return -1;
+  if (o->admission_ruleset_reads && tns_owner_admission_current(o->birth) < 0) return -1;
   if (oci_policy_runtime_current(o) < 0) return -1;
   return oci_not_canceled();
 }
@@ -551,6 +561,7 @@ int tns_oci_stop_init(struct tns_oci_owner *o, struct tns_oci_init_reaped *reape
   if (!o || !reaped) { errno = EINVAL; return -1; }
   if (tns_oci_once(&o->init_stop_attempt) < 0) { errno = EALREADY; return -1; }
   o->invalid = 1; /* STOP can never resume CREATE/START, including unknown failure. */
+  if (oci_admission_cut(o) < 0) return -1;
   if (oci_reap_owner_current(o) < 0) return -1;
   siginfo_t info;
   int state = oci_peek_init(o, &info);
@@ -563,7 +574,7 @@ int tns_oci_stop_init(struct tns_oci_owner *o, struct tns_oci_init_reaped *reape
   return tns_oci_join_init(o, reaped);
 }
 
-int tns_oci_observe_started(struct tns_oci_owner *o, struct tns_oci_started *started) {
+static int oci_observe_started_exec(struct tns_oci_owner *o, struct tns_oci_started *started) {
   if (!o || !started || o->invalid || !o->start_attempt || !o->start_joined ||
       !o->start_ok || o->stopped_exe < 0 || !o->init_custody) { errno = EINVAL; return -1; }
   struct tns_identity birth;
@@ -588,7 +599,23 @@ int tns_oci_observe_started(struct tns_oci_owner *o, struct tns_oci_started *sta
   return 0;
 fail:
   o->invalid = 1;
+  if (oci_admission_cut(o) < 0) return -1;
   return -1;
+}
+
+int tns_oci_observe_started(struct tns_oci_owner *o, struct tns_oci_started *started) {
+  if (!o || !started) { errno=EINVAL;return -1; }
+  /* The pre-OPEN executable transition is private to the original START.
+   * Selected policy has no public positive started reply while birth denied. */
+  if (oci_admission_observable(o) < 0) {
+    int saved=errno;
+    if (o->admission_attempt) {
+      o->invalid=1;
+      if (oci_admission_cut(o) < 0) return -1;
+    }
+    errno=saved;return -1;
+  }
+  return oci_observe_started_exec(o,started);
 }
 
 int tns_oci_start(struct tns_oci_owner *o, struct tns_oci_started *started) {
@@ -613,11 +640,16 @@ int tns_oci_start(struct tns_oci_owner *o, struct tns_oci_started *started) {
   if (elapsed < now || elapsed - now >= 10000) { errno = ETIMEDOUT; goto fail; }
   if (oci_join_start_command(o, 10000 - (int)(elapsed - now)) < 0) goto fail;
   if (!o->start_ok) { errno = EPROTO; goto fail; }
-  return tns_oci_observe_started(o, started);
+  struct tns_oci_started executed;
+  if (oci_observe_started_exec(o, &executed) < 0 || oci_admission_open(o) < 0 ||
+      tns_oci_observe_started(o, started) < 0) goto fail;
+  return 0;
 fail: {
   int saved = errno ? errno : EPROTO;
   o->invalid = 1;
+  int cut = oci_admission_cut(o), cut_error = errno;
   if (oci_stop_start_command(o) < 0) return -1;
+  if (cut < 0) { errno = cut_error; return -1; }
   errno = saved;
   return -1;
   }
@@ -667,6 +699,7 @@ fail:
 #include "docker-container-terminal-oci-egress.h"
 #include "docker-container-terminal-oci-uplink.h"
 #include "docker-container-terminal-oci-policy.h"
+#include "docker-container-terminal-oci-admission.h"
 
 int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner **slot) {
   if (!slot) { errno = EINVAL; return -1; }
@@ -780,7 +813,9 @@ int tns_oci_cancel(struct tns_oci_owner *o) {
   if (!o) { errno = EINVAL; return -1; }
   o->invalid = 1;
   tns_oci_note_cancel();
-  if (oci_policy_stop(o->policy) < 0 || oci_egress_stop(o) < 0) return -1;
+  int cut = oci_admission_cut(o), cut_error = errno;
+  if (oci_admission_stop(o) < 0 || oci_policy_stop(o->policy) < 0 || oci_egress_stop(o) < 0) return -1;
+  if (cut < 0) { errno = cut_error; return -1; }
   if (o->command_pid && !o->command_joined && !o->kill_attempted) {
     o->kill_attempted = 1;
     if (syscall(SYS_pidfd_send_signal, o->command_pidfd, SIGKILL, NULL, 0) < 0 &&
@@ -800,6 +835,10 @@ int tns_oci_close_transport(struct tns_oci_owner *o) {
   /* Uplink cleanup must run while the actual original birth is still HELD.
    * Unknown/born custody must survive transport loss for original init join;
    * stopping the custodian first would destroy its live namespace proof. */
+  if (o->admission) {
+    if (!o->command_pid && oci_admission_close(o) < 0 && !saved) saved = errno;
+    if (o->admission) { errno = saved ? saved : EUCLEAN; return -1; }
+  }
   if (o->policy) {
     if (!o->command_pid && oci_policy_close(&o->policy) < 0 && !saved) saved = errno;
     if (o->policy) { errno = saved ? saved : EUCLEAN; return -1; }
@@ -821,7 +860,7 @@ int tns_oci_release_uncreated(struct tns_oci_owner **slot) {
     if (!errno) errno = EUCLEAN;
     return -1;
   }
-  if (oci_policy_close(&o->policy) < 0 || oci_uplink_cleanup(&o->uplink) < 0 || oci_egress_close(o) < 0) return -1;
+  if (oci_admission_close(o) < 0 || oci_policy_close(&o->policy) < 0 || oci_uplink_cleanup(&o->uplink) < 0 || oci_egress_close(o) < 0) return -1;
   if (o->birth && tns_owner_close(&o->birth) < 0) return -1;
   if (o->config_created && unlinkat(o->bundle, "config.json", 0) < 0) return -1;
   int *fds[] = {&o->root, &o->rootfs, &o->receipt, &o->runtime, &o->bundle,
@@ -869,7 +908,7 @@ static int oci_namespace_release_progress(struct tns_oci_owner *o,
     if (!errno) errno = ESTALE;
     return -1;
   }
-  if (oci_policy_close(&o->policy) < 0 || oci_uplink_cleanup(&o->uplink) < 0) return -1;
+  if (oci_admission_close(o) < 0 || oci_policy_close(&o->policy) < 0 || oci_uplink_cleanup(&o->uplink) < 0) return -1;
   if (o->network >= 0) {
     struct stat st; struct statfs fs;
     if (fstat(o->network, &st) < 0 || fstatfs(o->network, &fs) < 0 ||

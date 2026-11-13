@@ -660,8 +660,9 @@ static _Noreturn void oci_policy_child(struct oci_policy_owner *p,unsigned int s
   if(flags<0 || fcntl(fd,F_SETFL,flags&~O_NONBLOCK)<0 || fcntl(fd,F_SETFD,0)<0)_exit(125);
   }
   char *const check[]={"nft","--check","-f","-",NULL},*const apply[]={"nft","-f","-",NULL},*const readback[]={"nft","-j","list","table","inet",OCI_POLICY_TABLE,NULL};
+  char *const ruleset[]={"nft","-j","list","ruleset",NULL};
   char *const environment[]={"PATH=/usr/sbin:/usr/bin:/sbin:/bin",NULL};
-  char *const *argv=stage==0?check:stage==1?apply:stage==2?readback:NULL;
+  char *const *argv=stage==0?check:stage==1?apply:stage==2?(o->admission_ruleset_reads?ruleset:readback):NULL;
   if(!argv)_exit(125);
   umask(077);
   syscall(SYS_execveat,3,"",argv,environment,AT_EMPTY_PATH);

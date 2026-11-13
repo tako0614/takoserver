@@ -45,6 +45,7 @@ struct tns_owner {
   int netfd;
   int kernel_fd;
   int kernel_attempted;
+  unsigned int admission_attempted,admission_acknowledged,cut_attempted,cut_confirmed;
   uint64_t kernel_cookie;
   struct stat device_identity;
   int control;
@@ -119,6 +120,15 @@ static int tns_device_current(struct tns_owner *owner) {
   return 0;
 }
 
+/* Known original CUT permits identity/cleanup observation of that sealed net.
+ * It does not change the old unsealed pure oracle or accept poison/count loss. */
+static int tns_kernel_snapshot_consistent(struct tns_owner *owner,
+                                          const struct tako_terminal_observation *s) {
+  if (s->sealed > 1 || s->sealed != (unsigned int)(owner->cut_confirmed != 0)) return 0;
+  return tns_kernel_counts_consistent(s->full_ip_sockets,s->allocations,
+                                     s->releases,0,s->poisoned);
+}
+
 static int tns_kernel_observe(struct tns_owner *owner) {
   struct tako_terminal_observation snapshot;
   struct tns_identity before, after;
@@ -138,9 +148,7 @@ static int tns_kernel_observe(struct tns_owner *owner) {
       !tns_identity_equal(&owner->identity, &after) ||
       !tns_kernel_identity_matches(&owner->creator, &after, snapshot.net_cookie,
                                    snapshot.namespace_inum, owner->kernel_cookie) ||
-      !tns_kernel_counts_consistent(snapshot.full_ip_sockets, snapshot.allocations,
-                                    snapshot.releases, snapshot.sealed,
-                                    snapshot.poisoned) ||
+      !tns_kernel_snapshot_consistent(owner,&snapshot) ||
       tns_device_current(owner) < 0) { errno = ESTALE; return -1; }
   if (!owner->kernel_cookie) owner->kernel_cookie = snapshot.net_cookie;
   return 0;
@@ -536,6 +544,73 @@ int tns_owner_observe_lifetime(struct tns_owner *owner,
   return 0;
 }
 
+/* These no-field effects remain bound to the original device open. A lost
+ * response consumes its attempt; neither an observation nor a caller flag
+ * permits reopening. CUT is allowed in failed/closing phases so uncertainty
+ * cannot require successful policy/currentness before closing the gate. */
+int tns_owner_cut_admission(struct tns_owner *owner) {
+  if (!owner || tns_controller(owner) < 0) return -1;
+  /* With no device and CREATE never attempted there is no kernel target.
+   * Keep OPEN forbidden without manufacturing a confirmed CUT or replaying I/O. */
+  if (owner->kernel_fd < 0 && !owner->kernel_attempted) {
+    owner->cut_attempted = 1;
+    return 0;
+  }
+  if (owner->cut_attempted) {
+    if (owner->cut_confirmed) return 0;
+    errno = EUCLEAN; return -1;
+  }
+  owner->cut_attempted = 1;
+  if (tns_device_current(owner) < 0) return -1;
+  int result = ioctl(owner->kernel_fd,TAKO_TERMINAL_CUT,0UL);
+  if (result < 0) return -1;
+  if (result) { errno = EPROTO; return -1; }
+  struct tako_terminal_observation observed;
+  memset(&observed,0,sizeof(observed));
+  struct tns_identity before,after;
+  if (owner->netfd < 0 || tns_fd_identity(owner->netfd,&before) < 0 ||
+      !tns_identity_equal(&before,&owner->identity) || !owner->kernel_cookie) return -1;
+  result = ioctl(owner->kernel_fd,TAKO_TERMINAL_OBSERVE,&observed);
+  if (result < 0) return -1;
+  if (result || observed.sealed != 1 || observed.poisoned > 1 ||
+      !tns_kernel_identity_matches(&owner->creator,&owner->identity,
+          observed.net_cookie,observed.namespace_inum,owner->kernel_cookie) ||
+      tns_fd_identity(owner->netfd,&after) < 0 || !tns_identity_equal(&before,&after) ||
+      tns_device_current(owner) < 0) { errno = ESTALE; return -1; }
+  owner->cut_confirmed = 1; /* Sealed same-owner observation, never a packet join. */
+  return 0;
+}
+int tns_owner_admission_current(struct tns_owner *owner) {
+  if (!owner || tns_controller(owner) < 0) return -1;
+  if (!owner->admission_acknowledged || owner->cut_attempted ||
+      owner->namespace_release_attempted || owner->kernel_release_attempted) {
+    errno=EUCLEAN;return -1;
+  }
+  return tns_kernel_observe(owner);
+}
+int tns_owner_open_admission(struct tns_owner *owner) {
+  if (!owner || tns_controller(owner) < 0) return -1;
+  if (owner->admission_attempted || owner->cut_attempted) { errno = EALREADY; return -1; }
+  owner->admission_attempted = 1;
+  struct tns_identity identity;
+  struct tns_lifetime lifetime;
+  if (tns_owner_observe(owner,&identity) < 0 ||
+      tns_owner_observe_lifetime(owner,&lifetime) < 0 ||
+      !tns_identity_equal(&identity,&lifetime.identity) || lifetime.release_attempted ||
+      lifetime.reference_released || lifetime.net_gone || lifetime.poisoned) goto fail;
+  int result = ioctl(owner->kernel_fd,TAKO_TERMINAL_OPEN,0UL);
+  if (result < 0) goto fail;
+  if (result) { errno = EPROTO; goto fail; }
+  if (tns_kernel_observe(owner) < 0) goto fail;
+  owner->admission_acknowledged = 1; /* Effect/read fact only, not serving. */
+  return 0;
+fail: {
+  int saved = errno ? errno : ESTALE;
+  if (tns_owner_cut_admission(owner) < 0) return -1;
+  errno = saved; return -1;
+  }
+}
+
 /* The held NSFS may already have had a close attempted. In that phase use
  * the SAME original creator-bound ledger/cookie, preserving original sealed,
  * poisoned and full-sock consistency refusal; no observation creates a phase. */
@@ -553,8 +628,7 @@ static int tns_release_ledger_current(struct tns_owner *owner) {
   if (result || !tns_kernel_identity_matches(&owner->creator, &owner->identity,
                                              actual.net_cookie, actual.namespace_inum,
                                              owner->kernel_cookie) ||
-      !tns_kernel_counts_consistent(actual.full_ip_sockets, actual.allocations,
-                                    actual.releases, actual.sealed, actual.poisoned) ||
+      !tns_kernel_snapshot_consistent(owner,&actual) ||
       tns_device_current(owner) < 0) { errno = ESTALE; return -1; }
   return 0;
 }
