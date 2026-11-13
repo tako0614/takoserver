@@ -149,7 +149,7 @@ async function fixture() {
     helperAttempts++;
     throw new Error("synthetic raw helper open failure");
   });
-  if (importedSpawn !== spawn) {
+  if (!Object.is(importedSpawn, spawn)) {
     spawn.mockRestore();
     restoreHttp();
     database.close();

@@ -60,7 +60,7 @@ function interceptRawIo(onRequest: () => Promise<void>) {
     helpers++;
     throw new Error("synthetic raw helper failure");
   });
-  if (importedRequest !== request || importedSpawn !== spawn) {
+  if (importedRequest !== request || !Object.is(importedSpawn, spawn)) {
     request.mockRestore();
     spawn.mockRestore();
     throw new Error("raw IO interception unavailable");
@@ -202,7 +202,7 @@ async function fixture() {
         selection,
         formSelectionFactory: baseFactory,
         privateInputCustody: custody,
-        retainedExecutionActions: actions,
+        ...(actions === undefined ? {} : { retainedExecutionActions: actions }),
       });
       return node;
     },
@@ -335,14 +335,16 @@ test("one selected original graph adds retained F2 without changing public Forms
     const node = f.compose();
     const maps = node.appPorts.v2FormSelectionFactory?.(f.context);
     if (!maps) throw new Error("selected maps missing");
-    expect(maps.forms).toBe(f.baseMaps[0]?.forms);
+    const original = f.baseMaps[0];
+    if (!original) throw new Error("original maps missing");
+    expect(maps.forms).toBe(original.forms);
     expect(Object.keys(maps.forms)).toEqual([WORKER_BUNDLE_FORM_URL]);
     expect(Object.keys(maps.retainedForms)).toEqual([
       STATIC_ASSET_BUNDLE_FORM_URL,
       V2_CONTAINER_F2_FORM,
     ]);
     expect(maps.retainedForms[STATIC_ASSET_BUNDLE_FORM_URL]).toBe(
-      f.baseMaps[0]?.retainedForms[STATIC_ASSET_BUNDLE_FORM_URL],
+      original.retainedForms[STATIC_ASSET_BUNDLE_FORM_URL],
     );
     expect(node.appPorts.v2PrivateInputCustody).toBe(f.custody);
     expect(node.appPorts.v2RetainedExecutionActions?.[V2_CONTAINER_F2_FORM]).toEqual(["delete"]);

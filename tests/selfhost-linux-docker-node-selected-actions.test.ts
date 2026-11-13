@@ -80,7 +80,7 @@ function rawIo(handler: Engine) {
     helpers++;
     throw new Error("synthetic raw helper refusal");
   });
-  if (importedRequest !== request || importedSpawn !== spawn) {
+  if (importedRequest !== request || !Object.is(importedSpawn, spawn)) {
     request.mockRestore();
     spawn.mockRestore();
     throw new Error("raw IO interception unavailable");
