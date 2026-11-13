@@ -168,7 +168,11 @@ const readSuffixes = [
 type ReadSuffix = (typeof readSuffixes)[number];
 const guardedReads = readSuffixes.slice(0, 3);
 const suffixOf = (request: Request) => new URL(request.url).pathname.split("/").slice(4).join("/");
-const organizationOf = (request: Request) => new URL(request.url).pathname.split("/")[3];
+const organizationOf = (request: Request): string => {
+  const organizationId = new URL(request.url).pathname.split("/")[3];
+  if (!organizationId) throw new Error("missing local Organization path segment");
+  return organizationId;
+};
 let requests: Request[];
 let stopObserver: (() => void) | undefined;
 const disableFrames: (() => void)[] = [];

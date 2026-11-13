@@ -242,8 +242,12 @@ async function fixture() {
           throw new Error("synthetic CREATE ACK invalid");
         // The generic double normally attaches its ordinary network. A Linux
         // none-network CREATE is quarantined, with no owned-network attachment.
-        for (const current of docker.containers.values())
-          if (current.Id === value.Id) current.NetworkSettings = { Networks: { none: {} } };
+        for (const [name, current] of docker.containers)
+          if (current.Id === value.Id)
+            docker.containers.set(name, {
+              ...current,
+              NetworkSettings: { Networks: { none: {} } },
+            });
         return value.Id;
       },
       stop: async () => {
