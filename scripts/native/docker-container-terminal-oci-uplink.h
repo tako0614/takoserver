@@ -476,6 +476,21 @@ static int oci_uplink_text(const struct oci_uplink_attrs *a, unsigned int type, 
 static int oci_uplink_records(const struct oci_uplink_dump *d) {
   return d && d->done && !d->failed && d->records && d->used ? 0 : -1;
 }
+/* The fixed v6.12 RTM_NEWLINK producer always reports this subtree,
+ * including a no-program NONE. Missing state is not a NONE observation.
+ * a comes only from the complete validated parent attribute span above.
+ * This snapshot refuses XDP; it does not lock later attachment or offloads.
+ */
+static int oci_uplink_xdp(const struct oci_uplink_attrs *a) {
+  const unsigned char *p = a->p[IFLA_XDP];
+  struct rtattr outer, attached;
+  if (!p || a->size[IFLA_XDP] != RTA_ALIGN(RTA_LENGTH(sizeof(uint8_t)))) return -1;
+  memcpy(&outer, p - sizeof(outer), sizeof(outer));
+  memcpy(&attached, p, sizeof(attached));
+  if (outer.rta_type != IFLA_XDP || attached.rta_type != IFLA_XDP_ATTACHED ||
+      attached.rta_len != RTA_LENGTH(sizeof(uint8_t)) || p[sizeof(attached)] != XDP_ATTACHED_NONE) return -1;
+  return 0;
+}
 static int oci_uplink_link(const unsigned char *bytes, size_t size, const char *name,
                              uint32_t index, unsigned char mac[6], uint32_t *peer, int uplink) {
   struct ifinfomsg h; if (size < sizeof(h)) return -1; memcpy(&h, bytes, sizeof(h));
@@ -483,7 +498,7 @@ static int oci_uplink_link(const unsigned char *bytes, size_t size, const char *
   if (h.ifi_index <= 0 || (index && (uint32_t)h.ifi_index != index) || h.ifi_type != ARPHRD_ETHER ||
       (h.ifi_flags & (IFF_LOOPBACK | IFF_POINTOPOINT)) || (uplink && !(h.ifi_flags & IFF_UP)) ||
       oci_uplink_attrs(bytes + NLMSG_ALIGN(sizeof(h)), size - NLMSG_ALIGN(sizeof(h)), &a) < 0 ||
-      oci_uplink_text(&a, IFLA_IFNAME, name) < 0 || !a.p[IFLA_ADDRESS] || a.size[IFLA_ADDRESS] != 6 ||
+      oci_uplink_xdp(&a) < 0 || oci_uplink_text(&a, IFLA_IFNAME, name) < 0 || !a.p[IFLA_ADDRESS] || a.size[IFLA_ADDRESS] != 6 ||
       (a.p[IFLA_ADDRESS][0] & 1)) return -1;
   static const unsigned char zero[6] = {0}; if (!memcmp(a.p[IFLA_ADDRESS], zero, 6)) return -1;
   uint32_t master = 0; if (a.p[IFLA_MASTER] && (oci_uplink_u32(&a, IFLA_MASTER, &master) < 0 || master)) return -1;
