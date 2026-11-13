@@ -111,8 +111,11 @@ import {
   observeSelfhostBackgroundPasses,
   SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
 } from "./selfhost-health-signals.ts";
-import type { SelfhostLinuxDockerCoreSelection } from "./selfhost-linux-docker-core.ts";
 import { createSelfhostLinuxDockerNodeComposition } from "./selfhost-linux-docker-node-composition.ts";
+import {
+  createSelfhostLinuxDockerNodeSelection,
+  type SelfhostLinuxDockerNodeSelectionSource,
+} from "./selfhost-linux-docker-node-selection.ts";
 import {
   formatSelfhostListenAddress,
   parseSelfhostListenHost,
@@ -720,7 +723,8 @@ const clock = () => new Date();
 // F2 requires an explicit operator-code selection on this exact Sql. The legacy
 // Docker environment selects only its existing zero-only bootstrap. The candidate
 // remains retained-only, with no public support or realized activation here.
-const selfhostLinuxDockerSelection: SelfhostLinuxDockerCoreSelection | undefined = undefined;
+const selfhostLinuxDockerOperatorSelection: SelfhostLinuxDockerNodeSelectionSource | undefined =
+  undefined;
 let selfhostLinuxDockerNode:
   | ReturnType<typeof createSelfhostLinuxDockerNodeComposition>
   | undefined;
@@ -798,6 +802,10 @@ const runtimeInputKeyAuthority = runtimeInputsAvailable
   ? await parseRuntimeInputKeyAuthority(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string)
   : undefined;
 const runtimeInputSealKeyRing = runtimeInputKeyAuthority?.sealKeys;
+const selfhostLinuxDockerSelection = createSelfhostLinuxDockerNodeSelection({
+  selection: selfhostLinuxDockerOperatorSelection,
+  sealKeys: runtimeInputSealKeyRing,
+});
 const runtimeInputs = runtimeInputSealKeyRing
   ? createRuntimeInputAuthority({
       sql,
