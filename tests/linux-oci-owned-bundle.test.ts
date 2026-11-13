@@ -218,6 +218,7 @@ async function fixture(
   let originalCreate: JsonObject | undefined;
   let nativeClosing: Promise<void> | undefined;
   let rawChild: EventEmitter | undefined;
+  const unpackEnvironments: unknown[] = [];
   let unpackerStarted = () => {};
   const unpackerEntered = new Promise<void>((resolve) => {
     unpackerStarted = resolve;
@@ -225,6 +226,7 @@ async function fixture(
   const raw = spyOn(childProcess, "spawn").mockImplementation(((
     file: string,
     args: readonly string[],
+    options: childProcess.SpawnOptions,
   ) => {
     if (file === physicalBinary) {
       expect(args).toEqual([]);
@@ -393,6 +395,7 @@ async function fixture(
     if (file !== unpacker || args[0] !== "unpack" || args[1] !== "--image" || args.length !== 4)
       throw new Error("unexpected synthetic child");
     unpacks++;
+    unpackEnvironments.push(options.env);
     const child = Object.assign(new EventEmitter(), {
       stdout: new PassThrough(),
       stderr: new PassThrough(),
@@ -631,6 +634,7 @@ async function fixture(
     nativeExits: () => nativeExits,
     nativeClosing: () => nativeClosing,
     unpackerEntered,
+    unpackEnvironments,
     releaseUnpacker() {
       rawChild?.emit("close", 1, null);
     },
@@ -1673,3 +1677,23 @@ for (const boundary of [3, 4] as const) {
     });
   }
 }
+
+test("the genuine OCI unpack child receives a fresh empty environment without inherited keys", async () => {
+  const f = await fixture();
+  try {
+    await f.create();
+    const result = await f.engine.runNext();
+    expect(f.failures).toEqual([]);
+    expect(f.counts()).toEqual({ reads: 2, unpacks: 1, uses: 1 });
+    expect(f.unpackEnvironments).toHaveLength(1);
+    const environment = f.unpackEnvironments[0];
+    if (environment === null || typeof environment !== "object")
+      throw new Error("original unpack environment absent");
+    expect(Reflect.ownKeys(environment)).toEqual([]);
+    expect(Object.getPrototypeOf(environment)).toBeNull();
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+    expect(result?.effect).not.toBe("complete");
+  } finally {
+    await f.close();
+  }
+});

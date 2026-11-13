@@ -242,7 +242,7 @@ async function unpack(
   await new Promise<void>((resolve, reject) => {
     const child = spawn(binary, ["unpack", "--image", `${layout}:owned`, bundle], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: {},
+      env: Object.create(null),
       signal,
     });
     children.set(staging, child);

@@ -63,6 +63,29 @@ export interface LinuxOciInitReapedObservation {
   readonly pidNamespaceInode: number;
   readonly barrier: "unproven";
 }
+/** Factual retained-ledger data from the SAME original namespace owner.
+ * Counters/cookie remain lossless uint64 strings; no combination grants
+ * admission, full lifetime coverage, runtime deletion or successful close. */
+export interface LinuxOciNamespaceLifetimeObservation {
+  readonly kind:
+    | "linux-oci-namespace-release-observation@1"
+    | "linux-oci-namespace-release-continuation@1"
+    | "linux-oci-namespace-lifetime-observation@1";
+  readonly nativeId: string;
+  readonly namespaceDevice: number;
+  readonly namespaceInode: number;
+  readonly netCookie: string;
+  readonly fullIpSockets: string;
+  readonly requests: string;
+  readonly timewait: string;
+  readonly packetGroups: string;
+  readonly born: 1;
+  readonly releaseAttempted: 0 | 1;
+  readonly referenceReleased: 0 | 1;
+  readonly netGone: 0 | 1;
+  readonly poisoned: 0 | 1;
+  readonly barrier: "unproven";
+}
 export interface LinuxOciCancelObservation {
   readonly kind: "linux-oci-cancel-observation@1";
   readonly stage: "cancel";
@@ -81,6 +104,9 @@ interface Refusal {
     | "observe-started"
     | "stop-init"
     | "join-init"
+    | "release-namespace"
+    | "continue-namespace-release"
+    | "observe-namespace-lifetime"
     | "cancel";
   readonly errno: number;
   readonly custody: "released-uncreated" | "retained";
@@ -90,6 +116,7 @@ type Reply =
   | LinuxOciStoppedObservation
   | LinuxOciStartedObservation
   | LinuxOciInitReapedObservation
+  | LinuxOciNamespaceLifetimeObservation
   | LinuxOciCancelObservation
   | Refusal;
 type Operation =
@@ -99,6 +126,9 @@ type Operation =
   | "observe-started"
   | "stop-init"
   | "join-init"
+  | "release-namespace"
+  | "continue-namespace-release"
+  | "observe-namespace-lifetime"
   | "cancel";
 interface Pending {
   readonly operation: Operation;
@@ -119,6 +149,17 @@ function integer(
   return (
     typeof value === "number" && Number.isSafeInteger(value) && value >= minimum && value <= maximum
   );
+}
+function uint64(value: unknown, nonzero = false): value is string {
+  return (
+    typeof value === "string" &&
+    /^(?:0|[1-9][0-9]{0,19})$/u.test(value) &&
+    (value.length < 20 || value <= "18446744073709551615") &&
+    (!nonzero || value !== "0")
+  );
+}
+function bit(value: unknown): value is 0 | 1 {
+  return value === 0 || value === 1;
 }
 function text(value: unknown, maximum: number, nonempty = true): value is string {
   if (typeof value !== "string" || (nonempty && !value) || value.includes("\0")) return false;
@@ -272,6 +313,47 @@ function parseReply(body: Buffer): Reply {
       barrier: "unproven",
     };
   } else if (
+    value.kind === "linux-oci-namespace-release-observation@1" ||
+    value.kind === "linux-oci-namespace-release-continuation@1" ||
+    value.kind === "linux-oci-namespace-lifetime-observation@1"
+  ) {
+    if (
+      typeof value.nativeId !== "string" ||
+      !CLAIM.test(value.nativeId) ||
+      !integer(value.namespaceDevice, 1) ||
+      !integer(value.namespaceInode, 1) ||
+      !uint64(value.netCookie, true) ||
+      !uint64(value.fullIpSockets) ||
+      !uint64(value.requests) ||
+      !uint64(value.timewait) ||
+      !uint64(value.packetGroups) ||
+      value.born !== 1 ||
+      !bit(value.releaseAttempted) ||
+      !bit(value.referenceReleased) ||
+      !bit(value.netGone) ||
+      !bit(value.poisoned) ||
+      (value.referenceReleased === 1 && value.releaseAttempted !== 1) ||
+      (value.netGone === 1 && value.releaseAttempted !== 1)
+    )
+      throw failure();
+    reply = {
+      kind: value.kind,
+      nativeId: value.nativeId,
+      namespaceDevice: value.namespaceDevice,
+      namespaceInode: value.namespaceInode,
+      netCookie: value.netCookie,
+      fullIpSockets: value.fullIpSockets,
+      requests: value.requests,
+      timewait: value.timewait,
+      packetGroups: value.packetGroups,
+      born: value.born,
+      releaseAttempted: value.releaseAttempted,
+      referenceReleased: value.referenceReleased,
+      netGone: value.netGone,
+      poisoned: value.poisoned,
+      barrier: "unproven",
+    };
+  } else if (
     value.kind === "linux-oci-refused@1" ||
     value.kind === "linux-oci-cancel-observation@1"
   ) {
@@ -299,6 +381,9 @@ function parseReply(body: Buffer): Reply {
         value.stage !== "observe-started" &&
         value.stage !== "stop-init" &&
         value.stage !== "join-init" &&
+        value.stage !== "release-namespace" &&
+        value.stage !== "continue-namespace-release" &&
+        value.stage !== "observe-namespace-lifetime" &&
         value.stage !== "cancel"
       )
         throw failure();
@@ -369,6 +454,9 @@ export class LinuxOciPhysicalSession {
   #initStopAttempted = false;
   #initStopSent = false;
   #initIdentity: LinuxOciInitReapedObservation | undefined;
+  #namespaceReleaseAttempted = false;
+  #namespaceReleaseSent = false;
+  #namespaceLifetime: LinuxOciNamespaceLifetimeObservation | undefined;
   #claim: string | undefined;
   #identity: LinuxOciStoppedObservation | undefined;
   #mustRetain = false;
@@ -389,7 +477,7 @@ export class LinuxOciPhysicalSession {
     this.#assertBinary = ownedExecutable(options.binary);
     this.#assertBinary();
     this.#child = spawn(options.binary, [], {
-      env: {},
+      env: Object.create(null),
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -518,6 +606,101 @@ export class LinuxOciPhysicalSession {
     return reply;
   }
 
+  /** One original-owner namespace release request, only after a positive
+   * original init reap. Cancellation/lost framing consumes this attempt;
+   * only decoded operation-bound retained refusal permits continuation. */
+  async releaseNamespace(signal: AbortSignal): Promise<LinuxOciNamespaceLifetimeObservation> {
+    if (this.#namespaceReleaseAttempted) throw failure("one_use");
+    if (
+      !this.#identity ||
+      !this.#initIdentity ||
+      this.#admissionClosed ||
+      this.#pending ||
+      !this.#usable
+    )
+      throw failure();
+    this.#namespaceReleaseAttempted = true;
+    if (signal.aborted) throw failure();
+    const reply = await this.#request(
+      "release-namespace",
+      { kind: "linux-oci-release-namespace@1" },
+      signal,
+    );
+    if (signal.aborted) {
+      this.#break();
+      throw failure();
+    }
+    if (
+      this.#admissionClosed ||
+      !this.#usable ||
+      reply.kind !== "linux-oci-namespace-release-observation@1"
+    )
+      throw failure();
+    return reply;
+  }
+
+  /** Continue recorded unperformed phases on this SAME child only. The C
+   * owner decides them; no counter, flag or ACK resets a release attempt. */
+  async continueNamespaceRelease(
+    signal: AbortSignal,
+  ): Promise<LinuxOciNamespaceLifetimeObservation> {
+    if (
+      !this.#identity ||
+      !this.#initIdentity ||
+      !this.#namespaceReleaseSent ||
+      this.#admissionClosed ||
+      signal.aborted
+    )
+      throw failure();
+    const reply = await this.#request(
+      "continue-namespace-release",
+      { kind: "linux-oci-continue-namespace-release@1" },
+      signal,
+    );
+    if (signal.aborted) {
+      this.#break();
+      throw failure();
+    }
+    if (
+      this.#admissionClosed ||
+      !this.#usable ||
+      reply.kind !== "linux-oci-namespace-release-continuation@1"
+    )
+      throw failure();
+    return reply;
+  }
+
+  /** Read the retained original ledger; never release again or turn born
+   * custody into released-uncreated/successful close. */
+  async observeNamespaceLifetime(
+    signal: AbortSignal,
+  ): Promise<LinuxOciNamespaceLifetimeObservation> {
+    if (
+      !this.#identity ||
+      !this.#initIdentity ||
+      !this.#namespaceReleaseSent ||
+      this.#admissionClosed ||
+      signal.aborted
+    )
+      throw failure();
+    const reply = await this.#request(
+      "observe-namespace-lifetime",
+      { kind: "linux-oci-observe-namespace-lifetime@1" },
+      signal,
+    );
+    if (signal.aborted) {
+      this.#break();
+      throw failure();
+    }
+    if (
+      this.#admissionClosed ||
+      !this.#usable ||
+      reply.kind !== "linux-oci-namespace-lifetime-observation@1"
+    )
+      throw failure();
+    return reply;
+  }
+
   cancel(): Promise<LinuxOciCancelObservation> {
     this.#admissionClosed = true;
     this.#cancelPromise ??= (async () => {
@@ -596,7 +779,13 @@ export class LinuxOciPhysicalSession {
       const reply = parseReply(this.#buffer.subarray(4));
       const operation = this.#pending.operation;
       if (reply.kind === "linux-oci-refused@1") {
-        if (operation === "stop-init" || operation === "join-init") {
+        if (
+          operation === "stop-init" ||
+          operation === "join-init" ||
+          operation === "release-namespace" ||
+          operation === "continue-namespace-release" ||
+          operation === "observe-namespace-lifetime"
+        ) {
           if (reply.stage !== operation || reply.custody !== "retained") throw failure();
         } else if (
           reply.stage !== "frame" &&
@@ -618,7 +807,13 @@ export class LinuxOciPhysicalSession {
                   ? "linux-oci-init-reaped@1"
                   : operation === "join-init"
                     ? "linux-oci-init-reaped-observation@1"
-                    : "linux-oci-cancel-observation@1")
+                    : operation === "release-namespace"
+                      ? "linux-oci-namespace-release-observation@1"
+                      : operation === "continue-namespace-release"
+                        ? "linux-oci-namespace-release-continuation@1"
+                        : operation === "observe-namespace-lifetime"
+                          ? "linux-oci-namespace-lifetime-observation@1"
+                          : "linux-oci-cancel-observation@1")
       )
         throw failure();
       if ("nativeId" in reply) {
@@ -638,6 +833,21 @@ export class LinuxOciPhysicalSession {
           )
             throw failure();
           this.#initIdentity = reply;
+        }
+        if ("netCookie" in reply) {
+          const previous = this.#namespaceLifetime;
+          if (
+            !this.#namespaceReleaseSent ||
+            !this.#initIdentity ||
+            (previous &&
+              (reply.netCookie !== previous.netCookie ||
+                reply.releaseAttempted < previous.releaseAttempted ||
+                reply.referenceReleased < previous.referenceReleased ||
+                reply.netGone < previous.netGone ||
+                reply.poisoned < previous.poisoned))
+          )
+            throw failure();
+          this.#namespaceLifetime = reply;
         }
         if (operation === "create") {
           // The operation-kind check above already refused every other kind.
@@ -692,6 +902,7 @@ export class LinuxOciPhysicalSession {
         if (operation === "create") this.#createSent = true;
         if (operation === "start") this.#startSent = true;
         if (operation === "stop-init") this.#initStopSent = true;
+        if (operation === "release-namespace") this.#namespaceReleaseSent = true;
         this.#child.stdin.write(frame, (error) => {
           if (error) this.#break();
         });

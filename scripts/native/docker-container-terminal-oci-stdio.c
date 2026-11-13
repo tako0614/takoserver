@@ -175,6 +175,95 @@ static int ocip_init_reaped(const char *kind, struct tns_oci_owner *owner, int s
   return ocip_reply(bytes) < 0 ? -2 : 0;
 }
 
+/* These markers serialize private requests only. The opaque producer owns
+ * actual init/task/release phases and sticky UNKNOWN; readback grants none. */
+struct ocip_namespace_state { int entered, release_requested, unusable; };
+
+static const char *ocip_namespace_stage(enum tns_ocip_kind kind) {
+  switch (kind) {
+    case TNS_OCIP_RELEASE_NAMESPACE: return "release-namespace";
+    case TNS_OCIP_CONTINUE_NAMESPACE_RELEASE: return "continue-namespace-release";
+    case TNS_OCIP_OBSERVE_NAMESPACE_LIFETIME: return "observe-namespace-lifetime";
+    default: return NULL;
+  }
+}
+
+static int ocip_namespace_encode(enum tns_ocip_kind kind,
+                                   const struct tns_oci_namespace_lifetime *observed,
+                                   char *bytes, size_t size) {
+  const char *reply;
+  switch (kind) {
+    case TNS_OCIP_RELEASE_NAMESPACE: reply = "linux-oci-namespace-release-observation@1"; break;
+    case TNS_OCIP_CONTINUE_NAMESPACE_RELEASE: reply = "linux-oci-namespace-release-continuation@1"; break;
+    case TNS_OCIP_OBSERVE_NAMESPACE_LIFETIME: reply = "linux-oci-namespace-lifetime-observation@1"; break;
+    default: errno = EPROTO; return -1;
+  }
+  if (!observed || !bytes || !size || observed->native_id[64] ||
+      tns_oci_claim(observed->native_id) < 0) { errno = EPROTO; return -1; }
+  const struct tns_lifetime *o = &observed->lifetime;
+  if (!o->identity.device || !o->identity.inode ||
+      o->identity.device > UINT64_C(9007199254740991) ||
+      o->identity.inode > UINT64_C(9007199254740991)) { errno = EOVERFLOW; return -1; }
+  if (!o->net_cookie || o->born != 1 || o->release_attempted > 1 ||
+      o->reference_released > 1 || o->net_gone > 1 || o->poisoned > 1 ||
+      (o->reference_released && !o->release_attempted) ||
+      (o->net_gone && !o->release_attempted)) { errno = EPROTO; return -1; }
+  int n = snprintf(bytes, size,
+    "{\"kind\":\"%s\",\"nativeId\":\"%s\",\"namespaceDevice\":%" PRIu64
+    ",\"namespaceInode\":%" PRIu64 ",\"netCookie\":\"%" PRIu64
+    "\",\"fullIpSockets\":\"%" PRIu64 "\",\"requests\":\"%" PRIu64
+    "\",\"timewait\":\"%" PRIu64 "\",\"packetGroups\":\"%" PRIu64
+    "\",\"born\":%" PRIu32 ",\"releaseAttempted\":%" PRIu32
+    ",\"referenceReleased\":%" PRIu32 ",\"netGone\":%" PRIu32
+    ",\"poisoned\":%" PRIu32 ",\"barrier\":\"unproven\"}",
+    reply, observed->native_id, o->identity.device, o->identity.inode,
+    o->net_cookie, o->full_ip_sockets, o->requests, o->timewait, o->packet_groups,
+    o->born, o->release_attempted, o->reference_released, o->net_gone, o->poisoned);
+  if (n < 0 || (size_t)n >= size) { errno = EOVERFLOW; return -1; }
+  return 0;
+}
+
+/* -1 is an operation-bound retained refusal; -2 is lost framing; -3 is a
+ * hard request/codec refusal. None retries a physical producer or a reply. */
+static int ocip_namespace_command(enum tns_ocip_kind kind, struct tns_oci_owner *owner,
+                                    struct ocip_namespace_state *state) {
+  if (!state || !owner || state->unusable || !ocip_namespace_stage(kind)) {
+    errno = EPROTO; return -3;
+  }
+  state->entered = 1;
+  if (interrupted) { state->unusable = 1; errno = ECANCELED; return -2; }
+  struct tns_oci_namespace_lifetime observed;
+  int result;
+  if (kind == TNS_OCIP_RELEASE_NAMESPACE) {
+    if (state->release_requested) { errno = EALREADY; return -1; }
+    state->release_requested = 1; /* Spent request before the actual original call. */
+    result = tns_oci_release_namespace(owner, &observed);
+  } else {
+    if (!state->release_requested) { state->unusable = 1; errno = EPROTO; return -3; }
+    if (kind == TNS_OCIP_CONTINUE_NAMESPACE_RELEASE)
+      result = tns_oci_continue_namespace_release(owner, &observed);
+    else result = tns_oci_observe_namespace_lifetime(owner, &observed);
+  }
+  if (interrupted) { state->unusable = 1; errno = ECANCELED; return -2; }
+  if (result < 0) return -1;
+  if (result) { state->unusable = 1; errno = EPROTO; return -3; }
+  char bytes[1024];
+  if (ocip_namespace_encode(kind, &observed, bytes, sizeof(bytes)) < 0) {
+    state->unusable = 1; return -3;
+  }
+  if (ocip_reply(bytes) < 0) { state->unusable = 1; return -2; }
+  return 0;
+}
+
+static int ocip_namespace_retained_error(struct ocip_namespace_state *state,
+                                          const char *stage) {
+  if (state->entered && !state->unusable &&
+      (!strcmp(stage, "release-namespace") || !strcmp(stage, "continue-namespace-release") ||
+       !strcmp(stage, "observe-namespace-lifetime"))) return 1;
+  if (strcmp(stage, "stop-init") && strcmp(stage, "join-init")) state->unusable = 1;
+  return 0;
+}
+
 static _Noreturn void ocip_retain(struct tns_oci_owner **owner) {
   /* Protocol is gone; retain this original process, no fork/detach/rebind.
    * SIGCHLD can finish outstanding owned joins. Signals only request another
@@ -226,6 +315,7 @@ int main(int argc, char **argv) {
   if (sigprocmask(SIG_UNBLOCK, &controls, NULL) < 0) return 77;
   struct tns_oci_owner *owner = NULL;
   unsigned int attempt = 0; int sealed = 0;
+  struct ocip_namespace_state namespace_state = {0};
   for (;;) {
     unsigned char *body = NULL; uint32_t size = 0;
     int result = ocip_read(&body, &size);
@@ -267,12 +357,22 @@ int main(int argc, char **argv) {
       stage = "stop-init";
       result = ocip_init_reaped("linux-oci-init-reaped@1", owner, 1);
       if (result < 0) failure = errno ? errno : EPROTO;
-    } else if (!result && !interrupted && request->kind == TNS_OCIP_JOIN_INIT && owner) {
+    } else if (!result && !interrupted && request->kind == TNS_OCIP_JOIN_INIT && owner && !namespace_state.entered) {
       /* A failed STOP seals CREATE/START but may only rejoin this original init. */
       stage = "join-init";
       result = ocip_init_reaped("linux-oci-init-reaped-observation@1", owner, 0);
       if (result < 0) failure = errno ? errno : EPROTO;
+    } else if (!result && !interrupted && owner && !namespace_state.unusable &&
+               ocip_namespace_stage(request->kind)) {
+      /* Actual producer init_joined is mandatory, including after a recovered
+       * STOP/JOIN. This closes normal requests before any namespace effect. */
+      sealed = 1;
+      stage = ocip_namespace_stage(request->kind);
+      result = ocip_namespace_command(request->kind, owner, &namespace_state);
+      if (result < 0) failure = errno ? errno : EPROTO;
+      if (result == -3) { stage = "request"; result = -1; }
     } else if (!result && request->kind == TNS_OCIP_CANCEL) {
+      namespace_state.unusable = 1; /* Close never resynchronizes namespace IO. */
       sealed = 1; int cleanup_error = ocip_cleanup(&owner);
       interrupted = 0;
       result = ocip_error("linux-oci-cancel-observation@1", "cancel", cleanup_error, owner);
@@ -290,7 +390,10 @@ int main(int argc, char **argv) {
     if (result == -2) break;
     if (result < 0) {
       sealed = 1;
-      if (!strcmp(stage, "stop-init") || !strcmp(stage, "join-init")) {
+      if (ocip_namespace_retained_error(&namespace_state, stage)) {
+        /* Decoded cleanup refusal preserves this original owner and its real
+         * pending phases. Only continue/read may follow; do no extra cleanup. */
+      } else if (!strcmp(stage, "stop-init") || !strcmp(stage, "join-init")) {
         /* Preserve the live birth custodian so an unknown STOP can only rejoin
          * this same init. EOF/CANCEL retains the original close semantics. */
         if (owner) (void)tns_oci_cancel(owner);
