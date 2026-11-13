@@ -3567,3 +3567,171 @@ test("normal OCI backend close during final original serving read refuses comple
     await expect(f.close()).rejects.toThrow("custody_retained");
   }
 });
+
+test("singleton OCI topology claim checks the original durable pending winner before image allocation effects", async () => {
+  const selected = syntheticTopology();
+  const f = await fixture(false, {
+    hostTopology: selected,
+    egressLimits: { maxConnections: 9, packetLimitBytes: 65536 },
+  });
+  const query = f.sql.query.bind(f.sql);
+  let checked = false;
+  const observed = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+    const rows = await query(statement, params);
+    if (
+      statement.startsWith(
+        "SELECT q.resource_uid,q.generation,q.installation_id,q.claim_id,q.state,q.native_id,q.claimed_at_ms,",
+      )
+    ) {
+      expect(checked).toBe(false);
+      checked = true;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.state).toBe("pending");
+      expect(rows[0]?.native_id).toBeNull();
+      expect(f.counts()).toEqual({ reads: 0, unpacks: 0, uses: 0 });
+      expect(await readdir(f.artifactRoot)).toEqual([]);
+    }
+    return rows;
+  });
+  f.onLoan(async (_execution, _signal, bundle) => {
+    expect(checked).toBe(true);
+    const raw: unknown = JSON.parse(
+      await readFile(join(bundle.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE), "utf8"),
+    );
+    if (!isJsonObject(raw) || !isJsonObject(raw.artifact))
+      throw new Error("original claim topology file absent");
+    expect(raw.artifact.claimId).toBe(bundle.record.claimId);
+    expect(raw.topology).toEqual(selected);
+    expect(
+      await query("SELECT claim_id,state,native_id FROM tf_v2_container_create_claims"),
+    ).toEqual([{ claim_id: bundle.record.claimId, state: "pending", native_id: null }]);
+  });
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      effect: "unknown",
+      status: "reconciling",
+    });
+    expect(f.failures).toEqual([]);
+    expect(checked).toBe(true);
+    expect(f.counts()).toEqual({ reads: 2, unpacks: 1, uses: 1 });
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+  } finally {
+    observed.mockRestore();
+    await f.close();
+  }
+});
+
+test("singleton OCI topology claim retains second-generation and foreign pending collisions without restart replay", async () => {
+  const f = await fixture(false, { ...acceptedHttpSelection(), normalBackend: true }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  const originalQuery = f.sql.query.bind(f.sql);
+  const checked: number[] = [];
+  const observed = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+    const rows = await originalQuery(statement, params);
+    if (
+      statement.startsWith(
+        "SELECT q.resource_uid,q.generation,q.installation_id,q.claim_id,q.state,q.native_id,q.claimed_at_ms,",
+      )
+    )
+      checked.push(rows.length);
+    return rows;
+  });
+  let restarted: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
+    const first = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: first.id,
+      effect: "complete",
+      status: "succeeded",
+    });
+    expect(checked).toEqual([1]);
+    const counts = f.counts(),
+      native = f.nativeCounts(),
+      files = await readdir(f.artifactRoot);
+    const row = (
+      await originalQuery("SELECT spec_json FROM tf_v2_resources WHERE uid=?", [first.resourceUid])
+    )[0];
+    if (typeof row?.spec_json !== "string") throw new Error("original accepted spec absent");
+    const spec: unknown = JSON.parse(row.spec_json);
+    if (!isJsonObject(spec)) throw new Error("original accepted spec malformed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: first.resourceUid,
+      expectedGeneration: 1,
+      spec: { ...spec, [CONTAINER_CONTRACT.fields.workloadRevision]: "2".repeat(64) },
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: updated.id,
+      effect: "unknown",
+      status: "reconciling",
+    });
+    expect(checked).toEqual([1, 2]);
+    expect(f.counts()).toEqual(counts);
+    expect(f.nativeCounts()).toEqual(native);
+    expect(await readdir(f.artifactRoot)).toEqual(files);
+    expect(raw.calls).toHaveLength(1);
+    const foreign = await f.engine.acceptCreate({
+      principal: "synthetic-foreign-parent",
+      key: crypto.randomUUID(),
+      input: {
+        form: V2_CONTAINER_F2_FORM,
+        space: "synthetic-space",
+        name: "other-resource",
+        spec,
+        privateInputs: { SECRET: "synthetic-other-loan" },
+      },
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: foreign.id,
+      effect: "unknown",
+      status: "reconciling",
+    });
+    expect(checked).toEqual([1, 2, 3]);
+    expect(f.counts()).toEqual(counts);
+    expect(f.nativeCounts()).toEqual(native);
+    expect(await readdir(f.artifactRoot)).toEqual(files);
+    const claims = await originalQuery(
+      "SELECT resource_uid,generation,state,native_id FROM tf_v2_container_create_claims ORDER BY resource_uid,generation",
+    );
+    expect(claims).toHaveLength(3);
+    expect(
+      claims.filter(({ state }) => state === "pending").map(({ native_id }) => native_id),
+    ).toEqual([null, null]);
+    expect(
+      claims.find(
+        ({ resource_uid, generation }) => resource_uid === first.resourceUid && generation === 1,
+      )?.state,
+    ).toBe("bound");
+    expect(
+      await originalQuery("SELECT generation,state FROM tf_v2_container_start_attempts"),
+    ).toEqual([{ generation: 1, state: "running" }]);
+    restarted = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    expect(await restarted.engine.runNext()).toMatchObject({
+      effect: "unknown",
+      status: "reconciling",
+    });
+    expect(checked).toEqual([1, 2, 3]);
+    expect(f.counts()).toEqual(counts);
+    expect(f.nativeCounts()).toEqual(native);
+    expect(
+      await originalQuery(
+        "SELECT resource_uid,generation,state,native_id FROM tf_v2_container_create_claims ORDER BY resource_uid,generation",
+      ),
+    ).toEqual(claims);
+    expect(raw.calls).toHaveLength(1);
+  } finally {
+    observed.mockRestore();
+    raw.join();
+    raw.restore();
+    await restarted?.close();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});

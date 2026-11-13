@@ -888,6 +888,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             requiredSecretNames: accepted.requiredSecretNames,
           };
           if (await core.owner.read(intent)) return fail("retained_create_unknown");
+          // Only the explicit singleton-topology branch moves its ORIGINAL
+          // claim before artifact/image effects. A refused collision retains
+          // that pending claim permanently; no empty-map/restart replay.
+          let topologyClaim: Awaited<ReturnType<typeof core.owner.claim>> | undefined;
+          if (hostTopology !== undefined) {
+            topologyClaim = await core.claimAcceptedTopology(execution, intent);
+            await guard();
+          }
           const image = accepted.spec.image;
           if (typeof image !== "string") return fail("image");
           await privateDirectory(artifactRoot);
@@ -956,7 +964,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                   rootfs.mode & 0o022
                 )
                   return fail("rootfs");
-                const claim = await core.owner.claim(intent);
+                const claim = topologyClaim ?? (await core.owner.claim(intent));
                 await guard();
                 if (claim.status !== "won") return fail("retained_create_unknown");
                 const { record } = claim;

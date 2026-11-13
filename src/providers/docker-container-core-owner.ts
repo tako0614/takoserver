@@ -112,6 +112,14 @@ export interface DockerContainerCoreOwner {
     requiredSecretNames: readonly string[],
   ): ReturnType<typeof createDockerContainerCreateCustody>;
   readAcceptedExecution(original: V2Execution): Promise<DockerContainerAcceptedExecution>;
+  /** Claim once under the ORIGINAL accepted execution, then refuse a singleton
+   * topology when any other same-target claim lacks proven released coordinates.
+   * This is a negative collision fence, never an allocation/native permission. */
+  claimAcceptedTopology(
+    execution: V2Execution,
+    intent: DockerContainerCreateIntent,
+  ): ReturnType<DockerContainerCreateOwnerPort["claim"]>;
+
   /** Consume the ORIGINAL one-use START ledger for an already bound accepted
    * record under this owner's live reconcile authority. This records only the
    * attempt; it grants no admission, physical result, running or serving state.
@@ -2211,6 +2219,95 @@ export function createDockerContainerCoreOwner(
     return observation;
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
+    async claimAcceptedTopology(execution, input) {
+      const intent = intentSnapshot(input);
+      const accepted = await result.readAcceptedExecution(execution);
+      if (
+        accepted.action === "delete" ||
+        accepted.resourceUid !== intent.resourceUid ||
+        accepted.generation !== intent.policy.generation ||
+        accepted.incarnationId !== intent.incarnationId ||
+        accepted.revision !== intent.revision
+      )
+        return fail();
+      // Preserve the original durable random one-use claim. No new constructor
+      // can replace a pending/unknown claim, even if there is only one SQL row.
+      const claimed = await owner.claim(intent);
+      if (claimed.status !== "won") return fail();
+      const captured = claimed.record;
+      const rows = await sql.query(
+        "SELECT q.resource_uid,q.generation,q.installation_id,q.claim_id,q.state,q.native_id,q.claimed_at_ms,q.bound_at_ms,q.removed_at_ms,i.target_key FROM main.tf_v2_container_create_claims q LEFT JOIN main.tf_v2_container_instances i ON i.resource_uid=q.resource_uid WHERE i.target_key=? OR i.resource_uid IS NULL LIMIT 4097",
+        [targetKey],
+      );
+      if (rows.length < 1 || rows.length > 4096) return fail();
+      let foundOriginal = false;
+      for (const row of rows) {
+        const claimedAt = row.claimed_at_ms,
+          boundAt = row.bound_at_ms,
+          removedAt = row.removed_at_ms;
+        if (
+          !text(row.resource_uid) ||
+          typeof row.generation !== "number" ||
+          !Number.isSafeInteger(row.generation) ||
+          row.generation < 1 ||
+          !text(row.installation_id) ||
+          !hex(row.claim_id) ||
+          row.target_key !== targetKey ||
+          typeof claimedAt !== "number" ||
+          !Number.isSafeInteger(claimedAt) ||
+          claimedAt < 0 ||
+          !(
+            (row.state === "pending" &&
+              row.native_id === null &&
+              boundAt === null &&
+              removedAt === null) ||
+            ((row.state === "bound" || row.state === "removed") &&
+              hex(row.native_id) &&
+              typeof boundAt === "number" &&
+              Number.isSafeInteger(boundAt) &&
+              boundAt >= claimedAt &&
+              (row.state === "bound"
+                ? removedAt === null
+                : typeof removedAt === "number" &&
+                  Number.isSafeInteger(removedAt) &&
+                  removedAt >= boundAt))
+          )
+        )
+          return fail();
+        // Existing schema has no immutable per-claim coordinates. Neither a
+        // private map nor current Host settings can reinterpret another claim.
+        // Even a removed tombstone supplies no topology-specific full-lifetime
+        // release here: no singleton slot is reclaimed by this read-only fence.
+        if (
+          foundOriginal ||
+          row.claim_id !== captured.claimId ||
+          row.resource_uid !== captured.intent.resourceUid ||
+          row.generation !== captured.intent.policy.generation ||
+          row.installation_id !== captured.intent.installationId ||
+          row.state !== "pending" ||
+          row.native_id !== null
+        )
+          return fail();
+        foundOriginal = true;
+      }
+      if (!foundOriginal) return fail();
+      const fresh = await result.readAcceptedExecution(execution);
+      const saved = fresh.retained.find(({ record }) => record.claimId === captured.claimId);
+      if (
+        fresh.action === "delete" ||
+        fresh.resourceUid !== captured.intent.resourceUid ||
+        fresh.generation !== captured.intent.policy.generation ||
+        !saved ||
+        saved.removedAtMs !== null ||
+        canonicalJson(saved.record) !== canonicalJson(captured)
+      )
+        return fail();
+      // The caller's existing local cancellation fence follows this await.
+      // This final synchronous scope check cannot reopen an expired execution.
+      executionScope(execution);
+      return claimed;
+    },
+
     releaseRetainedNamespace(execution, record, originalCustody, signal) {
       return retainedNamespace(execution, record, originalCustody, signal, "release");
     },
