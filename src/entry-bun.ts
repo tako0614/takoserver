@@ -111,11 +111,11 @@ import {
   observeSelfhostBackgroundPasses,
   SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
 } from "./selfhost-health-signals.ts";
-import { createSelfhostLinuxDockerNodeComposition } from "./selfhost-linux-docker-node-composition.ts";
+import { createSelfhostLinuxContainerNodeComposition } from "./selfhost-linux-container-node-composition.ts";
 import {
-  createSelfhostLinuxDockerNodeSelection,
-  type SelfhostLinuxDockerNodeSelectionSource,
-} from "./selfhost-linux-docker-node-selection.ts";
+  createSelfhostLinuxContainerNodeSelection,
+  type SelfhostLinuxContainerNodeSelectionSource,
+} from "./selfhost-linux-container-node-selection.ts";
 import {
   formatSelfhostListenAddress,
   parseSelfhostListenHost,
@@ -723,10 +723,11 @@ const clock = () => new Date();
 // F2 requires an explicit operator-code selection on this exact Sql. The legacy
 // Docker environment selects only its existing zero-only bootstrap. The candidate
 // remains retained-only, with no public support or realized activation here.
-const selfhostLinuxDockerOperatorSelection: SelfhostLinuxDockerNodeSelectionSource | undefined =
-  undefined;
-let selfhostLinuxDockerNode:
-  | ReturnType<typeof createSelfhostLinuxDockerNodeComposition>
+const selfhostLinuxContainerOperatorSelection:
+  | SelfhostLinuxContainerNodeSelectionSource
+  | undefined = undefined;
+let selfhostLinuxContainerNode:
+  | ReturnType<typeof createSelfhostLinuxContainerNodeComposition>
   | undefined;
 // Native startup and the application share these exact canonical ledgers.
 const resourceStores = createAppResourceStoreBundle(sql, clock);
@@ -802,8 +803,8 @@ const runtimeInputKeyAuthority = runtimeInputsAvailable
   ? await parseRuntimeInputKeyAuthority(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string)
   : undefined;
 const runtimeInputSealKeyRing = runtimeInputKeyAuthority?.sealKeys;
-const selfhostLinuxDockerSelection = createSelfhostLinuxDockerNodeSelection({
-  selection: selfhostLinuxDockerOperatorSelection,
+const selfhostLinuxContainerSelection = createSelfhostLinuxContainerNodeSelection({
+  selection: selfhostLinuxContainerOperatorSelection,
   sealKeys: runtimeInputSealKeyRing,
 });
 const runtimeInputs = runtimeInputSealKeyRing
@@ -1497,7 +1498,7 @@ async function closeBeforePublicIngress(): Promise<void> {
     workerdShutdown: () => workerd.shutdown(),
     mayCloseDependents: () => true,
     v2WorkerSuspend: async () => {
-      await selfhostLinuxDockerNode?.close();
+      await selfhostLinuxContainerNode?.close();
       await v2WorkerComposition.closeScheduledHost();
       await v2QueueScheduler?.close();
       await v2WorkerComposition.closeWorkflowHost();
@@ -1557,10 +1558,10 @@ try {
       ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
       : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
     : undefined;
-  selfhostLinuxDockerNode = createSelfhostLinuxDockerNodeComposition({
+  selfhostLinuxContainerNode = createSelfhostLinuxContainerNodeComposition({
     sql,
     clock,
-    selection: selfhostLinuxDockerSelection,
+    selection: selfhostLinuxContainerSelection,
     formSelectionFactory: v2FormSelectionFactory,
     privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
   });
@@ -1578,7 +1579,7 @@ try {
         ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
         : unconfigured),
     v2: takoformV2Config,
-    ...selfhostLinuxDockerNode.appPorts,
+    ...selfhostLinuxContainerNode.appPorts,
     ...(billingConfig ? { billingConfig } : {}),
     hostedPaidFreeExclusion: Boolean(hostedPricing),
     ...(hostedBilling ? { hostedBilling } : {}),
@@ -1741,7 +1742,7 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
         workerdShutdown: () => workerd.shutdown(),
         mayCloseDependents: () => shutdownClean,
         v2WorkerSuspend: async () => {
-          await selfhostLinuxDockerNode?.close();
+          await selfhostLinuxContainerNode?.close();
           await v2WorkerComposition.closeScheduledHost();
           await v2QueueScheduler?.close();
           await v2WorkerComposition.closeWorkflowHost();
