@@ -177,6 +177,7 @@ export function createRawLinuxDockerStdio(input: {
   readonly installationId: string;
 }) {
   const commands: string[] = [];
+  const nativeCommands: { kind: string; nativeId: string | undefined; operation: string }[] = [];
   const errors: string[] = [];
   const children = new Set<EventEmitter>();
   const guestTables = new Map<string, string>();
@@ -207,6 +208,10 @@ export function createRawLinuxDockerStdio(input: {
   const spawn = (_file: string, args: readonly string[]) => {
     const nativeIndex = args.indexOf("--container");
     const nativeId = nativeIndex < 0 ? undefined : args[nativeIndex + 1];
+    const identityPrefix = Number.parseInt(nativeId?.slice(0, 8) ?? "0", 16);
+    const host = 2 + (Number.parseInt(nativeId?.slice(0, 2) ?? "0", 16) % 250);
+    const ipv4 = `172.22.0.${host}`;
+    const guestFailClosed = args.includes("--guest-failclosed");
     const kind = args.includes("--host-bridge")
       ? "bridge"
       : args.includes("--quarantine-control")
@@ -218,11 +223,38 @@ export function createRawLinuxDockerStdio(input: {
     children.add(child);
     const stdout = new EventEmitter();
     let ended = false;
+    let armed = false;
     const finish = () => {
       if (ended) return;
       ended = true;
+      let status = 0;
+      if (armed && guestFailClosed) {
+        try {
+          const wire = guestTables.get(table);
+          const parsed: unknown = wire === undefined ? null : JSON.parse(wire);
+          if (!isJsonObject(parsed) || !Array.isArray(parsed.nftables))
+            throw new Error("raw lifetime table unavailable");
+          // The native watchdog inserts this exact unconditional output prefix
+          // on EOF. Keep all original rules, counters and quota data intact.
+          const handle = 10_000 + parsed.nftables.length;
+          const deny = {
+            rule: {
+              family: "inet",
+              table,
+              chain: "output",
+              expr: [{ counter: "killed" }, { drop: null }],
+              comment: "guest_lifetime_closed",
+              handle,
+            },
+          };
+          guestTables.set(table, JSON.stringify({ nftables: [deny, ...parsed.nftables] }));
+        } catch {
+          status = 1;
+          errors.push("raw lifetime close unavailable");
+        }
+      }
       children.delete(child);
-      child.emit("close", 0, null);
+      child.emit("close", status, null);
     };
     const reply = (body: string, status = 0) => {
       const bytes = Buffer.concat([Buffer.from([status]), Buffer.from(body)]);
@@ -236,8 +268,33 @@ export function createRawLinuxDockerStdio(input: {
     const command = (text: string): string => {
       const operation = text.split("\n")[0] ?? "";
       commands.push(`${kind}:${operation}`);
-      if (["CURRENT", "KEEPGUEST", "ARMGUEST", "RESUMEGUEST", "CLOSE"].includes(operation))
+      nativeCommands.push({ kind, nativeId, operation });
+      if (["CURRENT", "CLOSE"].includes(operation)) return "";
+      if (operation === "ARMGUEST") {
+        armed = true;
         return "";
+      }
+      if (operation === "KEEPGUEST") {
+        if (!armed) throw new Error("raw guest lifetime unarmed");
+        return "";
+      }
+      if (operation === "RESUMEGUEST") {
+        const parsed: unknown = JSON.parse(guestTables.get(table) ?? "null");
+        if (!isJsonObject(parsed) || !Array.isArray(parsed.nftables))
+          throw new Error("raw lifetime absent");
+        const kept = parsed.nftables.filter(
+          (item) =>
+            !(
+              isJsonObject(item) &&
+              isJsonObject(item.rule) &&
+              item.rule.comment === "guest_lifetime_closed"
+            ),
+        );
+        if (kept.length === parsed.nftables.length) throw new Error("raw lifetime deny absent");
+        armed = true;
+        guestTables.set(table, JSON.stringify({ nftables: kept }));
+        return "";
+      }
       if (operation === "NETWORK") {
         const body = JSON.stringify(network());
         return `HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`;
@@ -261,6 +318,7 @@ export function createRawLinuxDockerStdio(input: {
       if (operation === "NFTAPPLY") {
         const script = text.slice(operation.length + 1);
         guestTables.set(table, JSON.stringify(nftJson(script)));
+        if (guestFailClosed) armed = true;
         return "";
       }
       if (operation === "NFTREAD inet") {
@@ -283,7 +341,7 @@ export function createRawLinuxDockerStdio(input: {
         input.containers.set(name, {
           ...current,
           NetworkSettings: {
-            Networks: { [input.networkName]: { NetworkID: NETWORK_ID, IPAddress: "172.22.0.2" } },
+            Networks: { [input.networkName]: { NetworkID: NETWORK_ID, IPAddress: ipv4 } },
           },
         });
         return "";
@@ -306,7 +364,7 @@ export function createRawLinuxDockerStdio(input: {
         isJsonObject(settings) && isJsonObject(settings.Networks) ? settings.Networks : {};
       return JSON.stringify({
         id: current.Id,
-        pid: running ? 123 : 0,
+        pid: running ? 123 + (identityPrefix % 65536) : 0,
         running,
         paused: false,
         restarting: false,
@@ -336,7 +394,7 @@ export function createRawLinuxDockerStdio(input: {
           name,
           networkId: name === "none" ? NONE_ID : NETWORK_ID,
           endpointId: "e".repeat(64),
-          ipv4: name === "none" ? "" : "172.22.0.2",
+          ipv4: name === "none" ? "" : ipv4,
           ipv6: "",
           mac: "02:42:ac:16:00:02",
         })),
@@ -378,7 +436,7 @@ export function createRawLinuxDockerStdio(input: {
           ...(nativeId === undefined ? {} : { nativeId }),
           namespaceKind: kind,
           namespaceDevice: "4",
-          namespaceInode: kind === "container" ? "200" : "100",
+          namespaceInode: kind === "container" ? String(200 + identityPrefix) : "100",
           parentDevice: "4",
           parentInode: "100",
         }),
@@ -390,9 +448,13 @@ export function createRawLinuxDockerStdio(input: {
     spawn,
     network,
     commands,
+    nativeCommands,
     errors,
     starts: () => starts,
     liveChildren: () => children.size,
+    guestReadback(nativeId: string) {
+      return guestTables.get(`takos_cx_${nativeId.slice(0, 32)}`);
+    },
     corruptGuestRead() {
       corruptGuestRead = true;
     },
