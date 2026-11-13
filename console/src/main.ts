@@ -24,7 +24,12 @@ import {
   bootstrapSharedSession,
   captureSessionScope,
   currentOrganization,
+  currentOrganizationId,
+  loadOrganizationPage,
+  nextOrganizationCursor,
   observeSessionIdentity,
+  organizationPageCursor,
+  organizationPageState,
   organizations,
   principal,
   recordCreatedOrganization,
@@ -251,15 +256,6 @@ function canCreateLocalOrganization(): boolean {
 function organizationPicker(): Child {
   const all = organizations();
   const current = currentOrganization();
-  if (all.length === 0) {
-    if (!canCreateLocalOrganization()) return null;
-    return h(
-      "button",
-      { class: "btn btn--sm btn--primary", type: "button", onClick: createOrganization },
-      icon(ICON.plus, 13),
-      text(tr("組織を作成", "Create organization")),
-    );
-  }
   return h(
     "div",
     { class: "topbar__picker", style: { display: "flex", alignItems: "center", gap: "8px" } },
@@ -271,6 +267,15 @@ function organizationPicker(): Child {
         "aria-label": tr("組織", "Organization"),
         onChange: (event: Event) => selectOrganization((event.target as HTMLSelectElement).value),
       },
+      !current
+        ? h(
+            "option",
+            { value: "", disabled: true, selected: true },
+            tr("組織を選択", "Select organization"),
+          )
+        : !all.some((organization) => organization.id === current.id)
+          ? h("option", { value: current.id, selected: true }, current.name)
+          : null,
       ...all.map((organization) =>
         h(
           "option",
@@ -282,6 +287,7 @@ function organizationPicker(): Child {
         ),
       ),
     ),
+    organizationPageControls(),
     canCreateLocalOrganization()
       ? h(
           "button",
@@ -293,6 +299,44 @@ function organizationPicker(): Child {
             onClick: createOrganization,
           },
           icon(ICON.plus, 15),
+        )
+      : null,
+  );
+}
+
+function organizationPageControls(): Child {
+  const loading = organizationPageState() === "loading";
+  const next = nextOrganizationCursor();
+  const load = (cursor?: string) => {
+    void loadOrganizationPage(cursor).catch((error: unknown) =>
+      toast(explain(error as Error), "bad"),
+    );
+  };
+  return h(
+    "span",
+    null,
+    organizationPageCursor() !== undefined || organizationPageState() === "error"
+      ? h(
+          "button",
+          {
+            class: "btn btn--ghost btn--sm",
+            type: "button",
+            disabled: loading,
+            onClick: () => load(),
+          },
+          tr("最初のページ", "First page"),
+        )
+      : null,
+    next !== null
+      ? h(
+          "button",
+          {
+            class: "btn btn--ghost btn--sm",
+            type: "button",
+            disabled: loading,
+            onClick: () => load(next),
+          },
+          tr("次の組織", "Next organizations"),
         )
       : null,
   );
@@ -374,7 +418,31 @@ function page(): Child {
   const organization = currentOrganization();
 
   if (!organization) {
-    const knownIdentity = principal() !== null;
+    const pageState = organizationPageState();
+    if (
+      pageState === "error" ||
+      (principal() !== null &&
+        (currentOrganizationId() !== null ||
+          organizations().length > 0 ||
+          organizationPageCursor() !== undefined))
+    ) {
+      return card(
+        null,
+        empty(
+          pageState === "error"
+            ? tr("組織一覧を読み込めませんでした", "Organization list unavailable")
+            : currentOrganizationId() !== null
+              ? tr("選択した組織は未読込です", "Selected organization is not loaded")
+              : tr("組織を選択してください", "Choose an organization"),
+          tr(
+            "一覧から組織を選択するか、別のページを読み込んでください。",
+            "Choose a listed organization or load another page.",
+          ),
+          organizationPageControls(),
+        ),
+      );
+    }
+    const knownIdentity = principal() !== null && pageState === "ready";
     const canCreate = canCreateLocalOrganization();
     return card(
       null,

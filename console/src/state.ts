@@ -1,5 +1,6 @@
 import {
   type Api,
+  ApiError,
   createApi,
   type HostDiscovery,
   type Organization,
@@ -42,6 +43,10 @@ export const sharedAuthAvailable = signal<boolean | null>(null);
 let latestSharedAuthAvailabilityProbe = 0;
 export const principal = signal<Principal | null>(null);
 export const organizations = signal<readonly Organization[]>([]);
+export const organizationPageState = signal<"loading" | "ready" | "error">("loading");
+export const nextOrganizationCursor = signal<string | null>(null);
+export const organizationPageCursor = signal<string | undefined>(undefined);
+const confirmedSelectedOrganization = signal<Organization | null>(null);
 let organizationCreationRevision = 0;
 const createdOrganizations = new Map<
   string,
@@ -130,6 +135,10 @@ function clearSession(): void {
   createdOrganizations.clear();
   identityReadSequence = 0;
   lastAppliedIdentityRead = 0;
+  organizationPageState.set("loading");
+  nextOrganizationCursor.set(null);
+  organizationPageCursor.set(undefined);
+  confirmedSelectedOrganization.set(null);
   localStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(SESSION_KIND_KEY);
   localStorage.removeItem(ORG_KEY);
@@ -172,6 +181,10 @@ export function adoptSession(kind: SessionKind = "legacy"): void {
   createdOrganizations.clear();
   identityReadSequence = 0;
   lastAppliedIdentityRead = 0;
+  organizationPageState.set("loading");
+  nextOrganizationCursor.set(null);
+  organizationPageCursor.set(undefined);
+  confirmedSelectedOrganization.set(null);
   principal.set(null);
   organizations.set([]);
   localStorage.setItem(SESSION_KEY, "cookie");
@@ -207,11 +220,13 @@ export async function bootstrapSharedSession(): Promise<boolean> {
   if (!isCurrent()) return false;
   sharedAuthAvailable.set(status.available);
   if (!status.available || !status.authenticated) return false;
-  const me = await api.me();
-  if (!isCurrent()) return false;
+  const me = await api.me().catch((error: unknown) => {
+    if (!isCurrent()) return null;
+    throw error;
+  });
+  if (!isCurrent() || me === null) return false;
   adoptSession("shared-auth");
-  principal.set(me.principal);
-  organizations.set(me.organizations);
+  applyOrganizationPage(me);
   return true;
 }
 
@@ -221,11 +236,57 @@ export function recordCreatedOrganization(organization: Organization): void {
     organization,
     revision: ++organizationCreationRevision,
   });
+  // Retain at most one page of concurrent create acknowledgements.
+  if (createdOrganizations.size > 100) {
+    const oldest = createdOrganizations.keys().next().value;
+    if (oldest !== undefined) createdOrganizations.delete(oldest);
+  }
   organizations.update((all) =>
     all.some((item) => item.id === organization.id)
       ? all.map((item) => (item.id === organization.id ? organization : item))
-      : [...all, organization],
+      : [...all.slice(-99), organization],
   );
+}
+
+function applyOrganizationPage(
+  me: Awaited<ReturnType<Api["me"]>>,
+  cursor?: string,
+  additions: readonly Organization[] = [],
+): void {
+  const previous = principal()?.id === me.principal.id ? currentOrganization() : null;
+  const selectedId = currentOrganizationId();
+  const selected = [...me.organizations, ...additions].find((item) => item.id === selectedId);
+  // An absent row on an incomplete traversal cannot revoke a confirmed selection.
+  // A complete first page can establish absence; it still cannot choose a replacement.
+  confirmedSelectedOrganization.set(
+    selected ?? (cursor !== undefined || me.nextOrganizationCursor !== null ? previous : null),
+  );
+  principal.set(me.principal);
+  organizations.set([...me.organizations, ...additions]);
+  organizationPageCursor.set(cursor);
+  nextOrganizationCursor.set(me.nextOrganizationCursor);
+  organizationPageState.set("ready");
+}
+
+/** One user action reads one page, replacing the page rather than accumulating a roster. */
+export async function loadOrganizationPage(cursor?: string): Promise<void> {
+  if (!session() || organizationPageState() === "loading") return;
+  const isCurrent = captureSessionScope();
+  const read = ++identityReadSequence;
+  const expectedPrincipal = principal();
+  organizationPageState.set("loading");
+  try {
+    const me = await api.me(cursor);
+    if (!isCurrent() || read < lastAppliedIdentityRead) return;
+    if (cursor !== undefined && JSON.stringify(me.principal) !== JSON.stringify(expectedPrincipal))
+      throw new ApiError("invalid_response", 200, "/v1/me");
+    lastAppliedIdentityRead = read;
+    applyOrganizationPage(me, cursor);
+  } catch (error) {
+    if (!isCurrent() || read < lastAppliedIdentityRead) return;
+    organizationPageState.set("error");
+    throw error;
+  }
 }
 
 /** Load identity once per local session/origin, ignoring completions from a retired scope. */
@@ -244,8 +305,6 @@ export function observeSessionIdentity(onError: (error: unknown) => void): () =>
       (me) => {
         if (disposed || !isCurrent() || read < lastAppliedIdentityRead) return;
         lastAppliedIdentityRead = read;
-        // Only a create acknowledged after this read began can supplement it.
-        // A later read may remove it; never union the old Organization list.
         const additions = [...createdOrganizations.values()]
           .filter(
             ({ organization, revision }) =>
@@ -253,10 +312,7 @@ export function observeSessionIdentity(onError: (error: unknown) => void): () =>
               !me.organizations.some((item) => item.id === organization.id),
           )
           .map(({ organization }) => organization);
-        principal.set(me.principal);
-        organizations.set(
-          additions.length > 0 ? [...me.organizations, ...additions] : me.organizations,
-        );
+        applyOrganizationPage(me, undefined, additions);
       },
       (error: unknown) => {
         if (
@@ -264,8 +320,10 @@ export function observeSessionIdentity(onError: (error: unknown) => void): () =>
           isCurrent() &&
           read >= lastAppliedIdentityRead &&
           (error as { isExpiredSession?: boolean }).isExpiredSession !== true
-        )
+        ) {
+          organizationPageState.set("error");
           onError(error);
+        }
       },
     );
   });
@@ -329,6 +387,11 @@ export function resolveSharedSessionReturnPath(currentPath: string): string {
 }
 
 export function selectOrganization(id: string): void {
+  const confirmed =
+    organizations().find((organization) => organization.id === id) ??
+    createdOrganizations.get(id)?.organization ??
+    null;
+  confirmedSelectedOrganization.set(confirmed);
   if (id !== currentOrganizationId())
     organizationSelectionRevision.update((revision) => revision + 1);
   localStorage.setItem(ORG_KEY, id);
@@ -360,7 +423,11 @@ export const api: Api = createApi({
 export function currentOrganization(): Organization | null {
   const id = currentOrganizationId();
   const all = organizations();
-  return all.find((organization) => organization.id === id) ?? all[0] ?? null;
+  if (id === null) return null;
+  return (
+    all.find((organization) => organization.id === id) ??
+    (confirmedSelectedOrganization()?.id === id ? confirmedSelectedOrganization() : null)
+  );
 }
 
 /* ----------------------------------------------------------------- theme -- */
