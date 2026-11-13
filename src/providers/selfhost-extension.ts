@@ -13,6 +13,12 @@ export {
 export type { DockerRegistryCodecLimits } from "./docker-registry-codec.ts";
 export { expandDockerRegistryLayer } from "./docker-registry-codec.ts";
 export {
+  createLinuxDockerCoreRuntime,
+  type LinuxDockerCorePreparationOptions,
+  type LinuxDockerCoreRuntime,
+  type LinuxDockerCoreRuntimeOptions,
+} from "./linux-docker-core-runtime.ts";
+export {
   createSelfhostContainerRuntime,
   SelfhostContainerError,
   type SelfhostContainerIdentity,
