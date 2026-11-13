@@ -527,8 +527,10 @@ static bool capture_native(char *const argv[], const char *input, size_t input_l
   free(data); return false;
 }
 #include "docker-container-guest-resume.h"
+#include "docker-container-guest-drain.h"
 static bool command(char *operation, char *argument, const char *input, size_t input_length) {
   if (!native_mode || quarantine_control || !(bridge_mode ? db_current() : selected_current())) return refusal("native_command_refused");
+  if (guest_drain_attempted && !strcmp(operation, "NFTAPPLY")) return refusal("drain_is_monotonic");
   if (guest_mode && guest_fail_closed && !strcmp(operation, "NFTAPPLY") && !guest_watch_arm()) return refusal("guest_lifetime_unavailable");
   const char *binary; char *argv[12]; int i = 0;
   if (!strcmp(operation, "LINK") || !strcmp(operation, "ADDR")) {
@@ -669,7 +671,11 @@ int main(int argc, char **argv) {
       !strcmp(request, "CONNECTOWNED")) && !*argument && !length)
       ok = quarantine_mutation(request);
     else if (!strcmp(request, "RESUMEGUEST") && !*argument && !length)
-      ok = guest_resume();
+      ok = guest_drain_attempted ? refusal("drain_is_monotonic") : guest_resume();
+    else if (!strcmp(request, "DRAINBEGIN") && !*argument && !length)
+      ok = guest_drain_begin();
+    else if (!strcmp(request, "DRAINREAD") && !*argument && !length)
+      ok = guest_drain_read();
     else if (!strcmp(request, "HOSTINVENTORY") && !*argument && !length)
       ok = host_inventory_reply();
     else if (!strcmp(request, "KEEPGUEST") && !*argument && !length)

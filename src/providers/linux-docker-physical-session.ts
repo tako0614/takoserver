@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { isIP } from "node:net";
 import { canonicalJson, isJsonObject } from "../json.ts";
+import { parseStrictJson } from "../strict-json.ts";
 import type {
   DockerContainerNativeIdentity,
   DockerContainerRuntimePolicy,
@@ -14,6 +15,32 @@ import type {
 const LIMIT = 1024 * 1024;
 function fail(): never {
   throw new Error("docker_physical_session_unavailable");
+}
+
+/** Fresh native collection only. A completed dump, including zero, is not a
+ * packet-path quiescence barrier or a retained-generation retirement grant. */
+export interface DockerPhysicalGuestFlowSnapshot {
+  readonly kind: "docker-guest-flow-snapshot@1";
+  readonly nativeId: string;
+  readonly namespaceDevice: string;
+  readonly namespaceInode: string;
+  readonly fenceTable: string;
+  readonly barrier: "unproven";
+  readonly tcp4: number;
+  readonly udp4: number;
+  readonly tcp6: number;
+  readonly udp6: number;
+}
+const guestDrainReaders = new WeakMap<object, () => Promise<DockerPhysicalGuestFlowSnapshot>>();
+
+/** Only an original process closure can access its bound drain channel. A
+ * copied metadata object or a caller's method-shaped port cannot enter it. */
+export function observeDockerPhysicalGuestDrain(
+  original: object,
+): Promise<DockerPhysicalGuestFlowSnapshot> {
+  const read = guestDrainReaders.get(original);
+  if (!read) return Promise.reject(new Error("docker_physical_session_unavailable"));
+  return read();
 }
 
 /** Closed nonsecret metadata from the original pinned daemon, not authority or
@@ -271,7 +298,37 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
     )
       fail();
     const metadata = Object.freeze({ ...hello });
-    return Object.freeze({
+    let drainAttempted = false,
+      drainFenced = false;
+    const drainIdentity = (bytes: Buffer, kind: string, flow: boolean) => {
+      const value = parseStrictJson(bytes, LIMIT);
+      const keys = [
+        "kind",
+        "nativeId",
+        "namespaceDevice",
+        "namespaceInode",
+        "fenceTable",
+        "barrier",
+        ...(flow ? ["tcp4", "udp4", "tcp6", "udp6"] : []),
+      ];
+      if (
+        !isJsonObject(value) ||
+        Object.keys(value).length !== keys.length ||
+        keys.some((key) => !Object.hasOwn(value, key)) ||
+        value.kind !== kind ||
+        typeof value.nativeId !== "string" ||
+        value.nativeId !== options.nativeId ||
+        typeof value.namespaceDevice !== "string" ||
+        value.namespaceDevice !== metadata.namespaceDevice ||
+        typeof value.namespaceInode !== "string" ||
+        value.namespaceInode !== metadata.namespaceInode ||
+        value.fenceTable !== `${options.table}_drain` ||
+        value.barrier !== "unproven"
+      )
+        return fail();
+      return value;
+    };
+    const process = Object.freeze({
       metadata,
       closed: exited,
       async current() {
@@ -359,7 +416,7 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
       /** Each command's attempt is consumed natively before its socket write.
        * A lost ACK rejects; neither this helper nor recovery re-sends it. */
       async resumeGuestLifetime() {
-        if (!options.native?.guestFailClosed) return fail();
+        if (!options.native?.guestFailClosed || drainAttempted) return fail();
         await request("RESUMEGUEST");
       },
       async hostInventory(): Promise<{
@@ -453,7 +510,8 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
               argv === canonicalJson(["nft", "--check", "-f", "-"]) ||
               argv === canonicalJson(["nft", "-f", "-"])
             ) {
-              if (command.stdin !== script) fail();
+              if (command.stdin !== script || (drainAttempted && command.argv[1] !== "--check"))
+                fail();
               return (
                 await request(
                   `${command.argv[1] === "--check" ? "NFTCHECK" : "NFTAPPLY"}\n${script}`,
@@ -483,6 +541,55 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
         if (options.native?.guestFailClosed && !cleanExit) return fail();
       },
     });
+    if (options.native?.guestFailClosed) {
+      guestDrainReaders.set(process, async () => {
+        if (drainAttempted && !drainFenced) return fail();
+        if (!drainAttempted) {
+          // Consume before the first possible effect. Unknown fence ACK never
+          // permits a second mutation attempt or a resumed guest lifetime.
+          drainAttempted = true;
+          await request("CURRENT");
+          await request("ARMGUEST");
+          drainIdentity(await request("DRAINBEGIN"), "docker-guest-drain-fence@1", false);
+          await request("CURRENT");
+          drainFenced = true;
+        }
+        await request("CURRENT");
+        const value = drainIdentity(
+          await request("DRAINREAD"),
+          "docker-guest-flow-snapshot@1",
+          true,
+        );
+        const count = (value: unknown): number => {
+          if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return fail();
+          return value;
+        };
+        const tcp4 = count(value.tcp4),
+          udp4 = count(value.udp4),
+          tcp6 = count(value.tcp6),
+          udp6 = count(value.udp6);
+        await request("CURRENT");
+        if (
+          typeof value.nativeId !== "string" ||
+          typeof value.namespaceDevice !== "string" ||
+          typeof value.namespaceInode !== "string"
+        )
+          return fail();
+        return Object.freeze({
+          kind: "docker-guest-flow-snapshot@1",
+          nativeId: value.nativeId,
+          namespaceDevice: value.namespaceDevice,
+          namespaceInode: value.namespaceInode,
+          fenceTable: `${options.table}_drain`,
+          barrier: "unproven",
+          tcp4,
+          udp4,
+          tcp6,
+          udp6,
+        });
+      });
+    }
+    return process;
   } catch {
     stop();
     await exited;

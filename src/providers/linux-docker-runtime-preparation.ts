@@ -25,7 +25,9 @@ import {
 } from "./linux-docker-guest-egress.ts";
 import {
   type DockerPhysicalContainerInspection,
+  type DockerPhysicalGuestFlowSnapshot,
   type DockerPhysicalProcessOptions,
+  observeDockerPhysicalGuestDrain,
   openDockerPhysicalProcess,
 } from "./linux-docker-physical-session.ts";
 
@@ -133,6 +135,9 @@ export class LinuxDockerRuntimePreparation {
   #options: LinuxDockerRuntimePreparationOptions;
   #owner: LinuxDockerPhysicalOwnerPort;
   #pending = new Map<string, Promise<HeldRuntime>>();
+  #drainScopes = new Set<Promise<unknown>>();
+  #drainCancellation = new Set<AbortController>();
+  #drainCleanupFailed = false;
   #closed = false;
   constructor(options: LinuxDockerRuntimePreparationOptions) {
     if (
@@ -955,9 +960,86 @@ export class LinuxDockerRuntimePreparation {
     await this.#owner.publishServing(record, native, this.policy, this);
     await guard();
   }
+  /** Original remove authority permits this fixed old-generation native fence
+   * and observation. The result remains unqualified for retirement: the native
+   * collector has not established a packet-path quiescence barrier. */
+  observeRetainedFlows(
+    identity: DockerContainerNativeIdentity,
+    signal?: AbortSignal,
+  ): Promise<DockerPhysicalGuestFlowSnapshot> {
+    if (this.#closed || (signal !== undefined && !(signal instanceof AbortSignal)))
+      return Promise.reject(new Error("linux_docker_runtime_preparation_unavailable"));
+    const native = nativeSnapshot(identity);
+    const cancellation = new AbortController();
+    const abort = () => cancellation.abort();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    this.#drainCancellation.add(cancellation);
+    // Register synchronously before original SQL or native IO can start. Close
+    // fences new work, cancels helpers and joins this complete original scope.
+    const running = Promise.resolve().then(async () => {
+      if (this.#closed || cancellation.signal.aborted) return fail();
+      const record = await this.#record(native);
+      return this.#owner.withAuthority(record, "remove", async (held) => {
+        held.revocation.addEventListener("abort", abort, { once: true });
+        let physical: Physical | undefined;
+        let observed: DockerPhysicalGuestFlowSnapshot | undefined;
+        const guard = async () => {
+          if (
+            this.#closed ||
+            cancellation.signal.aborted ||
+            held.revocation.aborted ||
+            (await held.stillCurrent()) !== true ||
+            !same(await this.#owner.read(record.intent), record)
+          )
+            return fail();
+          await this.#owner.assertNetworkAllocation(record, native, this.policy, "remove");
+          if (this.#closed || cancellation.signal.aborted || held.revocation.aborted) return fail();
+        };
+        try {
+          await guard();
+          physical = await this.#open(native, "guest", cancellation.signal);
+          await guard();
+          const snapshot = await physical.inspect();
+          this.#inspect(snapshot, record, native);
+          if (
+            !snapshot.running ||
+            snapshot.networks.length !== 1 ||
+            snapshot.networks[0]?.networkId !== native.networkId ||
+            snapshot.networks[0]?.name !== native.network
+          )
+            return fail();
+          await guard();
+          observed = await observeDockerPhysicalGuestDrain(physical);
+          await guard();
+        } finally {
+          held.revocation.removeEventListener("abort", abort);
+          if (physical) {
+            try {
+              await physical.close();
+            } catch {
+              this.#drainCleanupFailed = true;
+            }
+          }
+        }
+        if (!observed || this.#drainCleanupFailed) return fail();
+        return observed;
+      });
+    });
+    this.#drainScopes.add(running);
+    const release = () => {
+      this.#drainScopes.delete(running);
+      this.#drainCancellation.delete(cancellation);
+      signal?.removeEventListener("abort", abort);
+    };
+    void running.then(release, release);
+    return running;
+  }
   async close(): Promise<void> {
     this.#closed = true;
-    let failed = false;
+    for (const cancellation of this.#drainCancellation) cancellation.abort();
+    await Promise.allSettled([...this.#drainScopes]);
+    let failed = this.#drainCleanupFailed;
     for (const pending of this.#pending.values()) {
       try {
         await (await pending).close();

@@ -54,6 +54,7 @@ export interface DockerPhysicalCoreOwnerPort extends DockerContainerCreateOwnerP
     record: DockerContainerCreateRecord,
     native: DockerContainerNativeIdentity,
     policy: DockerContainerRuntimePolicy,
+    phase?: "remove",
   ): Promise<void>;
   readNetworkMemberRecords(
     record: DockerContainerCreateRecord,
@@ -1172,6 +1173,7 @@ export function createDockerContainerCoreOwner(
   async function boundNative(
     native: DockerContainerNativeIdentity,
     policy: DockerContainerRuntimePolicy,
+    phase: "observe" | "remove" = "observe",
   ) {
     const captured = snapshotNative(native);
     if (!own(policy, policyKeys)) return fail();
@@ -1202,7 +1204,7 @@ export function createDockerContainerCoreOwner(
       !saved ||
       saved.state !== "bound" ||
       saved.nativeId !== captured.nativeId ||
-      !usable(loaded.proof, "observe") ||
+      !usable(loaded.proof, phase) ||
       loaded.intent.installationId !== captured.installationId ||
       loaded.intent.resourceUid !== captured.resourceUid ||
       loaded.intent.incarnationId !== captured.incarnationId ||
@@ -1221,9 +1223,11 @@ export function createDockerContainerCoreOwner(
     input: DockerContainerCreateRecord,
     native: DockerContainerNativeIdentity,
     policy: DockerContainerRuntimePolicy,
+    phase?: "remove",
   ) {
-    const lease = await activeRecord(input);
-    const loaded = await boundNative(native, policy);
+    if (phase !== undefined && phase !== "remove") return fail();
+    const lease = await activeRecord(input, phase);
+    const loaded = await boundNative(native, policy, phase ?? "observe");
     sameRecord(input, loaded.record);
     if (!(await current(lease))) return fail();
     return { ...loaded, lease };
@@ -1524,8 +1528,8 @@ export function createDockerContainerCoreOwner(
       // only this successful insertion's one pipeline; recovery never repeats it.
       return "claimed";
     },
-    async assertNetworkAllocation(input, native, policy) {
-      await allocation(input, native, policy);
+    async assertNetworkAllocation(input, native, policy, phase) {
+      await allocation(input, native, policy, phase);
     },
     async readNetworkMemberRecords(input, native, policy, observedIds) {
       return memberRecords(input, native, policy, observedIds);
