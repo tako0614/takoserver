@@ -23,15 +23,29 @@ import {
 import { findReferrers, REFERRER_PAGES } from "../referrers.ts";
 import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
-import { api, currentOrganization } from "../state.ts";
+import { api, captureSelectedOrganizationScope, currentOrganization } from "../state.ts";
 import { badge, card, copyable, copyText, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
 import { createResource, deleteResource, updateResource } from "./create-resource.ts";
 
 export { publishedUrl, type SpecReference, specReferences } from "../references.ts";
 export { findReferrers, type Referrer } from "../referrers.ts";
 
+/** Only the newest detail mount may read or display an answer. */
+let detailGeneration = 0;
+
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
+  const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
+  const pageRoute = route();
+  if (!isOrganizationCurrent())
+    return card(
+      tr("リソース", "Resources"),
+      empty(
+        tr("組織を選択してください", "Choose an organization"),
+        tr("一覧から組織を選択してください。", "Select an organization from the list."),
+      ),
+    );
+  const detailToken = ++detailGeneration;
   // Made once per read of the Resource: a re-render does not look the
   // Deployment up again, and Reload reads both afresh.
   let worker: { readonly for: ResourceSummary; readonly action: WorkerAction } | undefined;
@@ -55,30 +69,39 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
     return worker.action;
   };
   const isCurrent = (): boolean =>
+    isOrganizationCurrent() &&
+    route() === pageRoute &&
+    detailToken === detailGeneration &&
     currentOrganization()?.id === organizationId &&
     route().segments.length === 2 &&
     route().segments[0] === "resources" &&
     route().segments[1] === uid;
   const page = resource(async () => {
+    if (!isCurrent()) return null;
     try {
       const found = await api.resource(organizationId, uid);
       return isCurrent() ? found : null;
     } catch (error) {
+      if (!isCurrent()) return null;
       if (error instanceof ApiError && (error.status === 404 || error.status === 410)) return null;
       throw error;
     }
   });
+  const reload = (): void => {
+    if (isCurrent()) page.reload();
+  };
 
   return h(
     "div",
     { class: "page" },
-    live(() =>
-      whenReady(
+    live(() => {
+      if (!isCurrent()) return null;
+      return whenReady(
         page.get(),
         (found) => {
           if (!isCurrent()) return null;
           return found
-            ? body(found, organizationId, page.reload, workerAction(found))
+            ? body(found, organizationId, reload, workerAction(found))
             : card(
                 null,
                 empty(
@@ -95,9 +118,9 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
                 ),
               );
         },
-        { retry: page.reload },
-      ),
-    ),
+        { retry: reload },
+      );
+    }),
   );
 }
 
