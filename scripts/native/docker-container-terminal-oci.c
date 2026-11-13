@@ -64,7 +64,20 @@ struct tns_oci_owner {
   char rootpath[96], netpath[96], bundlepath[96], statepath[96], pidpath[128];
   char receipt_bytes[8192];
   size_t receipt_size;
+  /* Optional original-root input selects only an additional birth DROP guard.
+   * No field authorizes OPEN, accepted policy completion, or serving. */
+  int egress_selected, egress_file, egress_binary;
+  unsigned int egress_guard_attempt, egress_file_attempt, egress_binary_attempt;
+  int egress_guard_verified, egress_close_unknown;
+  int egress_pidfd[3], egress_in[3], egress_out[3];
+  pid_t egress_pid[3];
+  unsigned int egress_joined[3], egress_ok[3], egress_kill[3];
+  struct stat egress_file_identity, egress_binary_identity;
+  char egress_bytes[32769];
+  size_t egress_size;
 };
+
+static int oci_egress_current(struct tns_oci_owner *o);
 
 static volatile sig_atomic_t oci_cancel_requested;
 
@@ -154,7 +167,8 @@ static int oci_inputs(struct tns_oci_owner *o) {
   if (fstat(o->receipt, &held) < 0 ||
       fstatat(o->root, ".tako-oci-artifact.json", &named, AT_SYMLINK_NOFOLLOW) < 0 ||
       !oci_same(&held, &named) || held.st_nlink != 1) { errno = ESTALE; return -1; }
-  return oci_read_exact_file(o->receipt, o->receipt_bytes, o->receipt_size);
+  if (oci_read_exact_file(o->receipt, o->receipt_bytes, o->receipt_size) < 0) return -1;
+  return oci_egress_current(o);
 }
 
 static int oci_initial_contents(int root) {
@@ -168,7 +182,8 @@ static int oci_initial_contents(int root) {
   while ((entry = readdir(dir))) {
     if (strcmp(entry->d_name, ".") && strcmp(entry->d_name, "..") &&
         strcmp(entry->d_name, "rootfs") &&
-        strcmp(entry->d_name, ".tako-oci-artifact.json")) { ok = 0; break; }
+        strcmp(entry->d_name, ".tako-oci-artifact.json") &&
+        strcmp(entry->d_name, ".tako-oci-egress.json")) { ok = 0; break; }
   }
   int e = errno;
   closedir(dir);
@@ -637,6 +652,8 @@ fail:
   return -1;
 }
 
+#include "docker-container-terminal-oci-egress.h"
+
 int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner **slot) {
   if (!slot) { errno = EINVAL; return -1; }
   if (*slot) { errno = EALREADY; return -1; }
@@ -645,6 +662,9 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   o->root = o->rootfs = o->receipt = o->runtime = o->bundle = o->state = -1;
   o->network = o->command_pidfd = o->init_pidfd = o->init_proc = -1;
   o->start_pidfd = o->stopped_exe = o->parent_pidns = o->init_pidns = -1;
+  o->egress_file = o->egress_binary = -1;
+  for (size_t i = 0; i < 3; ++i)
+    o->egress_pidfd[i] = o->egress_in[i] = o->egress_out[i] = -1;
   o->controller_pid = getpid();
   *slot = o;
   if (tns_oci_once(&o->attempt) < 0 || tns_oci_data(options) < 0 ||
@@ -669,6 +689,7 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   if (receipt.failed) { errno = EOVERFLOW; goto fail; }
   o->receipt_size = receipt.used;
   if (oci_not_canceled() < 0 || oci_inputs(o) < 0) goto fail;
+  if (oci_egress_select(o, options->generation) < 0) goto fail;
   /* Real dedicated subreaper/default SIGCHLD must precede namespace/runtime effects. */
   if (oci_reaper_current() < 0) goto fail;
   o->parent_pidns = open("/proc/self/ns/pid", O_RDONLY | O_CLOEXEC);
@@ -680,6 +701,7 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   o->network = tns_owner_dup_namespace(o->birth);
   if (o->network < 0 || tns_owner_observe(o->birth, &o->identity) < 0 ||
       oci_inputs(o) < 0) goto fail;
+  if (oci_egress_guard_install(o) < 0) goto fail;
   if (oci_not_canceled() < 0 || mkdirat(o->root, "bundle", 0700) < 0 ||
       mkdirat(o->root, "runtime-state", 0700) < 0) goto fail;
   o->bundle = openat(o->root, "bundle", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -742,6 +764,7 @@ int tns_oci_cancel(struct tns_oci_owner *o) {
   if (!o) { errno = EINVAL; return -1; }
   o->invalid = 1;
   tns_oci_note_cancel();
+  if (oci_egress_stop(o) < 0) return -1;
   if (o->command_pid && !o->command_joined && !o->kill_attempted) {
     o->kill_attempted = 1;
     if (syscall(SYS_pidfd_send_signal, o->command_pidfd, SIGKILL, NULL, 0) < 0 &&
@@ -767,6 +790,11 @@ int tns_oci_release_uncreated(struct tns_oci_owner **slot) {
   if (!slot || !*slot) { errno = EINVAL; return -1; }
   struct tns_oci_owner *o = *slot;
   if (o->command_pid) { errno = EBUSY; return -1; }
+  if (oci_egress_stop(o) < 0 || o->egress_close_unknown) {
+    if (!errno) errno = EUCLEAN;
+    return -1;
+  }
+  if (oci_egress_close(o) < 0) return -1;
   if (o->birth && tns_owner_close(&o->birth) < 0) return -1;
   if (o->config_created && unlinkat(o->bundle, "config.json", 0) < 0) return -1;
   int *fds[] = {&o->root, &o->rootfs, &o->receipt, &o->runtime, &o->bundle,
