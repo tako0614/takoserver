@@ -36,6 +36,10 @@ import {
   createLinuxOciPhysicalSession,
   type LinuxOciCreateStoppedRequest,
 } from "../src/providers/linux-oci-physical-session.ts";
+import {
+  LINUX_OCI_SERVICE_POLICY_FILE,
+  serializeLinuxOciServicePolicy,
+} from "../src/providers/linux-oci-service-policy.ts";
 import { createSelfhostLinuxOciCore } from "../src/selfhost-linux-oci-core.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
@@ -2359,6 +2363,7 @@ test("accepted OCI topology close revokes the loan, retains the claimed allocati
     expect((await readdir(allocation)).sort()).toEqual([
       ".tako-oci-artifact.json",
       LINUX_OCI_EGRESS_POLICY_FILE,
+      LINUX_OCI_SERVICE_POLICY_FILE,
       LINUX_OCI_HOST_TOPOLOGY_FILE,
       "rootfs",
     ]);
@@ -2382,4 +2387,154 @@ test("accepted OCI topology rejects zero-network uplink selections before origin
     expect(() =>
       snapshotLinuxOciHostTopology({ ...syntheticTopology(), ipv4Address, ipv4Gateway }),
     ).toThrow("linux_oci_host_topology_invalid");
+});
+
+test("accepted OCI service data binds the original HTTP spec to the claimed private artifact", async () => {
+  const f = await fixture(false, {
+    hostTopology: syntheticTopology(),
+    egressLimits: { maxConnections: 9, packetLimitBytes: 65536 },
+    viaHostCreator: true,
+  });
+  let visited = false;
+  f.onLoan(async (_execution, signal, bundle) => {
+    await bundle.guard();
+    const receipt = await readFile(join(bundle.allocationRoot, ".tako-oci-artifact.json"), "utf8");
+    const path = join(bundle.allocationRoot, LINUX_OCI_SERVICE_POLICY_FILE);
+    const bytes = await readFile(path, "utf8");
+    const data: unknown = JSON.parse(bytes);
+    if (!isJsonObject(data)) throw new Error("original service data absent");
+    expect(Object.keys(data)).toEqual(["kind", "artifact", "service"]);
+    expect(data.kind).toBe("linux-oci-owned-service@1");
+    expect(JSON.stringify(data.artifact)).toBe(receipt);
+    expect(data.service).toEqual({ httpPort: 8080, healthPath: "/health" });
+    expect(bytes).toBe(JSON.stringify(data));
+    const egress: unknown = JSON.parse(
+      await readFile(join(bundle.allocationRoot, LINUX_OCI_EGRESS_POLICY_FILE), "utf8"),
+    );
+    if (!isJsonObject(egress) || !isJsonObject(egress.policy))
+      throw new Error("original policy absent");
+    expect(egress.policy.policyDigest).toBe(bundle.record.intent.policy.policyDigest);
+    expect(egress.limits).toEqual({ maxConnections: 9, packetLimitBytes: 65536 });
+    const stat = await lstat(path);
+    expect(stat.isFile()).toBe(true);
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.mode & 0o777).toBe(0o600);
+    expect(stat.nlink).toBe(1);
+    const uid = process.getuid?.();
+    if (uid === undefined) throw new Error("original host uid unavailable");
+    expect(stat.uid).toBe(uid);
+    expect(signal.aborted).toBe(false);
+    await bundle.guard();
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(visited).toBe(true);
+    expect(f.failures).toEqual([]);
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+    expect(await f.sql.query("SELECT state,native_id FROM tf_v2_container_create_claims")).toEqual([
+      { state: "pending", native_id: null },
+    ]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_container_start_attempts")).toEqual([
+      { n: 0 },
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("accepted OCI service serialization rejects mismatched original records and invalid HTTP data", async () => {
+  const f = await fixture(false, {
+    hostTopology: syntheticTopology(),
+    egressLimits: { maxConnections: 9, packetLimitBytes: 65536 },
+  });
+  const storage = createDockerContainerCoreOwner({
+    sql: f.sql,
+    clock: () => new Date(),
+    installationId: "synthetic-oci-installation",
+    backendId: "synthetic-oci-backend",
+    targetKey: "synthetic-oci-target",
+    configuredInputs: f.configuredInputs,
+  });
+  let visited = false;
+  f.onLoan(async (execution, _signal, bundle) => {
+    await storage.withExecution(execution, async () => {
+      const accepted = await storage.readAcceptedExecution(execution);
+      const serialized = serializeLinuxOciServicePolicy(bundle.receipt, bundle.record, accepted);
+      expect(serialized).toBe(
+        await readFile(join(bundle.allocationRoot, LINUX_OCI_SERVICE_POLICY_FILE), "utf8"),
+      );
+      for (const changed of [
+        { ...accepted, principal: "another-parent" },
+        { ...accepted, generation: accepted.generation + 1 },
+        { ...accepted, resourceUid: "another-resource" },
+        { ...accepted, outboundInternet: !accepted.outboundInternet },
+      ])
+        expect(() =>
+          serializeLinuxOciServicePolicy(bundle.receipt, bundle.record, changed),
+        ).toThrow("linux_oci_service_policy_invalid");
+      expect(() =>
+        serializeLinuxOciServicePolicy(
+          { ...bundle.receipt, claimId: "0".repeat(64) },
+          bundle.record,
+          accepted,
+        ),
+      ).toThrow("linux_oci_service_policy_invalid");
+      for (const spec of [
+        { ...accepted.spec, httpPort: 0 },
+        { ...accepted.spec, httpPort: 65536 },
+        { ...accepted.spec, healthPath: "//foreign.example/" },
+        { ...accepted.spec, healthPath: "/%2e%2e/" },
+      ])
+        expect(() =>
+          serializeLinuxOciServicePolicy(bundle.receipt, bundle.record, { ...accepted, spec }),
+        ).toThrow();
+      let reads = 0;
+      const spec = { ...accepted.spec };
+      Object.defineProperty(spec, "httpPort", {
+        enumerable: true,
+        get() {
+          reads++;
+          return 8080;
+        },
+      });
+      expect(() =>
+        serializeLinuxOciServicePolicy(bundle.receipt, bundle.record, { ...accepted, spec }),
+      ).toThrow();
+      expect(reads).toBe(0);
+    });
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(visited).toBe(true);
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+  } finally {
+    await f.close();
+  }
+});
+
+test("accepted OCI service is absent without explicit Host topology selection", async () => {
+  const f = await fixture(false, { egressLimits: { maxConnections: 9, packetLimitBytes: 65536 } });
+  let visited = false;
+  f.onLoan(async (_execution, _signal, bundle) => {
+    expect((await readdir(bundle.allocationRoot)).sort()).toEqual([
+      ".tako-oci-artifact.json",
+      LINUX_OCI_EGRESS_POLICY_FILE,
+      "rootfs",
+    ]);
+    visited = true;
+  });
+  try {
+    await f.create();
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(visited).toBe(true);
+    expect(f.nativeCounts()).toEqual({ processes: 0, requests: [] });
+  } finally {
+    await f.close();
+  }
 });

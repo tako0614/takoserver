@@ -35,8 +35,10 @@
  * including UNKNOWN. Native execution and runtime provenance are unqualified.
  * Caller must serialize this owner and exclusively reap its command child. */
 struct oci_uplink_owner;
+struct oci_policy_owner;
 struct tns_oci_owner {
   struct oci_uplink_owner *uplink;
+  struct oci_policy_owner *policy;
   unsigned int attempt;
   unsigned int command_attempt;
   int command_joined;
@@ -81,6 +83,7 @@ struct tns_oci_owner {
 
 static int oci_egress_current(struct tns_oci_owner *o);
 static int oci_uplink_current(struct tns_oci_owner *o);
+static int oci_policy_current(struct tns_oci_owner *o);
 
 static volatile sig_atomic_t oci_cancel_requested;
 
@@ -172,7 +175,8 @@ static int oci_inputs(struct tns_oci_owner *o) {
       !oci_same(&held, &named) || held.st_nlink != 1) { errno = ESTALE; return -1; }
   if (oci_read_exact_file(o->receipt, o->receipt_bytes, o->receipt_size) < 0) return -1;
   if (oci_egress_current(o) < 0) return -1;
-  return oci_uplink_current(o);
+  if (oci_uplink_current(o) < 0) return -1;
+  return oci_policy_current(o);
 }
 
 static int oci_initial_contents(int root) {
@@ -188,7 +192,8 @@ static int oci_initial_contents(int root) {
         strcmp(entry->d_name, "rootfs") &&
         strcmp(entry->d_name, ".tako-oci-artifact.json") &&
         strcmp(entry->d_name, ".tako-oci-egress.json") &&
-        strcmp(entry->d_name, ".tako-oci-topology.json")) { ok = 0; break; }
+        strcmp(entry->d_name, ".tako-oci-topology.json") &&
+        strcmp(entry->d_name, ".tako-oci-service.json")) { ok = 0; break; }
   }
   int e = errno;
   closedir(dir);
@@ -659,6 +664,7 @@ fail:
 
 #include "docker-container-terminal-oci-egress.h"
 #include "docker-container-terminal-oci-uplink.h"
+#include "docker-container-terminal-oci-policy.h"
 
 int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner **slot) {
   if (!slot) { errno = EINVAL; return -1; }
@@ -695,7 +701,8 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   if (receipt.failed) { errno = EOVERFLOW; goto fail; }
   o->receipt_size = receipt.used;
   if (oci_not_canceled() < 0 || oci_inputs(o) < 0) goto fail;
-  if (oci_egress_select(o, options->generation) < 0 || oci_uplink_select(o, &o->uplink) < 0) goto fail;
+  if (oci_egress_select(o, options->generation) < 0 || oci_uplink_select(o, &o->uplink) < 0 ||
+      oci_policy_select(o, &o->policy) < 0) goto fail;
   /* Real dedicated subreaper/default SIGCHLD must precede namespace/runtime effects. */
   if (oci_reaper_current() < 0) goto fail;
   o->parent_pidns = open("/proc/self/ns/pid", O_RDONLY | O_CLOEXEC);
@@ -707,7 +714,8 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   o->network = tns_owner_dup_namespace(o->birth);
   if (o->network < 0 || tns_owner_observe(o->birth, &o->identity) < 0 ||
       oci_inputs(o) < 0) goto fail;
-  if (oci_egress_guard_install(o) < 0 || oci_uplink_install(o, o->uplink) < 0) goto fail;
+  if (oci_egress_guard_install(o) < 0 || oci_uplink_install(o, o->uplink) < 0 ||
+      oci_policy_install(o->policy) < 0) goto fail;
   if (oci_not_canceled() < 0 || mkdirat(o->root, "bundle", 0700) < 0 ||
       mkdirat(o->root, "runtime-state", 0700) < 0) goto fail;
   o->bundle = openat(o->root, "bundle", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
@@ -770,7 +778,7 @@ int tns_oci_cancel(struct tns_oci_owner *o) {
   if (!o) { errno = EINVAL; return -1; }
   o->invalid = 1;
   tns_oci_note_cancel();
-  if (oci_egress_stop(o) < 0) return -1;
+  if (oci_policy_stop(o->policy) < 0 || oci_egress_stop(o) < 0) return -1;
   if (o->command_pid && !o->command_joined && !o->kill_attempted) {
     o->kill_attempted = 1;
     if (syscall(SYS_pidfd_send_signal, o->command_pidfd, SIGKILL, NULL, 0) < 0 &&
@@ -790,6 +798,10 @@ int tns_oci_close_transport(struct tns_oci_owner *o) {
   /* Uplink cleanup must run while the actual original birth is still HELD.
    * Unknown/born custody must survive transport loss for original init join;
    * stopping the custodian first would destroy its live namespace proof. */
+  if (o->policy) {
+    if (!o->command_pid && oci_policy_close(&o->policy) < 0 && !saved) saved = errno;
+    if (o->policy) { errno = saved ? saved : EUCLEAN; return -1; }
+  }
   if (o->uplink) {
     if (!o->command_pid && oci_uplink_cleanup(&o->uplink) < 0 && !saved) saved = errno;
     if (o->uplink) { errno = saved ? saved : EUCLEAN; return -1; }
@@ -807,7 +819,7 @@ int tns_oci_release_uncreated(struct tns_oci_owner **slot) {
     if (!errno) errno = EUCLEAN;
     return -1;
   }
-  if (oci_uplink_cleanup(&o->uplink) < 0 || oci_egress_close(o) < 0) return -1;
+  if (oci_policy_close(&o->policy) < 0 || oci_uplink_cleanup(&o->uplink) < 0 || oci_egress_close(o) < 0) return -1;
   if (o->birth && tns_owner_close(&o->birth) < 0) return -1;
   if (o->config_created && unlinkat(o->bundle, "config.json", 0) < 0) return -1;
   int *fds[] = {&o->root, &o->rootfs, &o->receipt, &o->runtime, &o->bundle,
@@ -855,7 +867,7 @@ static int oci_namespace_release_progress(struct tns_oci_owner *o,
     if (!errno) errno = ESTALE;
     return -1;
   }
-  if (oci_uplink_cleanup(&o->uplink) < 0) return -1;
+  if (oci_policy_close(&o->policy) < 0 || oci_uplink_cleanup(&o->uplink) < 0) return -1;
   if (o->network >= 0) {
     struct stat st; struct statfs fs;
     if (fstat(o->network, &st) < 0 || fstatfs(o->network, &fs) < 0 ||

@@ -41,6 +41,10 @@ import {
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
 } from "./linux-oci-physical-session.ts";
+import {
+  LINUX_OCI_SERVICE_POLICY_FILE,
+  serializeLinuxOciServicePolicy,
+} from "./linux-oci-service-policy.ts";
 
 type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
@@ -813,6 +817,15 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                       await writeFile(
                         join(allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE),
                         serializeLinuxOciHostTopology(receipt, record, hostTopology),
+                        { flag: "wx", mode: 0o600 },
+                      );
+                      await heldGuard();
+                      // Only original accepted application data is supplied.
+                      // Native policy still needs its own actual topology,
+                      // installed rules/readback and closed-birth custody.
+                      await writeFile(
+                        join(allocationRoot, LINUX_OCI_SERVICE_POLICY_FILE),
+                        serializeLinuxOciServicePolicy(receipt, record, accepted),
                         { flag: "wx", mode: 0o600 },
                       );
                       await heldGuard();
