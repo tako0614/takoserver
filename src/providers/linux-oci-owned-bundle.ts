@@ -2188,10 +2188,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             try {
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
-              // Same original creator only. A fresh creator cannot infer a
-              // vanished predecessor's I/O from its empty map; normal removal
-              // remains UNKNOWN. This actual route closes before native STOP.
-              await httpRuntimes.get(record.claimId)?.close();
+              // Close admission and start cancellation before native STOP.
+              // An unjoined/unknown application stream must not block init
+              // retirement. The same runtime retains its cached terminal
+              // Promise; Core joins it at the genuine H-result handoff before
+              // allocation cleanup. Fresh creators gain no missing I/O fact.
+              const applicationClose = httpRuntimes.get(record.claimId)?.close();
+              void applicationClose?.catch(() => undefined);
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
               const result = await core.manageAcceptedPeerInit(

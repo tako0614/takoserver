@@ -86,14 +86,12 @@ test("retirement handoff consumes same original application close and H result w
     for (let i = 0; i < 30 && !io.counts().requestDestroy; i++) await rawTick();
     expect(io.counts().requestDestroy).toBe(1);
     expect(body.state()).toBe("rejected");
-    expect(first.state()).toBe("pending");
-    expect(stops(x)).toBe(0);
+    expect(await first.value).toHaveProperty("result");
+    expect(stops(x)).toBe(1);
     io.closeResponse();
     await rawTick();
-    expect(first.state()).toBe("pending");
-    expect(stops(x)).toBe(0);
+    expect(stops(x)).toBe(1);
     io.closeRequest();
-    expect(await first.value).toHaveProperty("result");
     expect(stops(x)).toBe(1);
     x.f.advanceNormalClock(61_000);
     await resultStep(x);

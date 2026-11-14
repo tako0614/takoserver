@@ -128,7 +128,7 @@ test("OCI HTTP original creator uses accepted serving/native source and ignores 
   }
 });
 
-test("OCI HTTP ordinary DELETE waits original stream closes before same creator STOP", async () => {
+test("OCI HTTP ordinary DELETE starts original stream close before same creator STOP", async () => {
   const x = await liveOriginal(),
     io = ownedRawHttp();
   try {
@@ -145,18 +145,17 @@ test("OCI HTTP ordinary DELETE waits original stream closes before same creator 
     for (let i = 0; i < 30 && !io.counts().requestDestroy; i++) await rawTick();
     expect(io.counts().requestDestroy).toBe(1);
     expect(body.state()).toBe("rejected");
-    expect(stops(x.f)).toBe(0);
-    expect(pass.state()).toBe("pending");
-    io.closeResponse();
-    await rawTick();
-    expect(stops(x.f)).toBe(0);
-    io.closeRequest();
     const result = await pass.value;
     expect(result).toHaveProperty("result");
     expect("result" in result && result.result).toMatchObject({
       status: "reconciling",
       effect: "unknown",
     });
+    expect(stops(x.f)).toBe(1);
+    io.closeResponse();
+    await rawTick();
+    expect(stops(x.f)).toBe(1);
+    io.closeRequest();
     expect(stops(x.f)).toBe(1);
     expect(io.counts().calls).toBe(1);
     const rejected = observeRawPromise(
@@ -272,14 +271,14 @@ test("OCI HTTP retire during final pre-send read fences the already-owned runtim
     for (let i = 0; i < 30 && !io.counts().requestDestroy; i++) await rawTick();
     expect(io.counts().requestDestroy).toBe(1);
     expect(io.counts().calls).toBe(1);
-    expect(stops(x.f)).toBe(0);
+    expect(await pass.value).toHaveProperty("result");
+    expect(stops(x.f)).toBe(1);
     io.closeRequest();
     io.closeResponse();
     await rawTick();
-    expect(stops(x.f)).toBe(0); // pending original invoke has not joined yet
+    expect(stops(x.f)).toBe(1); // pending original invoke still cannot send
     release();
     expect(await request.value).toHaveProperty("error");
-    expect(await pass.value).toHaveProperty("result");
     expect(stops(x.f)).toBe(1);
     expect(io.counts().calls).toBe(1);
     expect(
@@ -296,7 +295,7 @@ test("OCI HTTP retire during final pre-send read fences the already-owned runtim
   }
 });
 
-test("OCI HTTP unknown upload cancellation retains original handle and blocks STOP/replay", async () => {
+test("OCI HTTP unknown upload cancellation retains original handle without STOP/replay duplication", async () => {
   const x = await liveOriginal(),
     io = ownedRawHttp();
   const upload = new ReadableStream<Uint8Array>(
@@ -324,13 +323,13 @@ test("OCI HTTP unknown upload cancellation retains original handle and blocks ST
     io.closeResponse();
     io.closeRequest();
     expect(await pass).toMatchObject({ status: "reconciling", effect: "unknown" });
-    expect(stops(x.f)).toBe(0);
+    expect(stops(x.f)).toBe(1);
     await x.f.sql.run(
       "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
       [deletion.id],
     );
     expect(await x.f.engine.runNext()).toMatchObject({ status: "reconciling", effect: "unknown" });
-    expect(stops(x.f)).toBe(0);
+    expect(stops(x.f)).toBe(1);
     expect(io.counts().calls).toBe(1);
     expect(io.counts().requestDestroy).toBeLessThanOrEqual(1);
     expect(x.network).not.toHaveBeenCalled();
