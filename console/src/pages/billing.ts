@@ -298,14 +298,24 @@ export function billingPage(organizationId: string): Child {
         ),
       ),
       h(
-        "button",
-        {
-          class: "btn btn--primary",
-          type: "button",
-          onClick: openAddFunds,
-        },
-        icon(ICON.plus, 14),
-        text(tr("残高を追加", "Add funds")),
+        "div",
+        { class: "toolbar" },
+        h(
+          "button",
+          { class: "btn", type: "button", onClick: reloadWallet },
+          icon(ICON.refresh, 14),
+          text(tr("残高と使用量を更新", "Refresh balance and usage")),
+        ),
+        h(
+          "button",
+          {
+            class: "btn btn--primary",
+            type: "button",
+            onClick: openAddFunds,
+          },
+          icon(ICON.plus, 14),
+          text(tr("残高を追加", "Add funds")),
+        ),
       ),
     ),
     live(() => (billingMode() === "hosted" ? topUpStatus(topUp) : null)),
