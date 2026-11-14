@@ -35,6 +35,7 @@ import {
 } from "./docker-container-runtime-preparation.ts";
 import { LinuxDockerRuntimePreparation } from "./linux-docker-runtime-preparation.ts";
 import {
+  advanceOriginalLinuxOciOwnedDisposal,
   observeOriginalLinuxOciOwnedInitReaped,
   observeOriginalLinuxOciOwnedNamespaceLifetime,
   observeOriginalLinuxOciOwnedRunning,
@@ -42,10 +43,19 @@ import {
   stopOriginalLinuxOciOwnedInit,
 } from "./linux-oci-owned-bundle.ts";
 import type {
+  LinuxOciDisposedHelperObservation,
   LinuxOciInitReapedObservation,
   LinuxOciNamespaceLifetimeObservation,
+  LinuxOciRetirementObservation,
   LinuxOciStartedObservation,
 } from "./linux-oci-physical-session.ts";
+
+/** Original native progress only; no member supplies full lifetime coverage
+ * or authority to write a removed claim. */
+export type LinuxOciDisposalProgress =
+  | LinuxOciNamespaceLifetimeObservation
+  | LinuxOciRetirementObservation
+  | LinuxOciDisposedHelperObservation;
 
 export interface DockerPhysicalCoreOwnerPort extends DockerContainerCreateOwnerPort {
   publishServing(
@@ -166,6 +176,12 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciNamespaceLifetimeObservation>;
+  advanceRetainedBornDisposal(
+    execution: V2Execution,
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciDisposalProgress>;
   withExecution<T>(execution: V2Execution, work: () => Promise<T>): Promise<T>;
 }
 export interface DockerContainerAcceptedExecution {
@@ -2118,13 +2134,27 @@ export function createDockerContainerCoreOwner(
       if (removed.nativeId !== nativeId || removed.state !== "removed") return fail();
     },
   });
-  async function retainedNamespace(
+  function retainedNamespace(
     execution: V2Execution,
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
     mode: "release" | "observe",
-  ): Promise<LinuxOciNamespaceLifetimeObservation> {
+  ): Promise<LinuxOciNamespaceLifetimeObservation>;
+  function retainedNamespace(
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    mode: "dispose",
+  ): Promise<LinuxOciDisposalProgress>;
+  async function retainedNamespace(
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    mode: "release" | "observe" | "dispose",
+  ): Promise<LinuxOciDisposalProgress> {
     if (
       !own(input, ["claimId", "intent", "nativeId", "state"]) ||
       !hex(input.claimId) ||
@@ -2208,9 +2238,11 @@ export function createDockerContainerCoreOwner(
       if ((await startPhase()) !== "exited") return fail();
       await guard();
     }
-    const observation = await (mode === "release"
-      ? releaseOriginalLinuxOciOwnedNamespace(originalCustody, result, captured, signal)
-      : observeOriginalLinuxOciOwnedNamespaceLifetime(originalCustody, result, captured, signal));
+    const observation = await (mode === "dispose"
+      ? advanceOriginalLinuxOciOwnedDisposal(originalCustody, result, captured, signal)
+      : mode === "release"
+        ? releaseOriginalLinuxOciOwnedNamespace(originalCustody, result, captured, signal)
+        : observeOriginalLinuxOciOwnedNamespaceLifetime(originalCustody, result, captured, signal));
     await guard();
     // No final await after the local execution/lease/cancel fence.
     if (signal.aborted || !lease.active || lease.controller.signal.aborted || !leases.has(lease))
@@ -2313,6 +2345,9 @@ export function createDockerContainerCoreOwner(
     },
     observeRetainedNamespaceLifetime(execution, record, originalCustody, signal) {
       return retainedNamespace(execution, record, originalCustody, signal, "observe");
+    },
+    advanceRetainedBornDisposal(execution, record, originalCustody, signal) {
+      return retainedNamespace(execution, record, originalCustody, signal, "dispose");
     },
     async claimAcceptedStart(input: DockerContainerCreateRecord) {
       // Snapshot data before the first await. Accessors or a later caller edit

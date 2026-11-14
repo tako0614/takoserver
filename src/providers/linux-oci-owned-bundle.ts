@@ -15,6 +15,7 @@ import {
   type DockerContainerAcceptedExecution,
   type DockerContainerCoreOwner,
   type DockerContainerCoreOwnerOptions,
+  type LinuxOciDisposalProgress,
 } from "./docker-container-core-owner.ts";
 import type {
   DockerContainerCreateIntent,
@@ -41,6 +42,7 @@ import {
 import { createLinuxOciHttpHealthProbe } from "./linux-oci-http-health.ts";
 import {
   createLinuxOciPhysicalSession,
+  type LinuxOciDisposedHelperObservation,
   type LinuxOciInitReapedObservation,
   type LinuxOciNamespaceLifetimeObservation,
   LinuxOciPhysicalSession,
@@ -59,6 +61,10 @@ type OriginalOciCustody = {
   readonly signal: AbortSignal;
   readonly initStops: Set<string>;
   readonly namespaceReleases: Set<string>;
+  readonly disposalSteps: Map<
+    string,
+    "begin" | "read" | "delete" | "join-delete" | "dispose" | "continue-dispose" | "join-helper"
+  >;
 };
 // Populated ONLY inside the real creator below. There is no registration API
 // and its opaque keys are never returned to a caller or serialized.
@@ -69,6 +75,71 @@ const joinOriginalOciInit = LinuxOciPhysicalSession.prototype.joinInit;
 const releaseOriginalOciNamespace = LinuxOciPhysicalSession.prototype.releaseNamespace;
 const continueOriginalOciNamespace = LinuxOciPhysicalSession.prototype.continueNamespaceRelease;
 const readOriginalOciNamespace = LinuxOciPhysicalSession.prototype.observeNamespaceLifetime;
+const beginOriginalOciTrackedJoin = LinuxOciPhysicalSession.prototype.beginTrackedJoin;
+const readOriginalOciTrackedJoin = LinuxOciPhysicalSession.prototype.readTrackedJoin;
+const deleteOriginalOciBorn = LinuxOciPhysicalSession.prototype.deleteBorn;
+const joinOriginalOciBornDelete = LinuxOciPhysicalSession.prototype.joinBornDelete;
+const disposeOriginalOciBorn = LinuxOciPhysicalSession.prototype.disposeBorn;
+const continueOriginalOciDisposal = LinuxOciPhysicalSession.prototype.continueBornDisposal;
+const joinOriginalOciDisposedHelper = LinuxOciPhysicalSession.prototype.joinDisposedHelper;
+
+/** Exactly one next original operation per Core lease/currentness check.
+ * The private route only prevents replay; every fact comes from the original
+ * initialized physical session. No callback or public registration is accepted. */
+export async function advanceOriginalLinuxOciOwnedDisposal(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+): Promise<LinuxOciDisposalProgress> {
+  const custody = originalOciCustodies.get(original);
+  if (!custody || custody.core !== core || !custody.initStops.has(record.claimId))
+    return fail("retained_native_unknown");
+  const session = custody.sessions.get(record.claimId),
+    nativeId = custody.bindings.get(record.claimId);
+  if (!session || nativeId === undefined || nativeId !== record.nativeId)
+    return fail("retained_native_unknown");
+  const local = () => {
+    if (
+      custody.signal.aborted ||
+      signal.aborted ||
+      custody.sessions.get(record.claimId) !== session ||
+      custody.bindings.get(record.claimId) !== nativeId
+    )
+      return fail("revoked");
+  };
+  local();
+  let observation: LinuxOciDisposalProgress;
+  const step = custody.disposalSteps.get(record.claimId);
+  if (step === undefined) {
+    observation = await originalNamespaceObservation(original, core, record, signal, "release");
+    custody.disposalSteps.set(record.claimId, "begin");
+  } else if (step === "begin") {
+    custody.disposalSteps.set(record.claimId, "read");
+    observation = await beginOriginalOciTrackedJoin.call(session, signal);
+  } else if (step === "read") {
+    observation = await readOriginalOciTrackedJoin.call(session, signal);
+    custody.disposalSteps.set(record.claimId, "delete");
+  } else if (step === "delete") {
+    custody.disposalSteps.set(record.claimId, "join-delete");
+    observation = await deleteOriginalOciBorn.call(session, signal);
+    custody.disposalSteps.set(record.claimId, "dispose");
+  } else if (step === "join-delete") {
+    observation = await joinOriginalOciBornDelete.call(session, signal);
+    custody.disposalSteps.set(record.claimId, "dispose");
+  } else if (step === "dispose") {
+    custody.disposalSteps.set(record.claimId, "continue-dispose");
+    observation = await disposeOriginalOciBorn.call(session, signal);
+    custody.disposalSteps.set(record.claimId, "join-helper");
+  } else if (step === "continue-dispose") {
+    observation = await continueOriginalOciDisposal.call(session, signal);
+    custody.disposalSteps.set(record.claimId, "join-helper");
+  } else observation = await joinOriginalOciDisposedHelper.call(session, signal);
+  // Record consumed effects before refusing a cancelled return, so a later
+  // genuine lease can only continue the original phase, never resend it.
+  local();
+  return observation;
+}
 
 async function originalNamespaceObservation(
   original: object,
@@ -533,6 +604,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     signal: nativeLifetime.signal,
     initStops: new Set<string>(),
     namespaceReleases: new Set<string>(),
+    disposalSteps: new Map(),
   });
   let nativeClosing: Promise<void> | undefined;
   const joinTimeoutMs = Math.min(timeout, 1000);
@@ -565,7 +637,19 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     execution: V2Execution,
     externalSignal: AbortSignal | undefined,
     mode: "release" | "observe",
-  ): Promise<readonly LinuxOciNamespaceLifetimeObservation[]> {
+  ): Promise<readonly LinuxOciNamespaceLifetimeObservation[]>;
+  function retainedNamespaceObservations(
+    execution: V2Execution,
+    externalSignal: AbortSignal | undefined,
+    mode: "dispose",
+  ): Promise<readonly LinuxOciDisposedHelperObservation[]>;
+  function retainedNamespaceObservations(
+    execution: V2Execution,
+    externalSignal: AbortSignal | undefined,
+    mode: "release" | "observe" | "dispose",
+  ): Promise<
+    readonly (LinuxOciNamespaceLifetimeObservation | LinuxOciDisposedHelperObservation)[]
+  > {
     if (closed) return Promise.reject(new Error("linux_oci_owned_bundle_closed"));
     if (physicalBinary === undefined)
       return Promise.reject(new Error("linux_oci_owned_bundle_physical_not_configured"));
@@ -603,7 +687,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           )
             return fail("retained_native_unknown");
         }
-        const observations: LinuxOciNamespaceLifetimeObservation[] = [];
+        const observations: (
+          | LinuxOciNamespaceLifetimeObservation
+          | LinuxOciDisposedHelperObservation
+        )[] = [];
         for (const { record } of retained) {
           if (closed || cancel.signal.aborted) return fail("revoked");
           await core.owner.withAuthority(record, "remove", async (held) => {
@@ -615,19 +702,41 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             try {
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
-              const observation = await (mode === "release"
-                ? core.releaseRetainedNamespace(
+              let observation:
+                | LinuxOciNamespaceLifetimeObservation
+                | LinuxOciDisposedHelperObservation;
+              if (mode === "dispose") {
+                for (;;) {
+                  // Each step re-enters the genuine Core current/START gate;
+                  // the private creator route alone cannot authorize an effect.
+                  const progress = await core.advanceRetainedBornDisposal(
                     execution,
                     record,
                     originalNativeCustody,
                     loan.signal,
-                  )
-                : core.observeRetainedNamespaceLifetime(
-                    execution,
-                    record,
-                    originalNativeCustody,
-                    loan.signal,
-                  ));
+                  );
+                  if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                    return fail("revoked");
+                  if (closed || loan.signal.aborted) return fail("revoked");
+                  if (progress.kind === "linux-oci-disposed-helper-exit@1") {
+                    observation = progress;
+                    break;
+                  }
+                }
+              } else
+                observation = await (mode === "release"
+                  ? core.releaseRetainedNamespace(
+                      execution,
+                      record,
+                      originalNativeCustody,
+                      loan.signal,
+                    )
+                  : core.observeRetainedNamespaceLifetime(
+                      execution,
+                      record,
+                      originalNativeCustody,
+                      loan.signal,
+                    ));
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
               if (closed || loan.signal.aborted) return fail("revoked");
@@ -1190,10 +1299,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       );
       local();
       if (accepted.action === "delete") {
-        await creator.releaseRetainedNamespaces(execution, cancel.signal);
+        await creator.disposeRetainedBornOwners(execution, cancel.signal);
         local();
-        // Namespace release is factual cleanup. Full lifetime retirement and
-        // the original removed CAS are not supplied by this backend yet.
+        // Original tracked destruction/local disposal/helper join are factual.
+        // Full lifetime retirement and removed CAS are not supplied here.
         return unknown();
       }
       const current = accepted.retained.find(
@@ -1671,6 +1780,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     /** Reads the same owner after a prior release request; never starts cleanup. */
     observeRetainedNamespaceLifetimes(execution: V2Execution, signal?: AbortSignal) {
       return retainedNamespaceObservations(execution, signal, "observe");
+    },
+    /** Original accepted/remove custody only. No returned fact grants removal. */
+    disposeRetainedBornOwners(execution: V2Execution, signal?: AbortSignal) {
+      return retainedNamespaceObservations(execution, signal, "dispose");
     },
     close(): Promise<void> {
       const joined = artifact.close();

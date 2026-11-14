@@ -93,6 +93,12 @@ async function fixture(
     readonly nativeObservationRefusalAt?: number;
     readonly changingSql?: boolean;
     readonly namespaceMode?: "success" | "retained" | "foreign" | "unknown";
+    readonly disposalMode?:
+      | "success"
+      | "begin-retained"
+      | "delete-retained"
+      | "dispose-retained"
+      | "unknown";
     readonly egressLimits?: LinuxOciEgressLimits;
     readonly hostTopology?: LinuxOciHostTopology;
     readonly outboundInternet?: boolean;
@@ -302,6 +308,7 @@ async function fixture(
         void nativeClosing.catch(() => undefined);
       }
       let created = false;
+      let disposalRefused = false;
       let nativeId: string | undefined;
       const child = new EventEmitter();
       const stdout = new PassThrough(),
@@ -490,6 +497,41 @@ async function fixture(
                   poisoned: 0,
                   barrier: "unproven",
                 });
+            } else if (disposalWire.some(([kind]) => kind === request.kind)) {
+              if (!nativeId) throw new Error("original disposal native identity absent");
+              expect(Object.keys(request)).toEqual(["kind"]);
+              const selected = disposalWire.find(([kind]) => kind === request.kind);
+              if (!selected) throw new Error("original disposal operation absent");
+              const [kind, replyKind, stage] = selected;
+              const mode = adversarial.disposalMode;
+              if (
+                mode === undefined ||
+                (!disposalRefused &&
+                  ((mode === "begin-retained" && stage === "begin-tracked-join") ||
+                    (mode === "delete-retained" && stage === "delete-born") ||
+                    (mode === "dispose-retained" && stage === "dispose-born")))
+              ) {
+                disposalRefused = true;
+                reply({
+                  kind: "linux-oci-refused@1",
+                  stage,
+                  errno: 11,
+                  custody: "retained",
+                  barrier: "unproven",
+                });
+              } else if (mode === "unknown" && stage === "begin-tracked-join") stdout.end();
+              else {
+                reply({ kind: replyKind, barrier: "unproven" });
+                if (
+                  kind === "linux-oci-dispose-born@1" ||
+                  kind === "linux-oci-continue-born-disposal@1"
+                ) {
+                  nativeExits++;
+                  stdout.end();
+                  child.emit("exit", 0, null);
+                  child.emit("close", 0, null);
+                }
+              }
             } else if (request.kind === "linux-oci-cancel@1") {
               reply({
                 kind: "linux-oci-cancel-observation@1",
@@ -576,6 +618,7 @@ async function fixture(
   const started: unknown[] = [];
   const reaped: unknown[] = [];
   const namespaces: unknown[] = [];
+  const disposals: unknown[] = [];
   let retireSignal: AbortSignal | undefined;
   let beforeRetire: ((execution: V2Execution) => Promise<void>) | undefined;
   let afterRetire: ((execution: V2Execution) => Promise<void>) | undefined;
@@ -592,7 +635,12 @@ async function fixture(
             adversarial.nativeMode === "retire-pending")
         ) {
           await beforeRetire?.(execution);
-          if (adversarial.namespaceMode) {
+          if (adversarial.disposalMode) {
+            disposals.push(
+              ...(await composition.disposeRetainedBornOwners(execution, retireSignal)),
+            );
+            await afterRetire?.(execution);
+          } else if (adversarial.namespaceMode) {
             namespaces.push(
               ...(await composition.releaseRetainedNamespaces(execution, retireSignal)),
             );
@@ -789,6 +837,7 @@ async function fixture(
     started,
     reaped,
     namespaces,
+    disposals,
     retireSignal(signal: AbortSignal) {
       retireSignal = signal;
     },
@@ -3732,6 +3781,293 @@ test("singleton OCI topology claim retains second-generation and foreign pending
     raw.join();
     raw.restore();
     await restarted?.close();
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+// Closed C28 facts are raw IO here, never native/terminal qualifications.
+const disposalWire = [
+  ["linux-oci-begin-tracked-join@1", "linux-oci-tracked-join-handoff@1", "begin-tracked-join"],
+  ["linux-oci-read-tracked-join@1", "linux-oci-tracked-owner-destruction@1", "read-tracked-join"],
+  ["linux-oci-delete-born@1", "linux-oci-born-delete-observation@1", "delete-born"],
+  ["linux-oci-join-born-delete@1", "linux-oci-born-delete-join-observation@1", "join-born-delete"],
+  ["linux-oci-dispose-born@1", "linux-oci-local-disposal@1", "dispose-born"],
+  [
+    "linux-oci-continue-born-disposal@1",
+    "linux-oci-local-disposal-continuation@1",
+    "continue-born-disposal",
+  ],
+] as const;
+const disposalRequests = (f: Awaited<ReturnType<typeof fixture>>) =>
+  f
+    .nativeCounts()
+    .requests.filter((kind) => disposalWire.some(([requestKind]) => kind === requestKind));
+
+test("original OCI disposal binds genuine accepted exit to same original owner progress and child join without removal", async () => {
+  const f = await fixture(false, {
+    nativeMode: "start-retire",
+    namespaceMode: "success",
+    disposalMode: "success",
+  });
+  try {
+    await acceptNamespaceDelete(f);
+    const outcome = await f.engine.runNext();
+    expect(f.failures).toEqual([]);
+    expect(f.disposals).toEqual([
+      { kind: "linux-oci-disposed-helper-exit@1", barrier: "unproven" },
+    ]);
+    expect(disposalRequests(f)).toEqual([
+      disposalWire[0][0],
+      disposalWire[1][0],
+      disposalWire[2][0],
+      disposalWire[4][0],
+    ]);
+    expect(f.nativeCounts().requests.filter((kind) => namespaceKinds.includes(kind))).toEqual([
+      namespaceKinds[0],
+    ]);
+    expect(f.nativeExits()).toBe(1);
+    await assertNamespaceRetained(f);
+    expect(outcome?.effect).not.toBe("complete");
+  } finally {
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+for (const disposalMode of ["begin-retained", "delete-retained", "dispose-retained"] as const) {
+  test(`original OCI disposal ${disposalMode} resumes only original READ JOIN or continuation under a new genuine lease`, async () => {
+    const f = await fixture(false, {
+      nativeMode: "start-retire",
+      namespaceMode: "success",
+      disposalMode,
+    });
+    try {
+      const deletion = await acceptNamespaceDelete(f);
+      expect((await f.engine.runNext())?.effect).not.toBe("complete");
+      expect(f.failures).toHaveLength(1);
+      expect(f.disposals).toEqual([]);
+      const first = disposalRequests(f);
+      await f.sql.run(
+        "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+        [deletion.id],
+      );
+      expect((await f.engine.runNext())?.effect).not.toBe("complete");
+      expect(f.failures).toHaveLength(1);
+      expect(f.disposals).toEqual([
+        { kind: "linux-oci-disposed-helper-exit@1", barrier: "unproven" },
+      ]);
+      const all = disposalRequests(f);
+      const suffix = all.slice(first.length);
+      expect(suffix[0]).toBe(
+        disposalMode === "begin-retained"
+          ? disposalWire[1][0]
+          : disposalMode === "delete-retained"
+            ? disposalWire[3][0]
+            : disposalWire[5][0],
+      );
+      for (const effect of [disposalWire[0][0], disposalWire[2][0], disposalWire[4][0]])
+        expect(all.filter((kind) => kind === effect)).toHaveLength(1);
+      expect(f.nativeCounts().requests.filter((kind) => namespaceKinds.includes(kind))).toEqual([
+        namespaceKinds[0],
+      ]);
+      await assertNamespaceRetained(f);
+    } finally {
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+test("original OCI disposal broken original stream remains unknown without any effect replay", async () => {
+  const f = await fixture(false, {
+    nativeMode: "start-retire",
+    namespaceMode: "success",
+    disposalMode: "unknown",
+  });
+  try {
+    const deletion = await acceptNamespaceDelete(f);
+    await f.engine.runNext();
+    expect(f.disposals).toEqual([]);
+    const sent = f.nativeCounts();
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+      [deletion.id],
+    );
+    await f.engine.runNext();
+    expect(f.disposals).toEqual([]);
+    expect(f.nativeCounts()).toEqual(sent);
+    expect(disposalRequests(f)).toEqual([disposalWire[0][0]]);
+    await assertNamespaceRetained(f);
+  } finally {
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+test("original OCI disposal rejects foreign opaque custody even with real sameSql execution and remove lease before native IO", async () => {
+  const f = await fixture(false, {
+    nativeMode: "start-retire",
+    namespaceMode: "success",
+    disposalMode: "success",
+  });
+  const foreign = createDockerContainerCoreOwner({
+    sql: f.sql,
+    clock: () => new Date(),
+    installationId: "synthetic-oci-installation",
+    backendId: "synthetic-oci-backend",
+    targetKey: "synthetic-oci-target",
+    configuredInputs: f.configuredInputs,
+  });
+  f.beforeRetire(async (execution) => {
+    const before = f.nativeCounts();
+    await foreign.withExecution(execution, async () => {
+      const accepted = await foreign.readAcceptedExecution(execution);
+      const old = accepted.retained.find(({ record }) => record.intent.policy.generation === 1);
+      if (!old) throw new Error("genuine retained record absent");
+      await foreign.owner.withAuthority(old.record, "remove", async () => {
+        await expect(
+          foreign.advanceRetainedBornDisposal(
+            execution,
+            old.record,
+            Object.freeze({}),
+            new AbortController().signal,
+          ),
+        ).rejects.toThrow();
+      });
+    });
+    expect(f.nativeCounts()).toEqual(before);
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+  });
+  try {
+    await acceptNamespaceDelete(f);
+    await f.engine.runNext();
+    expect(f.failures).toEqual([]);
+    expect(f.disposals).toHaveLength(1);
+    await assertNamespaceRetained(f);
+  } finally {
+    await expect(f.close()).rejects.toThrow("custody_retained");
+  }
+});
+
+for (const action of ["cancel", "close"] as const) {
+  test(`original OCI disposal ${action} during actual currentSql read prevents the next unrequested DELETE`, async () => {
+    const f = await fixture(false, {
+      nativeMode: "start-retire",
+      namespaceMode: "success",
+      disposalMode: "success",
+    });
+    const cancel = new AbortController();
+    f.retireSignal(cancel.signal);
+    let entered = () => {},
+      release = () => {};
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let closing: Promise<void> | undefined,
+      held = false,
+      restore = () => {};
+    try {
+      await acceptNamespaceDelete(f);
+      const original = f.sql.query.bind(f.sql);
+      const query = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+        const rows = await original(statement, params);
+        if (
+          !held &&
+          disposalRequests(f).includes(disposalWire[1][0]) &&
+          statement.includes(" FROM tf_v2_container_instances i JOIN ")
+        ) {
+          held = true;
+          entered();
+          await gate;
+        }
+        return rows;
+      });
+      restore = () => query.mockRestore();
+      const pending = f.engine.runNext();
+      await Promise.race([
+        reached,
+        pending.then(() => {
+          throw new Error("original current Sql boundary absent");
+        }),
+      ]);
+      if (action === "cancel") cancel.abort();
+      else {
+        closing = f.composition.close();
+        closing.catch(() => {});
+      }
+      release();
+      expect((await pending)?.effect).not.toBe("complete");
+      expect(held).toBe(true);
+      expect(f.disposals).toEqual([]);
+      expect(disposalRequests(f)).toEqual([disposalWire[0][0], disposalWire[1][0]]);
+      await assertNamespaceRetained(f);
+      if (closing) await expect(closing).rejects.toThrow("custody_retained");
+    } finally {
+      release();
+      restore();
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+test("original OCI disposal normal DELETE rejects a reconstructed creator and resumes the original child without removal", async () => {
+  const f = await fixture(false, {
+      ...acceptedHttpSelection(),
+      normalBackend: true,
+      namespaceMode: "success",
+      disposalMode: "begin-retained",
+    }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let reconstructed: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+    const deletion = await f.engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(disposalRequests(f)).toEqual([disposalWire[0][0]]);
+    const before = f.nativeCounts();
+    reconstructed = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    expect(await reconstructed.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(f.nativeCounts()).toEqual(before);
+    f.advanceNormalClock(61_000);
+    expect(await f.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(disposalRequests(f)).toEqual([
+      disposalWire[0][0],
+      disposalWire[1][0],
+      disposalWire[2][0],
+      disposalWire[4][0],
+    ]);
+    expect(f.nativeExits()).toBe(1);
+    await assertNamespaceRetained(f);
+    expect(raw.calls).toHaveLength(1);
+  } finally {
+    await reconstructed?.close();
+    raw.join();
+    raw.restore();
     await expect(f.close()).rejects.toThrow("custody_retained");
   }
 });
