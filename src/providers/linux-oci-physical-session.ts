@@ -10,6 +10,21 @@ const DIGEST = /^sha256:[a-f0-9]{64}$/u;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const failure = (code = "unavailable") => new Error(`linux_oci_physical_session_${code}`);
+const RETIREMENT = {
+  "begin-tracked-join": ["linux-oci-begin-tracked-join@1", "linux-oci-tracked-join-handoff@1"],
+  "read-tracked-join": ["linux-oci-read-tracked-join@1", "linux-oci-tracked-owner-destruction@1"],
+  "delete-born": ["linux-oci-delete-born@1", "linux-oci-born-delete-observation@1"],
+  "join-born-delete": ["linux-oci-join-born-delete@1", "linux-oci-born-delete-join-observation@1"],
+  "dispose-born": ["linux-oci-dispose-born@1", "linux-oci-local-disposal@1"],
+  "continue-born-disposal": [
+    "linux-oci-continue-born-disposal@1",
+    "linux-oci-local-disposal-continuation@1",
+  ],
+} as const;
+type RetirementOperation = keyof typeof RETIREMENT;
+function retirementOperation(operation: string): operation is RetirementOperation {
+  return Object.hasOwn(RETIREMENT, operation);
+}
 
 /** Private physical protocol data. Acceptance and the original artifact/claim
  * remain the calling owner's responsibility; none of these fields is a grant. */
@@ -93,9 +108,17 @@ export interface LinuxOciCancelObservation {
   readonly custody: "released-uncreated" | "retained";
   readonly barrier: "unproven";
 }
+/** Facts from this original stream only. BEGIN acknowledges handoff; READ
+ * observes tracked-owner destruction. Local disposal covers current held
+ * slots, never historical FDs, helper-child exit, full traffic or Core removal. */
+export interface LinuxOciRetirementObservation {
+  readonly kind: (typeof RETIREMENT)[RetirementOperation][1];
+  readonly barrier: "unproven";
+}
 interface Refusal {
   readonly kind: "linux-oci-refused@1";
   readonly stage:
+    | RetirementOperation
     | "frame"
     | "request"
     | "create"
@@ -117,9 +140,11 @@ type Reply =
   | LinuxOciStartedObservation
   | LinuxOciInitReapedObservation
   | LinuxOciNamespaceLifetimeObservation
+  | LinuxOciRetirementObservation
   | LinuxOciCancelObservation
   | Refusal;
 type Operation =
+  | RetirementOperation
   | "create"
   | "observe"
   | "start"
@@ -353,6 +378,19 @@ function parseReply(body: Buffer): Reply {
       poisoned: value.poisoned,
       barrier: "unproven",
     };
+  } else if (Object.values(RETIREMENT).some(([, kind]) => kind === value.kind)) {
+    // Repeat the closed kinds for narrowing; neither identity nor custody is
+    // read after the C producer may have freed its original owner.
+    if (
+      value.kind !== "linux-oci-tracked-join-handoff@1" &&
+      value.kind !== "linux-oci-tracked-owner-destruction@1" &&
+      value.kind !== "linux-oci-born-delete-observation@1" &&
+      value.kind !== "linux-oci-born-delete-join-observation@1" &&
+      value.kind !== "linux-oci-local-disposal@1" &&
+      value.kind !== "linux-oci-local-disposal-continuation@1"
+    )
+      throw failure();
+    reply = { kind: value.kind, barrier: "unproven" };
   } else if (
     value.kind === "linux-oci-refused@1" ||
     value.kind === "linux-oci-cancel-observation@1"
@@ -384,7 +422,8 @@ function parseReply(body: Buffer): Reply {
         value.stage !== "release-namespace" &&
         value.stage !== "continue-namespace-release" &&
         value.stage !== "observe-namespace-lifetime" &&
-        value.stage !== "cancel"
+        value.stage !== "cancel" &&
+        !(typeof value.stage === "string" && retirementOperation(value.stage))
       )
         throw failure();
       reply = {
@@ -457,6 +496,15 @@ export class LinuxOciPhysicalSession {
   #namespaceReleaseAttempted = false;
   #namespaceReleaseSent = false;
   #namespaceLifetime: LinuxOciNamespaceLifetimeObservation | undefined;
+  #trackedJoinAttempted = false;
+  #trackedJoinSent = false;
+  #trackedDestructionKnown = false;
+  #bornDeleteAttempted = false;
+  #bornDeleteSent = false;
+  #bornDeleteKnown = false;
+  #bornDisposalAttempted = false;
+  #bornDisposalSent = false;
+  #localDisposalReply = false;
   #claim: string | undefined;
   #identity: LinuxOciStoppedObservation | undefined;
   #mustRetain = false;
@@ -489,15 +537,16 @@ export class LinuxOciPhysicalSession {
     this.#child.stdin.on("error", () => this.#break());
     this.#child.stdout.on("error", () => this.#break());
     this.#child.stderr.on("error", () => this.#break());
-    this.#child.stdout.on("end", () => this.#break());
+    this.#child.stdout.on("end", () => this.#end());
     this.#child.on("error", () => this.#break());
     this.#child.on("exit", (code, signal) => {
       this.#exit = { code, signal };
-      this.#break();
+      if (code === 0 && signal === null) this.#end();
+      else this.#break();
     });
     this.#child.on("close", () => {
       this.#closed = true;
-      this.#break();
+      this.#end();
       for (const done of this.#exitWaiters) done();
     });
   }
@@ -701,6 +750,85 @@ export class LinuxOciPhysicalSession {
     return reply;
   }
 
+  /** One handoff request, then only same-stream READ. No old namespace
+   * observation may use the kernel context after its owner was detached. */
+  beginTrackedJoin(signal: AbortSignal): Promise<LinuxOciRetirementObservation> {
+    return this.#retirementRequest("begin-tracked-join", signal);
+  }
+
+  readTrackedJoin(signal: AbortSignal): Promise<LinuxOciRetirementObservation> {
+    return this.#retirementRequest("read-tracked-join", signal);
+  }
+
+  /** One original runtime DELETE attempt. A decoded retained refusal only
+   * permits joining the already requested child; it never permits re-DELETE. */
+  deleteBorn(signal: AbortSignal): Promise<LinuxOciRetirementObservation> {
+    return this.#retirementRequest("delete-born", signal);
+  }
+
+  joinBornDelete(signal: AbortSignal): Promise<LinuxOciRetirementObservation> {
+    return this.#retirementRequest("join-born-delete", signal);
+  }
+
+  /** C may free its owner and end stdout immediately after this closed reply.
+   * That expected end does not qualify helper-child exit or legacy close(). */
+  disposeBorn(signal: AbortSignal): Promise<LinuxOciRetirementObservation> {
+    return this.#retirementRequest("dispose-born", signal);
+  }
+
+  continueBornDisposal(signal: AbortSignal): Promise<LinuxOciRetirementObservation> {
+    return this.#retirementRequest("continue-born-disposal", signal);
+  }
+
+  async #retirementRequest(
+    operation: RetirementOperation,
+    signal: AbortSignal,
+  ): Promise<LinuxOciRetirementObservation> {
+    if (
+      !this.#identity ||
+      !this.#initIdentity ||
+      !this.#namespaceReleaseSent ||
+      this.#admissionClosed ||
+      this.#pending ||
+      !this.#usable ||
+      this.#localDisposalReply
+    )
+      throw failure();
+    if (operation === "begin-tracked-join") {
+      if (this.#trackedJoinAttempted) throw failure("one_use");
+      this.#trackedJoinAttempted = true;
+    } else if (!this.#trackedJoinSent) throw failure();
+    if (operation === "read-tracked-join" && this.#bornDeleteAttempted) throw failure();
+    if (operation === "delete-born") {
+      if (this.#bornDeleteAttempted) throw failure("one_use");
+      if (!this.#trackedDestructionKnown) throw failure();
+      this.#bornDeleteAttempted = true;
+    }
+    if (operation === "join-born-delete" && !this.#bornDeleteSent) throw failure();
+    if (operation === "dispose-born") {
+      if (this.#bornDisposalAttempted) throw failure("one_use");
+      if (!this.#bornDeleteKnown) throw failure();
+      this.#bornDisposalAttempted = true;
+    } else if (this.#bornDisposalAttempted && operation !== "continue-born-disposal")
+      throw failure();
+    if (operation === "continue-born-disposal" && !this.#bornDisposalSent) throw failure();
+    if (signal.aborted) throw failure();
+    const reply = await this.#request(operation, { kind: RETIREMENT[operation][0] }, signal);
+    if (signal.aborted) {
+      this.#break();
+      throw failure();
+    }
+    if (
+      this.#admissionClosed ||
+      (!this.#usable && !this.#localDisposalReply) ||
+      reply.kind !== RETIREMENT[operation][1]
+    )
+      throw failure();
+    // Exact kind above is one of the closed two-field replies, never a grant.
+    if ("nativeId" in reply || "custody" in reply) throw failure();
+    return reply;
+  }
+
   cancel(): Promise<LinuxOciCancelObservation> {
     this.#admissionClosed = true;
     this.#cancelPromise ??= (async () => {
@@ -743,8 +871,17 @@ export class LinuxOciPhysicalSession {
     return this.#closePromise;
   }
 
+  #end() {
+    if (this.#localDisposalReply && !this.#pending && this.#buffer.length === 0) {
+      this.#usable = false;
+      return;
+    }
+    this.#break();
+  }
+
   #break() {
     this.#usable = false;
+    this.#localDisposalReply = false;
     this.#buffer = Buffer.alloc(0);
     if (this.#createSent && !this.#releasedUncreated) this.#mustRetain = true;
     this.#settle(undefined);
@@ -762,7 +899,12 @@ export class LinuxOciPhysicalSession {
   }
 
   #data(chunk: Buffer) {
-    if (!this.#usable) return;
+    if (!this.#usable) {
+      // exit can precede the final stdout bytes. A disposal reply followed by
+      // expected end must still reject any later bytes before async resume.
+      if (this.#localDisposalReply) this.#break();
+      return;
+    }
     if (!this.#pending || chunk.length > LIMIT + 4 - this.#buffer.length) {
       this.#break();
       return;
@@ -784,7 +926,8 @@ export class LinuxOciPhysicalSession {
           operation === "join-init" ||
           operation === "release-namespace" ||
           operation === "continue-namespace-release" ||
-          operation === "observe-namespace-lifetime"
+          operation === "observe-namespace-lifetime" ||
+          retirementOperation(operation)
         ) {
           if (reply.stage !== operation || reply.custody !== "retained") throw failure();
         } else if (
@@ -795,25 +938,27 @@ export class LinuxOciPhysicalSession {
           throw failure();
       } else if (
         reply.kind !==
-        (operation === "create"
-          ? "linux-oci-created-stopped@1"
-          : operation === "observe"
-            ? "linux-oci-stopped-observation@1"
-            : operation === "start"
-              ? "linux-oci-started@1"
-              : operation === "observe-started"
-                ? "linux-oci-started-observation@1"
-                : operation === "stop-init"
-                  ? "linux-oci-init-reaped@1"
-                  : operation === "join-init"
-                    ? "linux-oci-init-reaped-observation@1"
-                    : operation === "release-namespace"
-                      ? "linux-oci-namespace-release-observation@1"
-                      : operation === "continue-namespace-release"
-                        ? "linux-oci-namespace-release-continuation@1"
-                        : operation === "observe-namespace-lifetime"
-                          ? "linux-oci-namespace-lifetime-observation@1"
-                          : "linux-oci-cancel-observation@1")
+        (retirementOperation(operation)
+          ? RETIREMENT[operation][1]
+          : operation === "create"
+            ? "linux-oci-created-stopped@1"
+            : operation === "observe"
+              ? "linux-oci-stopped-observation@1"
+              : operation === "start"
+                ? "linux-oci-started@1"
+                : operation === "observe-started"
+                  ? "linux-oci-started-observation@1"
+                  : operation === "stop-init"
+                    ? "linux-oci-init-reaped@1"
+                    : operation === "join-init"
+                      ? "linux-oci-init-reaped-observation@1"
+                      : operation === "release-namespace"
+                        ? "linux-oci-namespace-release-observation@1"
+                        : operation === "continue-namespace-release"
+                          ? "linux-oci-namespace-release-continuation@1"
+                          : operation === "observe-namespace-lifetime"
+                            ? "linux-oci-namespace-lifetime-observation@1"
+                            : "linux-oci-cancel-observation@1")
       )
         throw failure();
       if ("nativeId" in reply) {
@@ -856,6 +1001,12 @@ export class LinuxOciPhysicalSession {
           this.#identity = reply;
           this.#mustRetain = true;
         }
+      } else if (!("custody" in reply)) {
+        if (operation === "read-tracked-join") this.#trackedDestructionKnown = true;
+        if (operation === "delete-born" || operation === "join-born-delete")
+          this.#bornDeleteKnown = true;
+        if (operation === "dispose-born" || operation === "continue-born-disposal")
+          this.#localDisposalReply = true;
       } else if (reply.custody === "retained") this.#mustRetain = true;
       else {
         if (this.#mustRetain || this.#identity) throw failure();
@@ -869,7 +1020,13 @@ export class LinuxOciPhysicalSession {
   }
 
   #request(operation: Operation, value: unknown, signal?: AbortSignal): Promise<Reply> {
-    if (!this.#usable || this.#pending) return Promise.reject(failure());
+    if (
+      !this.#usable ||
+      this.#pending ||
+      this.#localDisposalReply ||
+      (this.#trackedJoinAttempted && operation !== "cancel" && !retirementOperation(operation))
+    )
+      return Promise.reject(failure());
     const body = Buffer.from(JSON.stringify(value));
     if (!body.length || body.length > LIMIT) return Promise.reject(failure("request"));
     const frame = Buffer.alloc(body.length + 4);
@@ -903,6 +1060,9 @@ export class LinuxOciPhysicalSession {
         if (operation === "start") this.#startSent = true;
         if (operation === "stop-init") this.#initStopSent = true;
         if (operation === "release-namespace") this.#namespaceReleaseSent = true;
+        if (operation === "begin-tracked-join") this.#trackedJoinSent = true;
+        if (operation === "delete-born") this.#bornDeleteSent = true;
+        if (operation === "dispose-born") this.#bornDisposalSent = true;
         this.#child.stdin.write(frame, (error) => {
           if (error) this.#break();
         });

@@ -585,3 +585,343 @@ test("namespace physical spawn uses an empty environment with no own or inherite
     f.cleanup();
   }
 });
+
+// C28's kind-only facts never certify original accepted custody or full traffic.
+// The original initialized class, framing, stdin and stdout remain under test.
+const retirementOperations = [
+  [
+    "beginTrackedJoin",
+    "linux-oci-begin-tracked-join@1",
+    "linux-oci-tracked-join-handoff@1",
+    "begin-tracked-join",
+  ],
+  [
+    "readTrackedJoin",
+    "linux-oci-read-tracked-join@1",
+    "linux-oci-tracked-owner-destruction@1",
+    "read-tracked-join",
+  ],
+  ["deleteBorn", "linux-oci-delete-born@1", "linux-oci-born-delete-observation@1", "delete-born"],
+  [
+    "joinBornDelete",
+    "linux-oci-join-born-delete@1",
+    "linux-oci-born-delete-join-observation@1",
+    "join-born-delete",
+  ],
+  ["disposeBorn", "linux-oci-dispose-born@1", "linux-oci-local-disposal@1", "dispose-born"],
+  [
+    "continueBornDisposal",
+    "linux-oci-continue-born-disposal@1",
+    "linux-oci-local-disposal-continuation@1",
+    "continue-born-disposal",
+  ],
+] as const;
+function retirementFact(kind: string) {
+  return { kind, barrier: "unproven" };
+}
+function retirementReplies(f: ReturnType<typeof fixture>) {
+  f.onRequest((kind) => {
+    const op = retirementOperations.find(([, requestKind]) => requestKind === kind);
+    if (op) f.reply(retirementFact(op[2]));
+    else f.standard(kind);
+  });
+}
+async function retirementReady(f: ReturnType<typeof fixture>, index: number) {
+  const session = await f.ready();
+  await session.releaseNamespace(signal());
+  retirementReplies(f);
+  for (let step = 0; step < index; step++) {
+    const op = retirementOperations[step];
+    if (!op) throw new Error("missing operation");
+    if (step === 4) {
+      // Only an exact retained initial DISPOSE refusal leaves continuation.
+      f.onRequest(() => f.reply(refused(op[3])));
+      await expect(session[op[0]](signal())).rejects.toThrow();
+      retirementReplies(f);
+    } else await session[op[0]](signal());
+  }
+  return session;
+}
+
+test("retirement wire uses six original nofield operations with exact two-field facts and no legacy close success", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 0);
+    for (const [index, [method, requestKind, replyKind, stage]] of retirementOperations.entries()) {
+      if (index === 4) {
+        f.onRequest(() => f.reply(refused(stage)));
+        await expect(session[method](signal())).rejects.toThrow();
+        retirementReplies(f);
+      } else {
+        const observed = await session[method](signal());
+        expect<unknown>(observed).toEqual(retirementFact(replyKind));
+        expect(Object.keys(observed)).toEqual(["kind", "barrier"]);
+        expect(Object.isFrozen(observed)).toBe(true);
+      }
+      expect(f.writes.at(-1)?.subarray(4).toString()).toBe(JSON.stringify({ kind: requestKind }));
+    }
+    const sent = f.writes.length;
+    await expect(session.continueBornDisposal(signal())).rejects.toThrow();
+    await expect(session.observeNamespaceLifetime(signal())).rejects.toThrow();
+    await expect(session.close()).rejects.toThrow("custody_retained");
+    expect(f.writes).toHaveLength(sent);
+    expect(f.counts()).toEqual({ kills: 0, unrefs: 0 });
+    expect(f.raw).toHaveBeenCalledTimes(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("retirement wire rejects missing original init or namespace phases and every unsent successor without IO", async () => {
+  for (const initialized of [false, true]) {
+    const f = fixture();
+    try {
+      const session = initialized ? await f.ready() : f.open();
+      const sent = f.writes.length;
+      for (const [method] of retirementOperations)
+        await expect(session[method](signal())).rejects.toThrow();
+      expect(f.writes).toHaveLength(sent);
+    } finally {
+      f.cleanup();
+    }
+  }
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 0);
+    const sent = f.writes.length;
+    for (const [method] of retirementOperations.slice(1))
+      await expect(session[method](signal())).rejects.toThrow();
+    expect(f.writes).toHaveLength(sent);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("retirement wire consumes BEGIN DELETE and DISPOSE once and blocks old observers after handoff", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 1);
+    let sent = f.writes.length;
+    await expect(session.beginTrackedJoin(signal())).rejects.toThrow("one_use");
+    await expect(session.observeStopped(signal())).rejects.toThrow();
+    await expect(session.observeStarted(signal())).rejects.toThrow();
+    await expect(session.joinInit(signal())).rejects.toThrow();
+    await expect(session.continueNamespaceRelease(signal())).rejects.toThrow();
+    await expect(session.observeNamespaceLifetime(signal())).rejects.toThrow();
+    await expect(session.deleteBorn(signal())).rejects.toThrow();
+    expect(f.writes).toHaveLength(sent);
+    await session.readTrackedJoin(signal());
+    await session.deleteBorn(signal());
+    sent = f.writes.length;
+    await expect(session.deleteBorn(signal())).rejects.toThrow("one_use");
+    await expect(session.readTrackedJoin(signal())).rejects.toThrow();
+    expect(f.writes).toHaveLength(sent);
+    f.onRequest(() => f.reply(refused("dispose-born")));
+    await expect(session.disposeBorn(signal())).rejects.toThrow();
+    sent = f.writes.length;
+    await expect(session.disposeBorn(signal())).rejects.toThrow("one_use");
+    await expect(session.joinBornDelete(signal())).rejects.toThrow();
+    expect(f.writes).toHaveLength(sent);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("retirement wire permits only same-stream READ JOIN or disposal continuation after exact retained refusal", async () => {
+  for (const [index, successor] of [
+    [0, 1],
+    [2, 3],
+    [4, 5],
+  ] as const) {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, index);
+      const op = retirementOperations[index],
+        next = retirementOperations[successor];
+      f.onRequest(() => f.reply(refused(op[3])));
+      await expect(session[op[0]](signal())).rejects.toThrow();
+      const sent = f.writes.length;
+      await expect(session[op[0]](signal())).rejects.toThrow("one_use");
+      expect(f.writes).toHaveLength(sent);
+      retirementReplies(f);
+      expect<unknown>(await session[next[0]](signal())).toEqual(retirementFact(next[2]));
+      expect(f.writes).toHaveLength(sent + 1);
+      expect(f.raw).toHaveBeenCalledTimes(1);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+for (const [index, [method, , replyKind, stage]] of retirementOperations.entries()) {
+  test(`retirement wire ${method} rejects malformed or foreign canonical replies without retry`, async () => {
+    for (const mode of [
+      "extra",
+      "order",
+      "barrier",
+      "wrong-kind",
+      "frame",
+      "request",
+      "foreign-stage",
+      "uncreated",
+    ]) {
+      const f = fixture();
+      try {
+        const session = await retirementReady(f, index);
+        f.onRequest(() => {
+          if (mode === "extra") f.reply({ ...retirementFact(replyKind), nativeId: claim });
+          if (mode === "order") f.json(JSON.stringify({ barrier: "unproven", kind: replyKind }));
+          if (mode === "barrier") f.reply({ kind: replyKind, barrier: "complete" });
+          if (mode === "wrong-kind")
+            f.reply(retirementFact(retirementOperations[(index + 1) % 6]?.[2] ?? "unknown"));
+          if (mode === "frame" || mode === "request") f.reply(refused(mode));
+          if (mode === "foreign-stage") f.reply(refused("release-namespace"));
+          if (mode === "uncreated") f.reply(refused(stage, "released-uncreated"));
+        });
+        await expect(session[method](signal())).rejects.toThrow();
+        const sent = f.writes.length;
+        retirementReplies(f);
+        for (const [next] of retirementOperations)
+          await expect(session[next](signal())).rejects.toThrow();
+        expect(f.writes).toHaveLength(sent);
+        await expect(session.close()).rejects.toThrow("custody_retained");
+        expect(f.writes).toHaveLength(sent);
+      } finally {
+        f.cleanup();
+      }
+    }
+  });
+
+  test(`retirement wire ${method} seals cancellation after its last reply await`, async () => {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, index),
+        controller = new AbortController();
+      f.onRequest(() => {
+        f.reply(retirementFact(replyKind));
+        queueMicrotask(() => controller.abort());
+      });
+      await expect(session[method](controller.signal)).rejects.toThrow();
+      const sent = f.writes.length;
+      retirementReplies(f);
+      for (const [next] of retirementOperations)
+        await expect(session[next](signal())).rejects.toThrow();
+      expect(f.writes).toHaveLength(sent);
+      await expect(session.close()).rejects.toThrow("custody_retained");
+    } finally {
+      f.cleanup();
+    }
+  });
+}
+
+test("retirement wire loses framing EOF timeout or write failure without any resynchronization", async () => {
+  for (const mode of ["partial", "eof", "timeout", "write-error", "double-frame"]) {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, 0);
+      f.onRequest(() => {
+        if (mode === "partial") {
+          f.bytes(Buffer.from([0, 0]));
+          f.child.stdout.emit("end");
+        }
+        if (mode === "eof") f.child.stdout.emit("end");
+        if (mode === "write-error") f.child.stdin.emit("error", new Error("raw write"));
+        if (mode === "double-frame")
+          f.bytes(
+            Buffer.concat([
+              frame(JSON.stringify(retirementFact(retirementOperations[0][2]))),
+              frame("{}"),
+            ]),
+          );
+      });
+      await expect(session.beginTrackedJoin(signal())).rejects.toThrow();
+      const sent = f.writes.length;
+      retirementReplies(f);
+      await expect(session.readTrackedJoin(signal())).rejects.toThrow();
+      await expect(session.beginTrackedJoin(signal())).rejects.toThrow();
+      expect(f.writes).toHaveLength(sent);
+      expect(f.raw).toHaveBeenCalledTimes(1);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("retirement wire accepts the dedicated disposal reply followed by EOF or zero exit without legacy close success", async () => {
+  for (const index of [4, 5])
+    for (const end of ["eof", "exit", "close"]) {
+      const f = fixture();
+      try {
+        const session = await retirementReady(f, index),
+          op = retirementOperations[index];
+        if (!op) throw new Error("missing operation");
+        f.onRequest(() => {
+          f.reply(retirementFact(op[2]));
+          if (end === "eof") f.child.stdout.emit("end");
+          if (end === "exit") f.child.emit("exit", 0, null);
+          if (end === "close") f.child.emit("close", 0, null);
+        });
+        expect<unknown>(await session[op[0]](signal())).toEqual(retirementFact(op[2]));
+        const sent = f.writes.length;
+        await expect(session.close()).rejects.toThrow("custody_retained");
+        expect(f.writes).toHaveLength(sent);
+      } finally {
+        f.cleanup();
+      }
+    }
+});
+
+test("retirement wire disposal reply cannot hide trailing data abnormal exit cancellation or close before resume", async () => {
+  for (const mode of [
+    "trailing",
+    "exit-trailing",
+    "eof-trailing",
+    "close-trailing",
+    "exit",
+    "signal",
+    "stdout-error",
+    "abort",
+    "close",
+  ]) {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, 4),
+        controller = new AbortController();
+      let closing: Promise<void> | undefined;
+      f.onRequest(() => {
+        f.reply(retirementFact(retirementOperations[4][2]));
+        if (mode === "trailing") f.bytes(Buffer.from([0]));
+        if (mode === "exit-trailing") {
+          f.child.emit("exit", 0, null);
+          f.bytes(Buffer.from([0]));
+        }
+        if (mode === "eof-trailing") {
+          f.child.stdout.emit("end");
+          f.bytes(Buffer.from([0]));
+        }
+        if (mode === "close-trailing") {
+          f.child.emit("close", 0, null);
+          f.bytes(Buffer.from([0]));
+        }
+        if (mode === "exit") f.child.emit("exit", 1, null);
+        if (mode === "signal") f.child.emit("exit", null, "SIGTERM");
+        if (mode === "stdout-error") f.child.stdout.emit("error", new Error("raw stream"));
+        if (mode === "abort") {
+          f.child.stdout.emit("end");
+          queueMicrotask(() => controller.abort());
+        }
+        if (mode === "close") {
+          closing = session.close();
+          closing.catch(() => {});
+        }
+      });
+      await expect(session.disposeBorn(controller.signal)).rejects.toThrow();
+      if (closing) await expect(closing).rejects.toThrow("custody_retained");
+      const sent = f.writes.length;
+      await expect(session.continueBornDisposal(signal())).rejects.toThrow();
+      expect(f.writes).toHaveLength(sent);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
