@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
+import { spawn as importedSpawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as http from "node:http";
 import { request as importedRequest } from "node:http";
@@ -8,6 +10,7 @@ import { CONTAINER_CONTRACT } from "../src/container-contract.ts";
 import { canonicalDigest, isJsonObject, type JsonObject } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { DockerContainerCreateDriver } from "../src/providers/docker-container-create-custody.ts";
+import type { DockerContainerNativeIdentity } from "../src/providers/docker-container-runtime-preparation.ts";
 import type { DockerHttpRevisionOptions } from "../src/providers/docker-http-revision.ts";
 import {
   createSelfhostLinuxDockerCore,
@@ -22,6 +25,7 @@ import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2BackendResult, V2Execution } from "../src/takoform-v2/types.ts";
 import { engineDouble } from "./helpers/docker-container-configured-owner-snapshot.ts";
 import { SOURCE_SELECTION } from "./helpers/docker-container-configured-source-selection.ts";
+import { createRawLinuxDockerStdio } from "./helpers/linux-docker-raw-stdio.ts";
 
 type Engine = NonNullable<DockerHttpRevisionOptions["engine"]>;
 
@@ -76,7 +80,12 @@ function interceptRawHttp(engine: Engine) {
   return () => intercepted.mockRestore();
 }
 
-async function fixture() {
+async function fixture(
+  prepare?: (
+    runtime: SelfhostLinuxDockerAcceptedRevision["runtime"],
+    native: DockerContainerNativeIdentity,
+  ) => Promise<void>,
+) {
   const database = new Database(":memory:");
   migrateSqlite(database);
   const sql = createSqliteSql(database);
@@ -260,6 +269,7 @@ async function fixture() {
     await runtime.createCustody.withAuthority(target, "reconcile", driver, async (session) => {
       const observed = await session.ensureCreated();
       expect(observed?.state).toBe("stopped");
+      if (observed && prepare) await prepare(runtime, observed.native);
     });
   }
   const dispatch = async (execution: V2Execution): Promise<V2BackendResult> => {
@@ -352,7 +362,8 @@ async function fixture() {
       expect(await sql.query("SELECT serving_generation FROM tf_v2_container_instances")).toEqual([
         { serving_generation: null },
       ]);
-      expect(await sql.query("SELECT * FROM tf_v2_container_start_attempts")).toEqual([]);
+      if (!prepare)
+        expect(await sql.query("SELECT * FROM tf_v2_container_start_attempts")).toEqual([]);
       return accepted;
     },
     async remove(uid: string) {
@@ -521,6 +532,129 @@ test("unknown native DELETE ACK resumes exact-ID observation without another DEL
     expect(f.docker.creates()).toHaveLength(1);
     expect(f.docker.starts()).toHaveLength(0);
   } finally {
+    await f.close();
+  }
+});
+
+test("original cleanup UNKNOWN cannot become a fresh empty runtime close after removal", async () => {
+  const f = await fixture((runtime, native) => runtime.ensureRunning(native));
+  const raw = createRawLinuxDockerStdio({
+    containers: f.docker.containers,
+    networkName: f.selection.docker.network,
+    installationId: f.selection.installationId,
+  });
+  let failedGuestCloses = 0;
+  const spawn = spyOn(childProcess, "spawn").mockImplementation(
+    new Proxy(childProcess.spawn, {
+      apply(_target, _receiver, [file, args]) {
+        if (!Array.isArray(args)) throw new Error("raw helper arguments missing");
+        const child = raw.spawn(String(file), args);
+        const emit = child.emit.bind(child);
+        child.emit = (event, ...values) => {
+          if (event === "close" && args.includes("--guest-failclosed")) {
+            failedGuestCloses++;
+            return emit(event, 1, null);
+          }
+          return emit(event, ...values);
+        };
+        return child;
+      },
+    }),
+  );
+  if (!Object.is(importedSpawn, spawn)) throw new Error("raw helper interception unavailable");
+  f.raw((method, path, body) =>
+    path === `/networks/${f.selection.docker.network}`
+      ? Promise.resolve({ status: 200, body: JSON.stringify(raw.network()) })
+      : f.docker.engine(method, path, body),
+  );
+  const reconstructed = createSelfhostLinuxDockerCore({
+    sql: f.sql,
+    clock: () => new Date(),
+    selection: f.selection,
+  });
+  if (!reconstructed) throw new Error("reconstructed creator missing");
+  try {
+    const created = await f.create();
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "pending" },
+    ]);
+    let originalFailure: unknown;
+    let reachedReconstruction = false;
+    f.action(async (execution) => {
+      originalFailure = await f.composition
+        .retireAccepted(execution)
+        .catch((error: unknown) => error);
+      expect(originalFailure).toBeInstanceOf(Error);
+      expect(failedGuestCloses).toBeGreaterThan(0);
+      expect(raw.liveChildren()).toBe(0);
+      expect(await f.sql.query("SELECT state FROM tf_v2_container_create_claims")).toEqual([
+        { state: "removed" },
+      ]);
+      const before = f.docker.calls.length;
+      const commands = raw.commands.length;
+      await expect(f.composition.retireAccepted(execution)).rejects.toThrow(
+        "linux_docker_runtime_preparation_unavailable",
+      );
+      reachedReconstruction = true;
+      // Reading primitives may create a data-only revision-map member; it is
+      // deliberately not the original cleanup result or a retirement permit.
+      await expect(reconstructed.observeRetainedFlowPrimitives(execution)).rejects.toThrow();
+      await expect(reconstructed.retireAccepted(execution)).rejects.toThrow(
+        "retained_scope_unavailable",
+      );
+      expect(f.docker.calls.length).toBe(before);
+      expect(raw.commands.length).toBe(commands);
+    });
+    await f.remove(created.resourceUid);
+    expect(f.failures).toEqual([]);
+    expect(reachedReconstruction).toBe(true);
+    expect(f.docker.creates()).toHaveLength(1);
+    expect(f.docker.calls.filter(({ method }) => method === "DELETE")).toHaveLength(1);
+  } finally {
+    try {
+      await reconstructed.close();
+      await expect(f.close()).rejects.toThrow("linux_docker_runtime_preparation_unavailable");
+    } finally {
+      spawn.mockRestore();
+    }
+  }
+});
+
+test("original successful cleanup result rejoins without native resend and refuses reconstruction", async () => {
+  const f = await fixture();
+  const reconstructed = createSelfhostLinuxDockerCore({
+    sql: f.sql,
+    clock: () => new Date(),
+    selection: f.selection,
+  });
+  if (!reconstructed) throw new Error("reconstructed creator missing");
+  try {
+    const created = await f.create();
+    let originalRejoined = false;
+    f.action(async (execution) => {
+      await f.composition.retireAccepted(execution);
+      const before = f.docker.calls.length;
+      await f.composition.retireAccepted(execution);
+      originalRejoined = true;
+      expect(f.docker.calls.length).toBe(before);
+      const cancelled = new AbortController();
+      cancelled.abort();
+      await expect(f.composition.retireAccepted(execution, cancelled.signal)).rejects.toThrow(
+        "retirement_cancelled",
+      );
+      await expect(reconstructed.retireAccepted(execution)).rejects.toThrow(
+        "retained_scope_unavailable",
+      );
+      expect(f.docker.calls.length).toBe(before);
+    });
+    await f.remove(created.resourceUid);
+    expect(originalRejoined).toBe(true);
+    expect(f.failures).toEqual([]);
+    expect(f.docker.creates()).toHaveLength(1);
+    expect(f.docker.starts()).toHaveLength(0);
+    expect(f.docker.calls.filter(({ method }) => method === "DELETE")).toHaveLength(1);
+  } finally {
+    await reconstructed.close();
     await f.close();
   }
 });

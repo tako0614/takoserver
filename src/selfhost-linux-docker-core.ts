@@ -161,6 +161,12 @@ export function createSelfhostLinuxDockerCore(input: {
     maxSecretBytes: selection.configuredInputs.maxSecretBytes,
   });
   const revisions = new Map<string, Omit<SelfhostLinuxDockerAcceptedRevision, "accepted">>();
+  // Only an actual original close operation supplies this result. A rebuilt
+  // runtime or a removed SQL tombstone cannot join historical helper cleanup.
+  const cleanup = new Map<
+    string,
+    { readonly claimId: string; readonly nativeId: string; readonly closing: Promise<void> }
+  >();
   const scopes = new Set<Promise<unknown>>();
   const retainedCancellation = new Set<AbortController>();
   let closed = false;
@@ -176,6 +182,7 @@ export function createSelfhostLinuxDockerCore(input: {
       request: DockerHttpRevision,
       nativeId: string,
       key: string,
+      record: DockerContainerAcceptedExecution["retained"][number]["record"],
     ) => Promise<T>,
   ): Promise<T[]> {
     assertOpen();
@@ -279,7 +286,7 @@ export function createSelfhostLinuxDockerCore(input: {
           }
           // Original custody still decides whether this old generation is
           // actually removable; a current execution is no remove grant.
-          results.push(await work(revision, request, nativeId, key));
+          results.push(await work(revision, request, nativeId, key, record));
           assertRemovalOpen();
         }
         return results;
@@ -365,9 +372,26 @@ export function createSelfhostLinuxDockerCore(input: {
       return running;
     },
     async retireAccepted(execution: V2Execution, signal?: AbortSignal): Promise<void> {
-      await withRetained(execution, signal, async (revision, request, nativeId, key) => {
-        await revision.docker.remove(request, nativeId, signal);
-        await revision.runtime.close();
+      await withRetained(execution, signal, async (revision, request, nativeId, key, record) => {
+        let original = cleanup.get(key);
+        if (original) {
+          if (original.claimId !== record.claimId || original.nativeId !== nativeId)
+            throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+        } else {
+          if (record.state === "removed")
+            throw new SelfhostLinuxDockerCoreError("retained_scope_unavailable");
+          await revision.docker.remove(request, nativeId, signal);
+          // Register this exact original cleanup before it starts. Its pending,
+          // failed or successful outcome survives same-creator retries; none is
+          // reconstructed from an empty runtime, a marker or a caller result.
+          original = Object.freeze({
+            claimId: record.claimId,
+            nativeId,
+            closing: Promise.resolve().then(() => revision.runtime.close()),
+          });
+          cleanup.set(key, original);
+        }
+        await original.closing;
         revisions.delete(key);
       });
     },
