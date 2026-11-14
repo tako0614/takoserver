@@ -215,6 +215,12 @@ test("Console selection and real SQLite Host resource create/update/unknown dele
   let stopIdentity: (() => void) | undefined;
   const failures: unknown[] = [];
   const requests: { method: string; path: string; status: number; selected: string | null }[] = [];
+  const deleteRequests: {
+    key: string | null;
+    generation: string | null;
+    selected: string | null;
+    originalSession: boolean;
+  }[] = [];
   let dropDelete = false;
   let lostDeleteId: string | null = null;
   try {
@@ -311,6 +317,14 @@ test("Console selection and real SQLite Host resource create/update/unknown dele
         original.headers.set("origin", CONSOLE);
         if (original.credentials === "include")
           original.headers.set("cookie", `takoserver_session=${OWNER_SESSION}`);
+        if (original.method === "DELETE")
+          deleteRequests.push({
+            key: original.headers.get("idempotency-key"),
+            generation: original.headers.get("takoform-expected-generation"),
+            selected: original.headers.get("takoform-organization"),
+            originalSession:
+              original.headers.get("cookie") === `takoserver_session=${OWNER_SESSION}`,
+          });
         const response = await app.fetch(original);
         requests.push({
           method: original.method,
@@ -493,18 +507,55 @@ test("Console selection and real SQLite Host resource create/update/unknown dele
     expect(intent.body).toEqual({ action: "delete", uid: first.uid, generation: 2 });
     expect(intent.operationId).toBeNull();
     const sentAt = intent.firstSentAt;
+    const originalKey = intent.key;
+    const originalPrincipal = state.principal();
+    const originalOrganization = state.currentOrganization();
     const beforeResend = requests.filter((row) => row.method !== "GET").length;
     await expect(
       sendResourceIntent(intent.id, sentAt + intent.replayWindowSeconds * 1000 + 1),
     ).rejects.toMatchObject({ code: "replay_window_expired" });
     expect(requests.filter((row) => row.method !== "GET")).toHaveLength(beforeResend);
+
+    // The dropped raw ACK is a comparison oracle only. The real Console must
+    // discover that Operation via its original same-key recovery action.
+    button("Retry exact request", frame).click();
+    await waitFor(
+      "normal Console discovers the original delete Operation",
+      () =>
+        route().query.get("operation") === lostDeleteId &&
+        intent.operationId === lostDeleteId &&
+        !intent.inFlight,
+    );
+    const recoveredDeleteId = route().query.get("operation");
+    if (recoveredDeleteId === null) throw new Error("normal delete recovery returned no handle");
+    expect(recoveredDeleteId === lostDeleteId).toBe(true);
+    expect(route().query.get("intent") === intent.id).toBe(true);
+    expect(route().query.get("acceptance")).toBeNull();
+    expect(intent.firstSentAt === sentAt && intent.key === originalKey).toBe(true);
+    expect(intent.uncertain).toBe(false);
+    expect(state.principal() === originalPrincipal).toBe(true);
+    expect(state.currentOrganization() === originalOrganization).toBe(true);
+    expect(deleteRequests).toHaveLength(2);
+    expect(
+      deleteRequests.every(
+        (request) =>
+          request.key !== null &&
+          request.key === originalKey &&
+          request.generation === "2" &&
+          request.selected === organization.id &&
+          request.originalSession,
+      ),
+    ).toBe(true);
+    expect(await sql.query("SELECT id FROM tf_v2_operations")).toHaveLength(3);
+    expect(existsSync(file)).toBe(true);
     expect(await app.tickTakoformV2()).toMatchObject({
-      id: lostDeleteId,
+      id: recoveredDeleteId,
       action: "delete",
       status: "succeeded",
     });
-    expect(await state.api.resourceOperation(organization.id, lostDeleteId)).toMatchObject({
-      id: lostDeleteId,
+    expect(await app.tickTakoformV2()).toBeNull();
+    expect(await state.api.resourceOperation(organization.id, recoveredDeleteId)).toMatchObject({
+      id: recoveredDeleteId,
       status: "succeeded",
       effect: "complete",
     });
@@ -525,7 +576,7 @@ test("Console selection and real SQLite Host resource create/update/unknown dele
     ).toHaveLength(1);
     expect(
       requests.filter((row) => row.method === "DELETE" && row.path.endsWith(first.uid)),
-    ).toHaveLength(1);
+    ).toHaveLength(2);
     expect(requests.some((row) => row.path === "/v1/me" && row.status === 200)).toBe(true);
     expect(failures).toEqual([]);
   } finally {
