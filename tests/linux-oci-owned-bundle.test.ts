@@ -216,6 +216,7 @@ async function fixture(
   let normalTime = Date.now();
   const normalClock = () => new Date(normalTime);
   let recreateNormal: (() => ReturnType<typeof createSelfhostLinuxOciContainerBackend>) | undefined;
+  let recreateParent: (() => ReturnType<typeof createLinuxOciOwnedBundle>) | undefined;
   const compose = (
     options: LinuxOciOwnedBundleOptions & {
       readonly configuredInputs: NonNullable<LinuxOciOwnedBundleOptions["configuredInputs"]>;
@@ -234,6 +235,7 @@ async function fixture(
         },
       });
     }
+    if (adversarial.parentControl) recreateParent = () => createLinuxOciOwnedBundle(options);
     if (adversarial.normalBackend) {
       const { sql, clock, ...selection } = options;
       recreateNormal = () => createSelfhostLinuxOciContainerBackend({ sql, clock, selection });
@@ -662,6 +664,10 @@ async function fixture(
     accepted = execution;
     try {
       await beforeLoan?.(execution);
+      if (adversarial.parentControl && execution.action === "delete") {
+        await beforeRetire?.(execution);
+        return composition.retainedForm.backend.execute(execution);
+      }
       if (adversarial.nativeMode !== undefined) {
         if (
           execution.action === "delete" &&
@@ -820,6 +826,10 @@ async function fixture(
     configuredInputs,
     advanceNormalClock(milliseconds: number) {
       normalTime += milliseconds;
+    },
+    reconstructParent() {
+      if (!recreateParent) throw new Error("original parent selection absent");
+      return recreateParent();
     },
     reconstructNormal() {
       if (!recreateNormal) throw new Error("normal backend mode absent");

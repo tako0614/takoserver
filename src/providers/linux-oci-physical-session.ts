@@ -4,6 +4,7 @@ import { isAbsolute, join, parse } from "node:path";
 import { canonicalDigest } from "../json.ts";
 import type { V2PrivateInputKey } from "../takoform-v2/private-inputs.ts";
 import {
+  decodeContainerSecretBytes,
   encodeContainerSecretBytes,
   encryptContainerSecretBytes,
   isContainerSecretKey,
@@ -1439,6 +1440,59 @@ export class LinuxOciParentBootstrap {
     this.assertCurrent(signal);
     this.#created = true;
     return Object.freeze({ session, observation });
+  }
+
+  /** Compare decrypted data with THIS original live bootstrap. This is not a
+   * restart peer proof and cannot adopt a P from an endpoint or decoded DTO. */
+  verifySealedControl(value: unknown, signal: AbortSignal): void {
+    this.assertCurrent(signal);
+    const keys = [
+      "kind",
+      "claimId",
+      "generation",
+      "listenerCookie",
+      "capability",
+      "executable",
+      "createDigest",
+    ];
+    if (
+      !record(value) ||
+      Reflect.ownKeys(value).length !== keys.length ||
+      !keys.every((key) =>
+        Object.hasOwn(Object.getOwnPropertyDescriptor(value, key) ?? {}, "value"),
+      ) ||
+      value.kind !== "linux-oci-original-control@1" ||
+      value.claimId !== this.#claim ||
+      value.generation !== this.#generation ||
+      value.listenerCookie !== this.#info?.listenerCookie ||
+      !this.#sealAttempted ||
+      typeof value.capability !== "string" ||
+      typeof value.createDigest !== "string" ||
+      !DIGEST.test(value.createDigest) ||
+      !record(value.executable)
+    )
+      throw failure("parent_binding");
+    const executable = value.executable,
+      names = ["path", "dev", "ino", "uid", "mode"] as const;
+    if (
+      Reflect.ownKeys(executable).length !== names.length ||
+      !names.every(
+        (key) =>
+          Object.hasOwn(Object.getOwnPropertyDescriptor(executable, key) ?? {}, "value") &&
+          executable[key] === this.#binaryIdentity[key],
+      )
+    )
+      throw failure("parent_binding");
+    const capability = decodeContainerSecretBytes(value.capability);
+    try {
+      if (capability.length !== 32) throw failure("parent_binding");
+      let difference = 0;
+      for (let i = 0; i < 32; i++) difference |= capability[i]! ^ this.#capability[i]!;
+      if (difference) throw failure("parent_binding");
+      this.assertCurrent(signal);
+    } finally {
+      capability.fill(0);
+    }
   }
 
   /** Only after original CREATE, bindNative and fresh same-Sql guard. This

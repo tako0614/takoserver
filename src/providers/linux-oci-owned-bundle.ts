@@ -109,6 +109,7 @@ const assertOriginalParent = LinuxOciParentBootstrap.prototype.assertCurrent;
 const sealOriginalParent = LinuxOciParentBootstrap.prototype.sealControlBinding;
 const createOriginalParent = LinuxOciParentBootstrap.prototype.createStopped;
 const finishOriginalParent = LinuxOciParentBootstrap.prototype.finishCreateScope;
+const verifyOriginalParent = LinuxOciParentBootstrap.prototype.verifySealedControl;
 
 /** Source-only same-key lookup for the Core's original won-claim save. No
  * caller registration, foreign parent/receipt or positive observation is used. */
@@ -147,6 +148,72 @@ export async function sealOriginalLinuxOciParentControl(
   if (originalLinuxOciParentControlSource(original, core, record, signal) !== entry)
     return fail("parent_custody");
   return sealed;
+}
+
+/** Fresh readback of this constructor's ORIGINAL allocation only. The
+ * receipt is input to authenticated Sql context, never a session factory. */
+export async function readOriginalLinuxOciControlArtifact(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+) {
+  const custody = originalOciCustodies.get(original),
+    allocation = custody?.allocations.get(record.claimId);
+  if (
+    !custody ||
+    custody.core !== core ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    !allocation ||
+    allocation.intent !== canonicalJson(record.intent) ||
+    allocation.cleanup === "unknown"
+  )
+    return fail("parent_custody");
+  if (allocation.cleanup === "removed") await assertOriginalAllocationAbsent(allocation);
+  else {
+    await assertOriginalAllocationParents(allocation);
+    await privateDirectory(allocation.root.path);
+    await assertOriginalFile(allocation.root, true);
+    await assertOriginalFile(allocation.receipt, false);
+    if ((await readFile(allocation.receipt.path, "utf8")) !== allocation.receiptBytes)
+      return fail("allocation_identity");
+    await assertOriginalFile(allocation.receipt, false);
+  }
+  const entry = custody.parents.get(record.claimId);
+  if (
+    !entry ||
+    entry.record.claimId !== record.claimId ||
+    canonicalJson(entry.record.intent) !== canonicalJson(record.intent) ||
+    JSON.stringify(entry.receipt) !== allocation.receiptBytes ||
+    custody.signal.aborted ||
+    signal.aborted
+  )
+    return fail("parent_custody");
+  if (custody.signal.aborted || signal.aborted) return fail("parent_custody");
+  return entry.receipt;
+}
+/** Decrypted data is compared to the genuine in-memory P only. No successful
+ * endpoint/ACK path or restart replacement is manufactured by this bridge. */
+export function verifyOriginalLinuxOciParentControl(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  value: unknown,
+  signal: AbortSignal,
+) {
+  const custody = originalOciCustodies.get(original),
+    entry = custody?.parents.get(record.claimId);
+  if (
+    !custody ||
+    custody.core !== core ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    !entry ||
+    canonicalJson(entry.record.intent) !== canonicalJson(record.intent)
+  )
+    return fail("parent_custody");
+  verifyOriginalParent.call(entry.parent, value, signal);
 }
 
 type OriginalFileIdentity = {
@@ -1550,6 +1617,71 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       return closing;
     },
   });
+  function readRetainedParentControls(
+    execution: V2Execution,
+    externalSignal?: AbortSignal,
+  ): Promise<void> {
+    if (closed || parentMode !== "sealed-original@1")
+      return Promise.reject(new Error("linux_oci_owned_bundle_parent_unavailable"));
+    if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
+      return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
+    const cancel = new AbortController(),
+      abort = () => cancel.abort();
+    cancellation.add(cancel);
+    externalSignal?.addEventListener("abort", abort, { once: true });
+    if (externalSignal?.aborted) abort();
+    const timer = setTimeout(abort, timeout);
+    const running = Promise.resolve().then(() =>
+      core.withExecution(execution, async () => {
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        const accepted = await core.readAcceptedExecution(execution);
+        if (!accepted.retained.length) return fail("parent_unavailable");
+        for (const item of accepted.retained) {
+          const { record } = item;
+          if (item.removedAtMs !== null || record.state === "removed")
+            return fail("parent_unavailable");
+          const phase =
+            accepted.action === "delete" || record.intent.policy.generation < accepted.generation
+              ? "remove"
+              : "reconcile";
+          await core.owner.withAuthority(record, phase, async (held) => {
+            const loan = new AbortController(),
+              revoke = () => loan.abort();
+            cancel.signal.addEventListener("abort", revoke, { once: true });
+            held.revocation.addEventListener("abort", revoke, { once: true });
+            if (cancel.signal.aborted || held.revocation.aborted) revoke();
+            try {
+              if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+              await core.readAcceptedParentControl(
+                execution,
+                record,
+                originalNativeCustody,
+                loan.signal,
+              );
+              if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+            } finally {
+              loan.abort();
+              cancel.signal.removeEventListener("abort", revoke);
+              held.revocation.removeEventListener("abort", revoke);
+            }
+          });
+        }
+        if (closed || cancel.signal.aborted) return fail("revoked");
+      }),
+    );
+    scopes.add(running);
+    void running
+      .finally(() => {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener("abort", abort);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+      })
+      .catch(() => undefined);
+    return running;
+  }
   // The normal backend closes over this ORIGINAL creator. Its execution input
   // selects no owner, native session, health callback or publication receipt.
   async function dispatch(
@@ -1572,6 +1704,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         core.readAcceptedExecution(execution),
       );
       local();
+      if (parentMode === "sealed-original@1" && accepted.retained.length) {
+        await creator.readRetainedParentControls(execution, cancel.signal);
+        local();
+      }
       if (accepted.action === "delete") {
         await creator.disposeRetainedBornOwners(execution, cancel.signal);
         local();
@@ -1691,6 +1827,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     }),
   });
   const creator = Object.freeze({
+    /** Original same-Sql binding readback only; no restart peer/session adoption. */
+    readRetainedParentControls,
     /** Internal normal Form only; no registration or Node entry activation. */
     formUrl: V2_CONTAINER_F2_FORM,
     retainedForm,
