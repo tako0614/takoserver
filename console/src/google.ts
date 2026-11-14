@@ -80,8 +80,15 @@ export type GoogleReturnResult =
 export function readGoogleReturn(): GoogleReturnResult {
   if (window.location.pathname !== RETURN_PATH) return { kind: "none" };
   const fragment = window.location.hash.replace(/^#/u, "");
-  const stored = sessionStorage.getItem(PENDING_KEY);
-  sessionStorage.removeItem(PENDING_KEY);
+  let stored: string | null = null;
+  try {
+    stored = sessionStorage.getItem(PENDING_KEY);
+    sessionStorage.removeItem(PENDING_KEY);
+  } catch {
+    // Unreadable or unconsumed state cannot authorize a return. Still clear
+    // the callback URL and let the ordinary sign-in screen recover.
+    stored = null;
+  }
   const clear = (): void => {
     navigate("/", { replace: true });
   };
@@ -107,7 +114,27 @@ export function readGoogleReturn(): GoogleReturnResult {
     };
   }
 
-  const pending = stored ? (JSON.parse(stored) as Pending) : null;
+  let pending: Pending | null = null;
+  try {
+    const value: unknown = stored ? JSON.parse(stored) : null;
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      !Array.isArray(value) &&
+      "state" in value &&
+      typeof value.state === "string" &&
+      value.state !== "" &&
+      "nonce" in value &&
+      typeof value.nonce === "string" &&
+      value.nonce !== "" &&
+      "from" in value &&
+      typeof value.from === "string" &&
+      value.from !== ""
+    )
+      pending = { state: value.state, nonce: value.nonce, from: value.from };
+  } catch {
+    // Pending browser storage can be damaged; it is not a verified identity.
+  }
   const idToken = params.get("id_token");
   if (!pending || !idToken) {
     return {
