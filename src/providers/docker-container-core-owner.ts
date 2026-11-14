@@ -5,6 +5,7 @@ import { parseStrictJson } from "../strict-json.ts";
 import { readV2ConfiguredPrivateInputs } from "../takoform-v2/configured-private-inputs.ts";
 import {
   createV2ContainerHostAcceptance,
+  inspectV2ContainerOwnerAllocationSchema,
   inspectV2ContainerOwnerControlSchema,
   serializeV2ContainerConfiguredPrivateInputs,
   V2_CONTAINER_CONTROL_RESERVED,
@@ -2562,6 +2563,93 @@ export function createDockerContainerCoreOwner(
                 // Exact original P's H join/EOF record only; no removed CAS or
                 // allocation cleanup is authorized by this private handoff.
                 read.observeHelperExited(signal);
+                if (await inspectV2ContainerOwnerAllocationSchema(sql)) {
+                  const cleanup = await sql.query(
+                    "SELECT allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=?",
+                    [
+                      input.intent.resourceUid,
+                      input.intent.policy.generation,
+                      input.claimId,
+                      input.nativeId,
+                      raw,
+                    ],
+                  );
+                  if (cleanup.length !== 1) return fail();
+                  if (cleanup[0]?.allocation_cleanup === "untouched") {
+                    await read.prepareAllocationDisposal(signal);
+                    await assertExecution(execution);
+                    const beforeCleanup = await boundStartRecord(input);
+                    if (!usable(beforeCleanup.proof, "remove") || !(await current(lease)))
+                      return fail();
+                    const cleanupGuard = fence(beforeCleanup.proof);
+                    if (
+                      signal.aborted ||
+                      !lease.active ||
+                      lease.controller.signal.aborted ||
+                      !leases.has(lease)
+                    )
+                      return fail();
+                    executionScope(execution);
+                    read.assertCurrent();
+                    read.observeHelperExited(signal);
+                    const consume = await sql.run(
+                      "UPDATE tf_v2_container_create_claims SET allocation_cleanup='consumed' WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=? AND allocation_cleanup='untouched' AND " +
+                        cleanupGuard.sql,
+                      [
+                        input.intent.resourceUid,
+                        input.intent.policy.generation,
+                        input.claimId,
+                        input.nativeId,
+                        raw,
+                        ...cleanupGuard.params,
+                      ],
+                    );
+                    if (consume.changes !== 1) return fail(); // lost receipt never dispatches rm
+                    await assertExecution(execution);
+                    if (!(await current(lease))) return fail();
+                    if (
+                      signal.aborted ||
+                      !lease.active ||
+                      lease.controller.signal.aborted ||
+                      !leases.has(lease)
+                    )
+                      return fail();
+                    executionScope(execution);
+                    read.assertCurrent();
+                    read.observeHelperExited(signal);
+                    await read.disposeAllocation(signal); // first destructive await consumes private slot too
+                    await assertExecution(execution);
+                    if (!(await current(lease))) return fail();
+                    if (
+                      signal.aborted ||
+                      !lease.active ||
+                      lease.controller.signal.aborted ||
+                      !leases.has(lease)
+                    )
+                      return fail();
+                    executionScope(execution);
+                    read.assertCurrent();
+                    read.observeHelperExited(signal);
+                    const completed = await sql.run(
+                      "UPDATE tf_v2_container_create_claims SET allocation_cleanup='closed' WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=? AND allocation_cleanup='consumed' AND " +
+                        cleanupGuard.sql,
+                      [
+                        input.intent.resourceUid,
+                        input.intent.policy.generation,
+                        input.claimId,
+                        input.nativeId,
+                        raw,
+                        ...cleanupGuard.params,
+                      ],
+                    );
+                    if (completed.changes !== 1) return fail();
+                  } else {
+                    const state = cleanup[0]?.allocation_cleanup;
+                    if (state !== null && state !== "consumed" && state !== "closed") return fail();
+                  }
+                  // Historical NULL and consumed UNKNOWN never acquire untouched
+                  // from this fresh creator or from a path/absence observation.
+                }
               }
               if (observation.operation === "join-init") {
                 // Only the same actual private connector can supply this original
@@ -2669,6 +2757,8 @@ export function createDockerContainerCoreOwner(
         policyDigest: input.intent.policy.policyDigest,
         artifact: entry.receipt,
       });
+      const initializeAllocation =
+        parentMode === "sealed-peer@1" && (await inspectV2ContainerOwnerAllocationSchema(sql));
       freshControlClaims.delete(input); // consumed before async sealing/save, never a retry grant
       const sealed = await sealOriginalLinuxOciParentControl(
         originalCustody,
@@ -2691,7 +2781,9 @@ export function createDockerContainerCoreOwner(
       const document = canonicalJson({ kind: "linux-oci-sealed-control@1", scope, ...sealed });
       if (!lease.active || lease.controller.signal.aborted || signal.aborted) return fail();
       const write = await sql.run(
-        "UPDATE tf_v2_container_create_claims SET native_control=? WHERE resource_uid=? AND generation=? AND claim_id=? AND state='pending' AND native_id IS NULL AND native_control=? AND " +
+        "UPDATE tf_v2_container_create_claims SET native_control=?" +
+          (initializeAllocation ? ",allocation_cleanup='untouched'" : "") +
+          " WHERE resource_uid=? AND generation=? AND claim_id=? AND state='pending' AND native_id IS NULL AND native_control=? AND " +
           guard.sql,
         [
           document,

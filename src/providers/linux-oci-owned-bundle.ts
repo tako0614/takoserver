@@ -253,7 +253,7 @@ type OriginalOciAllocation = {
   readonly rootfs: OriginalFileIdentity;
   readonly receipt: OriginalFileIdentity;
   readonly receiptBytes: string;
-  cleanup: "untouched" | "prepared" | "unknown" | "removed";
+  cleanup: "untouched" | "authenticated" | "prepared" | "unknown" | "removed";
 };
 
 async function originalFileIdentity(path: string, directory: boolean) {
@@ -407,7 +407,7 @@ async function authenticatedOriginalPeerSource(
     rootfs: file(a.rootfs),
     receipt: file(a.receipt),
     receiptBytes: a.receiptBytes,
-    cleanup: "untouched",
+    cleanup: "authenticated",
   };
   const expectedParents: string[] = [];
   let path = parse(custody.artifactRoot).root;
@@ -434,7 +434,7 @@ async function authenticatedOriginalPeerSource(
     return fail("allocation_identity");
   await assertOriginalFile(captured.receipt, false);
   if (custody.signal.aborted || signal.aborted) return fail("parent_custody");
-  return { custody, binary: custody.physicalBinary };
+  return { custody, binary: custody.physicalBinary, allocation: captured };
 }
 export async function prepareOriginalLinuxOciPeerRead(
   original: object,
@@ -472,7 +472,7 @@ export async function prepareOriginalLinuxOciPeerInit(
   binding: unknown,
   signal: AbortSignal,
 ) {
-  const { custody, binary } = await authenticatedOriginalPeerSource(
+  const { custody, binary, allocation } = await authenticatedOriginalPeerSource(
     original,
     core,
     record,
@@ -483,6 +483,22 @@ export async function prepareOriginalLinuxOciPeerInit(
   if (custody.peerReads.has(record.claimId) || signal.aborted || custody.signal.aborted)
     return fail("parent_custody");
   const control = prepareAuthenticatedLinuxOciPeerInit(binary, binding, custody.signal);
+  let preparedHelper: LinuxOciParentHResult | undefined;
+  const peerAllocationCurrent = (actualSignal: AbortSignal) => {
+    const held = custody.peerReads.get(record.claimId);
+    if (
+      signal !== actualSignal ||
+      signal.aborted ||
+      custody.signal.aborted ||
+      !held ||
+      held.custody !== control ||
+      held.settlement !== control.settlement
+    )
+      return fail("parent_custody");
+    const helper = control.observeHelperExited(actualSignal);
+    if (preparedHelper && preparedHelper !== helper) return fail("parent_custody");
+    return helper;
+  };
   return Object.freeze({
     ...control,
     advanceNamespace(nativeId: string, actualSignal: AbortSignal) {
@@ -497,6 +513,26 @@ export async function prepareOriginalLinuxOciPeerInit(
       )
         return fail("parent_custody");
       return control.advanceNamespace(nativeId, actualSignal);
+    },
+    async prepareAllocationDisposal(actualSignal: AbortSignal) {
+      if (allocation.cleanup !== "authenticated") return fail("allocation_custody_unknown");
+      const helper = peerAllocationCurrent(actualSignal);
+      await control.settlement; // same exact joined/closed connector Promise
+      await assertOriginalAllocationPresent(allocation);
+      if (peerAllocationCurrent(actualSignal) !== helper) return fail("parent_custody");
+      preparedHelper = helper;
+      allocation.cleanup = "prepared";
+    },
+    async disposeAllocation(actualSignal: AbortSignal) {
+      peerAllocationCurrent(actualSignal);
+      if (!preparedHelper || allocation.cleanup !== "prepared")
+        return fail("allocation_custody_unknown");
+      await removePreparedOriginalAllocation(allocation, actualSignal);
+      peerAllocationCurrent(actualSignal);
+      return Object.freeze({
+        kind: "linux-oci-original-allocation-disposal@1",
+        barrier: "unproven",
+      });
     },
     observeHelperExited(actualSignal: AbortSignal) {
       const held = custody.peerReads.get(record.claimId);
@@ -573,6 +609,16 @@ function originalAllocation(
   return { custody, allocation, session };
 }
 
+async function assertOriginalAllocationPresent(allocation: OriginalOciAllocation) {
+  await assertOriginalAllocationParents(allocation);
+  await privateDirectory(allocation.root.path);
+  await assertOriginalFile(allocation.root, true);
+  await assertOriginalFile(allocation.rootfs, true);
+  await assertOriginalFile(allocation.receipt, false);
+  if ((await readFile(allocation.receipt.path, "utf8")) !== allocation.receiptBytes)
+    return fail("allocation_identity");
+}
+
 /** Internal original-key bridge. This preflight is not an authorization receipt. */
 export async function prepareOriginalLinuxOciAllocationDisposal(
   original: object,
@@ -583,17 +629,24 @@ export async function prepareOriginalLinuxOciAllocationDisposal(
   const { allocation, session } = originalAllocation(original, core, record, signal);
   await closeOriginalOciDisposedHelper.call(session);
   if (allocation.cleanup === "removed") await assertOriginalAllocationAbsent(allocation);
-  else {
-    await assertOriginalAllocationParents(allocation);
-    await privateDirectory(allocation.root.path);
-    await assertOriginalFile(allocation.root, true);
-    await assertOriginalFile(allocation.rootfs, true);
-    await assertOriginalFile(allocation.receipt, false);
-    if ((await readFile(allocation.receipt.path, "utf8")) !== allocation.receiptBytes)
-      return fail("allocation_identity");
-  }
+  else await assertOriginalAllocationPresent(allocation);
   originalAllocation(original, core, record, signal);
   if (allocation.cleanup === "untouched") allocation.cleanup = "prepared";
+}
+
+async function removePreparedOriginalAllocation(
+  allocation: OriginalOciAllocation,
+  signal: AbortSignal,
+) {
+  if (allocation.cleanup === "prepared") {
+    // Consumed before the first destructive await. Error/cancel/partial result
+    // cannot be repaired by absence or another rm on a later Engine lease.
+    allocation.cleanup = "unknown";
+    await rm(allocation.root.path, { recursive: true, force: false });
+    if (signal.aborted) return fail("revoked");
+    await assertOriginalAllocationAbsent(allocation);
+    allocation.cleanup = "removed";
+  } else await assertOriginalAllocationAbsent(allocation);
 }
 
 /** Only the original prepared allocation may be removed once. A failed or
@@ -609,15 +662,7 @@ export async function disposeOriginalLinuxOciAllocation(
     return fail("allocation_custody_unknown");
   assertOriginalOciDisposedHelperClosed.call(session);
   originalAllocation(original, core, record, signal);
-  if (allocation.cleanup === "prepared") {
-    // Consumed before the first destructive await. Error/cancel/partial result
-    // cannot be repaired by absence or another rm on a later Engine lease.
-    allocation.cleanup = "unknown";
-    await rm(allocation.root.path, { recursive: true, force: false });
-    if (signal.aborted) return fail("revoked");
-    await assertOriginalAllocationAbsent(allocation);
-    allocation.cleanup = "removed";
-  } else await assertOriginalAllocationAbsent(allocation);
+  await removePreparedOriginalAllocation(allocation, signal);
   originalAllocation(original, core, record, signal);
   return Object.freeze({ kind: "linux-oci-original-allocation-disposal@1", barrier: "unproven" });
 }

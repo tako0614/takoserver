@@ -632,9 +632,92 @@ const controlReady =
     controlNames,
   ) +
   ")";
+/** Optional second additive expand. Existing recipes/statements are immutable.
+ * NULL is historical/unknown. Only one fresh reserved->sealed peer save may
+ * initialize untouched; consumed is persisted before rm and never rolls back.
+ * closed records this allocation's known local cleanup, not Resource removal. */
+const allocationColumn =
+  "allocation_cleanup TEXT CHECK (allocation_cleanup IS NULL OR allocation_cleanup IN ('untouched','consumed','closed'))";
+const allocationGuards = Object.freeze([
+  trigger(
+    "allocation_cleanup_insert",
+    Q,
+    "BEFORE INSERT",
+    refuse("NEW.allocation_cleanup IS NULL"),
+  ),
+  trigger(
+    "allocation_cleanup_transition",
+    Q,
+    "BEFORE UPDATE",
+    refuse(`
+    NEW.allocation_cleanup IS OLD.allocation_cleanup OR
+    (OLD.allocation_cleanup IS NULL AND NEW.allocation_cleanup = 'untouched'
+      AND OLD.state = 'pending' AND NEW.state = 'pending' AND NEW.native_id IS NULL
+      AND OLD.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)}
+      AND json_extract(NEW.native_control,'$.kind') = 'linux-oci-sealed-control@1'
+      AND json_extract(NEW.native_control,'$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1') OR
+    (OLD.allocation_cleanup = 'untouched' AND NEW.allocation_cleanup = 'consumed'
+      AND OLD.state = 'bound' AND NEW.state = 'bound' AND NEW.native_control IS OLD.native_control) OR
+    (OLD.allocation_cleanup = 'consumed' AND NEW.allocation_cleanup = 'closed'
+      AND OLD.state = 'bound' AND NEW.state = 'bound' AND NEW.native_control IS OLD.native_control)`),
+  ),
+]);
+const allocationObjects = Object.freeze([
+  ...controlObjects.map((item) =>
+    item.name === Q
+      ? object(
+          item.type,
+          item.name,
+          item.table,
+          item.sql.replace(
+            ",\n  PRIMARY KEY (resource_uid, generation),",
+            ", " + allocationColumn + ",\n  PRIMARY KEY (resource_uid, generation),",
+          ),
+        )
+      : item,
+  ),
+  ...allocationGuards,
+]);
+export const V2_CONTAINER_OWNER_ALLOCATION_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_CONTROL_EXPAND,
+  statements: Object.freeze([
+    `ALTER TABLE ${Q} ADD COLUMN ${allocationColumn}`,
+    ...allocationGuards.map((item) => item.sql),
+  ]),
+  objects: allocationObjects,
+});
+const allocationRows = Object.freeze(
+  allocationObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const allocationNames = allocationObjects.map((item) => literal(item.name)).join(", ");
+const allocationReadyParams = Object.freeze([JSON.stringify(allocationRows)]);
+const allocationReady =
+  "(WITH container_owner_allocation_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, rowIndex, columnIndex) =>
+      `json_extract((SELECT document FROM container_owner_allocation_values), '$[${rowIndex}][${columnIndex}]')`,
+    allocationRows,
+    allocationNames,
+  ) +
+  ")";
+const selectedControlReady = "(" + controlReady + " OR " + allocationReady + ")";
+const selectedControlReadyParams = Object.freeze([...controlReadyParams, ...allocationReadyParams]);
+export async function inspectV2ContainerOwnerAllocationSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(`SELECT ${allocationReady} AS ready`, allocationReadyParams);
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
 export async function inspectV2ContainerOwnerControlSchema(sql: Sql): Promise<boolean> {
   try {
-    const rows = await sql.query(`SELECT ${controlReady} AS ready`, controlReadyParams);
+    const rows = await sql.query(
+      `SELECT ${selectedControlReady} AS ready`,
+      selectedControlReadyParams,
+    );
     return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
   } catch {
     return false;
@@ -651,9 +734,11 @@ export function createV2ContainerHostAcceptance(options: {
 }): V2HostAcceptance {
   const { sql, installationId, backendId, targetKey } = options;
   const selectedReady =
-    options.ociParentControl === "sealed-original@1" ? controlReady : runtimeReady;
+    options.ociParentControl === "sealed-original@1" ? selectedControlReady : runtimeReady;
   const selectedReadyParams =
-    options.ociParentControl === "sealed-original@1" ? controlReadyParams : runtimeReadyParams;
+    options.ociParentControl === "sealed-original@1"
+      ? selectedControlReadyParams
+      : runtimeReadyParams;
   if (
     !sql ||
     typeof sql.query !== "function" ||

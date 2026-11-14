@@ -1,5 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
-import { lstat, rename, writeFile } from "node:fs/promises";
+import * as fsPromises from "node:fs/promises";
+import { rm as importedRm, lstat, mkdir, rename, writeFile } from "node:fs/promises";
 import * as net from "node:net";
 import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import {
@@ -8,6 +9,7 @@ import {
   encodeContainerSecretBytes,
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
+import { V2_CONTAINER_OWNER_ALLOCATION_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
 import {
   acceptedHttpSelection,
   acceptedRawHttp,
@@ -41,6 +43,7 @@ async function fixture(
       | "missing"
       | "wrong-phase";
     hResultFault?: "stdout" | "stderr" | "nonzero" | "signal" | "unknown";
+    allocationSchema?: boolean;
     managementFault?: "incomplete" | "missing-reply" | "lost-reply";
   } = {},
 ) {
@@ -85,6 +88,9 @@ async function fixture(
         ? {}
         : { peerRetirementFault: options.retirementFault }),
       ...(options.hResultFault === undefined ? {} : { peerHResultFault: options.hResultFault }),
+      ...(options.allocationSchema === undefined
+        ? {}
+        : { peerAllocationSchema: options.allocationSchema }),
       ...(options.configuredPeer
         ? acceptedHttpSelection()
         : { nativeMode: "retire-pending" as const }),
@@ -708,7 +714,10 @@ test("peer normal configured CREATE reaches original START HTTP publisher comple
 async function originalConfiguredPeerForJoin(
   joinFault?: "foreign" | "refused" | "unknown" | "pidns",
   namespaceFault?: "retained" | "lost" | "foreign" | "malformed" | "unknown" | "cookie" | "regress",
-  retirement?: Pick<NonNullable<Parameters<typeof fixture>[0]>, "retirementFault" | "hResultFault">,
+  retirement?: Pick<
+    NonNullable<Parameters<typeof fixture>[0]>,
+    "retirementFault" | "hResultFault" | "allocationSchema"
+  >,
 ) {
   const f = await fixture({
       normal: true,
@@ -1277,3 +1286,189 @@ for (const fault of ["row", "cancel", "execution"] as const) {
     }
   });
 }
+
+// New allocation handoff only: real owning CREATE save/capture, current original
+// P result and memorySQL consume-before-rm, with isolated nonsecret files.
+async function originalPeerForAllocation(allocationSchema = true) {
+  const x = await originalNamespaceForRetirement({ allocationSchema });
+  try {
+    for (const op of [
+      "begin-tracked-join",
+      "read-tracked-join",
+      "delete-born",
+      "join-born-delete",
+      "dispose-born",
+    ])
+      await retirementStep(x, op);
+    return x;
+  } catch (e) {
+    await x.current.close().catch(() => undefined);
+    await x.close();
+    throw e;
+  }
+}
+async function allocationState(f: Fixture) {
+  return (await f.sql.query("SELECT allocation_cleanup FROM tf_v2_container_create_claims"))[0]
+    ?.allocation_cleanup;
+}
+const noPath = async (path: string) => {
+  try {
+    await lstat(path);
+    return false;
+  } catch (e) {
+    if (e && typeof e === "object" && "code" in e && e.code === "ENOENT") return true;
+    throw e;
+  }
+};
+test("peer allocation actual sealed fresh source consumes before one local rm without removed permission", async () => {
+  const x = await originalPeerForAllocation(),
+    root = x.f.recordedCreate().allocationRoot,
+    actualRm = fsPromises.rm;
+  let effects = 0;
+  const spy = spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+    if (path === root) {
+      effects++;
+      expect(await allocationState(x.f)).toBe("consumed");
+      expect(options).toEqual({ recursive: true, force: false });
+    }
+    return actualRm(path, options);
+  });
+  expect(Object.is(importedRm, spy)).toBe(true);
+  try {
+    expect(await allocationState(x.f)).toBe("untouched");
+    await helperResultStep(x, true);
+    expect(effects).toBe(1);
+    expect(await noPath(root)).toBe(true);
+    expect(await allocationState(x.f)).toBe("closed");
+    expect((await x.f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state).toBe(
+      "bound",
+    );
+    expect((await x.f.sql.query("SELECT phase FROM tf_v2_resources"))[0]?.phase).toBe("deleting");
+    expect(await x.current.engine.runNext()).toMatchObject({
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(effects).toBe(1);
+    expect(x.f.network).not.toHaveBeenCalled();
+  } finally {
+    spy.mockRestore();
+    await x.current.close().catch(() => undefined);
+    await x.close();
+  }
+});
+for (const fault of ["before", "after", "cancel", "consume-ack", "execution"] as const) {
+  test(`peer allocation ${fault} uncertainty survives fresh creator without rm replay`, async () => {
+    const x = await originalPeerForAllocation(),
+      root = x.f.recordedCreate().allocationRoot,
+      actualRm = fsPromises.rm,
+      run = x.f.sql.run.bind(x.f.sql);
+    let effects = 0,
+      consumed = false;
+    const rmSpy = spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+      if (path !== root) return actualRm(path, options);
+      effects++;
+      expect(await allocationState(x.f)).toBe("consumed");
+      if (fault === "before") throw Error("synthetic no-effect rm error");
+      await actualRm(path, options);
+      if (fault === "cancel") void x.current.close().catch(() => undefined);
+      if (fault === "after") throw Error("synthetic lost rm completion");
+    });
+    const runSpy = spyOn(x.f.sql, "run").mockImplementation(async (sql, params) => {
+      const result = await run(sql, params);
+      if (
+        sql.startsWith("UPDATE tf_v2_container_create_claims SET allocation_cleanup='consumed'")
+      ) {
+        consumed = true;
+        if (fault === "consume-ack") throw Error("synthetic persisted consume receipt lost");
+        if (fault === "execution") {
+          const e = x.f.execution;
+          if (!e) throw Error("original execution absent");
+          Reflect.set(e, "leaseToken", "synthetic-after-consume-lease");
+        }
+      }
+      return result;
+    });
+    try {
+      expect(await x.current.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(consumed).toBe(true);
+      expect(await allocationState(x.f)).toBe("consumed");
+      const calls = effects;
+      expect(calls).toBe(fault === "consume-ack" || fault === "execution" ? 0 : 1);
+      await x.current.close().catch(() => undefined);
+      x.f.advanceNormalClock(61_000);
+      x.current = x.f.reconstructNormal();
+      expect(await x.current.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(effects).toBe(calls);
+      expect(await allocationState(x.f)).toBe("consumed");
+      expect(retirementCount(x.f, "dispose-born")).toBe(1);
+    } finally {
+      runSpy.mockRestore();
+      rmSpy.mockRestore();
+      await x.current.close().catch(() => undefined);
+      await x.close();
+    }
+  });
+}
+for (const fault of ["rootfs", "receipt", "parent"] as const) {
+  test(`peer allocation changed actual ${fault} identity refuses before consume or rm`, async () => {
+    const x = await originalPeerForAllocation(),
+      root = x.f.recordedCreate().allocationRoot,
+      actualRm = fsPromises.rm;
+    let effects = 0;
+    const spy = spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+      if (path === root) effects++;
+      return actualRm(path, options);
+    });
+    try {
+      if (fault === "receipt")
+        await writeFile(root + "/.tako-oci-artifact.json", "synthetic altered receipt", {
+          mode: 0o600,
+        });
+      else if (fault === "rootfs") {
+        await rename(root + "/rootfs", root + "/rootfs.saved");
+        await mkdir(root + "/rootfs", { mode: 0o700 });
+      } else {
+        await rename(x.f.artifactRoot, x.f.artifactRoot + ".saved");
+        await mkdir(x.f.artifactRoot, { mode: 0o700 });
+      }
+      expect(await x.current.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(await allocationState(x.f)).toBe("untouched");
+      expect(effects).toBe(0);
+    } finally {
+      spy.mockRestore();
+      await x.current.close().catch(() => undefined);
+      await x.close();
+    }
+  });
+}
+test("peer allocation historical sealed NULL never becomes fresh untouched after additive expand", async () => {
+  const x = await originalPeerForAllocation(false),
+    root = x.f.recordedCreate().allocationRoot,
+    actualRm = fsPromises.rm;
+  let effects = 0;
+  const spy = spyOn(fsPromises, "rm").mockImplementation(async (path, options) => {
+    if (path === root) effects++;
+    return actualRm(path, options);
+  });
+  try {
+    await x.f.sql.batch(V2_CONTAINER_OWNER_ALLOCATION_EXPAND.statements.map((sql) => ({ sql })));
+    expect(await allocationState(x.f)).toBe(null);
+    await retirementStep(x, "parent-read-result");
+    expect(effects).toBe(0);
+    expect(await allocationState(x.f)).toBe(null);
+    expect(await noPath(root)).toBe(false);
+  } finally {
+    spy.mockRestore();
+    await x.current.close().catch(() => undefined);
+    await x.close();
+  }
+});

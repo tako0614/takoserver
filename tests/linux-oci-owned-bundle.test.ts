@@ -48,7 +48,10 @@ import { createSelfhostLinuxOciCore } from "../src/selfhost-linux-oci-core.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
-import { V2_CONTAINER_OWNER_CONTROL_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
+import {
+  V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+  V2_CONTAINER_OWNER_CONTROL_EXPAND,
+} from "../src/takoform-v2/container-owner-schema.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2BackendResult, V2Execution } from "../src/takoform-v2/types.ts";
 
@@ -94,6 +97,7 @@ async function fixture(
       | "missing"
       | "wrong-phase";
     readonly peerHResultFault?: "stdout" | "stderr" | "nonzero" | "signal" | "unknown";
+    readonly peerAllocationSchema?: boolean;
     readonly parentFault?: "foreign-claim" | "foreign-generation";
     readonly fixedKeys?: { readonly key: CryptoKey; readonly comparison: CryptoKey };
     readonly extraImage?: boolean;
@@ -160,6 +164,8 @@ async function fixture(
   await sql.batch(v2ContainerOwnerMigrationCandidate());
   if (adversarial.parentControl || adversarial.parentPeer)
     await sql.batch(V2_CONTAINER_OWNER_CONTROL_EXPAND.statements.map((sql) => ({ sql })));
+  if (adversarial.peerAllocationSchema)
+    await sql.batch(V2_CONTAINER_OWNER_ALLOCATION_EXPAND.statements.map((sql) => ({ sql })));
   const key =
     adversarial.fixedKeys?.key ??
     (await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
@@ -697,6 +703,21 @@ async function fixture(
               if (peerKind === 1 || peerKind === 4) peerEffects |= 1 << peerKind;
             }
             if (request.kind === "linux-oci-create-stopped@1") {
+              if (adversarial.peerAllocationSchema) {
+                if (typeof request.claimId !== "string")
+                  throw new Error("raw original allocation absent");
+                const saved = (
+                  await sql.query(
+                    "SELECT allocation_cleanup,native_control FROM tf_v2_container_create_claims WHERE claim_id=?",
+                    [request.claimId],
+                  )
+                )[0];
+                expect(saved?.allocation_cleanup).toBe("untouched");
+                expect(typeof saved?.native_control).toBe("string");
+                expect(JSON.parse(String(saved?.native_control)).kind).toBe(
+                  "linux-oci-sealed-control@1",
+                );
+              }
               if (nativeProcesses === 1) originalCreate = request;
               created = true;
               if (typeof request.claimId !== "string" || typeof request.allocationRoot !== "string")
