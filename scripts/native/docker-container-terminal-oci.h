@@ -123,6 +123,17 @@ int tns_oci_read_tracked_join(struct tns_oci_owner *owner);
 int tns_oci_delete_born(struct tns_oci_owner *owner);
 int tns_oci_join_born_delete(struct tns_oci_owner *owner);
 
+/* Original born local cleanup only, after actual joined-zero DELETE/fresh
+ * state absence and tracked READ/currentness. One exact config unlink, actual
+ * birth-slot C26 disposal, then remaining original FD closes. Every attempted
+ * unlink/close is consumed; UNKNOWN retains the same objects and cannot be
+ * replayed or cleared by later progress. After this phase starts use ONLY
+ * this API, never legacy close, DELETE or old observation/currentness APIs.
+ * Zero frees/nulls only this local record; save reply identity BEFORE calling.
+ * Earlier transient-FD history, helper exit, full traffic terminal and Core
+ * removed/slot reuse are not qualified. Cancellation grants no positive fact. */
+int tns_oci_dispose_born(struct tns_oci_owner **slot);
+
 /* Pure closed data primitives; none is an owner or physical result. */
 #define TNS_OCI_MAX_JSON 1048576u
 #define TNS_OCI_MAX_STRING 131071u

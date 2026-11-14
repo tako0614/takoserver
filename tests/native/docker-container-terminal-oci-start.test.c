@@ -440,3 +440,8 @@ int tns_owner_begin_tracked_join(struct tns_owner *owner) {
 int tns_owner_read_tracked_join(struct tns_owner *owner) {
   (void)owner; abort();
 }
+
+/* Link compatibility only; old cohorts never model tracked disposal. */
+int tns_owner_dispose_tracked(struct tns_owner **slot) {
+  (void)slot; abort();
+}

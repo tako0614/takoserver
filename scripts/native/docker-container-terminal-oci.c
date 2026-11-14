@@ -61,6 +61,10 @@ struct tns_oci_owner {
   int delete_pidfd, delete_state_fd, delete_state_pinned;
   int delete_joined, delete_ok;
   struct stat delete_state_identity;
+  /* Dedicated local born disposal; old execution/currentness proofs stay
+   * unchanged until all local phases are known and this object is freed. */
+  unsigned int born_dispose_phase, born_config_unlink_attempted;
+  int born_config_fd, born_dispose_unknown;
   pid_t start_pid, controller_pid, init_pid;
   int parent_pidns, init_pidns, init_custody, init_joined;
   unsigned int init_stop_attempt;
@@ -1089,4 +1093,95 @@ int tns_oci_delete_born(struct tns_oci_owner *o) {
   if (elapsed < 0 || elapsed - now >= 10000) { errno = ETIMEDOUT; return -1; }
   if (oci_join_born_delete_command(o, 10000 - (int)(elapsed - now)) < 0) return -1;
   return oci_born_delete_observed(o);
+}
+
+
+/* Target-free local disposal only. Before config consumption the original
+ * currentness/DELETE/READ remains mandatory. Afterwards only recorded original
+ * phase history can continue; global held-input predicates are never relaxed. */
+int tns_oci_dispose_born(struct tns_oci_owner **slot) {
+  if (!slot || !*slot) { errno = EINVAL; return -1; }
+  struct tns_oci_owner *o = *slot;
+  if (o->controller_pid != getpid()) { errno = EPERM; return -1; }
+  if (!o->born_dispose_phase) {
+    if (o->admission || o->policy || o->uplink || o->egress_close_unknown ||
+        o->namespace_loan_close_unknown || !o->delete_attempt ||
+        !o->delete_joined || !o->delete_ok || !o->delete_state_pinned) {
+      errno = EUCLEAN; return -1;
+    }
+    for (size_t i = 0; i < 3; ++i)
+      if (o->egress_pid[i] && !o->egress_joined[i]) { errno = EBUSY; return -1; }
+    if (oci_born_delete_observed(o) < 0) return -1;
+    o->born_dispose_phase = 1;
+    o->born_config_fd = openat(o->bundle, "config.json",
+                              O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    /* Keep even a subsequently invalid pin for later original-owner custody;
+     * a failed pin never authorizes unlink or a second acquisition. */
+  }
+  if (o->born_dispose_phase == 1) {
+    if (o->born_config_unlink_attempted) { errno = EUCLEAN; return -1; }
+    struct stat held, named;
+    if (o->born_config_fd < 0 || oci_born_delete_observed(o) < 0 ||
+        oci_owned(o->born_config_fd, 0, 0600) < 0 ||
+        fstat(o->born_config_fd, &held) < 0 || held.st_nlink != 1 ||
+        !oci_same(&held, &o->config_identity) ||
+        held.st_size != o->config_identity.st_size ||
+        held.st_mtim.tv_sec != o->config_identity.st_mtim.tv_sec ||
+        held.st_mtim.tv_nsec != o->config_identity.st_mtim.tv_nsec ||
+        held.st_ctim.tv_sec != o->config_identity.st_ctim.tv_sec ||
+        held.st_ctim.tv_nsec != o->config_identity.st_ctim.tv_nsec ||
+        fstatat(o->bundle, "config.json", &named, AT_SYMLINK_NOFOLLOW) < 0 ||
+        !oci_same(&held, &named) || oci_born_delete_observed(o) < 0) {
+      if (!errno) errno = ESTALE;
+      return -1;
+    }
+    o->born_config_unlink_attempted = 1; /* Before sole exact original unlink. */
+    if (unlinkat(o->bundle, "config.json", 0) < 0) {
+      o->born_dispose_unknown = 1;
+      return -1; /* Unknown effect is never inferred from later absence. */
+    }
+    o->born_dispose_phase = 2;
+  }
+  /* Config is now consumed: never old OCI currentness/READ again. C26 owns
+   * fresh namespace READ until its own first close, then only its saved phase.
+   * Use the real birth slot, so known success actually clears original custody. */
+  if (o->born_dispose_phase == 2) {
+    if (tns_owner_dispose_tracked(&o->birth) < 0) return -1;
+    if (o->birth) { errno = EPROTO; return -1; }
+    o->born_dispose_phase = 3;
+  }
+  if (o->controller_pid != getpid()) { errno = EPERM; return -1; }
+  if (o->born_dispose_phase == 3) {
+    for (size_t i = 0; i < 3; ++i) {
+      if (o->egress_pid[i] && !o->egress_joined[i]) { errno = EUCLEAN; return -1; }
+      if (oci_egress_close_fd(o, &o->egress_in[i]) < 0 ||
+          oci_egress_close_fd(o, &o->egress_out[i]) < 0) return -1;
+    }
+    /* Existing joined/close helpers never signal, respawn or reset UNKNOWN. */
+    if (oci_egress_close(o) < 0) return -1;
+    o->born_dispose_phase = 4;
+  }
+  int *remaining[] = {&o->born_config_fd, &o->delete_pidfd, &o->delete_state_fd,
+    &o->command_pidfd, &o->start_pidfd, &o->stopped_exe,
+    &o->init_pidfd, &o->init_proc, &o->init_pidns, &o->parent_pidns,
+    &o->network, &o->state, &o->bundle, &o->runtime, &o->receipt,
+    &o->rootfs, &o->root};
+  for (size_t i = 0; i < sizeof(remaining) / sizeof(remaining[0]); ++i) {
+    if (*remaining[i] < 0) continue;
+    if (o->controller_pid != getpid()) { errno = EPERM; return -1; }
+    /* Reuse the original consume-before-close helper. Its sticky egress
+     * UNKNOWN is also preserved for any such remaining original close. */
+    if (oci_egress_close_fd(o, remaining[i]) < 0) {
+      o->born_dispose_unknown = 1;
+      return -1;
+    }
+  }
+  if (o->controller_pid != getpid()) { errno = EPERM; return -1; }
+  if (o->born_dispose_unknown || o->egress_close_unknown) { errno = EUCLEAN; return -1; }
+  /* Caller must save any reply identity before this local object is retired.
+   * This is neither historical all-FD proof nor Core/traffic permission. */
+  explicit_bzero(o, sizeof(*o));
+  free(o);
+  *slot = NULL;
+  return 0;
 }
