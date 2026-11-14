@@ -101,6 +101,18 @@ int tns_oci_continue_namespace_release(struct tns_oci_owner *owner,
 int tns_oci_observe_namespace_lifetime(struct tns_oci_owner *owner,
                                         struct tns_oci_namespace_lifetime *lifetime);
 
+/* Factual original tracked-owner join only, after actual init/command joins
+ * and original namespace release with no unknown own-loan close. Both calls
+ * bookend the original artifact/runtime/config/PIDNS cleanup custody, even
+ * after generic cancellation. No new owner/FD/target or result DTO is accepted.
+ * BEGIN zero is handoff ACK only; sent UNKNOWN cannot re-BEGIN. READ performs
+ * one original same-FD observation, never old LIFETIME/OBSERVE or effect replay.
+ * READ zero is tracked-owner destruction only, never full-flow/terminal/Core
+ * removal authority. Every result retains this same opaque owner and artifacts;
+ * born runtime deletion/FD/config cleanup is not supplied by these functions. */
+int tns_oci_begin_tracked_join(struct tns_oci_owner *owner);
+int tns_oci_read_tracked_join(struct tns_oci_owner *owner);
+
 /* Pure closed data primitives; none is an owner or physical result. */
 #define TNS_OCI_MAX_JSON 1048576u
 #define TNS_OCI_MAX_STRING 131071u

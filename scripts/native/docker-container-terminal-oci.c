@@ -945,3 +945,30 @@ int tns_oci_continue_namespace_release(struct tns_oci_owner *o,
   if (!o || !lifetime || !o->namespace_release_attempt) { errno = EINVAL; return -1; }
   return oci_namespace_release_progress(o, lifetime);
 }
+
+
+/* Original cleanup custody remains mandatory independently of generic cancel.
+ * The namespace owner alone retains the sent BEGIN and pre-handoff facts. */
+static int oci_tracked_join_current(struct tns_oci_owner *o) {
+  if (!o || !o->birth) { errno = EINVAL; return -1; }
+  if (!o->namespace_release_attempt || !o->namespace_release_dispatched ||
+      o->network >= 0 || o->namespace_loan_close_unknown) {
+    errno = EUCLEAN; return -1;
+  }
+  return oci_namespace_release_current(o);
+}
+
+int tns_oci_begin_tracked_join(struct tns_oci_owner *o) {
+  if (oci_tracked_join_current(o) < 0) return -1;
+  if (tns_owner_begin_tracked_join(o->birth) < 0) return -1;
+  /* BEGIN zero acknowledges only the original file-reference handoff. */
+  return oci_tracked_join_current(o);
+}
+
+int tns_oci_read_tracked_join(struct tns_oci_owner *o) {
+  if (oci_tracked_join_current(o) < 0) return -1;
+  /* Original same-FD READ only: old LIFETIME/OBSERVE no longer have an owner
+   * after BEGIN. No hidden retry, namespace release or cleanup is performed. */
+  if (tns_owner_read_tracked_join(o->birth) < 0) return -1;
+  return oci_tracked_join_current(o);
+}

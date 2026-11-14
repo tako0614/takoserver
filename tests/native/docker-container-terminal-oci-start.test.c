@@ -432,3 +432,11 @@ int tns_owner_observe_creator(struct tns_owner *owner, struct tns_identity *iden
 int tns_owner_open_admission(struct tns_owner *owner) { (void)owner; abort(); }
 int tns_owner_cut_admission(struct tns_owner *owner) { (void)owner; abort(); }
 int tns_owner_admission_current(struct tns_owner *owner) { (void)owner; abort(); }
+
+/* Link compatibility only; these old cohorts never model tracked join. */
+int tns_owner_begin_tracked_join(struct tns_owner *owner) {
+  (void)owner; abort();
+}
+int tns_owner_read_tracked_join(struct tns_owner *owner) {
+  (void)owner; abort();
+}
