@@ -8,7 +8,11 @@ import {
   encodeContainerSecretBytes,
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
-import { originalOwnedOciFixture } from "./linux-oci-owned-bundle.test.ts";
+import {
+  acceptedHttpSelection,
+  acceptedRawHttp,
+  originalOwnedOciFixture,
+} from "./linux-oci-owned-bundle.test.ts";
 
 // NONSECRET fixture keys/capabilities; actual memorySql/Core/creator and raw
 // spawn streams only. Imported old cases are filtered and never called.
@@ -17,6 +21,7 @@ async function fixture(
     pending?: boolean;
     v1?: boolean;
     normal?: boolean;
+    configuredPeer?: boolean;
     managementFault?: "incomplete" | "missing-reply" | "lost-reply";
   } = {},
 ) {
@@ -53,7 +58,9 @@ async function fixture(
       ...(options.managementFault === undefined
         ? {}
         : { peerManagementFault: options.managementFault }),
-      nativeMode: "retire-pending",
+      ...(options.configuredPeer
+        ? acceptedHttpSelection()
+        : { nativeMode: "retire-pending" as const }),
       fixedKeys: { key, comparison },
     });
     return Object.assign(f, {
@@ -597,5 +604,74 @@ test("peer management incomplete original request or missing captured reply cann
     } finally {
       await f.cleanup();
     }
+  }
+});
+
+// New configured-peer cohort only. Original HTTP helper is a raw transport
+// model; actual installed P/H/kernel/traffic and full retirement are unproved.
+test("peer normal configured CREATE reaches original START HTTP publisher complete then fresh DELETE same P", async () => {
+  const f = await fixture({ normal: true, configuredPeer: true }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    expect(f.nativeCounts().processes).toBe(1);
+    const requests = f.nativeCounts().requests;
+    for (const kind of [
+      "linux-oci-parent-bootstrap@2",
+      "linux-oci-create-stopped@1",
+      "linux-oci-start@1",
+    ])
+      expect(requests.filter((k) => k === kind)).toHaveLength(1);
+    expect(
+      requests.filter((k) => k === "linux-oci-observe-started@1").length,
+    ).toBeGreaterThanOrEqual(3);
+    expect(raw.calls).toHaveLength(1);
+    expect(
+      await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
+    ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+    expect((await f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state).toBe(
+      "bound",
+    );
+    const fresh = await acceptNormalDelete(f, accepted.resourceUid);
+    try {
+      expect(await fresh.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(stopCount(f)).toBe(1);
+      expect(f.nativeCounts().processes).toBe(2);
+      expect(
+        f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-read-outcome@2"),
+      ).toHaveLength(1);
+      expect(
+        f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-bootstrap@2"),
+      ).toHaveLength(1);
+      expect(
+        f.nativeCounts().requests.filter((k) => k === "linux-oci-create-stopped@1"),
+      ).toHaveLength(1);
+      expect((await f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state).toBe(
+        "bound",
+      );
+      await fresh.close();
+    } finally {
+      await fresh.close().catch(() => undefined);
+    }
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    raw.join();
+    raw.restore();
+    await f.cleanup();
   }
 });

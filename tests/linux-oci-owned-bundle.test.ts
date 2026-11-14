@@ -4882,4 +4882,4 @@ test("original allocation last SQL fence loses the real Engine lease without del
 });
 
 // Reuse the genuine engine/Sql/artifact/raw-stream fixture without calling its old cases.
-export { fixture as originalOwnedOciFixture };
+export { acceptedHttpSelection, acceptedRawHttp, fixture as originalOwnedOciFixture };
