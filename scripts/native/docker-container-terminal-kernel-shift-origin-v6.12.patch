@@ -1,0 +1,27 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] retain original donor origins across positive skb_shift
+
+Apply after the retained formal20 source graph. The common successful
+onlymerged continuation retains the live donor origin union on the target
+through the existing merge/snapshot/restore/COW producer. No call for zero
+or original refusal paths. Checksum/page/length/error behavior stays exact.
+No new helper/API/state or poison relaxation. Not live distinct-history TCP,
+hardware/shared-page physical-lastfree or fullflow/terminal qualification.
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -4389,6 +4389,13 @@
+ 	BUG_ON(todo > 0 && !skb_shinfo(skb)->nr_frags);
+ 
+ onlymerged:
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Both original headers remain live at this successful transfer.
++	 * Preserve history before the caller can free an emptied donor.
++	 */
++	if (shiftlen > 0)
++		tako_terminal_skb_merge(tgt, skb);
++#endif
+ 	/* Most likely the tgt won't ever need its checksum anymore, skb on
+ 	 * the other hand might need it if it needs to be resent
+ 	 */
