@@ -2412,6 +2412,27 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       }
       return result;
     },
+    /** Read only the observation produced by THIS completed original JOIN.
+     * A STOP reply, public progress DTO or connector exit alone cannot supply it. */
+    observeJoined(actualSignal: AbortSignal): LinuxOciInitReapedObservation {
+      current();
+      if (
+        signal !== actualSignal ||
+        phase !== "done" ||
+        !finished ||
+        operation !== "join-init" ||
+        reply?.kind !== "linux-oci-init-reaped-observation@1"
+      )
+        throw failure("parent_peer_phase");
+      if (
+        captured &&
+        "pidNamespaceDevice" in captured &&
+        (reply.pidNamespaceDevice !== captured.pidNamespaceDevice ||
+          reply.pidNamespaceInode !== captured.pidNamespaceInode)
+      )
+        throw failure("parent_peer_phase");
+      return reply;
+    },
     cancel: stop,
   });
 }

@@ -22,6 +22,7 @@ async function fixture(
     v1?: boolean;
     normal?: boolean;
     configuredPeer?: boolean;
+    joinFault?: "foreign" | "refused" | "unknown" | "pidns";
     managementFault?: "incomplete" | "missing-reply" | "lost-reply";
   } = {},
 ) {
@@ -58,6 +59,7 @@ async function fixture(
       ...(options.managementFault === undefined
         ? {}
         : { peerManagementFault: options.managementFault }),
+      ...(options.joinFault === undefined ? {} : { peerJoinFault: options.joinFault }),
       ...(options.configuredPeer
         ? acceptedHttpSelection()
         : { nativeMode: "retire-pending" as const }),
@@ -673,5 +675,188 @@ test("peer normal configured CREATE reaches original START HTTP publisher comple
     raw.join();
     raw.restore();
     await f.cleanup();
+  }
+});
+
+// New same-P JOIN cohort only. These observations are produced by the actual
+// private connector closure; modeled H frames do not qualify native/kernel flow.
+async function originalConfiguredPeerForJoin(
+  joinFault?: "foreign" | "refused" | "unknown" | "pidns",
+) {
+  const f = await fixture({
+      normal: true,
+      configuredPeer: true,
+      ...(joinFault === undefined ? {} : { joinFault }),
+    }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+    const stop = await acceptNormalDelete(f, accepted.resourceUid);
+    try {
+      expect(await stop.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(stopCount(f)).toBe(1);
+      await stop.close();
+    } finally {
+      await stop.close().catch(() => undefined);
+    }
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+    f.advanceNormalClock(61_000);
+    return {
+      f,
+      raw,
+      fresh: f.reconstructNormal(),
+      async close() {
+        raw.join();
+        raw.restore();
+        await f.cleanup();
+      },
+    };
+  } catch (error) {
+    raw.join();
+    raw.restore();
+    await f.cleanup();
+    throw error;
+  }
+}
+
+test("peer JOIN original consuming observation records exact stopped attempt without removed permission", async () => {
+  const x = await originalConfiguredPeerForJoin();
+  try {
+    expect(await x.fresh.engine.runNext()).toMatchObject({
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(stopCount(x.f)).toBe(1);
+    expect(x.f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(
+      1,
+    );
+    const row = (
+      await x.f.sql.query(
+        "SELECT state,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts",
+      )
+    )[0];
+    expect(row?.state).toBe("exited");
+    expect(typeof row?.confirmed_exited_at_ms).toBe("number");
+    expect(Number(row?.confirmed_exited_at_ms)).toBeGreaterThanOrEqual(
+      Number(row?.confirmed_running_at_ms),
+    );
+    expect((await x.f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state).toBe(
+      "bound",
+    );
+    expect((await x.f.sql.query("SELECT phase FROM tf_v2_resources"))[0]?.phase).toBe("deleting");
+    expect(
+      x.f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-bootstrap@2"),
+    ).toHaveLength(1);
+    expect(x.f.network).not.toHaveBeenCalled();
+    await x.fresh.close();
+  } finally {
+    await x.fresh.close().catch(() => undefined);
+    await x.close();
+  }
+});
+
+test("peer JOIN foreign retained or unknown original frame never records stopped or resends STOP", async () => {
+  for (const fault of ["foreign", "refused", "unknown"] as const) {
+    const x = await originalConfiguredPeerForJoin(fault);
+    try {
+      expect(await x.fresh.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(
+        await x.f.sql.query(
+          "SELECT state,confirmed_exited_at_ms FROM tf_v2_container_start_attempts",
+        ),
+      ).toEqual([{ state: "running", confirmed_exited_at_ms: null }]);
+      expect(stopCount(x.f)).toBe(1);
+      expect(x.f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(
+        1,
+      );
+      expect(
+        x.f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-bootstrap@2"),
+      ).toHaveLength(1);
+    } finally {
+      await x.fresh.close().catch(() => undefined);
+      await x.close();
+    }
+  }
+});
+
+test("peer JOIN fresh row cancellation and last SELECT execution scope fence stopped SQL", async () => {
+  for (const fault of ["row", "cancel", "execution"]) {
+    const x = await originalConfiguredPeerForJoin(),
+      query = x.f.sql.query.bind(x.f.sql);
+    let reached = false;
+    const spy = spyOn(x.f.sql, "query").mockImplementation(async (sql, params) => {
+      const rows = await query(sql, params);
+      if (!reached && x.f.nativeCounts().requests.includes("linux-oci-join-init@1")) {
+        if (fault === "row" && controlRead(sql)) {
+          reached = true;
+          return [{ native_control: null }];
+        }
+        if (
+          fault !== "row" &&
+          sql.startsWith(
+            "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts",
+          )
+        ) {
+          reached = true;
+          if (fault === "cancel") void x.fresh.close().catch(() => undefined);
+          else {
+            const execution = x.f.execution;
+            if (!execution) throw Error("actual original execution absent");
+            Reflect.set(execution, "leaseToken", "synthetic-late-changed-lease");
+          }
+        }
+      }
+      return rows;
+    });
+    try {
+      expect(await x.fresh.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(reached).toBe(true);
+      expect(stopCount(x.f)).toBe(1);
+      expect(
+        await query("SELECT state,confirmed_exited_at_ms FROM tf_v2_container_start_attempts"),
+      ).toEqual([{ state: "running", confirmed_exited_at_ms: null }]);
+    } finally {
+      spy.mockRestore();
+      await x.fresh.close().catch(() => undefined);
+      await x.close();
+    }
+  }
+});
+
+test("peer JOIN changed captured PIDNS cannot supply a stopped record", async () => {
+  const x = await originalConfiguredPeerForJoin("pidns");
+  try {
+    expect(await x.fresh.engine.runNext()).toMatchObject({
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(x.f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(
+      1,
+    );
+    expect(
+      await x.f.sql.query(
+        "SELECT state,confirmed_exited_at_ms FROM tf_v2_container_start_attempts",
+      ),
+    ).toEqual([{ state: "running", confirmed_exited_at_ms: null }]);
+    expect(stopCount(x.f)).toBe(1);
+  } finally {
+    await x.fresh.close().catch(() => undefined);
+    await x.close();
   }
 });

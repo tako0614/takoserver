@@ -75,6 +75,7 @@ async function fixture(
     readonly parentPeer?: boolean;
     readonly peerPending?: boolean;
     readonly peerManagementFault?: "incomplete" | "missing-reply" | "lost-reply";
+    readonly peerJoinFault?: "foreign" | "refused" | "unknown" | "pidns";
     readonly parentFault?: "foreign-claim" | "foreign-generation";
     readonly fixedKeys?: { readonly key: CryptoKey; readonly comparison: CryptoKey };
     readonly extraImage?: boolean;
@@ -391,14 +392,27 @@ async function fixture(
                 throw Error("original peer native absent");
               peerReply = {
                 kind: stop ? "linux-oci-init-reaped@1" : "linux-oci-init-reaped-observation@1",
-                nativeId: originalCreate.claimId,
+                nativeId:
+                  !stop && adversarial.peerJoinFault === "foreign"
+                    ? "f".repeat(64)
+                    : originalCreate.claimId,
                 namespaceDevice: 4,
                 namespaceInode: 55,
                 pidNamespaceDevice: 6,
-                pidNamespaceInode: 77,
+                pidNamespaceInode: !stop && adversarial.peerJoinFault === "pidns" ? 78 : 77,
                 barrier: "unproven",
               };
-              const lost = stop && adversarial.peerManagementFault === "lost-reply";
+              if (!stop && adversarial.peerJoinFault === "refused")
+                peerReply = {
+                  kind: "linux-oci-refused@1",
+                  stage: "join-init",
+                  errno: 11,
+                  custody: "retained",
+                  barrier: "unproven",
+                };
+              const lost =
+                (stop && adversarial.peerManagementFault === "lost-reply") ||
+                (!stop && adversarial.peerJoinFault === "unknown");
               if (!lost) reply(peerReply);
               done();
               queueMicrotask(() => {

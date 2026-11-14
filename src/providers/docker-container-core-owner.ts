@@ -1612,6 +1612,7 @@ export function createDockerContainerCoreOwner(
   async function confirmBoundStopped(
     loaded: BoundStart,
     lease: Lease,
+    local?: () => void,
   ): Promise<"unclaimed" | "confirmed"> {
     const { intent, proof, record: saved } = loaded;
     const nativeId = saved.nativeId;
@@ -1620,6 +1621,8 @@ export function createDockerContainerCoreOwner(
       "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?";
     const attemptParams = [intent.resourceUid, intent.policy.generation];
     const attempts = await sql.query(attemptSql, attemptParams);
+    // Optional original Core lexical assertion, never caller-supplied facts.
+    local?.();
     // Never started: there is no attempt to end, and confirmRemoved's own fence applies.
     if (attempts.length === 0) return "unclaimed";
     const attempt = attempts[0];
@@ -1661,6 +1664,7 @@ export function createDockerContainerCoreOwner(
     const exitedAt = Math.max(runningAt, now());
     const guard = fence(proof);
     if (!lease.active || lease.controller.signal.aborted) return fail();
+    local?.(); // no await between actual source/current assertion and SQL dispatch
     const write = await sql.run(
       "UPDATE tf_v2_container_start_attempts SET state='exited',confirmed_exited_at_ms=? WHERE resource_uid=? AND generation=? AND attempt=1 AND create_claim_id=? AND native_id=? AND state='running' AND claimed_at_ms=? AND confirmed_running_at_ms=? AND confirmed_exited_at_ms IS NULL AND " +
         guard.sql,
@@ -2546,6 +2550,40 @@ export function createDockerContainerCoreOwner(
               executionScope(execution);
               read.assertCurrent();
               observation = await read.advance(input.nativeId, signal);
+              if (observation.operation === "join-init") {
+                // Only the same actual private connector can supply this original
+                // consuming JOIN observation. The public progress is not a witness.
+                const joined = read.observeJoined(signal);
+                const local = () => {
+                  if (
+                    signal.aborted ||
+                    !lease.active ||
+                    lease.controller.signal.aborted ||
+                    !leases.has(lease)
+                  )
+                    return fail();
+                  executionScope(execution);
+                  if (read.observeJoined(signal) !== joined || joined.nativeId !== input.nativeId)
+                    return fail();
+                };
+                await assertExecution(execution);
+                const stopped = await boundStartRecord(input);
+                const bound = await sql.query(
+                  "SELECT native_control FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=?",
+                  [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
+                );
+                if (
+                  bound.length !== 1 ||
+                  bound[0]?.native_control !== raw ||
+                  !usable(stopped.proof, "remove") ||
+                  !(await current(lease))
+                )
+                  return fail();
+                local();
+                if ((await confirmBoundStopped(stopped, lease, local)) !== "confirmed")
+                  return fail();
+                local();
+              }
               complete = true;
             } finally {
               if (!complete) read.cancel();
