@@ -12,7 +12,14 @@ import { originalOwnedOciFixture } from "./linux-oci-owned-bundle.test.ts";
 
 // NONSECRET fixture keys/capabilities; actual memorySql/Core/creator and raw
 // spawn streams only. Imported old cases are filtered and never called.
-async function fixture(options: { pending?: boolean; v1?: boolean } = {}) {
+async function fixture(
+  options: {
+    pending?: boolean;
+    v1?: boolean;
+    normal?: boolean;
+    managementFault?: "incomplete" | "missing-reply" | "lost-reply";
+  } = {},
+) {
   const key = await crypto.subtle.importKey(
     "raw",
     new Uint8Array(32).fill(0xa5),
@@ -42,6 +49,10 @@ async function fixture(options: { pending?: boolean; v1?: boolean } = {}) {
     const f = await originalOwnedOciFixture(false, {
       ...(options.v1 ? { parentControl: true } : { parentPeer: true }),
       ...(options.pending === undefined ? {} : { peerPending: options.pending }),
+      ...(options.normal === undefined ? {} : { normalBackend: options.normal }),
+      ...(options.managementFault === undefined
+        ? {}
+        : { peerManagementFault: options.managementFault }),
       nativeMode: "retire-pending",
       fixedKeys: { key, comparison },
     });
@@ -419,5 +430,172 @@ test("peer reconstruction refuses midawait cancellation and original execution m
     expect(checked).toBe(2);
   } finally {
     await f.cleanup();
+  }
+});
+
+// New cohort only: existing reconstruction cases above are never selected.
+async function normalCreate(f: Fixture) {
+  await f.create();
+  expect(await f.engine.runNext()).toMatchObject({ status: "failed", effect: "partial" });
+  const row = (
+    await f.sql.query("SELECT resource_uid,state FROM tf_v2_container_create_claims")
+  )[0];
+  if (typeof row?.resource_uid !== "string" || row.state !== "bound")
+    throw Error("original bound CREATE absent");
+  return row.resource_uid;
+}
+async function acceptNormalDelete(f: Fixture, uid: string) {
+  const fresh = f.reconstructNormal();
+  await fresh.engine.acceptDelete({
+    principal: "synthetic-oci-parent",
+    key: crypto.randomUUID(),
+    uid,
+    expectedGeneration: 1,
+  });
+  return fresh;
+}
+function stopCount(f: Fixture) {
+  return f.nativeCounts().requests.filter((k) => k === "linux-oci-stop-init@1").length;
+}
+
+test("peer management ordinary fresh retained DELETE sends STOP then original JOIN only without P replacement or removed CAS", async () => {
+  const f = await fixture({ normal: false });
+  try {
+    const uid = await normalCreate(f),
+      before = f.nativeCounts(),
+      first = await acceptNormalDelete(f, uid);
+    try {
+      await first.engine.runNext();
+      expect(stopCount(f)).toBe(1);
+      expect(f.nativeCounts().processes).toBe(before.processes + 1);
+      await first.close();
+    } finally {
+      await first.close().catch(() => undefined);
+    }
+    f.advanceNormalClock(60_000);
+    const second = f.reconstructNormal();
+    try {
+      await second.engine.runNext();
+      expect(stopCount(f)).toBe(1);
+      expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(
+        1,
+      );
+      expect((await f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state).toBe(
+        "bound",
+      );
+      expect(
+        f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-bootstrap@2"),
+      ).toHaveLength(1);
+      expect(f.network).not.toHaveBeenCalled();
+    } finally {
+      await second.close().catch(() => undefined);
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("peer management fresh SQL row and cancellation after actual outcome fence H writes", async () => {
+  for (const fault of ["row", "cancel", "execution"]) {
+    const f = await fixture({ normal: false });
+    try {
+      const uid = await normalCreate(f),
+        fresh = await acceptNormalDelete(f, uid),
+        query = f.sql.query.bind(f.sql);
+      let crossed = false,
+        armed = false;
+      const spy = spyOn(f.sql, "query").mockImplementation(async (sql, params) => {
+        const rows = await query(sql, params);
+        if (
+          controlRead(sql) &&
+          f.nativeCounts().requests.includes("linux-oci-parent-read-outcome@2")
+        ) {
+          if (fault === "execution") armed = true;
+          else {
+            crossed = true;
+            if (fault === "row") return [{ native_control: null }];
+            void fresh.close().catch(() => undefined);
+          }
+        } else if (armed && sql.includes(" WHERE i.resource_uid=? AND v.generation=?")) {
+          armed = false;
+          crossed = true;
+          const execution = f.execution;
+          if (!execution) throw Error("actual normal execution absent");
+          Reflect.set(execution, "leaseToken", "synthetic-late-foreign-lease");
+        }
+        return rows;
+      });
+      try {
+        await fresh.engine.runNext();
+        expect(crossed).toBe(true);
+        expect(stopCount(f)).toBe(0);
+        expect(
+          f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-read-outcome@2"),
+        ).toHaveLength(1);
+      } finally {
+        spy.mockRestore();
+        await fresh.close().catch(() => undefined);
+      }
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test("peer management lost STOP reply reads original captured outcome and next fresh dispatch selects JOIN not resend", async () => {
+  const f = await fixture({ normal: false, managementFault: "lost-reply" });
+  try {
+    const uid = await normalCreate(f),
+      first = await acceptNormalDelete(f, uid);
+    try {
+      await first.engine.runNext();
+      expect(stopCount(f)).toBe(1);
+      await rejected(first.close());
+    } finally {
+      await first.close().catch(() => undefined);
+    }
+    f.advanceNormalClock(60_000);
+    const second = f.reconstructNormal();
+    try {
+      await second.engine.runNext();
+      expect(stopCount(f)).toBe(1);
+      expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(
+        1,
+      );
+      expect(
+        f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-bootstrap@2"),
+      ).toHaveLength(1);
+      expect((await f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state).toBe(
+        "bound",
+      );
+    } finally {
+      await second.close().catch(() => undefined);
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("peer management incomplete original request or missing captured reply cannot issue any STOP or CREATE", async () => {
+  for (const managementFault of ["incomplete", "missing-reply"] as const) {
+    const f = await fixture({ normal: false, managementFault });
+    try {
+      const uid = await normalCreate(f),
+        fresh = await acceptNormalDelete(f, uid);
+      try {
+        await fresh.engine.runNext();
+        expect(stopCount(f)).toBe(0);
+        expect(
+          f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-read-outcome@2"),
+        ).toHaveLength(1);
+        expect(
+          f.nativeCounts().requests.filter((k) => k === "linux-oci-create-stopped@1"),
+        ).toHaveLength(1);
+      } finally {
+        await fresh.close().catch(() => undefined);
+      }
+    } finally {
+      await f.cleanup();
+    }
   }
 });

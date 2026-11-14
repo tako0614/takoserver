@@ -51,9 +51,11 @@ import {
   type LinuxOciNamespaceLifetimeObservation,
   LinuxOciParentBootstrap,
   type LinuxOciParentHResult,
+  type LinuxOciPeerInitProgress,
   LinuxOciPhysicalSession,
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
+  prepareAuthenticatedLinuxOciPeerInit,
   prepareAuthenticatedLinuxOciPeerReader,
 } from "./linux-oci-physical-session.ts";
 import {
@@ -67,10 +69,7 @@ type OriginalOciCustody = {
   readonly physicalBinary: string | undefined;
   readonly peerReads: Map<
     string,
-    {
-      readonly read: ReturnType<typeof prepareAuthenticatedLinuxOciPeerReader>;
-      readonly settlement: Promise<LinuxOciParentHResult>;
-    }
+    { readonly custody: object; readonly settlement: Promise<unknown> }
   >;
   readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
   readonly parents: ReadonlyMap<
@@ -329,7 +328,7 @@ function capturedAllocationData(allocation: OriginalOciAllocation) {
 }
 /** Called only after owning Core AEAD authentication, with the real creator
  * custody key. Data cannot register an allocation, session or replacement P. */
-export async function prepareOriginalLinuxOciPeerRead(
+async function authenticatedOriginalPeerSource(
   original: object,
   core: DockerContainerCoreOwner,
   record: DockerContainerCreateRecord,
@@ -435,7 +434,24 @@ export async function prepareOriginalLinuxOciPeerRead(
     return fail("allocation_identity");
   await assertOriginalFile(captured.receipt, false);
   if (custody.signal.aborted || signal.aborted) return fail("parent_custody");
-  const binary = custody.physicalBinary;
+  return { custody, binary: custody.physicalBinary };
+}
+export async function prepareOriginalLinuxOciPeerRead(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+) {
+  const { custody, binary } = await authenticatedOriginalPeerSource(
+    original,
+    core,
+    record,
+    artifact,
+    binding,
+    signal,
+  );
   // Only original, not-yet-used reader state; no persistent adopted allocation.
   return async (actualSignal: AbortSignal) => {
     if (custody.signal.aborted || actualSignal.aborted || custody.peerReads.has(record.claimId))
@@ -443,9 +459,42 @@ export async function prepareOriginalLinuxOciPeerRead(
     const read = prepareAuthenticatedLinuxOciPeerReader(binary, binding, custody.signal);
     // Retain the actual closure/child even on UNKNOWN, never a replaceable flag.
     const settlement = Promise.resolve().then(() => read(actualSignal));
-    custody.peerReads.set(record.claimId, Object.freeze({ read, settlement })); // before sole connector spawn
+    custody.peerReads.set(record.claimId, Object.freeze({ custody: read, settlement })); // before sole connector spawn
     return settlement;
   };
+}
+
+export async function prepareOriginalLinuxOciPeerInit(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+) {
+  const { custody, binary } = await authenticatedOriginalPeerSource(
+    original,
+    core,
+    record,
+    artifact,
+    binding,
+    signal,
+  );
+  if (custody.peerReads.has(record.claimId) || signal.aborted || custody.signal.aborted)
+    return fail("parent_custody");
+  const control = prepareAuthenticatedLinuxOciPeerInit(binary, binding, custody.signal);
+  return Object.freeze({
+    ...control,
+    begin(actualSignal: AbortSignal) {
+      if (custody.peerReads.has(record.claimId) || actualSignal.aborted || custody.signal.aborted)
+        return fail("parent_custody");
+      custody.peerReads.set(
+        record.claimId,
+        Object.freeze({ custody: control, settlement: control.settlement }),
+      );
+      return control.begin(actualSignal);
+    },
+  });
 }
 
 async function assertOriginalAllocationAbsent(allocation: OriginalOciAllocation) {
@@ -1917,6 +1966,83 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       .catch(() => undefined);
     return running;
   }
+  function manageRetainedPeerInit(
+    execution: V2Execution,
+    externalSignal?: AbortSignal,
+  ): Promise<readonly LinuxOciPeerInitProgress[]> {
+    if (closed || parentMode !== "sealed-peer@1")
+      return Promise.reject(new Error("linux_oci_owned_bundle_parent_unavailable"));
+    if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
+      return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
+    const cancel = new AbortController(),
+      abort = () => cancel.abort();
+    cancellation.add(cancel);
+    externalSignal?.addEventListener("abort", abort, { once: true });
+    if (externalSignal?.aborted) abort();
+    const timer = setTimeout(abort, timeout);
+    const running = Promise.resolve().then(() =>
+      core.withExecution(execution, async () => {
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        const accepted = await core.readAcceptedExecution(execution);
+        if (
+          (accepted.action !== "delete" && accepted.action !== "update") ||
+          !accepted.retained.length
+        )
+          return fail("parent_unavailable");
+        const observations: LinuxOciPeerInitProgress[] = [];
+        for (const item of accepted.retained) {
+          const { record } = item;
+          if (
+            item.removedAtMs !== null ||
+            record.state !== "bound" ||
+            record.nativeId === null ||
+            record.intent.policy.generation >= accepted.generation
+          )
+            return fail("parent_unavailable");
+          const phase =
+            accepted.action === "delete" || record.intent.policy.generation < accepted.generation
+              ? "remove"
+              : "reconcile";
+          await core.owner.withAuthority(record, phase, async (held) => {
+            const loan = new AbortController(),
+              revoke = () => loan.abort();
+            cancel.signal.addEventListener("abort", revoke, { once: true });
+            held.revocation.addEventListener("abort", revoke, { once: true });
+            if (cancel.signal.aborted || held.revocation.aborted) revoke();
+            try {
+              if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+              const result = await core.manageAcceptedPeerInit(
+                execution,
+                record,
+                originalNativeCustody,
+                loan.signal,
+              );
+              if (!result || closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+              observations.push(result);
+            } finally {
+              loan.abort();
+              cancel.signal.removeEventListener("abort", revoke);
+              held.revocation.removeEventListener("abort", revoke);
+            }
+          });
+        }
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        return Object.freeze(observations);
+      }),
+    );
+    scopes.add(running);
+    void running
+      .finally(() => {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener("abort", abort);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+      })
+      .catch(() => undefined);
+    return running;
+  }
   // The normal backend closes over this ORIGINAL creator. Its execution input
   // selects no owner, native session, health callback or publication receipt.
   async function dispatch(
@@ -1942,6 +2068,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       if (parentMode === "sealed-original@1" && accepted.retained.length) {
         await creator.readRetainedParentControls(execution, cancel.signal);
         local();
+      }
+      if (
+        parentMode === "sealed-peer@1" &&
+        accepted.retained.some((item) => item.record.intent.policy.generation < accepted.generation)
+      ) {
+        await creator.manageRetainedPeerInit(execution, cancel.signal);
+        local();
+        return unknown();
       }
       if (accepted.action === "delete") {
         await creator.disposeRetainedBornOwners(execution, cancel.signal);
@@ -2066,6 +2200,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     readRetainedParentControls,
     /** Authenticated original peer result data only; no native/removed adoption. */
     readRetainedPeerResults,
+    /** Original same-P first init phase only; never an exited/removed Sql CAS. */
+    manageRetainedPeerInit,
     /** Internal normal Form only; no registration or Node entry activation. */
     formUrl: V2_CONTAINER_F2_FORM,
     retainedForm,

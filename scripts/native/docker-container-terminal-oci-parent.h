@@ -665,7 +665,8 @@ static int ocipp_main(void) {
  * kernel peer identity is checked BEFORE cap bytes and again after the read. */
 struct ocipp_connector {
   struct ocipp_owner custody;
-  int socket, peer_pidfd; unsigned int attempted;
+  int socket, peer_pidfd; unsigned int attempted, outcome_phase, init_attempt;
+  int64_t deadline;
   uint64_t device, inode; char boot[37];
 };
 static int ocipp_connector_current(struct ocipp_connector *c) {
@@ -699,8 +700,7 @@ static int ocipp_connector_result(const unsigned char *body, size_t size) {
   }
   return value ? 0 : -1;
 }
-static int ocipp_connector_read(struct ocipp_connector *c, const unsigned char *p, size_t size,
-                                 unsigned char reply[512], size_t *reply_size) {
+static int ocipp_connector_open(struct ocipp_connector *c, const unsigned char *p, size_t size) {
   if (!c || c->attempted || !p || size != 172 || memcmp(p, "TKOPEER2", 8)) return -1;
   c->attempted = 1; c->socket = c->peer_pidfd = -1;
   if (ocipp_initialize(&c->custody) < 0) return -1;
@@ -720,7 +720,7 @@ static int ocipp_connector_read(struct ocipp_connector *c, const unsigned char *
   memcpy(address.sun_path + 1, label, sizeof(label) - 1); memcpy(address.sun_path + sizeof(label), p + 8, 64);
   socklen_t length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof(label) + 64);
   int64_t now = ocip_now(); if (now < 0) return -1;
-  int64_t until = now + 4000;
+  int64_t until = now + 4000; c->deadline = until;
   if (connect(c->socket, (struct sockaddr *)&address, length) < 0) {
     if (errno != EINPROGRESS) return -1;
     struct pollfd writable = {.fd = c->socket, .events = POLLOUT};
@@ -742,6 +742,12 @@ static int ocipp_connector_read(struct ocipp_connector *c, const unsigned char *
   static const char ack[] = "{\"kind\":\"linux-oci-parent-authenticated@1\",\"barrier\":\"unproven\"}";
   if (ocipp_connector_frame(c->socket, frame, &n, until) < 0 || n != sizeof(ack) - 1 ||
       memcmp(frame, ack, n) || ocipp_connector_current(c) < 0) return -1;
+  return 0;
+}
+static int ocipp_connector_read(struct ocipp_connector *c, const unsigned char *p, size_t size,
+                                 unsigned char reply[512], size_t *reply_size) {
+  if (ocipp_connector_open(c, p, size) < 0) return -1;
+  int64_t until = c->deadline;
   static const char command[] = "{\"kind\":\"linux-oci-parent-read-result@1\"}";
   unsigned char request[4 + sizeof(command) - 1]; size_t bytes = sizeof(command) - 1;
   request[0] = (unsigned char)(bytes >> 24); request[1] = (unsigned char)(bytes >> 16);
@@ -753,6 +759,79 @@ static int ocipp_connector_read(struct ocipp_connector *c, const unsigned char *
   struct pollfd trailing = {.fd = c->socket, .events = POLLIN};
   if (poll(&trailing, 1, 0) != 0 || trailing.revents) return -1;
   return 0;
+}
+/* A fixed two-stage peer connection. Past outcome is never a management
+ * permission. Only a later explicit STOP/JOIN frame on original private stdin
+ * may issue that fixed command; original P and H still enforce one-use/phase. */
+static int ocipp_connector_command(struct ocipp_connector *c, const char *command, int64_t until) {
+  size_t size = strlen(command);
+  if (size >= 128 || ocipp_connector_current(c) < 0) return -1;
+  unsigned char frame[132];
+  frame[0] = frame[1] = frame[2] = 0; frame[3] = (unsigned char)size;
+  memcpy(frame + 4, command, size);
+  return ocip_io(c->socket, frame, size + 4, 1, 0, until);
+}
+static int ocipp_outcome_literal(const unsigned char **at, const unsigned char *end, const char *text) {
+  size_t size = strlen(text);
+  if ((size_t)(end - *at) < size || memcmp(*at, text, size)) return -1;
+  *at += size; return 0;
+}
+static int ocipp_outcome_decimal(const unsigned char **at, const unsigned char *end, uint64_t limit, uint64_t *value) {
+  const unsigned char *start = *at; uint64_t n = 0;
+  while (*at < end && **at >= '0' && **at <= '9') {
+    unsigned int digit = (unsigned int)(**at - '0');
+    if (n > limit / 10 || (n == limit / 10 && digit > limit % 10)) return -1;
+    n = n * 10 + digit; ++*at;
+  }
+  if (*at == start || (*at - start > 1 && *start == '0')) return -1;
+  *value = n; return 0;
+}
+static int ocipp_connector_outcome_size(const unsigned char *body, size_t size, size_t *reply_size) {
+  const unsigned char *at = body, *end = body + size; uint64_t kind, effects, request, issued, unknown, reply;
+  if (ocipp_outcome_literal(&at,end,"{\"kind\":\"linux-oci-parent-outcome@1\",\"requestKind\":") < 0 ||
+      ocipp_outcome_decimal(&at,end,TNS_OCIP_CONTINUE_BORN_DISPOSAL,&kind) < 0 ||
+      ocipp_outcome_literal(&at,end,",\"effects\":") < 0 || ocipp_outcome_decimal(&at,end,UINT_MAX,&effects) < 0 ||
+      ocipp_outcome_literal(&at,end,",\"requestBytes\":\"") < 0 || ocipp_outcome_decimal(&at,end,TNS_OCI_MAX_JSON+4u,&request) < 0 ||
+      ocipp_outcome_literal(&at,end,"\",\"issuedBytes\":\"") < 0 || ocipp_outcome_decimal(&at,end,request,&issued) < 0 ||
+      ocipp_outcome_literal(&at,end,"\",\"deliveryUnknown\":") < 0 || ocipp_outcome_decimal(&at,end,1,&unknown) < 0 ||
+      ocipp_outcome_literal(&at,end,",\"replyBytes\":\"") < 0 || ocipp_outcome_decimal(&at,end,TNS_OCI_MAX_JSON+4u,&reply) < 0 ||
+      ocipp_outcome_literal(&at,end,"\",\"barrier\":\"unproven\"}") < 0 || at != end || (reply && reply < 5)) return -1;
+  *reply_size = (size_t)reply; return 0;
+}
+static int ocipp_connector_outcome(struct ocipp_connector *c, int64_t until) {
+  if (c->outcome_phase || ocipp_connector_current(c) < 0) return -1;
+  c->outcome_phase = 1;
+  unsigned char body[512]; size_t size = 0, captured_size = 0;
+  if (ocipp_connector_command(c,"{\"kind\":\"linux-oci-parent-read-outcome@1\"}",until) < 0 ||
+      ocipp_connector_frame(c->socket,body,&size,until) < 0 ||
+      ocipp_connector_outcome_size(body,size,&captured_size) < 0 || ocipp_connector_current(c) < 0 ||
+      ocip_reply((const char *)body) < 0) return -1;
+  if (captured_size) {
+    unsigned char *captured = malloc(captured_size);
+    if (!captured) return -1;
+    int result = ocip_io(c->socket,captured,captured_size,0,0,until);
+    uint32_t bytes = 0;
+    if (!result && (tns_ocip_frame(captured,&bytes) < 0 || (size_t)bytes + 4 != captured_size)) result = -1;
+    if (!result && ocipp_connector_current(c) < 0) result = -1;
+    if (!result) result = ocip_io(1,captured,captured_size,1,0,until);
+    free(captured); if (result < 0) return -1;
+  }
+  if (ocipp_connector_current(c) < 0) return -1;
+  c->outcome_phase = 2; return 0;
+}
+static int ocipp_connector_init(struct ocipp_connector *c, const unsigned char *body, size_t size,
+                                 unsigned char reply[512], size_t *reply_size) {
+  static const char stop[] = "{\"kind\":\"linux-oci-stop-init@1\"}";
+  static const char join[] = "{\"kind\":\"linux-oci-join-init@1\"}";
+  const char *command = size == sizeof(stop)-1 && !memcmp(body,stop,size) ? stop :
+    size == sizeof(join)-1 && !memcmp(body,join,size) ? join : NULL;
+  if (!command || c->outcome_phase != 2 || c->init_attempt || ocipp_connector_current(c) < 0) return -1;
+  c->init_attempt = 1; /* consumed before the sole fixed command write */
+  int64_t now = ocip_now(); if (now < 0) return -1;
+  if (ocipp_connector_command(c,command,now+4000) < 0 ||
+      ocipp_connector_frame(c->socket,reply,reply_size,now+20000) < 0 || ocipp_connector_current(c) < 0) return -1;
+  struct pollfd trailing = {.fd=c->socket,.events=POLLIN};
+  return poll(&trailing,1,0) || trailing.revents ? -1 : 0;
 }
 static int ocipp_connector_close(struct ocipp_connector *c) {
   if (ocipp_controller(&c->custody) < 0) return -1;
@@ -780,6 +859,23 @@ static int ocipp_connector_main(void) {
   if (result < 0) return 77;
   /* This relays original P's factual H reply, never connector-exit=>H-exit. */
   return ocip_reply((const char *)reply) < 0 ? 77 : 0;
+}
+static int ocipp_connector_management_main(void) {
+  if (geteuid() || ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
+  unsigned char *body = NULL; uint32_t size = 0;
+  if (ocip_read(&body,&size)) { if (body) { explicit_bzero(body,size); free(body); } return 77; }
+  struct ocipp_connector c; memset(&c,0,sizeof(c)); c.socket=c.peer_pidfd=c.custody.executable=-1;
+  int result=ocipp_connector_open(&c,body,size); explicit_bzero(body,size); free(body); body=NULL;
+  if (!result) result=ocipp_connector_outcome(&c,c.deadline);
+  unsigned char reply[512]; size_t reply_size=0;
+  /* This wait is the source window for the owning fresh Sql guard. No command
+   * or EOF before it authorises H IO; closing only this connector preserves P. */
+  if (!result) { if (ocip_read(&body,&size)) result=-1;
+    else result=ocipp_connector_init(&c,body,size,reply,&reply_size); }
+  if (body) { explicit_bzero(body,size); free(body); }
+  if (ocipp_connector_close(&c)<0) result=-1;
+  ocipp_connector_free(&c);
+  return result<0 || ocip_reply((const char *)reply)<0 ? 77 : 0;
 }
 static int ocipp_peer_main(void) { ocipp_peer_mode = 1; return ocipp_main(); }
 #endif

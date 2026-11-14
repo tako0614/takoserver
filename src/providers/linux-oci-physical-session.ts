@@ -1774,17 +1774,7 @@ function readOriginalPeerResult(
   signal: AbortSignal,
 ): Promise<LinuxOciParentHResult> {
   state.assertBinary();
-  const frame = Buffer.alloc(176),
-    peer = state.peer;
-  frame.writeUInt32BE(172);
-  frame.write("TKOPEER2", 4, "ascii");
-  frame.write(state.claim, 12, "ascii");
-  frame.writeBigUInt64BE(BigInt(state.generation), 76);
-  frame.writeBigUInt64BE(BigInt(state.info.listenerCookie), 84);
-  state.capability.copy(frame, 92);
-  frame.writeBigUInt64BE(BigInt(peer.device), 124);
-  frame.writeBigUInt64BE(BigInt(peer.inode), 132);
-  frame.write(peer.bootId, 140, "ascii");
+  const frame = originalPeerConnectorFrame(state);
   const child = spawn(state.binary, ["--parent-peer-read-result"], {
     env: Object.create(null),
     shell: false,
@@ -1936,11 +1926,7 @@ function readOriginalPeerResult(
  * constructs only a one-use read-only connector, never a Parent or H session.
  * Its input is data, not authority; the original same-Sql creator owns the
  * authenticated callsite and must recheck that scope around this interval. */
-export function prepareAuthenticatedLinuxOciPeerReader(
-  binary: string,
-  value: unknown,
-  lifetime: AbortSignal,
-) {
+function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortSignal) {
   const keys = [
     "kind",
     "claimId",
@@ -2017,6 +2003,17 @@ export function prepareAuthenticatedLinuxOciPeerReader(
     connector: undefined,
     unknown: false,
   };
+  return state;
+}
+
+export function prepareAuthenticatedLinuxOciPeerReader(
+  binary: string,
+  value: unknown,
+  lifetime: AbortSignal,
+) {
+  const state = authenticatedPeerState(binary, value, lifetime),
+    capability = state.capability,
+    assertBinary = state.assertBinary;
   let attempted = false;
   return async (signal: AbortSignal) => {
     if (attempted || signal.aborted || lifetime.aborted) throw failure("parent_peer_retained");
@@ -2028,4 +2025,393 @@ export function prepareAuthenticatedLinuxOciPeerReader(
       capability.fill(0);
     }
   };
+}
+
+function originalPeerConnectorFrame(state: OriginalPeerReaderState) {
+  const frame = Buffer.alloc(176),
+    peer = state.peer;
+  frame.writeUInt32BE(172);
+  frame.write("TKOPEER2", 4, "ascii");
+  frame.write(state.claim, 12, "ascii");
+  frame.writeBigUInt64BE(BigInt(state.generation), 76);
+  frame.writeBigUInt64BE(BigInt(state.info.listenerCookie), 84);
+  state.capability.copy(frame, 92);
+  frame.writeBigUInt64BE(BigInt(peer.device), 124);
+  frame.writeBigUInt64BE(BigInt(peer.inode), 132);
+  frame.write(peer.bootId, 140, "ascii");
+  return frame;
+}
+
+/** Past original P facts only. Delivery uncertainty stays a fact, never a new
+ * effect permission; current Core authority is required after this interval. */
+export interface LinuxOciPeerInitOutcome {
+  readonly kind: "linux-oci-parent-outcome@1";
+  readonly requestKind: number;
+  readonly effects: number;
+  readonly requestBytes: string;
+  readonly issuedBytes: string;
+  readonly deliveryUnknown: 0 | 1;
+  readonly replyBytes: string;
+  readonly barrier: "unproven";
+}
+export interface LinuxOciPeerInitProgress {
+  readonly kind: "linux-oci-peer-init-progress@1";
+  readonly operation: "stop-init" | "join-init";
+  readonly reply: Reply;
+  readonly barrier: "unproven";
+}
+/** Owning internal two-stage connector. No caller-selected target or command;
+ * advance selects only original STOP/JOIN from this connection's past facts. */
+export function prepareAuthenticatedLinuxOciPeerInit(
+  binary: string,
+  binding: unknown,
+  lifetime: AbortSignal,
+) {
+  const state = authenticatedPeerState(binary, binding, lifetime);
+  let started = false,
+    sent = false,
+    signal: AbortSignal | undefined,
+    timer: ReturnType<typeof setTimeout> | undefined;
+  let buffer = Buffer.alloc(0),
+    outcome: LinuxOciPeerInitOutcome | undefined,
+    captured: Reply | undefined;
+  let reply: Reply | undefined,
+    operation: "stop-init" | "join-init" | undefined,
+    phase: "outcome" | "paused" | "reply" | "done" = "outcome";
+  let commandWritten = false,
+    written = false,
+    exited = false,
+    ended = false,
+    errorEnded = false,
+    closed = false,
+    finished = false,
+    stderr = 0;
+  let code: number | null = null,
+    exitSignal: NodeJS.Signals | null = null;
+  let resolveOutcome!: (v: LinuxOciPeerInitOutcome) => void, rejectOutcome!: (e: Error) => void;
+  let resolveResult!: (v: LinuxOciPeerInitProgress) => void, rejectResult!: (e: Error) => void;
+  const rawOutcome = new Promise<LinuxOciPeerInitOutcome>((yes, no) => {
+    resolveOutcome = yes;
+    rejectOutcome = no;
+  });
+  const rawResult = new Promise<LinuxOciPeerInitProgress>((yes, no) => {
+    resolveResult = yes;
+    rejectResult = no;
+  });
+  const current = () => {
+    if (!started || state.unknown || signal?.aborted || lifetime.aborted)
+      throw failure("parent_peer_retained");
+    state.assertBinary();
+  };
+  const stop = () => {
+    state.unknown = true;
+    if (finished) return;
+    finished = true;
+    if (timer) clearTimeout(timer);
+    signal?.removeEventListener("abort", stop);
+    lifetime.removeEventListener("abort", stop);
+    state.capability.fill(0);
+    rejectOutcome(failure("parent_peer_retained"));
+    rejectResult(failure("parent_peer_retained"));
+    // Only the short-lived connector stdin, never the original H pipe.
+    try {
+      state.connector?.stdin.end();
+    } catch {
+      /* retained UNKNOWN */
+    }
+  };
+  const result = rawResult.then((value) => {
+    current();
+    return value;
+  });
+  const observed = rawOutcome.then((value) => {
+    current();
+    return value;
+  });
+  void result.catch(() => undefined);
+  void observed.catch(() => undefined);
+  const check = () => {
+    if (
+      finished ||
+      !sent ||
+      !commandWritten ||
+      !written ||
+      !exited ||
+      !ended ||
+      !errorEnded ||
+      !closed
+    )
+      return;
+    try {
+      current();
+      if (!reply || code !== 0 || exitSignal !== null || buffer.length) throw failure();
+      finished = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener("abort", stop);
+      lifetime.removeEventListener("abort", stop);
+      state.capability.fill(0);
+      phase = "done";
+      resolveResult(
+        Object.freeze({
+          kind: "linux-oci-peer-init-progress@1",
+          operation: operation!,
+          reply,
+          barrier: "unproven",
+        }),
+      );
+    } catch {
+      stop();
+    }
+  };
+  const frame = (): Buffer | undefined => {
+    if (buffer.length < 4) return;
+    const n = buffer.readUInt32BE(0);
+    if (!n || n > LIMIT) throw failure();
+    if (buffer.length < n + 4) return;
+    const body = buffer.subarray(4, n + 4);
+    buffer = buffer.subarray(n + 4);
+    return body;
+  };
+  const data = () => {
+    try {
+      current();
+      if (phase === "outcome") {
+        if (!outcome) {
+          const body = frame();
+          if (!body) return;
+          const v = parseStrictJson(body, 512);
+          const keys = [
+            "kind",
+            "requestKind",
+            "effects",
+            "requestBytes",
+            "issuedBytes",
+            "deliveryUnknown",
+            "replyBytes",
+            "barrier",
+          ];
+          if (
+            !record(v) ||
+            Object.keys(v).length !== keys.length ||
+            !keys.every((k) => Object.hasOwn(v, k)) ||
+            JSON.stringify(v) !== decoder.decode(body) ||
+            v.kind !== "linux-oci-parent-outcome@1" ||
+            v.barrier !== "unproven" ||
+            !integer(v.requestKind, 0, 16) ||
+            !integer(v.effects, 0, 131070) ||
+            (v.effects & ~131070) !== 0 ||
+            !uint64(v.requestBytes) ||
+            !uint64(v.issuedBytes) ||
+            !uint64(v.replyBytes) ||
+            !bit(v.deliveryUnknown) ||
+            BigInt(v.requestBytes) > BigInt(LIMIT + 4) ||
+            BigInt(v.issuedBytes) > BigInt(v.requestBytes) ||
+            BigInt(v.replyBytes) > BigInt(LIMIT + 4) ||
+            (v.replyBytes !== "0" && BigInt(v.replyBytes) < 5n)
+          )
+            throw failure();
+          outcome = Object.freeze({
+            kind: v.kind,
+            requestKind: v.requestKind,
+            effects: v.effects,
+            requestBytes: v.requestBytes,
+            issuedBytes: v.issuedBytes,
+            deliveryUnknown: v.deliveryUnknown,
+            replyBytes: v.replyBytes,
+            barrier: "unproven",
+          });
+        }
+        if (outcome.replyBytes !== "0" && !captured) {
+          if (buffer.length < Number(outcome.replyBytes)) return;
+          const amount = buffer.length,
+            body = frame();
+          if (!body || amount - buffer.length !== Number(outcome.replyBytes)) throw failure();
+          captured = parseReply(body);
+        }
+        if (buffer.length) throw failure();
+        if (written) {
+          phase = "paused";
+          resolveOutcome(outcome);
+        }
+        return;
+      }
+      if (phase === "reply") {
+        const body = frame();
+        if (!body) return;
+        if (reply || buffer.length) throw failure();
+        reply = parseReply(body);
+        if (reply.kind === "linux-oci-refused@1") {
+          if (reply.custody !== "retained" || reply.stage !== operation) throw failure();
+        } else if (
+          reply.kind !==
+          (operation === "stop-init"
+            ? "linux-oci-init-reaped@1"
+            : "linux-oci-init-reaped-observation@1")
+        )
+          throw failure();
+        if (
+          "nativeId" in reply &&
+          (reply.nativeId !== expectedNative ||
+            (captured &&
+              "namespaceDevice" in captured &&
+              (reply.namespaceDevice !== captured.namespaceDevice ||
+                reply.namespaceInode !== captured.namespaceInode)))
+        )
+          throw failure();
+        check();
+        return;
+      }
+      if (buffer.length) throw failure();
+    } catch {
+      stop();
+    }
+  };
+  let expectedNative: string | undefined;
+  return Object.freeze({
+    outcome: observed,
+    settlement: result,
+    assertCurrent: current,
+    begin(actualSignal: AbortSignal) {
+      if (started || actualSignal.aborted || lifetime.aborted)
+        throw failure("parent_peer_retained");
+      started = true;
+      signal = actualSignal;
+      state.assertBinary();
+      const child = spawn(binary, ["--parent-peer-manage-init"], {
+        env: Object.create(null),
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      state.connector = child;
+      timer = setTimeout(stop, state.timeout);
+      signal.addEventListener("abort", stop, { once: true });
+      lifetime.addEventListener("abort", stop, { once: true });
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (!Buffer.isBuffer(chunk) || chunk.length > LIMIT + 1024 - buffer.length) {
+          stop();
+          return;
+        }
+        buffer = Buffer.concat([buffer, chunk]);
+        data();
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (!Buffer.isBuffer(chunk) || chunk.length > STDERR_LIMIT - stderr) stop();
+        else stderr += chunk.length;
+      });
+      child.stdout.on("end", () => {
+        ended = true;
+        if (!sent) stop();
+        else check();
+      });
+      child.stderr.on("end", () => {
+        errorEnded = true;
+        check();
+      });
+      child.on("exit", (value, s) => {
+        exited = true;
+        code = value;
+        exitSignal = s;
+        if (!sent) stop();
+        else check();
+      });
+      child.on("close", (value, s) => {
+        closed = true;
+        if (value !== code || s !== exitSignal) stop();
+        else check();
+      });
+      child.on("error", stop);
+      child.stdin.on("error", stop);
+      child.stdout.on("error", stop);
+      child.stderr.on("error", stop);
+      const bootstrap = originalPeerConnectorFrame(state);
+      try {
+        current();
+        child.stdin.write(bootstrap, (error) => {
+          bootstrap.fill(0);
+          if (error) stop();
+          else {
+            written = true;
+            data();
+            check();
+          }
+        });
+      } catch {
+        bootstrap.fill(0);
+        stop();
+      }
+      return observed;
+    },
+    advance(nativeId: string, actualSignal: AbortSignal) {
+      current();
+      if (
+        signal !== actualSignal ||
+        sent ||
+        phase !== "paused" ||
+        !outcome ||
+        !captured ||
+        !CLAIM.test(nativeId) ||
+        outcome.requestBytes === "0" ||
+        outcome.requestBytes !== outcome.issuedBytes
+      )
+        throw failure("parent_peer_phase");
+      // Exact original completion facts fence routing; neither effects nor a
+      // captured reply can replace the fresh owning Core guard.
+      const allowed = (1 << 1) | (1 << 4) | (1 << 6);
+      if (outcome.effects & ~allowed) throw failure("parent_peer_phase");
+      if (outcome.effects & (1 << 6)) {
+        if (
+          ![6, 7].includes(outcome.requestKind) ||
+          !(
+            captured.kind === "linux-oci-init-reaped@1" ||
+            captured.kind === "linux-oci-init-reaped-observation@1" ||
+            (captured.kind === "linux-oci-refused@1" &&
+              captured.custody === "retained" &&
+              ["stop-init", "join-init"].includes(captured.stage))
+          )
+        )
+          throw failure("parent_peer_phase");
+        operation = "join-init";
+      } else {
+        if (
+          !(outcome.effects & (1 << 1)) ||
+          ![1, 2, 4, 5].includes(outcome.requestKind) ||
+          ![
+            "linux-oci-created-stopped@1",
+            "linux-oci-stopped-observation@1",
+            "linux-oci-started@1",
+            "linux-oci-started-observation@1",
+          ].includes(captured.kind)
+        )
+          throw failure("parent_peer_phase");
+        operation = "stop-init";
+      }
+      if ("nativeId" in captured && captured.nativeId !== nativeId)
+        throw failure("parent_peer_phase");
+      expectedNative = nativeId;
+      sent = true;
+      phase = "reply";
+      const body = Buffer.from(
+          JSON.stringify({
+            kind: operation === "stop-init" ? "linux-oci-stop-init@1" : "linux-oci-join-init@1",
+          }),
+        ),
+        request = Buffer.alloc(body.length + 4);
+      request.writeUInt32BE(body.length);
+      body.copy(request, 4);
+      try {
+        current();
+        state.connector!.stdin.write(request, (error) => {
+          if (error) stop();
+          else {
+            commandWritten = true;
+            check();
+          }
+        });
+      } catch {
+        stop();
+      }
+      return result;
+    },
+    cancel: stop,
+  });
 }

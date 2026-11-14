@@ -37,11 +37,13 @@ const refusedSql: Sql = {
 };
 const clock = () => new Date();
 
-async function settings() {
-  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
+async function settings(fixedKey?: CryptoKey) {
+  const key =
+    fixedKey ??
+    (await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+      "encrypt",
+      "decrypt",
+    ]));
   const config = new TextEncoder().encode(
     JSON.stringify({
       architecture: "amd64",
@@ -412,4 +414,35 @@ test("OCI Host creator preserves original same-Sql acceptance, configured secret
       await rm(root, { recursive: true, force: true });
     }
   }
+});
+
+// New selected cohort only; old Host cases remain filtered and unchanged.
+test("peer management Host selection rejects invalid private mode and accessor before IO", async () => {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new Uint8Array(32).fill(0x5a),
+    "AES-GCM",
+    false,
+    ["encrypt", "decrypt"],
+  );
+  const f = await settings(key);
+  for (const value of ["invalid", {}, false]) {
+    const selection = { ...f.selection };
+    Reflect.set(selection, "ociParentControl", value);
+    expect(() => createSelfhostLinuxOciCore({ sql: refusedSql, clock, selection })).toThrow();
+  }
+  let reads = 0;
+  const selection = { ...f.selection };
+  Object.defineProperty(selection, "ociParentControl", {
+    enumerable: true,
+    get() {
+      reads++;
+      throw Error("unexpected private mode getter");
+    },
+  });
+  expect(() => createSelfhostLinuxOciCore({ sql: refusedSql, clock, selection })).toThrow(
+    "invalid_selection",
+  );
+  expect(reads).toBe(0);
+  expect(f.reads()).toBe(0);
 });

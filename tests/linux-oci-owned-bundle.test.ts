@@ -74,6 +74,7 @@ async function fixture(
     readonly parentControl?: boolean;
     readonly parentPeer?: boolean;
     readonly peerPending?: boolean;
+    readonly peerManagementFault?: "incomplete" | "missing-reply" | "lost-reply";
     readonly parentFault?: "foreign-claim" | "foreign-generation";
     readonly fixedKeys?: { readonly key: CryptoKey; readonly comparison: CryptoKey };
     readonly extraImage?: boolean;
@@ -239,6 +240,10 @@ async function fixture(
     }
     if (adversarial.parentControl || adversarial.parentPeer)
       recreateParent = () => createLinuxOciOwnedBundle(options);
+    if (adversarial.parentPeer) {
+      const { sql, clock, ...selection } = options;
+      recreateNormal = () => createSelfhostLinuxOciContainerBackend({ sql, clock, selection });
+    }
     if (adversarial.normalBackend) {
       const { sql, clock, ...selection } = options;
       recreateNormal = () => createSelfhostLinuxOciContainerBackend({ sql, clock, selection });
@@ -319,16 +324,22 @@ async function fixture(
     unpackerStarted = resolve;
   });
   let originalPeerBootstrap: Buffer | undefined;
+  let peerReply: unknown,
+    peerKind = 0,
+    peerEffects = 0,
+    peerBytes = 0;
   const raw = spyOn(childProcess, "spawn").mockImplementation(((
     file: string,
     args: readonly string[],
     options: childProcess.SpawnOptions,
   ) => {
     if (file === physicalBinary) {
-      const connector = adversarial.parentPeer && args[0] === "--parent-peer-read-result";
+      const managing = adversarial.parentPeer && args[0] === "--parent-peer-manage-init";
+      const connector =
+        adversarial.parentPeer && (args[0] === "--parent-peer-read-result" || managing);
       expect(args).toEqual(
         connector
-          ? ["--parent-peer-read-result"]
+          ? [managing ? "--parent-peer-manage-init" : "--parent-peer-read-result"]
           : adversarial.parentPeer
             ? ["--persistent-parent-peer"]
             : adversarial.parentControl
@@ -340,6 +351,8 @@ async function fixture(
         nativeClosing = composition.close();
         void nativeClosing.catch(() => undefined);
       }
+      let managementReady = false,
+        managementSent = false;
       let created = false;
       let disposalRefused = false;
       let nativeId: string | undefined;
@@ -348,6 +361,7 @@ async function fixture(
         stderr = new PassThrough();
       if (nativeProcesses === 1) originalNativeStdout = stdout;
       const reply = (value: unknown) => {
+        if (adversarial.parentPeer && !connector) peerReply = value;
         const body = Buffer.from(JSON.stringify(value)),
           frame = Buffer.alloc(body.length + 4);
         frame.writeUInt32BE(body.length);
@@ -358,8 +372,47 @@ async function fixture(
         write(frame: Buffer, _encoding, done) {
           void (async () => {
             expect(frame.readUInt32BE(0)).toBe(frame.length - 4);
+            if (managing && managementReady) {
+              managementSent = true;
+              const command = JSON.parse(frame.subarray(4).toString("utf8"));
+              if (
+                Object.keys(command).length !== 1 ||
+                !["linux-oci-stop-init@1", "linux-oci-join-init@1"].includes(command.kind)
+              )
+                throw Error("nonfixed management command");
+              const stop = command.kind === "linux-oci-stop-init@1";
+              if (stop && peerEffects & (1 << 6)) throw Error("replayed original STOP");
+              if (!stop && !(peerEffects & (1 << 6))) throw Error("JOIN before original STOP");
+              nativeRequests.push(command.kind);
+              peerKind = stop ? 6 : 7;
+              peerEffects |= stop ? 1 << 6 : 0;
+              peerBytes = frame.length;
+              if (!originalCreate || typeof originalCreate.claimId !== "string")
+                throw Error("original peer native absent");
+              peerReply = {
+                kind: stop ? "linux-oci-init-reaped@1" : "linux-oci-init-reaped-observation@1",
+                nativeId: originalCreate.claimId,
+                namespaceDevice: 4,
+                namespaceInode: 55,
+                pidNamespaceDevice: 6,
+                pidNamespaceInode: 77,
+                barrier: "unproven",
+              };
+              const lost = stop && adversarial.peerManagementFault === "lost-reply";
+              if (!lost) reply(peerReply);
+              done();
+              queueMicrotask(() => {
+                stdout.end();
+                stderr.end();
+                child.emit("exit", lost ? 77 : 0, null);
+                child.emit("close", lost ? 77 : 0, null);
+              });
+              return;
+            }
             if (connector) {
-              nativeRequests.push("linux-oci-parent-read-result@2");
+              nativeRequests.push(
+                managing ? "linux-oci-parent-read-outcome@2" : "linux-oci-parent-read-result@2",
+              );
               const original = originalPeerBootstrap;
               const valid =
                 original &&
@@ -371,6 +424,29 @@ async function fixture(
                 frame.readBigUInt64BE(124) === 5n &&
                 frame.readBigUInt64BE(132) === 0x123456789abcdef0n &&
                 frame.subarray(140).equals(Buffer.from("11111111-2222-4333-8444-555555555555"));
+              if (valid && managing) {
+                const body = Buffer.from(JSON.stringify(peerReply)),
+                  captured = Buffer.alloc(body.length + 4);
+                captured.writeUInt32BE(body.length);
+                body.copy(captured, 4);
+                const missing = adversarial.peerManagementFault === "missing-reply";
+                reply({
+                  kind: "linux-oci-parent-outcome@1",
+                  requestKind: peerKind,
+                  effects: peerEffects,
+                  requestBytes: String(peerBytes),
+                  issuedBytes: String(
+                    adversarial.peerManagementFault === "incomplete" ? 0 : peerBytes,
+                  ),
+                  deliveryUnknown: 1,
+                  replyBytes: String(missing ? 0 : captured.length),
+                  barrier: "unproven",
+                });
+                if (!missing) stdout.write(captured);
+                managementReady = true;
+                done();
+                return;
+              }
               if (valid)
                 reply(
                   adversarial.peerPending
@@ -425,6 +501,17 @@ async function fixture(
             if (!isJsonObject(request) || typeof request.kind !== "string")
               throw new Error("malformed raw request");
             nativeRequests.push(request.kind);
+            if (adversarial.parentPeer && !connector) {
+              const kinds: Record<string, number> = {
+                "linux-oci-create-stopped@1": 1,
+                "linux-oci-observe-stopped@1": 2,
+                "linux-oci-start@1": 4,
+                "linux-oci-observe-started@1": 5,
+              };
+              peerKind = kinds[request.kind] ?? 0;
+              peerBytes = frame.length;
+              if (peerKind === 1 || peerKind === 4) peerEffects |= 1 << peerKind;
+            }
             if (request.kind === "linux-oci-create-stopped@1") {
               if (nativeProcesses === 1) originalCreate = request;
               created = true;
@@ -647,6 +734,13 @@ async function fixture(
         },
       });
       stdin.on("finish", () => {
+        if (managing && !managementSent) {
+          stdout.end();
+          stderr.end();
+          child.emit("exit", 77, null);
+          child.emit("close", 77, null);
+          return;
+        }
         if (!created) {
           nativeExits++;
           child.emit("exit", 0, null);
@@ -819,6 +913,24 @@ async function fixture(
       return { kind: "unknown" };
     }
   };
+  // Only the new private peer normal-form fixture captures the actual engine
+  // execution for await-boundary refusal tests, then calls the real backend.
+  const normalForm = (backend: ReturnType<typeof createLinuxOciOwnedBundle>) => {
+    if (!adversarial.parentPeer) return backend.retainedForm;
+    const invoke = async (execution: V2Execution, phase: "execute" | "reconcile") => {
+      accepted = execution;
+      if (execution.action === "delete") await beforeRetire?.(execution);
+      return backend.retainedForm.backend[phase](execution);
+    };
+    return {
+      ...backend.retainedForm,
+      backend: {
+        ...backend.retainedForm.backend,
+        execute: (execution: V2Execution) => invoke(execution, "execute"),
+        reconcile: (execution: V2Execution) => invoke(execution, "reconcile"),
+      },
+    };
+  };
   const normalEngine = (backend: ReturnType<typeof createLinuxOciOwnedBundle>) =>
     createTakoformV2Engine(
       {
@@ -831,7 +943,7 @@ async function fixture(
           comparison: { current: { id: "synthetic-oci-comparison", key: comparison } },
           transferTtlSeconds: 300,
         },
-        forms: { [V2_CONTAINER_F2_FORM]: backend.retainedForm },
+        forms: { [V2_CONTAINER_F2_FORM]: normalForm(backend) },
       },
       backend.acceptance,
     );
@@ -878,7 +990,7 @@ async function fixture(
         },
       },
       ...(adversarial.normalBackend
-        ? { now: normalClock, forms: { [V2_CONTAINER_F2_FORM]: composition.retainedForm } }
+        ? { now: normalClock, forms: { [V2_CONTAINER_F2_FORM]: normalForm(composition) } }
         : {}),
     },
     composition.acceptance,

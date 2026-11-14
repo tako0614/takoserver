@@ -416,6 +416,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent")) return ocipp_main();
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer")) return ocipp_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-result")) return ocipp_connector_main();
+  if (argc == 2 && !strcmp(argv[1], "--parent-peer-manage-init")) return ocipp_connector_management_main();
   (void)argv;
   if (argc != 1 || geteuid() != 0 || fcntl(2, F_GETFD) < 0 ||
       ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;

@@ -21,6 +21,7 @@ export type SelfhostLinuxOciCoreSelection = Pick<
   | "pidsLimit"
   | "egressLimits"
   | "hostTopology"
+  | "ociParentControl"
 > & {
   readonly configuredInputs: NonNullable<LinuxOciOwnedBundleOptions["configuredInputs"]>;
 };
@@ -75,7 +76,11 @@ export function createSelfhostLinuxOciCore(input: {
     "nanoCpus",
     "pidsLimit",
   ];
-  dataKeys(selection, [...required, "physicalBinary", "egressLimits", "hostTopology"], required);
+  dataKeys(
+    selection,
+    [...required, "physicalBinary", "egressLimits", "hostTopology", "ociParentControl"],
+    required,
+  );
   dataKeys(selection.configuredInputs, ["keyring", "maxSecretBytes"]);
   dataKeys(selection.configuredInputs.keyring, ["current", "keyForDecryption"]);
   dataKeys(selection.configuredInputs.keyring.current, ["id", "key"]);
@@ -136,6 +141,9 @@ export function createSelfhostLinuxOciCore(input: {
       : {}),
     ...(Object.hasOwn(selection, "hostTopology") && selection.hostTopology !== undefined
       ? { hostTopology: selection.hostTopology }
+      : {}),
+    ...(Object.hasOwn(selection, "ociParentControl") && selection.ociParentControl !== undefined
+      ? { ociParentControl: selection.ociParentControl }
       : {}),
   });
 }
