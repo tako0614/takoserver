@@ -321,3 +321,338 @@ test("binding validation and executable currentness refuse before bootstrap IO",
     f.cleanup();
   }
 });
+
+// New explicit profile only. Original cases above remain registered/filtered;
+// all native peer checks live in the separate actual-C syscall model.
+const PEER_BOOT = "11111111-1111-4111-8111-111111111111";
+const PEER_INODE = 0x1000000000000123n;
+function peerInfo() {
+  const bytes = Buffer.alloc(144);
+  bytes.writeUInt32BE(140);
+  bytes.write("TKOINFO2", 4);
+  bytes.write(CLAIM, 12);
+  bytes.writeBigUInt64BE(1n, 76);
+  bytes.writeBigUInt64BE(COOKIE, 84);
+  bytes.writeBigUInt64BE(42n, 92);
+  bytes.writeBigUInt64BE(PEER_INODE, 100);
+  bytes.write(PEER_BOOT, 108);
+  return bytes;
+}
+function peerOpen(f: ReturnType<typeof fixture>) {
+  return createLinuxOciParentBootstrap({
+    binary: f.binary,
+    claimId: CLAIM,
+    generation: 1,
+    capability: fixtureCapability(),
+    timeoutMs: 200,
+    peerProfile: "pidfs64@1",
+  });
+}
+async function readyPeer(f: ReturnType<typeof fixture>) {
+  const parent = peerOpen(f),
+    pending = parent.bootstrap(signal());
+  await wrote();
+  for (const byte of peerInfo()) f.stdout.write(Buffer.from([byte]));
+  const observed = await pending;
+  return { parent, observed };
+}
+function connectorStreams() {
+  const stdin = new PassThrough(),
+    stdout = new PassThrough(),
+    stderr = new PassThrough();
+  const stdio: childProcess.ChildProcessWithoutNullStreams["stdio"] = [
+    stdin,
+    stdout,
+    stderr,
+    undefined,
+    undefined,
+  ];
+  const child = Object.defineProperties(new childProcess.ChildProcess(), {
+    stdin: { value: stdin, writable: true },
+    stdout: { value: stdout, writable: true },
+    stderr: { value: stderr, writable: true },
+    stdio: { value: stdio, writable: true },
+  });
+  let kills = 0,
+    unrefs = 0;
+  const concrete = Object.assign(child, {
+    stdin,
+    stdout,
+    stderr,
+    stdio,
+    kill() {
+      kills++;
+      return true;
+    },
+    unref() {
+      unrefs++;
+    },
+  });
+  const writes: Buffer[] = [];
+  stdin.on("data", (bytes: Buffer) => writes.push(Buffer.from(bytes)));
+  return {
+    child: concrete,
+    stdin,
+    stdout,
+    stderr,
+    writes,
+    counts: () => ({ kills, unrefs }),
+    close() {
+      stdin.destroy();
+      stdout.destroy();
+      stderr.destroy();
+    },
+  };
+}
+function resultFrame(error = 0) {
+  const body = Buffer.from(
+    JSON.stringify({
+      kind: error ? "linux-oci-parent-h-result-refused@1" : "linux-oci-parent-h-exited@1",
+      error,
+      barrier: "unproven",
+    }),
+  );
+  const bytes = Buffer.alloc(body.length + 4);
+  bytes.writeUInt32BE(body.length);
+  body.copy(bytes, 4);
+  return bytes;
+}
+
+test("peer instance bootstrap captures original lossless pidfs/boot before H and purpose seal keeps it", async () => {
+  const f = fixture();
+  try {
+    const { parent, observed } = await readyPeer(f);
+    expect(f.raw).toHaveBeenCalledWith(f.binary, ["--persistent-parent-peer"], {
+      env: {},
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    expect(f.writes).toHaveLength(1);
+    expect(f.writes[0]?.subarray(4, 12).equals(Buffer.from("TKOBIND2"))).toBe(true);
+    expect(observed.kind).toBe("linux-oci-parent-bootstrap@2");
+    expect(observed.peer).toEqual({
+      kind: "linux-oci-parent-peer@1",
+      device: "42",
+      inode: PEER_INODE.toString(),
+      bootId: PEER_BOOT,
+    });
+    expect(Object.isFrozen(observed.peer)).toBe(true);
+    const codec = await import("../src/providers/container-secret-codec.ts");
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new Uint8Array(32).fill(0xa5),
+      "AES-GCM",
+      false,
+      ["encrypt", "decrypt"],
+    );
+    const other = await crypto.subtle.importKey(
+      "raw",
+      new Uint8Array(32).fill(0x5a),
+      "AES-GCM",
+      false,
+      ["encrypt", "decrypt"],
+    );
+    const selected = { id: "NONSECRET-original", key };
+    const request = {
+      allocationRoot: "/owned/allocation",
+      claimId: CLAIM,
+      installationId: "installation",
+      resourceUid: "resource",
+      incarnationId: "incarnation",
+      generation: 1,
+      revision: "revision",
+      sourceDigest: `sha256:${"1".repeat(64)}`,
+      manifestDigest: `sha256:${"2".repeat(64)}`,
+      configDigest: `sha256:${"3".repeat(64)}`,
+      archiveDigest: `sha256:${"4".repeat(64)}`,
+      args: ["/app"],
+      env: ["NONSECRET=fixture"],
+      cwd: "/",
+      uid: 0,
+      gid: 0,
+      memoryBytes: 1024,
+      nanoCpus: 10000000,
+      pidsLimit: 32,
+    };
+    const scope = JSON.stringify({
+      purpose: "takoserver.linux-oci-parent-peer-control@1",
+      claimId: CLAIM,
+    });
+    const pending = parent.sealPeerControlBinding(selected, scope, signal(), request);
+    selected.id = "NONSECRET-changed";
+    selected.key = other;
+    const sealed = await pending;
+    expect(sealed.keyId).toBe("NONSECRET-original");
+    const plaintext = await codec.decryptContainerSecretBytes(
+      key,
+      codec.decodeContainerSecretBytes(sealed.nonce),
+      codec.decodeContainerSecretBytes(sealed.ciphertext),
+      new TextEncoder().encode(scope),
+    );
+    try {
+      const value = JSON.parse(new TextDecoder().decode(plaintext));
+      expect(value.peer).toEqual(observed.peer);
+      expect(value.kind).toBe("linux-oci-original-peer-control@1");
+      expect(value.capability).toBe(codec.encodeContainerSecretBytes(fixtureCapability()));
+    } finally {
+      plaintext.fill(0);
+    }
+    expect(f.writes).toHaveLength(1);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("peer instance rejects malformed boot/inode/version and original P loss without replacement", async () => {
+  const bad: Buffer[] = [];
+  const zero = peerInfo();
+  zero.writeBigUInt64BE(0n, 100);
+  bad.push(zero);
+  const boot = peerInfo();
+  boot[108] = (boot[108] ?? 0) | 0x80;
+  bad.push(boot);
+  const version = peerInfo();
+  version.write("TKOINFO1", 4);
+  bad.push(version);
+  const length = peerInfo();
+  length.writeUInt32BE(88);
+  bad.push(length);
+  for (const bytes of bad) {
+    const f = fixture();
+    try {
+      const parent = peerOpen(f);
+      const pending = parent.bootstrap(signal()).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      f.stdout.write(bytes);
+      await wrote();
+      expect(await pending).toBeInstanceOf(Error);
+      const refused = await parent.readPeerHResult(signal()).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(refused).toBeInstanceOf(Error);
+      expect(f.raw).toHaveBeenCalledTimes(1);
+    } finally {
+      f.cleanup();
+    }
+  }
+  const f = fixture();
+  try {
+    const { parent } = await readyPeer(f);
+    f.child.emit("exit", 0, null);
+    expect(
+      await parent.readPeerHResult(signal()).then(
+        () => undefined,
+        (e: unknown) => e,
+      ),
+    ).toBeInstanceOf(Error);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("peer instance readonly consumer preserves original H result independently of connector exit and two EOF", async () => {
+  for (const pendingH of [false, true]) {
+    const f = fixture(),
+      c = connectorStreams();
+    try {
+      const { parent } = await readyPeer(f);
+      f.stdout.emit("end"); // original Host channel loss, not P death
+      f.raw.mockReturnValue(c.child);
+      let settled = false;
+      const pending = parent.readPeerHResult(signal()).then((value) => {
+        settled = true;
+        return value;
+      });
+      await wrote();
+      expect(f.raw).toHaveBeenLastCalledWith(f.binary, ["--parent-peer-read-result"], {
+        env: {},
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      expect(c.writes).toHaveLength(1);
+      const request = c.writes[0];
+      if (!request) throw new Error("raw private connector input absent");
+      expect(request.length).toBe(176);
+      expect(request.subarray(4, 12).equals(Buffer.from("TKOPEER2"))).toBe(true);
+      expect(request.readBigUInt64BE(132)).toBe(PEER_INODE);
+      expect(request.subarray(140).toString()).toBe(PEER_BOOT);
+      expect(request.subarray(92, 124).equals(Buffer.from(fixtureCapability()))).toBe(true);
+      const frame = resultFrame(pendingH ? 11 : 0);
+      for (const byte of frame) c.stdout.write(Buffer.from([byte]));
+      c.child.emit("exit", 0, null);
+      c.stdout.emit("end");
+      await wrote();
+      expect(settled).toBe(false);
+      c.stderr.emit("end");
+      await wrote();
+      expect(settled).toBe(false);
+      c.child.emit("close", 0, null);
+      const result = await pending;
+      expect(result).toEqual({
+        kind: pendingH ? "linux-oci-parent-h-result-refused@1" : "linux-oci-parent-h-exited@1",
+        error: pendingH ? 11 : 0,
+        barrier: "unproven",
+      });
+      expect(f.writes).toHaveLength(1);
+      expect(f.raw).toHaveBeenCalledTimes(2);
+      expect(c.counts()).toEqual({ kills: 0, unrefs: 0 });
+    } finally {
+      c.close();
+      f.cleanup();
+    }
+  }
+});
+
+test("peer instance connector malformed loss nonzero cancel and late bytes stay UNKNOWN without respawn", async () => {
+  for (const fault of ["bad-json", "nonzero", "signal", "error", "abort", "timeout", "late-byte"]) {
+    const f = fixture(),
+      c = connectorStreams();
+    try {
+      const { parent } = await readyPeer(f);
+      f.raw.mockReturnValue(c.child);
+      const controller = new AbortController();
+      const pending = parent.readPeerHResult(controller.signal).then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      await wrote();
+      if (fault === "abort") controller.abort();
+      else if (fault === "error") c.child.emit("error", new Error("raw failure"));
+      else if (fault !== "timeout") {
+        c.stdout.write(fault === "bad-json" ? Buffer.from([0, 0, 0, 2, 123, 125]) : resultFrame());
+        c.stdout.emit("end");
+        c.stderr.emit("end");
+        c.child.emit(
+          "exit",
+          fault === "nonzero" ? 1 : fault === "signal" ? null : 0,
+          fault === "signal" ? "SIGTERM" : null,
+        );
+        c.child.emit(
+          "close",
+          fault === "nonzero" ? 1 : fault === "signal" ? null : 0,
+          fault === "signal" ? "SIGTERM" : null,
+        );
+        if (fault === "late-byte") c.stdout.emit("data", Buffer.from([0]));
+      }
+      expect(await pending).toBeInstanceOf(Error);
+      expect(
+        await parent.readPeerHResult(signal()).then(
+          () => undefined,
+          (e: unknown) => e,
+        ),
+      ).toBeInstanceOf(Error);
+      expect(f.raw).toHaveBeenCalledTimes(2);
+      expect(c.counts()).toEqual({ kills: 0, unrefs: 0 });
+      expect(f.writes).toHaveLength(1);
+      expect(c.writes).toHaveLength(1);
+    } finally {
+      c.close();
+      f.cleanup();
+    }
+  }
+});

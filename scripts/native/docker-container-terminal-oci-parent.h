@@ -2,9 +2,16 @@
 #define TAKO_OCI_PERSISTENT_PARENT_H
 
 #include <linux/sched.h>
+#include <limits.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/un.h>
+#include <sys/vfs.h>
+#include <linux/magic.h>
+
+#ifndef SO_PEERPIDFD
+#define SO_PEERPIDFD 77 /* exact v6.12 asm-generic/socket.h */
+#endif
 
 /* Opt-in, dedicated same-binary parent, not an adopted/reconstructed session.
  * This record never leaves this original process. Authenticated frontends read
@@ -34,6 +41,9 @@ struct ocipp_owner {
   int64_t authentication_started;
   unsigned int binding_attempt, bound, create_attempt, management_unknown;
   unsigned int effects, delivery_unknown, replay_required, management_resume, input_paused;
+  /* Explicit v2 only: original self pidfs record, never a numeric PID lookup. */
+  int self_pidfd; unsigned int self_attempt;
+  uint64_t self_device, self_inode; char boot_id[37];
   enum tns_ocip_kind request_kind;
   size_t request_size, issued_size, last_reply_start, last_reply_end;
   unsigned char *frontend_input, *management_output;
@@ -155,6 +165,74 @@ static int ocipp_bootstrap_reply(struct ocipp_owner *o) {
   unsigned char bytes[92] = {0, 0, 0, 88};
   memcpy(bytes + 4, "TKOINFO1", 8); memcpy(bytes + 12, o->claim, 64);
   ocipp_put64(bytes + 76, o->generation); ocipp_put64(bytes + 84, o->listener_cookie);
+  int64_t now = ocip_now(); if (now < 0) return -1;
+  return ocip_io(1, bytes, sizeof(bytes), 1, 0, now + 4000);
+}
+/* Exact v6.12 64-bit pidfs profile only. pidfs_getattr deliberately masks
+ * S_IFMT, so no regular-file predicate applies. A live held pidfd plus boot,
+ * dev and pid->ino identifies this tracked process; 64-bit counter wrap and
+ * installed-kernel equivalence remain external qualification limits. */
+static int ocipp_pidfs(int fd, uint64_t *device, uint64_t *inode) {
+  struct statfs fs; struct stat st;
+  struct pollfd p = {.fd = fd, .events = POLLIN};
+  if (sizeof(unsigned long) != 8 || sizeof(ino_t) != 8 || fd < 0 ||
+      fstatfs(fd, &fs) < 0 || fs.f_type != PID_FS_MAGIC ||
+      fstat(fd, &st) < 0 || !st.st_ino || poll(&p, 1, 0) != 0 || p.revents) {
+    errno = ESTALE; return -1;
+  }
+  *device = (uint64_t)st.st_dev; *inode = (uint64_t)st.st_ino;
+  return 0;
+}
+static int ocipp_boot_id(struct ocipp_owner *o, char out[37]) {
+  int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) return -1;
+  struct statfs fs; unsigned char bytes[38], extra; int valid = 0;
+  if (fstatfs(fd, &fs) == 0 && fs.f_type == PROC_SUPER_MAGIC &&
+      read(fd, bytes, sizeof(bytes)) == 37 && bytes[36] == '\n' && read(fd, &extra, 1) == 0) {
+    valid = 1;
+    for (unsigned int i = 0; i < 36; ++i) {
+      int dash = i == 8 || i == 13 || i == 18 || i == 23;
+      if (dash ? bytes[i] != '-' : !((bytes[i] >= '0' && bytes[i] <= '9') ||
+          (bytes[i] >= 'a' && bytes[i] <= 'f'))) valid = 0;
+    }
+    if (valid) { memcpy(out, bytes, 36); out[36] = 0; }
+  }
+  if (ocipp_close(o, &fd) < 0 || !valid) { errno = ESTALE; return -1; }
+  return 0;
+}
+static int ocipp_self_current(struct ocipp_owner *o) {
+  uint64_t device = 0, inode = 0; char boot[37];
+  if (ocipp_binding_current(o) < 0 || o->close_unknown || !o->self_attempt ||
+      ocipp_pidfs(o->self_pidfd, &device, &inode) < 0 ||
+      device != o->self_device || inode != o->self_inode ||
+      ocipp_boot_id(o, boot) < 0 || memcmp(boot, o->boot_id, sizeof(boot))) return -1;
+  return ocipp_binding_current(o);
+}
+static int ocipp_peer_bootstrap(struct ocipp_owner *o, const unsigned char *p, size_t size) {
+  if (!p || size != 112 || memcmp(p, "TKOBIND2", 8)) { errno = EPROTO; return -1; }
+  unsigned char legacy[112]; memcpy(legacy, p, sizeof(legacy)); memcpy(legacy, "TKOBIND1", 8);
+  int result = ocipp_bootstrap(o, legacy, sizeof(legacy));
+  explicit_bzero(legacy, sizeof(legacy));
+  if (result < 0 || o->self_attempt) return -1;
+  o->self_attempt = 1; o->self_pidfd = -1;
+  /* Only our own current process: connector peers use SO_PEERPIDFD below. */
+  long fd = syscall(SYS_pidfd_open, getpid(), 0u);
+  if (fd < 0 || fd > INT_MAX) return -1;
+  o->self_pidfd = (int)fd;
+  if (fcntl(o->self_pidfd, F_SETFD, FD_CLOEXEC) < 0 ||
+      ocipp_pidfs(o->self_pidfd, &o->self_device, &o->self_inode) < 0 ||
+      ocipp_boot_id(o, o->boot_id) < 0) return -1;
+  return ocipp_self_current(o);
+}
+/* TKOINFO2 is original info plus devBE64/inoBE64/canonical boot UUID36.
+ * These are interval identity facts, no H/CREATE/SQL/retirement permission. */
+static int ocipp_peer_bootstrap_reply(struct ocipp_owner *o) {
+  if (ocipp_self_current(o) < 0 || o->attempted || o->create) return -1;
+  unsigned char bytes[144] = {0, 0, 0, 140};
+  memcpy(bytes + 4, "TKOINFO2", 8); memcpy(bytes + 12, o->claim, 64);
+  ocipp_put64(bytes + 76, o->generation); ocipp_put64(bytes + 84, o->listener_cookie);
+  ocipp_put64(bytes + 92, o->self_device); ocipp_put64(bytes + 100, o->self_inode);
+  memcpy(bytes + 108, o->boot_id, 36);
   int64_t now = ocip_now(); if (now < 0) return -1;
   return ocip_io(1, bytes, sizeof(bytes), 1, 0, now + 4000);
 }
@@ -554,6 +632,7 @@ static int ocipp_step(struct ocipp_owner *o) {
     (void)ocipp_flush_input(o);
   return ocipp_fact(o);
 }
+static int ocipp_peer_mode;
 static int ocipp_main(void) {
   if (geteuid() || ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
   for (int fd = 0; fd < 3; ++fd) {
@@ -572,13 +651,135 @@ static int ocipp_main(void) {
   unsigned char *body = NULL; uint32_t size = 0;
   if (ocip_read(&body, &size)) { if (body) { explicit_bzero(body, size); free(body); } return 77; }
   struct ocipp_owner *o = calloc(1, sizeof(*o));
-  int prepared = o ? ocipp_bootstrap(o, body, size) : -1;
+  int prepared = o ? (ocipp_peer_mode ? ocipp_peer_bootstrap(o, body, size) : ocipp_bootstrap(o, body, size)) : -1;
   explicit_bzero(body, size); free(body);
   if (prepared < 0) return 77; /* No H has been created or sent any bytes. */
-  if (ocipp_bootstrap_reply(o) < 0) return 77;
+  if ((ocipp_peer_mode ? ocipp_peer_bootstrap_reply(o) : ocipp_bootstrap_reply(o)) < 0) return 77;
   /* This SAME P stays alive after Host loss AND after a known H exit. Facts and
    * all original output remain in this record. Authenticated reads/control are
    * not SQL, full-traffic or retirement permission. */
   for (;;) (void)ocipp_step(o);
 }
+/* A separate one-shot same-binary process, not P/H or a result oracle from its
+ * own exit. Only the original P's fixed read-result reply is relayed, after
+ * kernel peer identity is checked BEFORE cap bytes and again after the read. */
+struct ocipp_connector {
+  struct ocipp_owner custody;
+  int socket, peer_pidfd; unsigned int attempted;
+  uint64_t device, inode; char boot[37];
+};
+static int ocipp_connector_current(struct ocipp_connector *c) {
+  uint64_t device = 0, inode = 0; char boot[37];
+  if (ocipp_current(&c->custody) < 0 || c->custody.close_unknown ||
+      ocipp_pidfs(c->peer_pidfd, &device, &inode) < 0 ||
+      device != c->device || inode != c->inode ||
+      ocipp_boot_id(&c->custody, boot) < 0 || memcmp(boot, c->boot, sizeof(boot))) return -1;
+  return ocipp_current(&c->custody);
+}
+static int ocipp_connector_frame(int fd, unsigned char out[512], size_t *size, int64_t until) {
+  unsigned char prefix[4];
+  if (ocip_io(fd, prefix, sizeof(prefix), 0, 0, until) < 0) return -1;
+  uint32_t n = ((uint32_t)prefix[0] << 24) | ((uint32_t)prefix[1] << 16) |
+    ((uint32_t)prefix[2] << 8) | prefix[3];
+  if (!n || n >= 512 || ocip_io(fd, out, n, 0, 0, until) < 0) return -1;
+  out[n] = 0; *size = n; return 0;
+}
+static int ocipp_connector_result(const unsigned char *body, size_t size) {
+  static const char yes[] = "{\"kind\":\"linux-oci-parent-h-exited@1\",\"error\":0,\"barrier\":\"unproven\"}";
+  static const char no[] = "{\"kind\":\"linux-oci-parent-h-result-refused@1\",\"error\":";
+  static const char tail[] = ",\"barrier\":\"unproven\"}";
+  if (size == sizeof(yes) - 1 && !memcmp(body, yes, size)) return 0;
+  if (size <= sizeof(no) + sizeof(tail) - 2 || memcmp(body, no, sizeof(no) - 1) ||
+      memcmp(body + size - (sizeof(tail) - 1), tail, sizeof(tail) - 1)) return -1;
+  size_t end = size - (sizeof(tail) - 1); int value = 0;
+  if (body[sizeof(no) - 1] < '1' || body[sizeof(no) - 1] > '9') return -1;
+  for (size_t i = sizeof(no) - 1; i < end; ++i) {
+    if (body[i] < '0' || body[i] > '9' || value > (INT_MAX - (body[i] - '0')) / 10) return -1;
+    value = value * 10 + body[i] - '0';
+  }
+  return value ? 0 : -1;
+}
+static int ocipp_connector_read(struct ocipp_connector *c, const unsigned char *p, size_t size,
+                                 unsigned char reply[512], size_t *reply_size) {
+  if (!c || c->attempted || !p || size != 172 || memcmp(p, "TKOPEER2", 8)) return -1;
+  c->attempted = 1; c->socket = c->peer_pidfd = -1;
+  if (ocipp_initialize(&c->custody) < 0) return -1;
+  for (unsigned int i = 0; i < 64; ++i)
+    if (!((p[8 + i] >= '0' && p[8 + i] <= '9') || (p[8 + i] >= 'a' && p[8 + i] <= 'f'))) return -1;
+  uint64_t generation = ocipp_u64(p + 72), cookie = ocipp_u64(p + 80);
+  unsigned int any = 0; for (unsigned int i = 0; i < 32; ++i) any |= p[88 + i];
+  c->device = ocipp_u64(p + 120); c->inode = ocipp_u64(p + 128);
+  memcpy(c->boot, p + 136, 36); c->boot[36] = 0;
+  char boot[37];
+  if (!generation || generation > UINT64_C(9007199254740991) || !cookie || !any || !c->inode ||
+      ocipp_boot_id(&c->custody, boot) < 0 || memcmp(boot, c->boot, sizeof(boot))) return -1;
+  c->socket = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  if (c->socket < 0) return -1;
+  struct sockaddr_un address; memset(&address, 0, sizeof(address)); address.sun_family = AF_UNIX;
+  static const char label[] = "tako-oci-parent-v1:";
+  memcpy(address.sun_path + 1, label, sizeof(label) - 1); memcpy(address.sun_path + sizeof(label), p + 8, 64);
+  socklen_t length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof(label) + 64);
+  int64_t now = ocip_now(); if (now < 0) return -1;
+  int64_t until = now + 4000;
+  if (connect(c->socket, (struct sockaddr *)&address, length) < 0) {
+    if (errno != EINPROGRESS) return -1;
+    struct pollfd writable = {.fd = c->socket, .events = POLLOUT};
+    if (poll(&writable, 1, 4000) != 1 || writable.revents != POLLOUT) return -1;
+    int error = 0; length = sizeof(error);
+    if (getsockopt(c->socket, SOL_SOCKET, SO_ERROR, &error, &length) < 0 ||
+        length != sizeof(error) || error) return -1;
+  }
+  /* Captures the actual connected struct pid, never pidfd_open(caller PID). */
+  length = sizeof(c->peer_pidfd);
+  if (getsockopt(c->socket, SOL_SOCKET, SO_PEERPIDFD, &c->peer_pidfd, &length) < 0 ||
+      length != sizeof(c->peer_pidfd) || c->peer_pidfd < 0 ||
+      fcntl(c->peer_pidfd, F_SETFD, FD_CLOEXEC) < 0 || ocipp_connector_current(c) < 0) return -1;
+  unsigned char auth[124] = {0, 0, 0, 120}; memcpy(auth + 4, "TKOAUTH1", 8);
+  memcpy(auth + 12, p + 8, 112);
+  int result = ocip_io(c->socket, auth, sizeof(auth), 1, 0, until);
+  explicit_bzero(auth, sizeof(auth)); if (result < 0) return -1;
+  unsigned char frame[512]; size_t n = 0;
+  static const char ack[] = "{\"kind\":\"linux-oci-parent-authenticated@1\",\"barrier\":\"unproven\"}";
+  if (ocipp_connector_frame(c->socket, frame, &n, until) < 0 || n != sizeof(ack) - 1 ||
+      memcmp(frame, ack, n) || ocipp_connector_current(c) < 0) return -1;
+  static const char command[] = "{\"kind\":\"linux-oci-parent-read-result@1\"}";
+  unsigned char request[4 + sizeof(command) - 1]; size_t bytes = sizeof(command) - 1;
+  request[0] = (unsigned char)(bytes >> 24); request[1] = (unsigned char)(bytes >> 16);
+  request[2] = (unsigned char)(bytes >> 8); request[3] = (unsigned char)bytes;
+  memcpy(request + 4, command, bytes);
+  if (ocip_io(c->socket, request, sizeof(request), 1, 0, until) < 0 ||
+      ocipp_connector_frame(c->socket, reply, reply_size, until) < 0 ||
+      ocipp_connector_result(reply, *reply_size) < 0 || ocipp_connector_current(c) < 0) return -1;
+  struct pollfd trailing = {.fd = c->socket, .events = POLLIN};
+  if (poll(&trailing, 1, 0) != 0 || trailing.revents) return -1;
+  return 0;
+}
+static int ocipp_connector_close(struct ocipp_connector *c) {
+  if (ocipp_controller(&c->custody) < 0) return -1;
+  int result = 0;
+  if (ocipp_close(&c->custody, &c->peer_pidfd) < 0) result = -1;
+  if (ocipp_close(&c->custody, &c->socket) < 0) result = -1;
+  if (ocipp_close(&c->custody, &c->custody.executable) < 0) result = -1;
+  return result || c->custody.close_unknown ? -1 : 0;
+}
+static void ocipp_connector_free(struct ocipp_connector *c) {
+  free(c->custody.incoming); free(c->custody.frontend_input); free(c->custody.management_output);
+  free(c->custody.captured[0]); free(c->custody.captured[1]);
+}
+static int ocipp_connector_main(void) {
+  if (geteuid() || ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
+  unsigned char *body = NULL; uint32_t size = 0;
+  if (ocip_read(&body, &size)) { if (body) { explicit_bzero(body, size); free(body); } return 77; }
+  struct ocipp_connector c; memset(&c, 0, sizeof(c)); c.socket = c.peer_pidfd = -1;
+  c.custody.executable = -1;
+  unsigned char reply[512]; size_t reply_size = 0;
+  int result = ocipp_connector_read(&c, body, size, reply, &reply_size);
+  explicit_bzero(body, size); free(body);
+  if (ocipp_connector_close(&c) < 0) result = -1;
+  ocipp_connector_free(&c);
+  if (result < 0) return 77;
+  /* This relays original P's factual H reply, never connector-exit=>H-exit. */
+  return ocip_reply((const char *)reply) < 0 ? 77 : 0;
+}
+static int ocipp_peer_main(void) { ocipp_peer_mode = 1; return ocipp_main(); }
 #endif

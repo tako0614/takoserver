@@ -26,7 +26,7 @@ static struct {
   unsigned char *sent; size_t sent_size, chunk;
   const unsigned char *stream[2], *host_bytes;
   size_t stream_size[2], stream_at[2], host_size, host_at;
-  unsigned char delivered[128]; size_t delivered_size;
+  unsigned char delivered[256]; size_t delivered_size;
   uint64_t instance_cookie;
   unsigned int sockets, bindings, listeners, accepts;
   unsigned char address[128]; socklen_t address_size;
@@ -35,6 +35,13 @@ static struct {
   int frontend_eof, frontend_epipe, peer_uid, accept_ready, bind_error;
   size_t frontend_write_chunk;
   unsigned int frontend_reads; int frontend_oversize;
+  unsigned int executable_stats; int tamper_after;
+  int connector, pidfd_unsupported, pidfd_short, old_pidfs, peer_dead, boot_other, boot_short;
+  unsigned int self_opens, peer_gets, peer_checks, cap_writes, readonly_writes, connects;
+  uint64_t self_inode, peer_inode; size_t boot_at;
+  unsigned char connector_reply[1024], expected_auth[124]; size_t connector_size, connector_at;
+  size_t connector_auth_at, connector_request_at;
+
 } pm;
 static jmp_buf parent_jump;
 static int parent_exit_code;
@@ -42,6 +49,8 @@ static long parent_syscall(long number, ...);
 static int parent_open(const char *name, int flags, ...);
 static int parent_close(int fd);
 static int parent_fstat(int fd, struct stat *out);
+static int parent_fstatfs(int fd, struct statfs *out);
+static int parent_connect(int fd, const struct sockaddr *address, socklen_t size);
 static int parent_fcntl(int fd, int command, ...);
 static int parent_dup3(int source, int target, int flags);
 static int parent_pipe2(int ends[2], int flags);
@@ -71,6 +80,8 @@ static _Noreturn void parent_exit(int status);
 #define open parent_open
 #define close parent_close
 #define fstat parent_fstat
+#define fstatfs parent_fstatfs
+#define connect parent_connect
 #define fcntl parent_fcntl
 #define dup3 parent_dup3
 #define pipe2 parent_pipe2
@@ -121,6 +132,8 @@ static _Noreturn void parent_exit(int status);
 #undef dup3
 #undef fcntl
 #undef fstat
+#undef fstatfs
+#undef connect
 #undef close
 #undef open
 #undef syscall
@@ -128,14 +141,24 @@ static _Noreturn void parent_exit(int status);
 
 static struct ocipp_owner cloned_image;
 static int parent_open(const char *name, int flags, ...) {
+  if(!strcmp(name,"/proc/sys/kernel/random/boot_id")){CHECK(flags==(O_RDONLY|O_CLOEXEC|O_NOFOLLOW));pm.boot_at=0;return 62;}
   CHECK(!strcmp(name, "/proc/self/exe") && flags == (O_PATH | O_CLOEXEC)); return 60;
 }
 static int parent_fstat(int fd, struct stat *out) {
+  if(fd==61 || fd==92){*out=(struct stat){.st_dev=42,.st_ino=fd==61?pm.self_inode:pm.peer_inode,.st_mode=0700};return 0;}
   CHECK(fd == 60 || (pm.child && fd == 3));
-  *out = (struct stat){.st_dev=99,.st_ino=pm.tamper ? 2u : 1u,.st_mode=S_IFREG|0755,
+  if(fd==60)pm.executable_stats++;
+  *out = (struct stat){.st_dev=99,.st_ino=(pm.tamper || (pm.tamper_after && pm.executable_stats>1)) ? 2u : 1u,.st_mode=S_IFREG|0755,
     .st_uid=0,.st_gid=0,.st_nlink=1,.st_size=12345}; return 0;
 }
-static pid_t parent_getpid(void) { return pm.wrong_controller ? 9 : pm.child ? 5001 : 5000; }
+static int parent_fstatfs(int fd,struct statfs *out){
+  CHECK(fd==61 || fd==62 || fd==92);memset(out,0,sizeof(*out));
+  out->f_type=fd==62?PROC_SUPER_MAGIC:pm.old_pidfs?ANON_INODE_FS_MAGIC:PID_FS_MAGIC;return 0;
+}
+static int parent_connect(int fd,const struct sockaddr *address,socklen_t size){
+  CHECK(pm.connector && fd==90 && size==pm.address_size && !memcmp(address,pm.address,size));pm.connects++;return 0;
+}
+static pid_t parent_getpid(void) { return pm.wrong_controller ? 9 : pm.child ? 5001 : pm.connector ? 5002 : 5000; }
 static pid_t parent_getppid(void) { return pm.wrong_parent ? 9 : 5000; }
 static uid_t parent_geteuid(void) { return pm.not_root ? 1 : 0; }
 static int parent_close(int fd) {
@@ -148,6 +171,7 @@ static int parent_pipe2(int ends[2], int flags) {
 }
 static int parent_fcntl(int fd, int command, ...) {
   va_list ap; va_start(ap,command); int minimum=va_arg(ap,int); va_end(ap);
+  if(command==F_SETFD){CHECK((fd==61 || fd==92) && minimum==FD_CLOEXEC);return 0;}
   CHECK(pm.child && command==F_DUPFD_CLOEXEC && minimum==10);
   CHECK(fd==70 || fd==73 || fd==75 || fd==60); return 100+(int)pm.duplicates++;
 }
@@ -157,6 +181,10 @@ static int parent_dup3(int source,int target,int flags) {
 }
 static long parent_syscall(long number, ...) {
   va_list ap; va_start(ap,number);
+  if(number==SYS_pidfd_open){int pid=va_arg(ap,int);unsigned int flags=va_arg(ap,unsigned int);
+    CHECK(!pm.connector && pid==parent_getpid() && !flags);pm.self_opens++;va_end(ap);
+    if(pm.pidfd_unsupported){errno=ENOSYS;return -1;}return 61;
+  }
   if(number==SYS_clone3) {
     struct clone_args *a=va_arg(ap,struct clone_args*);size_t n=va_arg(ap,size_t);
     CHECK(!pm.child && n==sizeof(*a) && a->flags==CLONE_PIDFD && a->exit_signal==SIGCHLD);
@@ -190,7 +218,11 @@ static int parent_clock(clockid_t kind,struct timespec *out) {
 }
 static int parent_getsockopt(int fd,int level,int option,void *out,socklen_t *size) {
   CHECK(level==SOL_SOCKET);
-  if(fd==90){CHECK(option==SO_COOKIE && *size==sizeof(uint64_t));memcpy(out,&pm.instance_cookie,sizeof(uint64_t));return 0;}
+  if(fd==90){
+    if(option==SO_PEERPIDFD){CHECK(pm.connector && *size==sizeof(int));pm.peer_gets++;
+      if(pm.pidfd_unsupported){errno=ENOPROTOOPT;return -1;}*(int*)out=92;*size=pm.pidfd_short?3:sizeof(int);return 0;}
+    CHECK(option==SO_COOKIE && *size==sizeof(uint64_t));memcpy(out,&pm.instance_cookie,sizeof(uint64_t));return 0;
+  }
   CHECK(fd==91 && option==SO_PEERCRED && *size==sizeof(struct ucred));
   *(struct ucred*)out=(struct ucred){.pid=7000,.uid=(uid_t)pm.peer_uid,.gid=0};return 0;
 }
@@ -216,6 +248,11 @@ static int parent_waitid(idtype_t kind,id_t id,siginfo_t *out,int flags) {
   out->si_status=pm.wait_kind==2?1:pm.wait_kind==3?SIGKILL:0;return 0;
 }
 static ssize_t parent_read(int fd,void *bytes,size_t size) {
+  if(fd==62){const char *boot=pm.boot_other?"22222222-2222-4222-8222-222222222222\n":"11111111-1111-4111-8111-111111111111\n";
+    if(pm.boot_at)return 0;
+    size_t n=pm.boot_short?36:37;CHECK(size>=n);memcpy(bytes,boot,n);pm.boot_at=n;return (ssize_t)n;}
+  if(fd==90 && pm.connector){size_t n=pm.connector_size-pm.connector_at;if(n>size)n=size;
+    if(!n){errno=EAGAIN;return -1;}memcpy(bytes,pm.connector_reply+pm.connector_at,n);pm.connector_at+=n;return (ssize_t)n;}
   if(fd==91){
     pm.frontend_reads++;
     if(pm.frontend_oversize)return (ssize_t)(size+1); /* impossible oversized syscall return, no memory write */
@@ -238,6 +275,14 @@ static ssize_t parent_read(int fd,void *bytes,size_t size) {
   errno=EAGAIN;return -1;
 }
 static ssize_t parent_write(int fd,const void *bytes,size_t size) {
+  if(fd==90 && pm.connector){
+    if(pm.connector_auth_at<sizeof(pm.expected_auth)){CHECK(size<=sizeof(pm.expected_auth)-pm.connector_auth_at);
+      CHECK(!memcmp(bytes,pm.expected_auth+pm.connector_auth_at,size));pm.connector_auth_at+=size;pm.cap_writes++;}
+    else {static const char request[]="{\"kind\":\"linux-oci-parent-read-result@1\"}";
+      unsigned char frame[4+sizeof(request)-1];size_t n=sizeof(request)-1;frame[0]=frame[1]=frame[2]=0;frame[3]=(unsigned char)n;memcpy(frame+4,request,n);
+      CHECK(size<=sizeof(frame)-pm.connector_request_at && !memcmp(bytes,frame+pm.connector_request_at,size));pm.connector_request_at+=size;pm.readonly_writes++;}
+    return (ssize_t)size;
+  }
   if(fd==91){if(pm.frontend_epipe){errno=EPIPE;return -1;}if(pm.frontend_write_chunk && size>pm.frontend_write_chunk)size=pm.frontend_write_chunk;CHECK(pm.frontend_sent_size+size<=TNS_OCI_MAX_JSON+1024);memcpy(pm.frontend_sent+pm.frontend_sent_size,bytes,size);pm.frontend_sent_size+=size;return (ssize_t)size;}
   if(fd==71) {
     pm.writes++;
@@ -250,7 +295,13 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
   CHECK(pm.delivered_size+size<=sizeof(pm.delivered));memcpy(pm.delivered+pm.delivered_size,bytes,size);pm.delivered_size+=size;return (ssize_t)size;
 }
 static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
-  if(count==1){CHECK(fds[0].fd==1 && fds[0].events==POLLOUT && timeout>0);fds[0].revents=POLLOUT;pm.clock++;return 1;}
+  if(count==1){
+    if(timeout==0 && (fds[0].fd==61 || fds[0].fd==92)){CHECK(fds[0].events==POLLIN);fds[0].revents=0;
+      if(fds[0].fd==92){pm.peer_checks++;if(pm.peer_dead){fds[0].revents=POLLIN;return 1;}}return 0;}
+    if(fds[0].fd==90 && pm.connector){fds[0].revents=0;if(fds[0].events==POLLIN && pm.connector_at<pm.connector_size){fds[0].revents=POLLIN;return 1;}
+      if(fds[0].events==POLLOUT){fds[0].revents=POLLOUT;return 1;}CHECK(timeout==0);return 0;}
+    CHECK(fds[0].fd==1 && fds[0].events==POLLOUT && timeout>0);fds[0].revents=POLLOUT;pm.clock++;return 1;
+  }
   CHECK(count==7 && timeout==1000);pm.polls++;int ready=0;
   for(nfds_t i=0;i<count;i++) {
     fds[i].revents=0;if(fds[i].fd<0)continue;
@@ -547,7 +598,71 @@ static void authentication_bounds_only(void) {
   CHECK(o.candidate<0 && o.frontend<0 && !o.authentication_used && pm.frontend_reads==1);
   CHECK(pm.closes[91]==1 && !pm.clones && !pm.sent_size);dispose_fixture(&o);
 }
+static void prepare_peer_parent(struct ocipp_owner *o) {
+  memset(&pm,0,sizeof(pm));ocipp_interrupted=0;pm.sent=calloc(1,TNS_OCI_MAX_JSON+4);
+  pm.frontend_sent=calloc(1,TNS_OCI_MAX_JSON+1024);CHECK(pm.sent && pm.frontend_sent);
+  pm.instance_cookie=UINT64_C(0xfedcba9876543210);pm.self_inode=pm.peer_inode=UINT64_C(0x1000000000000123);
+  memset(o,0,sizeof(*o));unsigned char body[112];memcpy(body,"TKOBIND2",8);memcpy(body+8,CLAIM,64);
+  ocipp_put64(body+72,1);memset(body+80,0xa5,32);
+  CHECK(ocipp_peer_bootstrap(o,body,sizeof(body))==0 && pm.self_opens==1 && !pm.clones);
+  CHECK(ocipp_peer_bootstrap_reply(o)==0 && pm.delivered_size==144 && !pm.sent_size);
+  CHECK(!memcmp(pm.delivered+4,"TKOINFO2",8) && ocipp_u64(pm.delivered+100)==pm.self_inode);
+}
+static void peer_request(const struct ocipp_owner *o,unsigned char request[172]) {
+  memcpy(request,"TKOPEER2",8);memcpy(request+8,o->claim,64);ocipp_put64(request+72,o->generation);
+  ocipp_put64(request+80,o->listener_cookie);memcpy(request+88,o->capability,32);
+  ocipp_put64(request+120,o->self_device);ocipp_put64(request+128,o->self_inode);memcpy(request+136,o->boot_id,36);
+}
+static void peer_server_replies(struct ocipp_owner *o,int pending) {
+  CHECK(ocipp_first_create(o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
+  CHECK(ocipp_spawn(o)==0 && ocipp_flush_input(o)==0);pm.wait_kind=1;CHECK(ocipp_wait(o)==0);
+  pm.eof[0]=1;CHECK(ocipp_drain(o,0)==0);
+  if(!pending){pm.eof[1]=1;CHECK(ocipp_drain(o,1)==0 && ocipp_fact(o)==0);}
+  ocipp_host_lost(o);authenticate_frontend(o,0);
+  memcpy(pm.connector_reply,o->management_output,o->management_size);pm.connector_size=o->management_size;
+  auth_bytes(o,pm.expected_auth);
+  CHECK(frontend_command(o,"{\"kind\":\"linux-oci-parent-read-result@1\"}")==0);
+  CHECK(pm.connector_size+pm.frontend_sent_size<=sizeof(pm.connector_reply));
+  memcpy(pm.connector_reply+pm.connector_size,pm.frontend_sent,pm.frontend_sent_size);pm.connector_size+=pm.frontend_sent_size;
+  pm.connector=1;
+}
+static void peer_instance_only(void) {
+  for(int pending=0;pending<2;++pending){
+    struct ocipp_owner o;prepare_peer_parent(&o);unsigned char request[172];peer_request(&o,request);peer_server_replies(&o,pending);
+    unsigned int waits=pm.waits,clones=pm.clones;struct ocipp_connector c={0};unsigned char reply[512];size_t size=0;
+    CHECK(ocipp_connector_read(&c,request,sizeof(request),reply,&size)==0);
+    CHECK(pm.cap_writes==1 && pm.readonly_writes==1 && pm.peer_gets==1 && pm.self_opens==1);
+    CHECK(memmem(reply,size,pending?"result-refused":"h-exited",pending?14:8));
+    CHECK(pm.waits==waits && pm.clones==clones && !pm.closes[71]);
+    CHECK(ocipp_connector_read(&c,request,sizeof(request),reply,&size)<0 && pm.cap_writes==1);
+    CHECK(ocipp_connector_close(&c)==0 && pm.closes[92]==1 && pm.closes[90]==1);
+    CHECK(ocipp_connector_close(&c)==0 && pm.closes[92]==1 && pm.closes[90]==1);
+    ocipp_connector_free(&c);pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
+  }
+  for(int fault=1;fault<=8;++fault){
+    struct ocipp_owner o;prepare_peer_parent(&o);unsigned char request[172];peer_request(&o,request);pm.connector=1;
+    if(fault==1)pm.peer_inode++; /* Same numeric peer/name, different struct pid inode. */
+    if(fault==2)pm.boot_other=1;
+    if(fault==3)pm.pidfd_unsupported=1;
+    if(fault==4)pm.pidfd_short=1;
+    if(fault==5)pm.old_pidfs=1;
+    if(fault==6)pm.peer_dead=1;
+    if(fault==7)pm.boot_short=1;
+    if(fault==8){pm.executable_stats=0;pm.tamper_after=1;}
+    struct ocipp_connector c={0};unsigned char reply[512];size_t size=0;
+    CHECK(ocipp_connector_read(&c,request,sizeof(request),reply,&size)<0 && !pm.cap_writes && !pm.readonly_writes);
+    if(c.custody.controller==parent_getpid())CHECK(ocipp_connector_close(&c)==0);
+    CHECK(pm.closes[92]<=1 && pm.closes[90]<=1 && !pm.clones && !pm.sent_size);
+    ocipp_connector_free(&c);pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
+  }
+  struct ocipp_owner o;prepare_peer_parent(&o);unsigned char request[172];peer_request(&o,request);peer_server_replies(&o,0);
+  struct ocipp_connector c={0};unsigned char reply[512];size_t size=0;CHECK(ocipp_connector_read(&c,request,sizeof(request),reply,&size)==0);
+  pm.close_fault=92;CHECK(ocipp_connector_close(&c)<0 && c.custody.close_unknown && c.peer_pidfd==-1);
+  CHECK(ocipp_connector_close(&c)<0 && pm.closes[92]==1 && pm.closes[90]==1);ocipp_connector_free(&c);
+  pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
+}
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"peer-instance")){peer_instance_only();printf("new peer-instance only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"authentication-bounds")) {
     authentication_bounds_only();printf("new authentication bounds only: %lu checks\n",checks);return 0;
   }
