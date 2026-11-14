@@ -173,6 +173,7 @@ export async function createSignedConsoleHost(
   io: LocalConsoleIo = {},
   billingConfig?: BillingConfig,
   ai?: AiGateway,
+  rawClock?: () => Date,
 ) {
   const origin = "https://api.logout-cookie.test";
   const now = "2026-11-13T00:00:00.000Z";
@@ -180,7 +181,7 @@ export async function createSignedConsoleHost(
   let cookie = "";
   try {
     const sql = createSqliteSql(database);
-    const clock = () => new Date(now);
+    const clock = rawClock ?? (() => new Date(now));
     const keys = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
     const publicJwk = await crypto.subtle.exportKey("jwk", keys.publicKey);
     if (typeof publicJwk.x !== "string") throw new Error("local public verifier key missing");
