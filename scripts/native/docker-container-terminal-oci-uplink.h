@@ -741,12 +741,13 @@ static int oci_uplink_host_routes(struct oci_uplink_owner *u, const struct oci_u
         unsigned int prefix = width == 4 ? 31u : 127u; if (h.rtm_dst_len < prefix) prefix = h.rtm_dst_len;
         if (oci_uplink_prefix(a.p[RTA_DST], peer, prefix)) return -1;
       }
-    } else if (table == RT_TABLE_MAIN) {
+    }
+    if (table == RT_TABLE_MAIN && (!h.rtm_dst_len || a.p[RTA_GATEWAY])) {
       const unsigned char *expected = width == 4 ? u->expected.gateway4 : u->expected.gateway6;
       if (h.rtm_type != RTN_UNICAST || h.rtm_scope != RT_SCOPE_UNIVERSE || h.rtm_flags ||
           index != u->expected.index || !a.p[RTA_GATEWAY] || a.size[RTA_GATEWAY] != width ||
           memcmp(a.p[RTA_GATEWAY], expected, width)) return -1;
-      if (width == 4) found4++; else found6++;
+      if (!h.rtm_dst_len) { if (width == 4) found4++; else found6++; }
     }
     at += NLMSG_ALIGN((size_t)n.nlmsg_len);
   }
