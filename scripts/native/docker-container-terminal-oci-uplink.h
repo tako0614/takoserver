@@ -45,6 +45,15 @@ struct oci_uplink_driver_facts {
   struct ethtool_drvinfo driver;
   struct oci_uplink_features features;
 };
+/* Exact selected RTM_NEWLINK descriptor, not a path/support classification.
+ * A kind uses the UAPI rtattr u16 payload limit, including its final NUL. */
+struct oci_uplink_link_path {
+  unsigned int info_present, kind_present, link_present, netns_present;
+  uint32_t link;
+  int32_t netns;
+  size_t kind_size;
+  unsigned char kind[UINT16_MAX - sizeof(struct rtattr)];
+};
 struct oci_uplink_owner {
   struct tns_oci_owner *original;
   struct oci_uplink_topology expected;
@@ -58,6 +67,8 @@ struct oci_uplink_owner {
   uint64_t host_cookie;
   struct oci_uplink_driver_facts driver_facts;
   unsigned int driver_attempted, driver_captured;
+  struct oci_uplink_link_path link_path;
+  unsigned int link_path_captured;
   int file; unsigned int file_selected; struct stat file_identity;
   size_t file_size; char file_bytes[32769];
   char host_name[16], guest_name[16];
@@ -597,9 +608,42 @@ static int oci_uplink_link(const unsigned char *bytes, size_t size, const char *
   }
   memcpy(mac, a.p[IFLA_ADDRESS], 6); return h.ifi_index;
 }
+/* rtnl_link_fill uses a no-flag LINKINFO nest; rtnl_link_info_fill puts
+ * KIND only when ops exists. A LINKINFO without KIND and no LINKINFO are
+ * distinct observations. INFO_DATA/SLAVE_DATA remain opaque and unqualified. */
+static int oci_uplink_path_decode(const struct oci_uplink_attrs *a, struct oci_uplink_link_path *out) {
+  struct rtattr h; memset(out, 0, sizeof(*out));
+  if (a->p[IFLA_LINKINFO]) {
+    struct oci_uplink_attrs info;
+    memcpy(&h, a->p[IFLA_LINKINFO] - sizeof(h), sizeof(h));
+    if (h.rta_type != IFLA_LINKINFO || oci_uplink_attrs(a->p[IFLA_LINKINFO], a->size[IFLA_LINKINFO], &info) < 0) return -1;
+    out->info_present = 1;
+    if (info.p[IFLA_INFO_KIND]) {
+      size_t n = info.size[IFLA_INFO_KIND];
+      memcpy(&h, info.p[IFLA_INFO_KIND] - sizeof(h), sizeof(h));
+      if (h.rta_type != IFLA_INFO_KIND || !n || n > sizeof(out->kind) ||
+          info.p[IFLA_INFO_KIND][n-1] || memchr(info.p[IFLA_INFO_KIND], 0, n-1)) return -1;
+      out->kind_present = 1; out->kind_size = n; memcpy(out->kind, info.p[IFLA_INFO_KIND], n);
+    }
+  }
+  /* NETNSID comes from rtnl_link_ops->get_link_net: rtnl_fill_ifinfo
+   * reports that ops KIND, and rtnl_fill_link_netnsid forces LINK. */
+  if (a->p[IFLA_LINK_NETNSID] && (!a->p[IFLA_LINK] || !out->kind_present)) return -1;
+  if (a->p[IFLA_LINK]) {
+    memcpy(&h, a->p[IFLA_LINK] - sizeof(h), sizeof(h));
+    if (h.rta_type != IFLA_LINK || oci_uplink_u32(a, IFLA_LINK, &out->link) < 0) return -1;
+    out->link_present = 1;
+  }
+  if (a->p[IFLA_LINK_NETNSID]) {
+    memcpy(&h, a->p[IFLA_LINK_NETNSID] - sizeof(h), sizeof(h));
+    if (h.rta_type != IFLA_LINK_NETNSID || a->size[IFLA_LINK_NETNSID] != sizeof(out->netns)) return -1;
+    memcpy(&out->netns, a->p[IFLA_LINK_NETNSID], sizeof(out->netns)); out->netns_present = 1;
+  }
+  return 0;
+}
 static int oci_uplink_host_links(struct oci_uplink_owner *u, const struct oci_uplink_dump *d) {
   if (oci_uplink_records(d) < 0 || d->type != RTM_NEWLINK) return -1;
-  unsigned int matches = 0; size_t at = 0;
+  unsigned int matches = 0; size_t at = 0; struct oci_uplink_link_path selected;
   while (at < d->used) {
     struct nlmsghdr n; memcpy(&n, d->bytes + at, sizeof(n)); const unsigned char *body = d->bytes + at + NLMSG_HDRLEN;
     struct ifinfomsg h; memcpy(&h, body, sizeof(h)); struct oci_uplink_attrs a;
@@ -608,11 +652,20 @@ static int oci_uplink_host_links(struct oci_uplink_owner *u, const struct oci_up
     if ((uint32_t)h.ifi_index == u->expected.index || oci_uplink_text(&a, IFLA_IFNAME, u->expected.name) == 0) {
       unsigned char mac[6]; uint32_t peer = 0;
       if (++matches != 1 || oci_uplink_link(body, n.nlmsg_len - NLMSG_HDRLEN, u->expected.name, u->expected.index, mac, &peer, 1) < 0 ||
-          memcmp(mac, u->expected.mac, 6)) return -1;
+          memcmp(mac, u->expected.mac, 6) || oci_uplink_path_decode(&a, &selected) < 0) return -1;
     }
     at += NLMSG_ALIGN((size_t)n.nlmsg_len);
   }
-  return matches == 1 ? 0 : -1;
+  if (matches != 1 || oci_uplink_original(u) < 0) return -1;
+  if (u->link_path_captured) {
+    if (memcmp(&u->link_path, &selected, sizeof(selected))) { errno = ESTALE; return -1; }
+  } else {
+    if (u->driver_captured || u->create_sent) { errno = ESTALE; return -1; }
+    /* A completed unique link observation can precede a later preflight
+     * refusal. It grants nothing and is never replaced by a changed record. */
+    u->link_path = selected; u->link_path_captured = 1;
+  }
+  return 0;
 }
 static int oci_uplink_host_addresses(struct oci_uplink_owner *u, const struct oci_uplink_dump *d) {
   if (oci_uplink_records(d) < 0 || d->type != RTM_NEWADDR) return -1;
