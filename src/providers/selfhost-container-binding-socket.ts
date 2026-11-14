@@ -10,8 +10,12 @@ import { createSelfhostContainerBindingBroker } from "./selfhost-container-bindi
 export async function openSelfhostContainerBindingSocket(
   options: Parameters<typeof createSelfhostContainerBindingBroker>[0] & {
     readonly directory: string;
+    readonly socketName?: string;
   },
 ) {
+  const socketName = options.socketName;
+  if (socketName !== undefined && !/^[0-9a-f]{64}\.sock$/u.test(socketName))
+    throw new TypeError("private broker basename required");
   const directory = await realpath(options.directory);
   const metadata = await lstat(options.directory);
   if (
@@ -22,7 +26,10 @@ export async function openSelfhostContainerBindingSocket(
     metadata.uid !== process.getuid?.()
   )
     throw new TypeError("private broker directory required");
-  const path = join(directory, `${randomUUID().replaceAll("-", "").slice(0, 22)}.sock`);
+  const path = join(
+    directory,
+    socketName ?? `${randomUUID().replaceAll("-", "").slice(0, 22)}.sock`,
+  );
   if (Buffer.byteLength(path) > 100) throw new TypeError("broker socket path too long");
   const broker = createSelfhostContainerBindingBroker(options);
   const server = createServer({ maxHeaderSize: 65_536 }, async (incoming, outgoing) => {

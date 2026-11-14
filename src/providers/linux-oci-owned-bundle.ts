@@ -2320,6 +2320,36 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       reconcile: (execution: V2Execution) => dispatch(execution, "reconcile"),
     }),
   });
+  function selectServingHttpRuntime(
+    identity: { readonly resourceUid: string; readonly incarnationId: string },
+    request: Request,
+  ) {
+    if (closed || !identity || !(request instanceof Request))
+      return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
+    const selected = [...httpRecords.values()].filter(
+      (record) =>
+        record.intent.resourceUid === identity.resourceUid &&
+        record.intent.incarnationId === identity.incarnationId,
+    );
+    // Core's fresh serving read chooses no fallback generation. If several
+    // original revisions exist, only its actual serving generation can send.
+    return (async () => {
+      let selectedRuntime: ReturnType<typeof createLinuxOciContainerHttpRuntime> | undefined;
+      for (const record of selected) {
+        try {
+          await core.observeServingOciHttp(record, originalNativeCustody, request.signal);
+        } catch {
+          continue;
+        }
+        if (selectedRuntime) return fail("http_custody");
+        const runtime = httpRuntimes.get(record.claimId);
+        if (!runtime) return fail("http_custody");
+        selectedRuntime = runtime;
+      }
+      if (closed || request.signal.aborted || !selectedRuntime) return fail("http_custody");
+      return selectedRuntime;
+    })();
+  }
   const creator = Object.freeze({
     /** Internal application transport. Identity is a selector to revalidate,
      * never caller authorization; a real binding composition must authorize it. */
@@ -2327,31 +2357,17 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       identity: { readonly resourceUid: string; readonly incarnationId: string },
       request: Request,
     ) {
-      if (closed || !identity || !(request instanceof Request))
-        return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
-      const selected = [...httpRecords.values()].filter(
-        (record) =>
-          record.intent.resourceUid === identity.resourceUid &&
-          record.intent.incarnationId === identity.incarnationId,
+      return selectServingHttpRuntime(identity, request).then((runtime) => runtime.fetch(request));
+    },
+    /** Private caller retains this same invocation through actual terminal I/O. */
+    openServingHttp(
+      identity: { readonly resourceUid: string; readonly incarnationId: string },
+      request: Request,
+      refuseIfRevoked: () => void,
+    ) {
+      return selectServingHttpRuntime(identity, request).then((runtime) =>
+        runtime.open(request, refuseIfRevoked),
       );
-      // Core's fresh serving read chooses no fallback generation. If several
-      // original revisions exist, only its actual serving generation can send.
-      return (async () => {
-        let selectedRuntime: ReturnType<typeof createLinuxOciContainerHttpRuntime> | undefined;
-        for (const record of selected) {
-          try {
-            await core.observeServingOciHttp(record, originalNativeCustody, request.signal);
-          } catch {
-            continue;
-          }
-          if (selectedRuntime) return fail("http_custody");
-          const runtime = httpRuntimes.get(record.claimId);
-          if (!runtime) return fail("http_custody");
-          selectedRuntime = runtime;
-        }
-        if (closed || request.signal.aborted || !selectedRuntime) return fail("http_custody");
-        return selectedRuntime.fetch(request);
-      })();
     },
     /** Original same-Sql binding readback only; no restart peer/session adoption. */
     readRetainedParentControls,

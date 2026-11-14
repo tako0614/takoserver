@@ -3,6 +3,10 @@ import { V2_CONTAINER_F2_FORM } from "./container-contract.ts";
 import type { Clock, Sql } from "./ports.ts";
 import { containerRecord } from "./providers/container-secret-codec.ts";
 import {
+  createLinuxOciContainerBindingSource,
+  type LinuxOciContainerBindingSource,
+} from "./providers/linux-oci-container-binding-broker.ts";
+import {
   type SelfhostLinuxContainerNodeSelection,
   validateSelfhostLinuxOciNodeConfiguration,
 } from "./selfhost-linux-container-node-selection.ts";
@@ -15,6 +19,7 @@ import {
   validatePrivateInputCustody,
 } from "./takoform-v2/private-inputs.ts";
 import type { V2Action, V2BackendResult, V2Execution, V2Form } from "./takoform-v2/types.ts";
+import { WORKER_VERSION_UNIFIED_BACKEND_ID } from "./takoform-v2/worker-lifecycle-backend.ts";
 
 /** Capture the existing code-only action selection, without widening it. The
  * engine still performs its original pre-claim retained-adapter binding. */
@@ -83,6 +88,7 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   > & {
     readonly v2RetainedExecutionActions?: Readonly<Record<string, readonly V2Action[]>>;
   };
+  readonly containerBindingSource?: LinuxOciContainerBindingSource;
   close(): Promise<void>;
 } {
   const baseFactory = input.formSelectionFactory;
@@ -112,18 +118,34 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   validatePrivateInputCustody(custody);
   const retainedExecutionActions = captureActions(input.retainedExecutionActions);
   const allowed: readonly V2Action[] = retainedExecutionActions[V2_CONTAINER_F2_FORM] ?? [];
-  const native =
+  const oci =
     selected.kind === "oci"
       ? createSelfhostLinuxOciContainerBackend({
           sql: input.sql,
           clock: input.clock,
           selection: selected.selection,
         })
-      : createSelfhostLinuxDockerContainerBackend({
+      : undefined;
+  const native =
+    oci ??
+    (selected.kind === "docker"
+      ? createSelfhostLinuxDockerContainerBackend({
           sql: input.sql,
           clock: input.clock,
           selection: selected.selection,
-        });
+        })
+      : undefined);
+  if (!native) throw new TypeError(`${prefix}_missing_original_creator`);
+  const containerBindingSource =
+    oci && selected.kind === "oci"
+      ? createLinuxOciContainerBindingSource({
+          sql: input.sql,
+          targetKey: selected.selection.targetKey,
+          workerBackendId: WORKER_VERSION_UNIFIED_BACKEND_ID,
+          containerBackendId: selected.selection.backendId,
+          original: oci,
+        })
+      : undefined;
   let closed = false;
   const guardAction = (execution: V2Execution): boolean => {
     const action = Object.getOwnPropertyDescriptor(execution, "action");
@@ -191,6 +213,7 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
     });
   };
   return Object.freeze({
+    ...(containerBindingSource ? { containerBindingSource } : {}),
     appPorts: Object.freeze({
       v2FormSelectionFactory: factory,
       v2ContainerHostAcceptance: native.acceptance,

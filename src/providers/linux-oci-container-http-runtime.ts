@@ -40,6 +40,10 @@ export function createLinuxOciContainerHttpRuntime(
     ],
   };
   const originalIO = new Set<ReturnType<typeof createContainerHttpInvocation>>();
+  const openCalls = new WeakMap<
+    Request,
+    { actual?: ReturnType<typeof createContainerHttpInvocation>; refuseIfRevoked: () => void }
+  >();
   let closed = false,
     closing: Promise<void> | undefined;
   const current = () => {
@@ -89,6 +93,13 @@ export function createLinuxOciContainerHttpRuntime(
             current();
             if (options.signal.aborted) throw new Error("linux_oci_http_revoked");
             const invocation = createContainerHttpInvocation();
+            const originalCall = openCalls.get(request);
+            if (originalCall) {
+              // A throw-only fence from the ORIGINAL native caller closure.
+              // It supplies no grant and its return value is never consulted.
+              originalCall.refuseIfRevoked();
+              originalCall.actual = invocation;
+            }
             originalIO.add(invocation); // BEFORE the actual raw constructor
             void invocation.settlement.then(
               () => {
@@ -134,6 +145,40 @@ export function createLinuxOciContainerHttpRuntime(
     return closing;
   }
   return Object.freeze({
+    /** Same original call, with terminal ownership separate from response head.
+     * A retained/unknown call cannot be rebound to a second use of its Request. */
+    open(request: Request, refuseIfRevoked: () => void) {
+      current();
+      if (openCalls.has(request)) throw new Error("linux_oci_http_request_retained");
+      refuseIfRevoked();
+      const call: {
+        actual?: ReturnType<typeof createContainerHttpInvocation>;
+        refuseIfRevoked: () => void;
+      } = { refuseIfRevoked };
+      openCalls.set(request, call);
+      // A response-body EOF can remove the forwarding adapter's listener
+      // before raw request/message close. This original call still owns I/O.
+      const cancel = () => {
+        void call.actual?.close().catch(() => undefined);
+      };
+      request.signal.addEventListener("abort", cancel, { once: true });
+      const response = handle.invoke(revision, request);
+      const settlement = response
+        .then(
+          () => undefined,
+          () => undefined,
+        )
+        .then(async () => {
+          if (call.actual) {
+            await call.actual.settlement;
+            call.actual.assertJoined();
+          }
+          request.signal.removeEventListener("abort", cancel);
+          openCalls.delete(request); // Only a known no-I/O or actual terminal result.
+        });
+      void settlement.catch(() => undefined);
+      return Object.freeze({ response, settlement });
+    },
     fetch(request: Request) {
       current();
       return handle.invoke(revision, request);

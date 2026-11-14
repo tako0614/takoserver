@@ -152,7 +152,10 @@ import {
   startSelfhostV2ScheduledDuePass,
   startSelfhostV2WorkflowDuePass,
 } from "./selfhost-v2-runtime-boot.ts";
-import { createSelfhostV2WorkerComposition } from "./selfhost-v2-worker-composition.ts";
+import {
+  createSelfhostV2ContainerWorkerComposition,
+  createSelfhostV2WorkerComposition,
+} from "./selfhost-v2-worker-composition.ts";
 import {
   createSelfhostV2WorkerEndpointBoot,
   type SelfhostV2WorkerEndpointBoot,
@@ -1100,7 +1103,24 @@ try {
       },
     });
   }
-  workers = createSelfhostV2WorkerComposition({
+  // The explicit OCI source exists before the native Worker owner is opened.
+  // The existing Form factory is evaluated only later by buildApp, after boot.
+  if (selfhostLinuxContainerSelection?.kind === "oci") {
+    selfhostLinuxContainerNode = createSelfhostLinuxContainerNodeComposition({
+      sql,
+      clock,
+      selection: selfhostLinuxContainerSelection,
+      privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
+      formSelectionFactory(context) {
+        if (!workers || !completeV2WorkerForms) return { forms: {}, retainedForms: {} };
+        const factory = runtimeInputKeyAuthority
+          ? workers.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
+          : workers.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint);
+        return factory(context);
+      },
+    });
+  }
+  const workerOptions: Parameters<typeof createSelfhostV2WorkerComposition>[0] = {
     sql,
     objects,
     clock,
@@ -1151,7 +1171,14 @@ try {
           },
         }
       : {}),
-  });
+  };
+  const containerBinding = selfhostLinuxContainerNode?.containerBindingSource;
+  workers = containerBinding
+    ? createSelfhostV2ContainerWorkerComposition({
+        ...workerOptions,
+        ociContainerBinding: containerBinding,
+      })
+    : createSelfhostV2WorkerComposition(workerOptions);
   if (v2QueueComposition) {
     if (!workers.queueCapability) throw new Error("v2 Queue native capability is unavailable");
     queueCapability = workers.queueCapability;
@@ -1558,7 +1585,7 @@ try {
       ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
       : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
     : undefined;
-  selfhostLinuxContainerNode = createSelfhostLinuxContainerNodeComposition({
+  selfhostLinuxContainerNode ??= createSelfhostLinuxContainerNodeComposition({
     sql,
     clock,
     selection: selfhostLinuxContainerSelection,

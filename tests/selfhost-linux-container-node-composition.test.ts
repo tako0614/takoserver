@@ -440,3 +440,6 @@ test("OCI Node refuses missing topology limits or physical target before Sql and
     await f.close();
   }
 });
+
+// Closed constructor/model source for the dedicated OCI binding cases only.
+export { fixture as originalOciNodeBindingFixture };
