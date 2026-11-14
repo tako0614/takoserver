@@ -115,6 +115,12 @@ export interface LinuxOciRetirementObservation {
   readonly kind: (typeof RETIREMENT)[RetirementOperation][1];
   readonly barrier: "unproven";
 }
+/** Same original helper process has exited zero and closed its stdio.
+ * This is not full traffic, historical FD coverage or Core removal authority. */
+export interface LinuxOciDisposedHelperObservation {
+  readonly kind: "linux-oci-disposed-helper-exit@1";
+  readonly barrier: "unproven";
+}
 interface Refusal {
   readonly kind: "linux-oci-refused@1";
   readonly stage:
@@ -505,6 +511,7 @@ export class LinuxOciPhysicalSession {
   #bornDisposalAttempted = false;
   #bornDisposalSent = false;
   #localDisposalReply = false;
+  #localDisposalObserved = false;
   #claim: string | undefined;
   #identity: LinuxOciStoppedObservation | undefined;
   #mustRetain = false;
@@ -826,7 +833,54 @@ export class LinuxOciPhysicalSession {
       throw failure();
     // Exact kind above is one of the closed two-field replies, never a grant.
     if ("nativeId" in reply || "custody" in reply) throw failure();
+    if (operation === "dispose-born" || operation === "continue-born-disposal")
+      this.#localDisposalObserved = true;
     return reply;
+  }
+
+  /** A local-only wait on this exact child, after its dedicated disposal
+   * observation. Timeout/abort stop only this wait; a fresh caller can rejoin
+   * the same handle. No wire operation, signal, unref or replacement occurs. */
+  async joinDisposedHelper(signal: AbortSignal): Promise<LinuxOciDisposedHelperObservation> {
+    if (
+      !this.#localDisposalObserved ||
+      !this.#localDisposalReply ||
+      this.#admissionClosed ||
+      signal.aborted
+    )
+      throw failure("custody_retained");
+    if (!this.#closed)
+      await new Promise<void>((resolve, reject) => {
+        const cleanup = () => {
+          clearTimeout(timer);
+          this.#exitWaiters.delete(done);
+          signal.removeEventListener("abort", abort);
+        };
+        const done = () => {
+          cleanup();
+          resolve();
+        };
+        const abort = () => {
+          cleanup();
+          reject(failure("custody_retained"));
+        };
+        const timer = setTimeout(abort, this.#timeout);
+        this.#exitWaiters.add(done);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+    // No await after this original local observation/cancellation fence.
+    if (
+      signal.aborted ||
+      this.#admissionClosed ||
+      !this.#localDisposalObserved ||
+      !this.#localDisposalReply ||
+      !this.#closed ||
+      this.#exit?.code !== 0 ||
+      this.#exit.signal !== null
+    )
+      throw failure("custody_retained");
+    return Object.freeze({ kind: "linux-oci-disposed-helper-exit@1", barrier: "unproven" });
   }
 
   cancel(): Promise<LinuxOciCancelObservation> {
@@ -882,6 +936,7 @@ export class LinuxOciPhysicalSession {
   #break() {
     this.#usable = false;
     this.#localDisposalReply = false;
+    this.#localDisposalObserved = false;
     this.#buffer = Buffer.alloc(0);
     if (this.#createSent && !this.#releasedUncreated) this.#mustRetain = true;
     this.#settle(undefined);

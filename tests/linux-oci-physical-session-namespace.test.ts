@@ -925,3 +925,134 @@ test("retirement wire disposal reply cannot hide trailing data abnormal exit can
     }
   }
 });
+
+test("retirement helper join waits for original zero exit AND close without another wire operation", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 4);
+    await session.disposeBorn(signal());
+    const sent = f.writes.length;
+    let settled = false;
+    const joined = session.joinDisposedHelper(signal());
+    void joined.then(() => {
+      settled = true;
+    });
+    f.child.stdout.emit("end");
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    f.child.emit("exit", 0, null);
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    f.child.emit("close", 0, null);
+    expect(await joined).toEqual({ kind: "linux-oci-disposed-helper-exit@1", barrier: "unproven" });
+    expect(f.writes).toHaveLength(sent);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+    expect(f.counts()).toEqual({ kills: 0, unrefs: 0 });
+    await expect(session.close()).rejects.toThrow("custody_retained");
+    expect(f.writes).toHaveLength(sent);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("retirement helper join timeout and wait cancellation only permit rejoining the same original handle", async () => {
+  for (const mode of ["timeout", "abort"]) {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, 4),
+        controller = new AbortController();
+      await session.disposeBorn(signal());
+      const sent = f.writes.length;
+      const joined = session.joinDisposedHelper(controller.signal);
+      if (mode === "abort") controller.abort();
+      await expect(joined).rejects.toThrow("custody_retained");
+      f.child.emit("exit", 0, null);
+      f.child.emit("close", 0, null);
+      expect(await session.joinDisposedHelper(signal())).toEqual({
+        kind: "linux-oci-disposed-helper-exit@1",
+        barrier: "unproven",
+      });
+      expect(f.writes).toHaveLength(sent);
+      expect(f.raw).toHaveBeenCalledTimes(1);
+      expect(f.counts()).toEqual({ kills: 0, unrefs: 0 });
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("retirement helper join refuses missing disposal and incomplete or failed child evidence", async () => {
+  for (const mode of ["no-dispose", "no-exit", "nonzero", "signal", "stream-error"]) {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, 4);
+      if (mode !== "no-dispose") await session.disposeBorn(signal());
+      const sent = f.writes.length;
+      if (mode === "nonzero") f.child.emit("exit", 1, null);
+      if (mode === "signal") f.child.emit("exit", null, "SIGTERM");
+      if (mode === "stream-error") f.child.stdout.emit("error", new Error("raw stdout"));
+      if (mode !== "no-dispose") f.child.emit("close", 0, null);
+      await expect(session.joinDisposedHelper(signal())).rejects.toThrow("custody_retained");
+      expect(f.writes).toHaveLength(sent);
+      expect(f.raw).toHaveBeenCalledTimes(1);
+      expect(f.counts()).toEqual({ kills: 0, unrefs: 0 });
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("retirement helper join fences abort or legacy close after the actual close event before async resume", async () => {
+  for (const mode of ["abort", "close"]) {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, 4),
+        controller = new AbortController();
+      await session.disposeBorn(signal());
+      let closing: Promise<void> | undefined;
+      f.child.once("close", () => {
+        if (mode === "abort") controller.abort();
+        else {
+          closing = session.close();
+          closing.catch(() => {});
+        }
+      });
+      const sent = f.writes.length;
+      const joined = session.joinDisposedHelper(controller.signal);
+      f.child.emit("exit", 0, null);
+      f.child.emit("close", 0, null);
+      await expect(joined).rejects.toThrow("custody_retained");
+      if (closing) await expect(closing).rejects.toThrow("custody_retained");
+      expect(f.writes).toHaveLength(sent);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("retirement helper join cannot consume a reply before the public disposal final cancellation fence", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 4);
+    let premature: Promise<unknown> | undefined;
+    f.onRequest(() => {
+      f.reply(retirementFact(retirementOperations[4][2]));
+      premature = session.joinDisposedHelper(signal());
+      premature.catch(() => {});
+      f.child.emit("exit", 0, null);
+      f.child.emit("close", 0, null);
+    });
+    await session.disposeBorn(signal());
+    if (!premature) throw new Error("no reentrant attempt");
+    await expect(premature).rejects.toThrow("custody_retained");
+    const sent = f.writes.length;
+    expect(await session.joinDisposedHelper(signal())).toEqual({
+      kind: "linux-oci-disposed-helper-exit@1",
+      barrier: "unproven",
+    });
+    expect(f.writes).toHaveLength(sent);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+  } finally {
+    f.cleanup();
+  }
+});
