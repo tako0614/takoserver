@@ -77,6 +77,17 @@ int tns_owner_observe_lifetime(struct tns_owner *owner,
 int tns_owner_begin_tracked_join(struct tns_owner *owner);
 int tns_owner_read_tracked_join(struct tns_owner *owner);
 
+/* Dispose only this original namespace owner's four remaining private FDs
+ * (kernel/proc-directory/proc-root/pidfd), after a fresh same-FD tracked READ.
+ * Each slot is consumed before close. Any close error is sticky UNKNOWN:
+ * retain *slot and continue only still-unattempted closes with this function.
+ * No old READ/ioctl is issued after the kernel FD is consumed. After starting,
+ * callers MUST NOT return to legacy close or other owner APIs; future OCI
+ * binding must preserve this exclusive disposal phase. Zero frees/nulls only
+ * this local object after all four known closes; it does not qualify earlier
+ * transient/status/control closes, OCI cleanup, slot reuse or terminal. */
+int tns_owner_dispose_tracked(struct tns_owner **slot);
+
 /* Closed internal byte protocol, shared with portable decoder tests.
  * A decoded message is not authority: the constructor verifies its own held
  * pidfd, proc directory, NSFS descriptor, namespace type and actual identity. */

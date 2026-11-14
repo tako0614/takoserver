@@ -58,6 +58,9 @@ struct tns_owner {
   uint32_t lifetime_seen;
   unsigned int tracked_join_attempted;
   struct tns_lifetime tracked_join_before;
+  /* Local remaining-FD disposal history only, not whole lifetime coverage. */
+  unsigned int tracked_dispose_started;
+  int tracked_dispose_close_unknown;
   struct tns_identity creator;
   struct tns_identity identity;
 };
@@ -747,4 +750,43 @@ int tns_owner_read_tracked_join(struct tns_owner *owner) {
   if (result < 0) return -1;
   if (result) { errno = EPROTO; return -1; }
   return tns_tracked_join_inputs(owner); /* Effect fact only, never terminal. */
+}
+
+
+/* This phase owns only the four remaining original private descriptors.
+ * Existing transient/status/control close history is deliberately unqualified.
+ * After it starts the caller must use only this function, never legacy close. */
+int tns_owner_dispose_tracked(struct tns_owner **slot) {
+  if (!slot || !*slot) { errno = EINVAL; return -1; }
+  struct tns_owner *owner = *slot;
+  if (tns_controller(owner) < 0) return -1;
+  if (!owner->tracked_dispose_started) {
+    if (owner->procfd < 0 || owner->procroot < 0 || owner->pidfd < 0) {
+      errno = EUCLEAN; return -1;
+    }
+    /* Fresh actual same-FD completion and its original currentness bookends
+     * precede the first close. Cache only this operation history before retiring
+     * that FD; after it closes no old READ/OBSERVE/LIFETIME is possible. */
+    if (tns_owner_read_tracked_join(owner) < 0) return -1;
+    owner->tracked_dispose_started = 1;
+  }
+  int *remaining[] = {&owner->kernel_fd, &owner->procfd,
+                     &owner->procroot, &owner->pidfd};
+  for (size_t i = 0; i < sizeof(remaining) / sizeof(remaining[0]); ++i) {
+    if (*remaining[i] < 0) continue; /* Recorded attempted close, never retry. */
+    if (tns_controller(owner) < 0) return -1;
+    int fd = *remaining[i];
+    *remaining[i] = -1; /* Consume before close, including unknown effect. */
+    if (close(fd) < 0) {
+      owner->tracked_dispose_close_unknown = 1;
+      return -1;
+    }
+  }
+  if (tns_controller(owner) < 0) return -1;
+  if (owner->tracked_dispose_close_unknown) { errno = EUCLEAN; return -1; }
+  /* All four recorded remaining closes succeeded. This frees only their
+   * private userspace object; it grants no OCI/Core/traffic terminal fact. */
+  free(owner);
+  *slot = NULL;
+  return 0;
 }
