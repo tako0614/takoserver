@@ -4,10 +4,11 @@
 #include <linux/sched.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/un.h>
 
 /* Opt-in, dedicated same-binary parent, not an adopted/reconstructed session.
- * This record never leaves this original process. No reconnect/authentication
- * or public completion reply exists. Even fact() zero is only this H's exact
+ * This record never leaves this original process. Authenticated frontends read
+ * and manage THIS record; even fact() zero is only this H's exact
  * consuming exit-zero plus independently read stdout/stderr EOF, not retirement.
  * All output is retained, including bytes whose delivery to Host is unknown.
  * Bounded capture exhaustion retains the original pipe/child as UNKNOWN.
@@ -26,6 +27,17 @@ struct ocipp_owner {
   size_t create_size, incoming_size, incoming_need, incoming_sent;
   size_t used[2], delivered[2], frame_start, frame_end;
   unsigned int pending, awaiting, reply_ready;
+  int listener, candidate, frontend;
+  uint64_t listener_cookie;
+  unsigned char capability[32], authentication[124];
+  size_t authentication_used;
+  int64_t authentication_started;
+  unsigned int binding_attempt, bound, create_attempt, management_unknown;
+  unsigned int effects, delivery_unknown, replay_required, management_resume, input_paused;
+  enum tns_ocip_kind request_kind;
+  size_t request_size, issued_size, last_reply_start, last_reply_end;
+  unsigned char *frontend_input, *management_output;
+  size_t frontend_used, frontend_need, management_size, management_sent;
 };
 static volatile sig_atomic_t ocipp_interrupted;
 static void ocipp_interrupt(int number) { (void)number; ocipp_interrupted = 1; }
@@ -56,7 +68,7 @@ static int ocipp_close(struct ocipp_owner *o, int *slot) {
 }
 /* Decode a separate copy: the original bytes sent to H are never rewritten. */
 static int ocipp_decode(const unsigned char *body, size_t size, char *claim,
-                          uint64_t *generation, int first) {
+                          uint64_t *generation, int first, enum tns_ocip_kind *kind) {
   unsigned char *copy = calloc(1, size + 1);
   struct tns_ocip_request *request = calloc(1, sizeof(*request));
   if (!copy || !request) { free(copy); free(request); return -1; }
@@ -68,27 +80,100 @@ static int ocipp_decode(const unsigned char *body, size_t size, char *claim,
   if (!result && first) {
     memcpy(claim, request->options.claim_id, 65); *generation = request->options.generation;
   }
+  if (!result && kind) *kind = request->kind;
   explicit_bzero(copy, size + 1); free(copy);
   explicit_bzero(request, sizeof(*request)); free(request); return result;
 }
-static int ocipp_prepare(struct ocipp_owner *o, const unsigned char *body, uint32_t size) {
-  if (!o || !body || !size || size > TNS_OCI_MAX_JSON) { errno = EINVAL; return -1; }
+static int ocipp_initialize(struct ocipp_owner *o) {
+  if (!o) { errno = EINVAL; return -1; }
   if (o->controller || o->attempted) { errno = EALREADY; return -1; }
   memset(o, 0, sizeof(*o)); o->controller = getpid(); o->executable = o->pidfd = -1;
+  o->listener = o->candidate = o->frontend = -1;
   for (unsigned int i = 0; i < 2; ++i) o->input[i] = o->output[i] = o->errors[i] = -1;
-  if (geteuid() || ocipp_decode(body, size, o->claim, &o->generation, 1) < 0) return -1;
+  if (geteuid()) return -1;
   o->executable = open("/proc/self/exe", O_PATH | O_CLOEXEC);
   if (o->executable < 0 || fstat(o->executable, &o->executable_identity) < 0 || ocipp_current(o) < 0) return -1;
-  o->create_size = (size_t)size + 4;
-  o->create = calloc(1, o->create_size);
   o->incoming = calloc(1, (size_t)TNS_OCI_MAX_JSON + 4);
+  o->frontend_input = calloc(1, (size_t)TNS_OCI_MAX_JSON + 4);
+  o->management_output = calloc(1, (size_t)TNS_OCI_MAX_JSON + 1024);
   o->captured[0] = calloc(1, OCIPP_OUTPUT_MAX); o->captured[1] = calloc(1, OCIPP_ERROR_MAX);
-  if (!o->create || !o->incoming || !o->captured[0] || !o->captured[1]) return -1;
+  if (!o->incoming || !o->frontend_input || !o->management_output || !o->captured[0] || !o->captured[1]) return -1;
+  o->incoming_need = o->frontend_need = 4;
+  return ocipp_current(o);
+}
+static uint64_t ocipp_u64(const unsigned char *p) {
+  uint64_t n = 0; for (unsigned int i = 0; i < 8; ++i) n = (n << 8) | p[i]; return n;
+}
+static void ocipp_put64(unsigned char *p, uint64_t n) {
+  for (unsigned int i = 0; i < 8; ++i) { p[7 - i] = (unsigned char)n; n >>= 8; }
+}
+static int ocipp_binding_current(struct ocipp_owner *o) {
+  uint64_t cookie = 0; socklen_t size = sizeof(cookie);
+  if (ocipp_current(o) < 0 || !o->bound || o->listener < 0 ||
+      getsockopt(o->listener, SOL_SOCKET, SO_COOKIE, &cookie, &size) < 0 ||
+      size != sizeof(cookie) || !cookie || cookie != o->listener_cookie) { errno = ESTALE; return -1; }
+  return 0;
+}
+/* Binary framed bootstrap: TKOBIND1 | claim64 | generationBE64 | capability32.
+ * Only the original private bootstrap supplies the capability. No runtime key
+ * is generated and no credential appears in the discoverable abstract name.
+ * The listener's actual SO_COOKIE binds this P instance, not a caller PID/name.
+ */
+static int ocipp_bootstrap(struct ocipp_owner *o, const unsigned char *p, size_t size) {
+  if (!p || size != 112 || memcmp(p, "TKOBIND1", 8)) { errno = EPROTO; return -1; }
+  if (ocipp_initialize(o) < 0) return -1;
+  for (unsigned int i = 0; i < 64; ++i)
+    if (!((p[8 + i] >= '0' && p[8 + i] <= '9') || (p[8 + i] >= 'a' && p[8 + i] <= 'f'))) return -1;
+  o->generation = ocipp_u64(p + 72);
+  if (!o->generation || o->generation > UINT64_C(9007199254740991)) return -1;
+  unsigned int any = 0; for (unsigned int i = 0; i < 32; ++i) any |= p[80 + i];
+  if (!any) return -1;
+  memcpy(o->claim, p + 8, 64); memcpy(o->capability, p + 80, 32);
+  o->binding_attempt = 1;
+  o->listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  if (o->listener < 0) return -1;
+  struct sockaddr_un address; memset(&address, 0, sizeof(address)); address.sun_family = AF_UNIX;
+  static const char label[] = "tako-oci-parent-v1:";
+  memcpy(address.sun_path + 1, label, sizeof(label) - 1);
+  memcpy(address.sun_path + sizeof(label), o->claim, 64);
+  socklen_t length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof(label) + 64);
+  if (bind(o->listener, (const struct sockaddr *)&address, length) < 0 || listen(o->listener, 1) < 0) return -1;
+  struct sockaddr_un actual; memset(&actual, 0, sizeof(actual)); socklen_t n = sizeof(actual);
+  if (getsockname(o->listener, (struct sockaddr *)&actual, &n) < 0 || n != length || memcmp(&address, &actual, length)) return -1;
+  n = sizeof(o->listener_cookie);
+  if (getsockopt(o->listener, SOL_SOCKET, SO_COOKIE, &o->listener_cookie, &n) < 0 ||
+      n != sizeof(o->listener_cookie) || !o->listener_cookie) return -1;
+  o->bound = 1;
+  return ocipp_binding_current(o);
+}
+/* No H spawn or CREATE is performed by bootstrap/info. The caller has a
+ * durable-save/fresh-guard window BEFORE it supplies the later canonical CREATE.
+ * Info body is TKOINFO1 | claim64 | generationBE64 | actualListenerCookieBE64.
+ */
+static int ocipp_bootstrap_reply(struct ocipp_owner *o) {
+  if (ocipp_binding_current(o) < 0 || o->attempted || o->create) return -1;
+  unsigned char bytes[92] = {0, 0, 0, 88};
+  memcpy(bytes + 4, "TKOINFO1", 8); memcpy(bytes + 12, o->claim, 64);
+  ocipp_put64(bytes + 76, o->generation); ocipp_put64(bytes + 84, o->listener_cookie);
+  int64_t now = ocip_now(); if (now < 0) return -1;
+  return ocip_io(1, bytes, sizeof(bytes), 1, 0, now + 4000);
+}
+static int ocipp_first_create(struct ocipp_owner *o, const unsigned char *body, uint32_t size) {
+  if (ocipp_binding_current(o) < 0 || o->create_attempt || o->attempted || o->create ||
+      !body || !size || size > TNS_OCI_MAX_JSON) return -1;
+  o->create_attempt = 1;
+  char claim[65]; uint64_t generation = 0;
+  if (ocipp_decode(body, size, claim, &generation, 1, NULL) < 0 ||
+      strcmp(claim, o->claim) || generation != o->generation) { errno = EPROTO; return -1; }
+  o->create_size = (size_t)size + 4; o->create = calloc(1, o->create_size);
+  if (!o->create) return -1;
   o->create[0] = (unsigned char)(size >> 24); o->create[1] = (unsigned char)(size >> 16);
   o->create[2] = (unsigned char)(size >> 8); o->create[3] = (unsigned char)size;
   memcpy(o->create + 4, body, size); memcpy(o->incoming, o->create, o->create_size);
   o->incoming_size = o->incoming_need = o->create_size; o->pending = 1;
-  return ocipp_current(o);
+  o->request_kind = TNS_OCIP_CREATE; o->effects |= 1u << TNS_OCIP_CREATE;
+  o->request_size = o->create_size;
+  return ocipp_binding_current(o);
 }
 static _Noreturn void ocipp_child(struct ocipp_owner *o) {
   if (getppid() != o->controller || prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) < 0 ||
@@ -116,7 +201,7 @@ static _Noreturn void ocipp_child(struct ocipp_owner *o) {
 }
 static int ocipp_spawn(struct ocipp_owner *o) {
   if (!o || o->attempted) { errno = EALREADY; return -1; }
-  if (ocipp_current(o) < 0 || !o->create || !o->pending) return -1;
+  if (ocipp_binding_current(o) < 0 || !o->create || !o->pending) return -1;
   o->attempted = 1; /* Permanently consumed before any possible child birth. */
   if (pipe2(o->input, O_CLOEXEC | O_NONBLOCK) < 0 ||
       pipe2(o->output, O_CLOEXEC | O_NONBLOCK) < 0 ||
@@ -181,18 +266,200 @@ static int ocipp_fact(struct ocipp_owner *o) {
   if (o->code != CLD_EXITED || o->status) { errno = ECHILD; return -1; }
   return 0;
 }
+static int ocipp_management_text(struct ocipp_owner *o, const char *body) {
+  size_t size = strlen(body);
+  if (o->management_sent != o->management_size || size > 900) { errno = EBUSY; return -1; }
+  o->management_output[0] = (unsigned char)(size >> 24); o->management_output[1] = (unsigned char)(size >> 16);
+  o->management_output[2] = (unsigned char)(size >> 8); o->management_output[3] = (unsigned char)size;
+  memcpy(o->management_output + 4, body, size); o->management_sent = 0; o->management_size = size + 4;
+  return 0;
+}
+static int ocipp_frontend_close(struct ocipp_owner *o, int *slot) {
+  if (*slot < 0) return 0;
+  int fd = *slot; *slot = -1;
+  if (close(fd) < 0) { o->management_unknown = 1; return -1; }
+  return 0;
+}
+/* Auth body: TKOAUTH1 | claim64 | generationBE64 | actualCookieBE64 | cap32.
+ * UID, endpoint and all public fields are insufficient without this original
+ * capability AND original listener cookie/current executable/controller.
+ */
+static int ocipp_authenticate(struct ocipp_owner *o, const unsigned char *p, size_t size) {
+  if (!p || ocipp_binding_current(o) < 0 || o->management_unknown || size != 120 ||
+      memcmp(p, "TKOAUTH1", 8) || memcmp(p + 8, o->claim, 64) ||
+      ocipp_u64(p + 72) != o->generation || ocipp_u64(p + 80) != o->listener_cookie) return -1;
+  unsigned int difference = 0;
+  for (unsigned int i = 0; i < 32; ++i) difference |= (unsigned int)(p[88 + i] ^ o->capability[i]);
+  if (difference) { errno = EACCES; return -1; }
+  return 0;
+}
+static int ocipp_accept(struct ocipp_owner *o) {
+  if (ocipp_binding_current(o) < 0 || o->management_unknown || o->candidate >= 0) return -1;
+  int fd = accept4(o->listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+  if (fd < 0) return -1;
+  o->candidate = fd;
+  struct ucred peer; socklen_t n = sizeof(peer);
+  if (!o->host_lost || o->frontend >= 0 || getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &n) < 0 ||
+      n != sizeof(peer) || peer.uid || peer.pid <= 0) return ocipp_frontend_close(o, &o->candidate);
+  o->authentication_used = 0; explicit_bzero(o->authentication, sizeof(o->authentication));
+  o->authentication_started = ocip_now();
+  if (o->authentication_started < 0) return ocipp_frontend_close(o, &o->candidate);
+  return 0;
+}
+static int ocipp_read_authentication(struct ocipp_owner *o) {
+  if (o->candidate < 0 || ocipp_binding_current(o) < 0) return -1;
+  int64_t now = ocip_now();
+  if (now < 0 || now - o->authentication_started >= 4000) return ocipp_frontend_close(o, &o->candidate);
+  if (o->authentication_used >= sizeof(o->authentication)) {
+    errno = EPROTO; (void)ocipp_frontend_close(o, &o->candidate); return -1;
+  }
+  size_t remaining = sizeof(o->authentication) - o->authentication_used;
+  ssize_t n = read(o->candidate, o->authentication + o->authentication_used, remaining);
+  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+  if (n <= 0) return ocipp_frontend_close(o, &o->candidate);
+  if ((size_t)n > remaining) {
+    errno = EPROTO; (void)ocipp_frontend_close(o, &o->candidate); return -1;
+  }
+  o->authentication_used += (size_t)n;
+  if (o->authentication_used >= 4 && memcmp(o->authentication, (unsigned char[]){0, 0, 0, 120}, 4))
+    return ocipp_frontend_close(o, &o->candidate);
+  if (o->authentication_used != sizeof(o->authentication)) return 0;
+  if (ocipp_authenticate(o, o->authentication + 4, 120) < 0)
+    return ocipp_frontend_close(o, &o->candidate);
+  o->frontend = o->candidate; o->candidate = -1; o->host_lost = 0; o->replay_required = 1;
+  o->frontend_used = 0; o->frontend_need = 4;
+  explicit_bzero(o->authentication, sizeof(o->authentication));
+  o->management_size = o->management_sent = 0; o->management_resume = 0;
+  return ocipp_management_text(o, "{\"kind\":\"linux-oci-parent-authenticated@1\",\"barrier\":\"unproven\"}");
+}
+static int ocipp_is_effect(enum tns_ocip_kind kind) {
+  return kind == TNS_OCIP_CREATE || kind == TNS_OCIP_START || kind == TNS_OCIP_STOP_INIT ||
+    kind == TNS_OCIP_RELEASE_NAMESPACE || kind == TNS_OCIP_BEGIN_TRACKED_JOIN ||
+    kind == TNS_OCIP_DELETE_BORN || kind == TNS_OCIP_DISPOSE_BORN;
+}
+static int ocipp_allowed(struct ocipp_owner *o, enum tns_ocip_kind kind) {
+  if (ocipp_is_effect(kind) && (o->effects & (1u << kind))) { errno = EALREADY; return -1; }
+  enum tns_ocip_kind original = kind == TNS_OCIP_JOIN_INIT ? TNS_OCIP_STOP_INIT :
+    kind == TNS_OCIP_CONTINUE_NAMESPACE_RELEASE || kind == TNS_OCIP_OBSERVE_NAMESPACE_LIFETIME ? TNS_OCIP_RELEASE_NAMESPACE :
+    kind == TNS_OCIP_READ_TRACKED_JOIN ? TNS_OCIP_BEGIN_TRACKED_JOIN :
+    kind == TNS_OCIP_JOIN_BORN_DELETE ? TNS_OCIP_DELETE_BORN :
+    kind == TNS_OCIP_CONTINUE_BORN_DISPOSAL ? TNS_OCIP_DISPOSE_BORN : 0;
+  if (original && !(o->effects & (1u << original))) return -1;
+  if ((o->effects & (1u << TNS_OCIP_DISPOSE_BORN)) && kind != TNS_OCIP_CONTINUE_BORN_DISPOSAL) return -1;
+  if ((o->effects & (1u << TNS_OCIP_BEGIN_TRACKED_JOIN)) && kind != TNS_OCIP_READ_TRACKED_JOIN &&
+      kind != TNS_OCIP_DELETE_BORN && kind != TNS_OCIP_JOIN_BORN_DELETE && kind != TNS_OCIP_DISPOSE_BORN &&
+      kind != TNS_OCIP_CONTINUE_BORN_DISPOSAL && kind != TNS_OCIP_CANCEL) return -1;
+  return 0; /* Routing only. The original H still enforces every producer phase. */
+}
+static int ocipp_queue(struct ocipp_owner *o, const unsigned char *body, uint32_t size) {
+  if (ocipp_binding_current(o) < 0 || o->joined || o->wait_unknown || o->reply_unknown || o->identity_unknown) return -1;
+  if (!o->create) {
+    if (ocipp_first_create(o, body, size) < 0) return -1;
+    return ocipp_spawn(o);
+  }
+  if (o->pending || o->awaiting) { errno = EBUSY; return -1; }
+  enum tns_ocip_kind kind = 0;
+  if (ocipp_decode(body, size, NULL, NULL, 0, &kind) < 0 || ocipp_allowed(o, kind) < 0) return -1;
+  if (ocipp_is_effect(kind)) o->effects |= 1u << kind;
+  o->request_kind = kind; o->request_size = (size_t)size + 4; o->issued_size = 0;
+  o->last_reply_start = o->last_reply_end = 0;
+  memmove(o->incoming + 4, body, size);
+  o->incoming[0] = (unsigned char)(size >> 24); o->incoming[1] = (unsigned char)(size >> 16);
+  o->incoming[2] = (unsigned char)(size >> 8); o->incoming[3] = (unsigned char)size;
+  o->incoming_size = o->incoming_need = (size_t)size + 4; o->incoming_sent = 0; o->pending = 1;
+  return 0;
+}
+static int ocipp_management(struct ocipp_owner *o, const unsigned char *body, size_t size) {
+  static const char result[] = "{\"kind\":\"linux-oci-parent-read-result@1\"}";
+  static const char outcome[] = "{\"kind\":\"linux-oci-parent-read-outcome@1\"}";
+  static const char resume[] = "{\"kind\":\"linux-oci-parent-continue-frame@1\"}";
+  if (ocipp_binding_current(o) < 0 || o->frontend < 0) return -1;
+  char text[900]; int n;
+  if (size == sizeof(resume) - 1 && !memcmp(body, resume, size)) {
+    /* Authentication and reading past facts cannot issue held unsent effects.
+     * Only this explicit operation continues the SAME previously saved frame. */
+    if (o->replay_required || !o->input_paused || !o->pending || o->incoming_sent ||
+        o->reply_unknown || o->wait_unknown || o->identity_unknown || o->joined) return -1;
+    o->input_paused = 0;
+    return ocipp_management_text(o, "{\"kind\":\"linux-oci-parent-frame-continued@1\",\"barrier\":\"unproven\"}");
+  }
+  if (size == sizeof(result) - 1 && !memcmp(body, result, size)) {
+    int fact = ocipp_fact(o), error = fact ? errno : 0;
+    n = snprintf(text, sizeof(text), "{\"kind\":\"%s\",\"error\":%d,\"barrier\":\"unproven\"}",
+      fact ? "linux-oci-parent-h-result-refused@1" : "linux-oci-parent-h-exited@1", error);
+    if (n < 0 || (size_t)n >= sizeof(text)) return -1;
+    return ocipp_management_text(o, text);
+  }
+  if (size != sizeof(outcome) - 1 || memcmp(body, outcome, size)) return 1;
+  size_t start = o->last_reply_start, end = o->last_reply_end;
+  if (end < start || end > o->used[0]) return -1;
+  n = snprintf(text, sizeof(text), "{\"kind\":\"linux-oci-parent-outcome@1\",\"requestKind\":%u,\"effects\":%u,\"requestBytes\":\"%zu\",\"issuedBytes\":\"%zu\",\"deliveryUnknown\":%u,\"replyBytes\":\"%zu\",\"barrier\":\"unproven\"}",
+    (unsigned int)o->request_kind, o->effects, o->request_size, o->issued_size, o->delivery_unknown, end - start);
+  if (n < 0 || (size_t)n >= sizeof(text) || ocipp_management_text(o, text) < 0) return -1;
+  if (end > start) {
+    if (end > o->used[0] || end - start > TNS_OCI_MAX_JSON + 4u) return -1;
+    memcpy(o->management_output + o->management_size, o->captured[0] + start, end - start);
+    o->management_size += end - start;
+    o->management_resume = o->awaiting && o->reply_ready;
+    o->replay_required = 0;
+  } else if (!o->awaiting) o->replay_required = 0;
+  return 0;
+}
+static void ocipp_host_lost(struct ocipp_owner *o);
+static int ocipp_frontend_read(struct ocipp_owner *o) {
+  if (o->frontend < 0 || o->management_size != o->management_sent) return -1;
+  ssize_t n = read(o->frontend, o->frontend_input + o->frontend_used, o->frontend_need - o->frontend_used);
+  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+  if (n <= 0) { ocipp_host_lost(o); return -1; }
+  o->frontend_used += (size_t)n;
+  if (o->frontend_used == 4 && o->frontend_need == 4) {
+    uint32_t length;
+    if (tns_ocip_frame(o->frontend_input, &length) < 0) { ocipp_host_lost(o); return -1; }
+    o->frontend_need = (size_t)length + 4;
+  }
+  if (o->frontend_used != o->frontend_need) return 0;
+  int result = ocipp_management(o, o->frontend_input + 4, o->frontend_used - 4);
+  if (result == 1) {
+    if (o->replay_required) result = -1;
+    else result = ocipp_queue(o, o->frontend_input + 4, (uint32_t)(o->frontend_used - 4));
+  }
+  if (result < 0) { ocipp_host_lost(o); return -1; }
+  explicit_bzero(o->frontend_input, o->frontend_used); o->frontend_used = 0; o->frontend_need = 4;
+  return 0;
+}
+static int ocipp_management_flush(struct ocipp_owner *o) {
+  if (o->frontend < 0 || o->management_sent == o->management_size) return 0;
+  ssize_t n = write(o->frontend, o->management_output + o->management_sent, o->management_size - o->management_sent);
+  if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) return 0;
+  if (n <= 0) { ocipp_host_lost(o); return -1; }
+  o->management_sent += (size_t)n;
+  if (o->management_sent == o->management_size && o->management_resume) {
+    /* Boundary comes from the actual captured original H frame, not a Host
+     * acknowledgement. Effect latches and delivery UNKNOWN are never cleared. */
+    o->management_resume = 0; o->awaiting = o->reply_ready = 0;
+    o->frame_start = o->frame_end; o->delivered[0] = o->frame_end;
+  }
+  return 0;
+}
 static void ocipp_host_lost(struct ocipp_owner *o) {
   /* Keep the original H stdin OPEN for later original-record management.
    * Host loss is not H EOF, a cleanup request, exit, or a delivery ACK. */
   o->host_lost = 1;
+  o->delivery_unknown = 1;
+  if (o->pending && !o->incoming_sent) o->input_paused = 1;
+  if (o->frontend >= 0) {
+    if (o->frontend_used) o->reply_unknown = 1; /* Never splice a partial frame from a new frontend. */
+    (void)ocipp_frontend_close(o, &o->frontend);
+  } else if (!o->pending && o->incoming_size) o->reply_unknown = 1;
 }
 static int ocipp_flush_input(struct ocipp_owner *o) {
   if (ocipp_controller(o) < 0 || o->joined || o->wait_unknown || o->identity_unknown || o->reply_unknown) return -1;
-  if (!o->pending || (o->host_lost && !o->incoming_sent)) return 0;
+  if (!o->pending || o->input_paused || (o->host_lost && !o->incoming_sent)) return 0;
   ssize_t n = write(o->input[1], o->incoming + o->incoming_sent, o->incoming_size - o->incoming_sent);
   if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
   if (n <= 0) { ocipp_host_lost(o); o->reply_unknown = 1; return -1; }
   o->incoming_sent += (size_t)n;
+  o->issued_size = o->incoming_sent;
   if (o->incoming_sent == o->incoming_size) {
     explicit_bzero(o->incoming, o->incoming_size); o->incoming_size = o->incoming_sent = 0;
     o->incoming_need = 4; o->pending = 0; o->awaiting = 1;
@@ -210,13 +477,16 @@ static int ocipp_parse_reply(struct ocipp_owner *o) {
   if (o->used[0] != o->frame_end) {
     o->reply_unknown = 1; ocipp_host_lost(o); errno = EPROTO; return -1;
   }
+  o->last_reply_start = o->frame_start; o->last_reply_end = o->frame_end;
   o->reply_ready = 1; return 0;
 }
 static int ocipp_forward(struct ocipp_owner *o, unsigned int which) {
   if (o->host_lost) return 0;
+  if (o->frontend >= 0 && (which || o->replay_required || o->management_size != o->management_sent)) return 0;
   size_t end = which ? o->used[1] : o->reply_ready ? o->frame_end : o->delivered[0];
   if (o->delivered[which] == end) return 0;
-  ssize_t n = write(which ? 2 : 1, o->captured[which] + o->delivered[which], end - o->delivered[which]);
+  ssize_t n = write(o->frontend >= 0 ? o->frontend : which ? 2 : 1,
+    o->captured[which] + o->delivered[which], end - o->delivered[which]);
   if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
   if (n <= 0) { ocipp_host_lost(o); return -1; }
   o->delivered[which] += (size_t)n;
@@ -237,10 +507,9 @@ static int ocipp_read_host(struct ocipp_owner *o) {
     o->incoming_need = (size_t)size + 4;
   }
   if (o->incoming_size == o->incoming_need) {
-    if (ocipp_decode(o->incoming + 4, o->incoming_size - 4, NULL, NULL, 0) < 0) {
+    if (ocipp_queue(o, o->incoming + 4, (uint32_t)(o->incoming_size - 4)) < 0) {
       ocipp_host_lost(o); return -1;
     }
-    o->pending = 1;
   }
   return 0;
 }
@@ -248,20 +517,31 @@ static int ocipp_step(struct ocipp_owner *o) {
   if (ocipp_controller(o) < 0) return -1;
   if (ocipp_current(o) < 0) { o->identity_unknown = 1; ocipp_host_lost(o); }
   if (ocipp_interrupted) ocipp_host_lost(o);
-  int sending = o->pending && (!o->host_lost || o->incoming_sent) &&
+  int sending = o->pending && !o->input_paused && (!o->host_lost || o->incoming_sent) &&
     !o->identity_unknown && !o->joined && !o->wait_unknown && !o->reply_unknown;
-  struct pollfd p[4] = {{.fd = o->host_lost || o->joined || o->wait_unknown ? -1 : 0,
+  struct pollfd p[7] = {{.fd = o->frontend >= 0 || o->host_lost || o->joined || o->wait_unknown ? -1 : 0,
       .events = o->pending || o->awaiting ? 0 : POLLIN},
     {.fd = o->eof[0] || o->pipe_unknown[0] ? -1 : o->output[0], .events = POLLIN},
     {.fd = o->eof[1] || o->pipe_unknown[1] ? -1 : o->errors[0], .events = POLLIN},
-    {.fd = sending ? o->input[1] : -1, .events = POLLOUT}};
-  int n = poll(p, 4, 1000);
+    {.fd = sending ? o->input[1] : -1, .events = POLLOUT},
+    {.fd = o->bound && !o->management_unknown && o->candidate < 0 ? o->listener : -1, .events = POLLIN},
+    {.fd = o->candidate, .events = POLLIN},
+    {.fd = o->frontend, .events = o->management_sent == o->management_size ? POLLIN : POLLOUT}};
+  int n = poll(p, 7, 1000);
   if (n < 0 && errno != EINTR) { o->reply_unknown = 1; ocipp_host_lost(o); }
   if (p[0].revents & (POLLHUP | POLLERR | POLLNVAL)) ocipp_host_lost(o);
   if (p[0].revents & POLLIN) (void)ocipp_read_host(o);
   for (unsigned int i = 0; i < 2; ++i) {
     if (p[i + 1].revents & (POLLERR | POLLNVAL)) o->pipe_unknown[i] = 1;
     else if (p[i + 1].revents & (POLLIN | POLLHUP)) (void)ocipp_drain(o, i);
+  }
+  if (p[4].revents & (POLLERR | POLLNVAL | POLLHUP)) o->management_unknown = 1;
+  else if (p[4].revents & POLLIN) (void)ocipp_accept(o);
+  if (o->candidate >= 0) (void)ocipp_read_authentication(o);
+  if (p[6].revents & (POLLERR | POLLHUP | POLLNVAL)) ocipp_host_lost(o);
+  else {
+    if (p[6].revents & POLLIN) (void)ocipp_frontend_read(o);
+    if (p[6].revents & POLLOUT) (void)ocipp_management_flush(o);
   }
   (void)ocipp_wait(o);
   (void)ocipp_parse_reply(o); (void)ocipp_forward(o, 0); (void)ocipp_forward(o, 1);
@@ -292,16 +572,13 @@ static int ocipp_main(void) {
   unsigned char *body = NULL; uint32_t size = 0;
   if (ocip_read(&body, &size)) { if (body) { explicit_bzero(body, size); free(body); } return 77; }
   struct ocipp_owner *o = calloc(1, sizeof(*o));
-  int prepared = o ? ocipp_prepare(o, body, size) : -1;
+  int prepared = o ? ocipp_bootstrap(o, body, size) : -1;
   explicit_bzero(body, size); free(body);
   if (prepared < 0) return 77; /* No H has been created or sent any bytes. */
-  int spawned = ocipp_spawn(o);
-  if (spawned < 0) {
-    if (!o->child) return 77;
-    o->identity_unknown = 1; ocipp_host_lost(o);
-  }
+  if (ocipp_bootstrap_reply(o) < 0) return 77;
   /* This SAME P stays alive after Host loss AND after a known H exit. Facts and
-   * all original output remain private. No listener, new frontend or grant. */
+   * all original output remain in this record. Authenticated reads/control are
+   * not SQL, full-traffic or retirement permission. */
   for (;;) (void)ocipp_step(o);
 }
 #endif
