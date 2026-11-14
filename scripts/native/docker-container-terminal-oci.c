@@ -53,6 +53,14 @@ struct tns_oci_owner {
   unsigned int start_attempt;
   int start_joined, start_ok, start_kill_attempted;
   int start_pidfd, stopped_exe;
+  /* Separate born DELETE custody; original CREATE/START proofs never change.
+   * These FDs are initialized before any delete-side acquisition and retained
+   * through all failures. Their later cleanup is a separate source phase. */
+  unsigned int delete_attempt, delete_wait_attempted;
+  pid_t delete_pid;
+  int delete_pidfd, delete_state_fd, delete_state_pinned;
+  int delete_joined, delete_ok;
+  struct stat delete_state_identity;
   pid_t start_pid, controller_pid, init_pid;
   int parent_pidns, init_pidns, init_custody, init_joined;
   unsigned int init_stop_attempt;
@@ -269,11 +277,13 @@ static int oci_init_executable(struct tns_oci_owner *o, int fd) {
   return 0;
 }
 
-enum oci_command_kind { OCI_COMMAND_CREATE, OCI_COMMAND_START };
+enum oci_command_kind { OCI_COMMAND_CREATE, OCI_COMMAND_START, OCI_COMMAND_DELETE };
 
 static _Noreturn void oci_command_child(struct tns_oci_owner *o, pid_t creator,
                                          enum oci_command_kind kind) {
-  if (oci_not_canceled() < 0) _exit(125);
+  /* DELETE is original-owner cleanup after consuming init/tracked joins.
+   * Its parent checks cleanup-current; generic cancel still gates CREATE/START. */
+  if (kind != OCI_COMMAND_DELETE && oci_not_canceled() < 0) _exit(125);
   int executable = fcntl(o->runtime, F_DUPFD_CLOEXEC, 4);
   if (executable < 0 || dup3(executable, 3, O_CLOEXEC) < 0 ||
       syscall(SYS_close_range, 4u, UINT_MAX, 0u) < 0) _exit(125);
@@ -288,9 +298,11 @@ static _Noreturn void oci_command_child(struct tns_oci_owner *o, pid_t creator,
   char *const create_args[] = {"runc", "--root", o->statepath, "create", "--bundle",
                               o->bundlepath, "--pid-file", o->pidpath, o->id, NULL};
   char *const start_args[] = {"runc", "--root", o->statepath, "start", o->id, NULL};
+  char *const delete_args[] = {"runc", "--root", o->statepath, "delete", o->id, NULL};
   char *const *args;
   if (kind == OCI_COMMAND_CREATE) args = create_args;
   else if (kind == OCI_COMMAND_START) args = start_args;
+  else if (kind == OCI_COMMAND_DELETE) args = delete_args;
   else _exit(125);
   char *const environment[] = {"PATH=/usr/sbin:/usr/bin:/sbin:/bin", NULL};
   umask(077);
@@ -971,4 +983,110 @@ int tns_oci_read_tracked_join(struct tns_oci_owner *o) {
    * after BEGIN. No hidden retry, namespace release or cleanup is performed. */
   if (tns_owner_read_tracked_join(o->birth) < 0) return -1;
   return oci_tracked_join_current(o);
+}
+
+
+/* No caller supplies a runtime ID, path, PID or namespace. The same original
+ * READ bookends all cleanup-current inputs; BEGIN ACK alone cannot enter here.
+ * The state path was produced from the original held controller FD at CREATE. */
+static int oci_born_delete_current(struct tns_oci_owner *o) {
+  if (tns_oci_read_tracked_join(o) < 0) return -1;
+  char path[sizeof(o->statepath)];
+  if (oci_fd_path(path, sizeof(path), o->state) < 0 ||
+      strcmp(path, o->statepath) || tns_oci_claim(o->id) < 0) {
+    errno = ESTALE; return -1;
+  }
+  return 0;
+}
+
+static int oci_born_delete_state_current(struct tns_oci_owner *o) {
+  struct stat held, named;
+  if (!o->delete_state_pinned ||
+      oci_owned(o->delete_state_fd, 1, 0700) < 0 ||
+      fstat(o->delete_state_fd, &held) < 0 ||
+      !oci_same(&held, &o->delete_state_identity) ||
+      fstatat(o->state, o->id, &named, AT_SYMLINK_NOFOLLOW) < 0 ||
+      !oci_same(&held, &named)) { errno = ESTALE; return -1; }
+  return 0;
+}
+
+/* Poll timeout permits only another join of this same child. A possibly
+ * consuming wait with an error/malformed reply is sticky UNKNOWN; neither
+ * another wait nor another DELETE can manufacture a lost exit status. */
+static int oci_join_born_delete_command(struct tns_oci_owner *o, int milliseconds) {
+  if (o->delete_joined) return 0;
+  if (o->delete_pid <= 0 || o->delete_pidfd < 0 || o->delete_wait_attempted) {
+    errno = EUCLEAN; return -1;
+  }
+  struct pollfd p = {.fd = o->delete_pidfd, .events = POLLIN};
+  int n = poll(&p, 1, milliseconds);
+  if (n < 0) return -1;
+  if (!n) { errno = ETIMEDOUT; return -1; }
+  if (n != 1 || p.revents != POLLIN) { errno = EPROTO; return -1; }
+  o->delete_wait_attempted = 1;
+  siginfo_t info; memset(&info, 0, sizeof(info));
+  if (waitid(P_PIDFD, (id_t)o->delete_pidfd, &info, WEXITED | WNOHANG) < 0)
+    return -1;
+  if (info.si_pid != o->delete_pid || info.si_signo != SIGCHLD ||
+      (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED &&
+       info.si_code != CLD_DUMPED) ||
+      (info.si_code == CLD_EXITED ? info.si_status < 0 || info.si_status > 255 :
+                                  info.si_status <= 0 || info.si_status >= NSIG)) {
+    errno = EPROTO; return -1;
+  }
+  o->delete_joined = 1;
+  o->delete_ok = info.si_code == CLD_EXITED && info.si_status == 0;
+  return 0;
+}
+
+static int oci_born_delete_observed(struct tns_oci_owner *o) {
+  if (!o->delete_joined || !o->delete_ok || !o->delete_state_pinned) {
+    errno = EUCLEAN; return -1;
+  }
+  if (oci_born_delete_current(o) < 0) return -1;
+  struct stat held, named;
+  if (fstat(o->delete_state_fd, &held) < 0 ||
+      !oci_same(&held, &o->delete_state_identity)) { errno = ESTALE; return -1; }
+  if (fstatat(o->state, o->id, &named, AT_SYMLINK_NOFOLLOW) == 0) {
+    errno = EEXIST; return -1;
+  }
+  if (errno != ENOENT) return -1;
+  /* Zero is only joined-zero runtime DELETE plus fresh exact-state absence.
+   * No remaining config/FD is released and no network/Core permit is created. */
+  return oci_born_delete_current(o);
+}
+
+int tns_oci_join_born_delete(struct tns_oci_owner *o) {
+  if (!o || !o->delete_attempt) { errno = EINVAL; return -1; }
+  if (oci_born_delete_current(o) < 0 ||
+      oci_join_born_delete_command(o, 10000) < 0) return -1;
+  return oci_born_delete_observed(o);
+}
+
+int tns_oci_delete_born(struct tns_oci_owner *o) {
+  if (!o) { errno = EINVAL; return -1; }
+  if (o->delete_attempt) { errno = EALREADY; return -1; }
+  if (oci_born_delete_current(o) < 0) return -1;
+  if (tns_oci_once(&o->delete_attempt) < 0) { errno = EALREADY; return -1; }
+  o->delete_pidfd = o->delete_state_fd = -1;
+  o->delete_state_fd = openat(o->state, o->id,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (o->delete_state_fd < 0 || oci_owned(o->delete_state_fd, 1, 0700) < 0 ||
+      fstat(o->delete_state_fd, &o->delete_state_identity) < 0) return -1;
+  o->delete_state_pinned = 1;
+  if (oci_born_delete_state_current(o) < 0 || oci_born_delete_current(o) < 0)
+    return -1;
+  int64_t now = oci_now();
+  if (now < 0) return -1;
+  struct clone_args args; memset(&args, 0, sizeof(args));
+  args.flags = CLONE_PIDFD | CLONE_CLEAR_SIGHAND;
+  args.pidfd = (uintptr_t)&o->delete_pidfd; args.exit_signal = SIGCHLD;
+  long child = syscall(SYS_clone3, &args, sizeof(args));
+  if (child < 0) return -1;
+  if (!child) oci_command_child(o, o->controller_pid, OCI_COMMAND_DELETE);
+  o->delete_pid = (pid_t)child;
+  int64_t elapsed = oci_now();
+  if (elapsed < 0 || elapsed - now >= 10000) { errno = ETIMEDOUT; return -1; }
+  if (oci_join_born_delete_command(o, 10000 - (int)(elapsed - now)) < 0) return -1;
+  return oci_born_delete_observed(o);
 }

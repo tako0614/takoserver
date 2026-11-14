@@ -113,6 +113,16 @@ int tns_oci_observe_namespace_lifetime(struct tns_oci_owner *owner,
 int tns_oci_begin_tracked_join(struct tns_oci_owner *owner);
 int tns_oci_read_tracked_join(struct tns_oci_owner *owner);
 
+/* Original born runtime only: actual init consuming join, namespace release
+ * and fresh same-FD tracked READ are mandatory, including after cancellation.
+ * DELETE consumes one fixed-command attempt and keeps separate child custody.
+ * JOIN can only join/read that child; it never resends DELETE. Timeout or
+ * UNKNOWN retains all original objects. Zero requires joined zero exit and
+ * fresh absence of this original state child; it is only a runtime-delete
+ * fact, never full traffic terminal, Core removal, or complete FD cleanup. */
+int tns_oci_delete_born(struct tns_oci_owner *owner);
+int tns_oci_join_born_delete(struct tns_oci_owner *owner);
+
 /* Pure closed data primitives; none is an owner or physical result. */
 #define TNS_OCI_MAX_JSON 1048576u
 #define TNS_OCI_MAX_STRING 131071u
