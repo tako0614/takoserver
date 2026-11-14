@@ -72,6 +72,8 @@ async function fixture(
   corrupt = false,
   adversarial: {
     readonly parentControl?: boolean;
+    readonly parentPeer?: boolean;
+    readonly peerPending?: boolean;
     readonly parentFault?: "foreign-claim" | "foreign-generation";
     readonly fixedKeys?: { readonly key: CryptoKey; readonly comparison: CryptoKey };
     readonly extraImage?: boolean;
@@ -136,7 +138,7 @@ async function fixture(
     frameHostMigrationSql(additiveV2ConfiguredUpdateInputsDDL).map((sql) => ({ sql })),
   );
   await sql.batch(v2ContainerOwnerMigrationCandidate());
-  if (adversarial.parentControl)
+  if (adversarial.parentControl || adversarial.parentPeer)
     await sql.batch(V2_CONTAINER_OWNER_CONTROL_EXPAND.statements.map((sql) => ({ sql })));
   const key =
     adversarial.fixedKeys?.key ??
@@ -235,7 +237,8 @@ async function fixture(
         },
       });
     }
-    if (adversarial.parentControl) recreateParent = () => createLinuxOciOwnedBundle(options);
+    if (adversarial.parentControl || adversarial.parentPeer)
+      recreateParent = () => createLinuxOciOwnedBundle(options);
     if (adversarial.normalBackend) {
       const { sql, clock, ...selection } = options;
       recreateNormal = () => createSelfhostLinuxOciContainerBackend({ sql, clock, selection });
@@ -256,7 +259,11 @@ async function fixture(
       backendId: "synthetic-oci-backend",
       targetKey: "synthetic-oci-target",
       configuredInputs,
-      ...(adversarial.parentControl ? { ociParentControl: "sealed-original@1" as const } : {}),
+      ...(adversarial.parentPeer
+        ? { ociParentControl: "sealed-peer@1" as const }
+        : adversarial.parentControl
+          ? { ociParentControl: "sealed-original@1" as const }
+          : {}),
       artifactRoot,
       umociBinary: unpacker,
       ...(adversarial.nativeMode !== undefined && !adversarial.noPhysicalBinary
@@ -311,13 +318,23 @@ async function fixture(
   const unpackerEntered = new Promise<void>((resolve) => {
     unpackerStarted = resolve;
   });
+  let originalPeerBootstrap: Buffer | undefined;
   const raw = spyOn(childProcess, "spawn").mockImplementation(((
     file: string,
     args: readonly string[],
     options: childProcess.SpawnOptions,
   ) => {
     if (file === physicalBinary) {
-      expect(args).toEqual(adversarial.parentControl ? ["--persistent-parent"] : []);
+      const connector = adversarial.parentPeer && args[0] === "--parent-peer-read-result";
+      expect(args).toEqual(
+        connector
+          ? ["--parent-peer-read-result"]
+          : adversarial.parentPeer
+            ? ["--persistent-parent-peer"]
+            : adversarial.parentControl
+              ? ["--persistent-parent"]
+              : [],
+      );
       nativeProcesses++;
       if (adversarial.nativeMode === "closed-during-spawn") {
         nativeClosing = composition.close();
@@ -341,6 +358,54 @@ async function fixture(
         write(frame: Buffer, _encoding, done) {
           void (async () => {
             expect(frame.readUInt32BE(0)).toBe(frame.length - 4);
+            if (connector) {
+              nativeRequests.push("linux-oci-parent-read-result@2");
+              const original = originalPeerBootstrap;
+              const valid =
+                original &&
+                frame.length === 176 &&
+                frame.subarray(4, 12).equals(Buffer.from("TKOPEER2")) &&
+                frame.subarray(12, 84).equals(original.subarray(12, 84)) &&
+                frame.subarray(92, 124).equals(original.subarray(84, 116)) &&
+                frame.readBigUInt64BE(84) === 0xfedcba9876543210n &&
+                frame.readBigUInt64BE(124) === 5n &&
+                frame.readBigUInt64BE(132) === 0x123456789abcdef0n &&
+                frame.subarray(140).equals(Buffer.from("11111111-2222-4333-8444-555555555555"));
+              if (valid)
+                reply(
+                  adversarial.peerPending
+                    ? {
+                        kind: "linux-oci-parent-h-result-refused@1",
+                        error: 11,
+                        barrier: "unproven",
+                      }
+                    : { kind: "linux-oci-parent-h-exited@1", error: 0, barrier: "unproven" },
+                );
+              done();
+              queueMicrotask(() => {
+                stdout.end();
+                stderr.end();
+                child.emit("exit", valid ? 0 : 1, null);
+                child.emit("close", valid ? 0 : 1, null);
+              });
+              return;
+            }
+            if (adversarial.parentPeer && frame.readUInt32BE(0) === 112) {
+              expect(frame.subarray(4, 12).equals(Buffer.from("TKOBIND2"))).toBe(true);
+              originalPeerBootstrap = Buffer.from(frame);
+              nativeRequests.push("linux-oci-parent-bootstrap@2");
+              const response = Buffer.alloc(144);
+              response.writeUInt32BE(140);
+              response.write("TKOINFO2", 4, "ascii");
+              frame.copy(response, 12, 12, 84);
+              response.writeBigUInt64BE(0xfedcba9876543210n, 84);
+              response.writeBigUInt64BE(5n, 92);
+              response.writeBigUInt64BE(0x123456789abcdef0n, 100);
+              response.write("11111111-2222-4333-8444-555555555555", 108, "ascii");
+              stdout.write(response);
+              done();
+              return;
+            }
             if (adversarial.parentControl && frame.readUInt32BE(0) === 112) {
               expect(frame.subarray(4, 12).equals(Buffer.from("TKOBIND1"))).toBe(true);
               nativeRequests.push("linux-oci-parent-bootstrap@1");

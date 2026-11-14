@@ -1458,6 +1458,7 @@ export class LinuxOciParentBootstrap {
     scope: string,
     signal: AbortSignal,
     originalCreate: LinuxOciCreateStoppedRequest,
+    originalAllocation?: Readonly<Record<string, unknown>>,
   ) {
     this.assertCurrent(signal);
     const context = parseStrictJson(encoder.encode(scope), LIMIT);
@@ -1488,6 +1489,12 @@ export class LinuxOciParentBootstrap {
         executable: this.#binaryIdentity,
         peer: this.#peer,
         createDigest: await canonicalDigest(actual),
+        ...(originalAllocation === undefined
+          ? {}
+          : {
+              purpose: "takoserver.linux-oci-peer-reconstruction@1",
+              allocation: originalAllocation,
+            }),
       }),
     );
     try {
@@ -1524,168 +1531,36 @@ export class LinuxOciParentBootstrap {
       this.#lifetime?.aborted
     )
       return Promise.reject(failure("parent_peer_retained"));
-    this.#assertBinary();
-    const frame = Buffer.alloc(176),
-      peer = this.#peer;
-    frame.writeUInt32BE(172);
-    frame.write("TKOPEER2", 4, "ascii");
-    frame.write(this.#claim, 12, "ascii");
-    frame.writeBigUInt64BE(BigInt(this.#generation), 76);
-    frame.writeBigUInt64BE(BigInt(this.#info.listenerCookie), 84);
-    this.#capability.copy(frame, 92);
-    frame.writeBigUInt64BE(BigInt(peer.device), 124);
-    frame.writeBigUInt64BE(BigInt(peer.inode), 132);
-    frame.write(peer.bootId, 140, "ascii");
-    const child = spawn(this.#binary, ["--parent-peer-read-result"], {
-      env: Object.create(null),
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.#peerConnector = child;
-    return new Promise<LinuxOciParentHResult>((resolve, reject) => {
-      let buffer = Buffer.alloc(0),
-        written = false,
-        ended = false,
-        errorsEnded = false,
-        exited = false,
-        closed = false,
-        code: number | null = null,
-        exitSignal: NodeJS.Signals | null = null,
-        errorBytes = 0,
-        finished = false;
-      const stop = () => {
-        this.#peerReadUnknown = true;
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        signal.removeEventListener("abort", stop);
-        this.#lifetime?.removeEventListener("abort", stop);
-        frame.fill(0);
-        reject(failure("parent_peer_retained"));
-      };
-      const check = () => {
-        if (finished || !written || !ended || !errorsEnded || !exited || !closed) return;
-        try {
-          if (
-            signal.aborted ||
-            this.#lifetime?.aborted ||
-            code !== 0 ||
-            exitSignal !== null ||
-            buffer.length < 5 ||
-            buffer.readUInt32BE(0) !== buffer.length - 4
-          )
-            throw failure();
-          this.#assertBinary();
-          const value = parseStrictJson(buffer.subarray(4), 512);
-          if (
-            JSON.stringify(value) !==
-            new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(4))
-          )
-            throw failure();
-          if (
-            !record(value) ||
-            Reflect.ownKeys(value).length !== 3 ||
-            !["kind", "error", "barrier"].every((k) =>
-              Object.hasOwn(Object.getOwnPropertyDescriptor(value, k) ?? {}, "value"),
-            ) ||
-            (value.kind !== "linux-oci-parent-h-exited@1" &&
-              value.kind !== "linux-oci-parent-h-result-refused@1") ||
-            !integer(value.error, 0, 2147483647) ||
-            value.barrier !== "unproven" ||
-            (value.kind === "linux-oci-parent-h-exited@1" ? value.error !== 0 : value.error === 0)
-          )
-            throw failure();
-          finished = true;
-          clearTimeout(timer);
-          signal.removeEventListener("abort", stop);
-          this.#lifetime?.removeEventListener("abort", stop);
-          this.#peerConnector = undefined;
-          resolve(Object.freeze({ kind: value.kind, error: value.error, barrier: "unproven" }));
-        } catch {
-          stop();
-        }
-      };
-      const timer = setTimeout(stop, this.#timeout);
-      signal.addEventListener("abort", stop, { once: true });
-      this.#lifetime?.addEventListener("abort", stop, { once: true });
-      child.stdout.on("data", (chunk: Buffer) => {
-        if (finished) {
-          if (chunk.length) stop();
-          return;
-        }
-        if (!Buffer.isBuffer(chunk) || chunk.length > 516 - buffer.length) {
-          stop();
-          return;
-        }
-        buffer = Buffer.concat([buffer, chunk]);
-        if (
-          buffer.length >= 4 &&
-          (!buffer.readUInt32BE(0) ||
-            buffer.readUInt32BE(0) >= 512 ||
-            buffer.length > buffer.readUInt32BE(0) + 4)
-        )
-          stop();
-      });
-      child.stderr.on("data", (chunk: Buffer) => {
-        if (!Buffer.isBuffer(chunk) || chunk.length > STDERR_LIMIT - errorBytes) stop();
-        else errorBytes += chunk.length;
-      });
-      child.stdout.on("end", () => {
-        ended = true;
-        check();
-      });
-      child.stderr.on("end", () => {
-        errorsEnded = true;
-        check();
-      });
-      child.on("exit", (value, signal) => {
-        exited = true;
-        code = value;
-        exitSignal = signal;
-        check();
-      });
-      child.on("close", (value, signal) => {
-        closed = true;
-        if (value !== code || signal !== exitSignal) stop();
-        else check();
-      });
-      child.on("error", stop);
-      child.stdin.on("error", stop);
-      child.stdout.on("error", stop);
-      child.stderr.on("error", stop);
-      try {
-        if (signal.aborted || this.#lifetime?.aborted) {
-          stop();
-          return;
-        }
-        this.#assertBinary();
-        child.stdin.write(frame, (error) => {
-          frame.fill(0);
-          if (error) stop();
-          else {
-            written = true;
-            check();
-          }
-        });
-      } catch {
-        stop();
-      }
-    }).then((value) => {
-      try {
-        if (
-          signal.aborted ||
-          this.#lifetime?.aborted ||
-          this.#peerReadUnknown ||
-          this.#peerProcessLost
-        )
-          throw failure("parent_peer_retained");
-        this.#assertBinary();
-        return value;
-      } catch (error) {
-        this.#peerReadUnknown = true;
-        throw error;
-      }
-    });
+    const owner = this;
+    return readOriginalPeerResult(
+      {
+        binary: this.#binary,
+        claim: this.#claim,
+        generation: this.#generation,
+        info: this.#info,
+        peer: this.#peer,
+        capability: this.#capability,
+        lifetime: this.#lifetime,
+        timeout: this.#timeout,
+        assertBinary: this.#assertBinary,
+        get connector() {
+          return owner.#peerConnector;
+        },
+        set connector(value) {
+          owner.#peerConnector = value;
+        },
+        get unknown() {
+          return owner.#peerReadUnknown;
+        },
+        set unknown(value) {
+          owner.#peerReadUnknown = value;
+        },
+        get processLost() {
+          return owner.#peerProcessLost;
+        },
+      },
+      signal,
+    );
   }
 
   async createStopped(request: LinuxOciCreateStoppedRequest, signal: AbortSignal) {
@@ -1875,4 +1750,282 @@ export function createLinuxOciParentBootstrap(
   options: ConstructorParameters<typeof LinuxOciParentBootstrap>[0],
 ): LinuxOciParentBootstrap {
   return new LinuxOciParentBootstrap(options);
+}
+
+/** Internal transport state; facts come from the original bootstrap or from
+ * the owning Core's authenticated capture + actual-file bridge. Neither this
+ * type nor the returned unproven result is an accepted/removed authority. */
+interface OriginalPeerReaderState {
+  readonly binary: string;
+  readonly claim: string;
+  readonly generation: number;
+  readonly info: { readonly listenerCookie: string };
+  readonly peer: LinuxOciParentPeerIdentity;
+  readonly capability: Buffer;
+  readonly lifetime: AbortSignal | undefined;
+  readonly timeout: number;
+  readonly assertBinary: () => void;
+  readonly processLost: boolean;
+  connector: ChildProcessWithoutNullStreams | undefined;
+  unknown: boolean;
+}
+function readOriginalPeerResult(
+  state: OriginalPeerReaderState,
+  signal: AbortSignal,
+): Promise<LinuxOciParentHResult> {
+  state.assertBinary();
+  const frame = Buffer.alloc(176),
+    peer = state.peer;
+  frame.writeUInt32BE(172);
+  frame.write("TKOPEER2", 4, "ascii");
+  frame.write(state.claim, 12, "ascii");
+  frame.writeBigUInt64BE(BigInt(state.generation), 76);
+  frame.writeBigUInt64BE(BigInt(state.info.listenerCookie), 84);
+  state.capability.copy(frame, 92);
+  frame.writeBigUInt64BE(BigInt(peer.device), 124);
+  frame.writeBigUInt64BE(BigInt(peer.inode), 132);
+  frame.write(peer.bootId, 140, "ascii");
+  const child = spawn(state.binary, ["--parent-peer-read-result"], {
+    env: Object.create(null),
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  state.connector = child;
+  return new Promise<LinuxOciParentHResult>((resolve, reject) => {
+    let buffer = Buffer.alloc(0),
+      written = false,
+      ended = false,
+      errorsEnded = false,
+      exited = false,
+      closed = false,
+      code: number | null = null,
+      exitSignal: NodeJS.Signals | null = null,
+      errorBytes = 0,
+      finished = false;
+    const stop = () => {
+      state.unknown = true;
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      signal.removeEventListener("abort", stop);
+      state.lifetime?.removeEventListener("abort", stop);
+      frame.fill(0);
+      reject(failure("parent_peer_retained"));
+    };
+    const check = () => {
+      if (finished || !written || !ended || !errorsEnded || !exited || !closed) return;
+      try {
+        if (
+          signal.aborted ||
+          state.lifetime?.aborted ||
+          code !== 0 ||
+          exitSignal !== null ||
+          buffer.length < 5 ||
+          buffer.readUInt32BE(0) !== buffer.length - 4
+        )
+          throw failure();
+        state.assertBinary();
+        const value = parseStrictJson(buffer.subarray(4), 512);
+        if (
+          JSON.stringify(value) !==
+          new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(4))
+        )
+          throw failure();
+        if (
+          !record(value) ||
+          Reflect.ownKeys(value).length !== 3 ||
+          !["kind", "error", "barrier"].every((k) =>
+            Object.hasOwn(Object.getOwnPropertyDescriptor(value, k) ?? {}, "value"),
+          ) ||
+          (value.kind !== "linux-oci-parent-h-exited@1" &&
+            value.kind !== "linux-oci-parent-h-result-refused@1") ||
+          !integer(value.error, 0, 2147483647) ||
+          value.barrier !== "unproven" ||
+          (value.kind === "linux-oci-parent-h-exited@1" ? value.error !== 0 : value.error === 0)
+        )
+          throw failure();
+        finished = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", stop);
+        state.lifetime?.removeEventListener("abort", stop);
+        state.connector = undefined;
+        resolve(Object.freeze({ kind: value.kind, error: value.error, barrier: "unproven" }));
+      } catch {
+        stop();
+      }
+    };
+    const timer = setTimeout(stop, state.timeout);
+    signal.addEventListener("abort", stop, { once: true });
+    state.lifetime?.addEventListener("abort", stop, { once: true });
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (finished) {
+        if (chunk.length) stop();
+        return;
+      }
+      if (!Buffer.isBuffer(chunk) || chunk.length > 516 - buffer.length) {
+        stop();
+        return;
+      }
+      buffer = Buffer.concat([buffer, chunk]);
+      if (
+        buffer.length >= 4 &&
+        (!buffer.readUInt32BE(0) ||
+          buffer.readUInt32BE(0) >= 512 ||
+          buffer.length > buffer.readUInt32BE(0) + 4)
+      )
+        stop();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (!Buffer.isBuffer(chunk) || chunk.length > STDERR_LIMIT - errorBytes) stop();
+      else errorBytes += chunk.length;
+    });
+    child.stdout.on("end", () => {
+      ended = true;
+      check();
+    });
+    child.stderr.on("end", () => {
+      errorsEnded = true;
+      check();
+    });
+    child.on("exit", (value, signal) => {
+      exited = true;
+      code = value;
+      exitSignal = signal;
+      check();
+    });
+    child.on("close", (value, signal) => {
+      closed = true;
+      if (value !== code || signal !== exitSignal) stop();
+      else check();
+    });
+    child.on("error", stop);
+    child.stdin.on("error", stop);
+    child.stdout.on("error", stop);
+    child.stderr.on("error", stop);
+    try {
+      if (signal.aborted || state.lifetime?.aborted) {
+        stop();
+        return;
+      }
+      state.assertBinary();
+      child.stdin.write(frame, (error) => {
+        frame.fill(0);
+        if (error) stop();
+        else {
+          written = true;
+          check();
+        }
+      });
+    } catch {
+      stop();
+    }
+  }).then((value) => {
+    try {
+      if (signal.aborted || state.lifetime?.aborted || state.unknown || state.processLost)
+        throw failure("parent_peer_retained");
+      state.assertBinary();
+      return value;
+    } catch (error) {
+      state.unknown = true;
+      throw error;
+    }
+  });
+}
+
+/** Owning internal entrance after AEAD and original-files validation. This
+ * constructs only a one-use read-only connector, never a Parent or H session.
+ * Its input is data, not authority; the original same-Sql creator owns the
+ * authenticated callsite and must recheck that scope around this interval. */
+export function prepareAuthenticatedLinuxOciPeerReader(
+  binary: string,
+  value: unknown,
+  lifetime: AbortSignal,
+) {
+  const keys = [
+    "kind",
+    "claimId",
+    "generation",
+    "listenerCookie",
+    "capability",
+    "executable",
+    "peer",
+    "createDigest",
+    "purpose",
+    "allocation",
+  ];
+  const exact = (v: unknown, names: readonly string[]): v is Record<string, unknown> =>
+    record(v) &&
+    Reflect.ownKeys(v).length === names.length &&
+    names.every((k) => Object.hasOwn(Object.getOwnPropertyDescriptor(v, k) ?? {}, "value"));
+  const u64 = (v: unknown): v is string =>
+    typeof v === "string" && /^[1-9][0-9]{0,19}$/u.test(v) && BigInt(v) <= 18446744073709551615n;
+  if (
+    !exact(value, keys) ||
+    value.kind !== "linux-oci-original-peer-control@1" ||
+    value.purpose !== "takoserver.linux-oci-peer-reconstruction@1" ||
+    typeof value.claimId !== "string" ||
+    !CLAIM.test(value.claimId) ||
+    !integer(value.generation, 1) ||
+    !u64(value.listenerCookie) ||
+    typeof value.capability !== "string" ||
+    typeof value.createDigest !== "string" ||
+    !DIGEST.test(value.createDigest) ||
+    !exact(value.executable, ["path", "dev", "ino", "uid", "mode"]) ||
+    !exact(value.peer, ["kind", "device", "inode", "bootId"]) ||
+    value.peer.kind !== "linux-oci-parent-peer@1" ||
+    !u64(value.peer.device) ||
+    !u64(value.peer.inode) ||
+    typeof value.peer.bootId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value.peer.bootId) ||
+    value.peer.bootId === "00000000-0000-0000-0000-000000000000" ||
+    lifetime.aborted
+  )
+    throw failure("parent_binding");
+  const assertBinary = ownedExecutable(binary),
+    stat = lstatSync(binary),
+    executable = value.executable;
+  if (
+    executable.path !== binary ||
+    executable.dev !== stat.dev ||
+    executable.ino !== stat.ino ||
+    executable.uid !== stat.uid ||
+    executable.mode !== stat.mode
+  )
+    throw failure("parent_binding");
+  const capability = Buffer.from(decodeContainerSecretBytes(value.capability));
+  if (capability.length !== 32 || !capability.some((b) => b !== 0)) {
+    capability.fill(0);
+    throw failure("parent_binding");
+  }
+  const peer: LinuxOciParentPeerIdentity = Object.freeze({
+    kind: "linux-oci-parent-peer@1",
+    device: value.peer.device,
+    inode: value.peer.inode,
+    bootId: value.peer.bootId,
+  });
+  const state: OriginalPeerReaderState = {
+    binary,
+    claim: value.claimId,
+    generation: value.generation,
+    info: Object.freeze({ listenerCookie: value.listenerCookie }),
+    peer,
+    capability,
+    lifetime,
+    timeout: 20_000,
+    assertBinary,
+    processLost: false,
+    connector: undefined,
+    unknown: false,
+  };
+  let attempted = false;
+  return async (signal: AbortSignal) => {
+    if (attempted || signal.aborted || lifetime.aborted) throw failure("parent_peer_retained");
+    attempted = true;
+    try {
+      assertBinary();
+      return await readOriginalPeerResult(state, signal);
+    } finally {
+      capability.fill(0);
+    }
+  };
 }

@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/
 import { dirname, isAbsolute, join, parse } from "node:path";
 import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "../container-contract.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
+import { parseStrictJson } from "../strict-json.ts";
 import type { V2BackendResult, V2Execution, V2Form } from "../takoform-v2/types.ts";
 import {
   createDockerContainerConfiguredInputs,
@@ -49,9 +50,11 @@ import {
   type LinuxOciInitReapedObservation,
   type LinuxOciNamespaceLifetimeObservation,
   LinuxOciParentBootstrap,
+  type LinuxOciParentHResult,
   LinuxOciPhysicalSession,
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
+  prepareAuthenticatedLinuxOciPeerReader,
 } from "./linux-oci-physical-session.ts";
 import {
   LINUX_OCI_SERVICE_POLICY_FILE,
@@ -60,6 +63,15 @@ import {
 
 type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
+  readonly artifactRoot: string;
+  readonly physicalBinary: string | undefined;
+  readonly peerReads: Map<
+    string,
+    {
+      readonly read: ReturnType<typeof prepareAuthenticatedLinuxOciPeerReader>;
+      readonly settlement: Promise<LinuxOciParentHResult>;
+    }
+  >;
   readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
   readonly parents: ReadonlyMap<
     string,
@@ -106,6 +118,7 @@ const assertOriginalOciDisposedHelperClosed =
   LinuxOciPhysicalSession.prototype.assertDisposedHelperClosed;
 
 const assertOriginalParent = LinuxOciParentBootstrap.prototype.assertCurrent;
+const sealOriginalPeerParent = LinuxOciParentBootstrap.prototype.sealPeerControlBinding;
 const sealOriginalParent = LinuxOciParentBootstrap.prototype.sealControlBinding;
 const createOriginalParent = LinuxOciParentBootstrap.prototype.createStopped;
 const finishOriginalParent = LinuxOciParentBootstrap.prototype.finishCreateScope;
@@ -140,11 +153,23 @@ export async function sealOriginalLinuxOciParentControl(
   key: Parameters<LinuxOciParentBootstrap["sealControlBinding"]>[0],
   scope: string,
   signal: AbortSignal,
+  peer = false,
 ) {
   const entry = originalLinuxOciParentControlSource(original, core, record, signal);
   const request = originalParentRequests.get(entry);
   if (!request) return fail("parent_custody");
-  const sealed = await sealOriginalParent.call(entry.parent, key, scope, signal, request);
+  const allocation = originalOciCustodies.get(original)?.allocations.get(record.claimId);
+  if (peer && (!allocation || allocation.cleanup !== "untouched")) return fail("parent_custody");
+  const sealed = peer
+    ? await sealOriginalPeerParent.call(
+        entry.parent,
+        key,
+        scope,
+        signal,
+        request,
+        capturedAllocationData(allocation!),
+      )
+    : await sealOriginalParent.call(entry.parent, key, scope, signal, request);
   if (originalLinuxOciParentControlSource(original, core, record, signal) !== entry)
     return fail("parent_custody");
   return sealed;
@@ -286,6 +311,141 @@ async function captureOriginalAllocation(artifactRoot: string, bundle: LinuxOciB
 async function assertOriginalAllocationParents(allocation: OriginalOciAllocation) {
   for (const parent of allocation.parents) await assertOriginalFile(parent, true);
   await privateDirectory(allocation.parents.at(-1)?.path ?? "");
+}
+
+// Lossless original lstat history is encrypted with P/accepted/artifact binding.
+function capturedAllocationData(allocation: OriginalOciAllocation) {
+  const file = (v: OriginalFileIdentity) =>
+    Object.freeze({ path: v.path, dev: String(v.dev), ino: String(v.ino), uid: String(v.uid) });
+  return Object.freeze({
+    kind: "linux-oci-original-allocation@1",
+    intent: allocation.intent,
+    parents: allocation.parents.map(file),
+    root: file(allocation.root),
+    rootfs: file(allocation.rootfs),
+    receipt: file(allocation.receipt),
+    receiptBytes: allocation.receiptBytes,
+  });
+}
+/** Called only after owning Core AEAD authentication, with the real creator
+ * custody key. Data cannot register an allocation, session or replacement P. */
+export async function prepareOriginalLinuxOciPeerRead(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+) {
+  const custody = originalOciCustodies.get(original);
+  if (
+    !custody ||
+    custody.core !== core ||
+    !custody.physicalBinary ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    custody.peerReads.has(record.claimId)
+  )
+    return fail("parent_custody");
+  const exact = (v: unknown, keys: readonly string[]): v is Record<string, unknown> =>
+    isJsonObject(v) &&
+    Object.keys(v).length === keys.length &&
+    keys.every((k) => Object.hasOwn(v, k));
+  if (
+    !isJsonObject(binding) ||
+    binding.claimId !== record.claimId ||
+    binding.generation !== record.intent.policy.generation ||
+    !exact(binding.allocation, [
+      "kind",
+      "intent",
+      "parents",
+      "root",
+      "rootfs",
+      "receipt",
+      "receiptBytes",
+    ])
+  )
+    return fail("parent_custody");
+  const a = binding.allocation;
+  if (
+    a.kind !== "linux-oci-original-allocation@1" ||
+    a.intent !== canonicalJson(record.intent) ||
+    typeof a.receiptBytes !== "string" ||
+    canonicalJson(parseStrictJson(new TextEncoder().encode(a.receiptBytes), 65536)) !==
+      canonicalJson(artifact) ||
+    !Array.isArray(a.parents) ||
+    !a.parents.length ||
+    a.parents.length > 256
+  )
+    return fail("allocation_identity");
+  const file = (v: unknown): OriginalFileIdentity => {
+    if (
+      !exact(v, ["path", "dev", "ino", "uid"]) ||
+      typeof v.path !== "string" ||
+      !isAbsolute(v.path)
+    )
+      return fail("allocation_identity");
+    const number = (n: unknown) => {
+      if (
+        typeof n !== "string" ||
+        !/^(0|[1-9][0-9]{0,19})$/u.test(n) ||
+        BigInt(n) > 18446744073709551615n
+      )
+        return fail("allocation_identity");
+      return BigInt(n);
+    };
+    return Object.freeze({
+      path: v.path,
+      dev: number(v.dev),
+      ino: number(v.ino),
+      uid: number(v.uid),
+    });
+  };
+  const captured: OriginalOciAllocation = {
+    intent: canonicalJson(record.intent),
+    parents: a.parents.map(file),
+    root: file(a.root),
+    rootfs: file(a.rootfs),
+    receipt: file(a.receipt),
+    receiptBytes: a.receiptBytes,
+    cleanup: "untouched",
+  };
+  const expectedParents: string[] = [];
+  let path = parse(custody.artifactRoot).root;
+  expectedParents.push(path);
+  for (const part of custody.artifactRoot.slice(path.length).split("/").filter(Boolean)) {
+    path = join(path, part);
+    expectedParents.push(path);
+  }
+  const root = join(custody.artifactRoot, record.claimId);
+  if (
+    captured.parents.length !== expectedParents.length ||
+    captured.parents.some((p, i) => p.path !== expectedParents[i]) ||
+    captured.root.path !== root ||
+    captured.rootfs.path !== join(root, "rootfs") ||
+    captured.receipt.path !== join(root, ".tako-oci-artifact.json")
+  )
+    return fail("allocation_identity");
+  await assertOriginalAllocationParents(captured);
+  await privateDirectory(root);
+  await assertOriginalFile(captured.root, true);
+  await assertOriginalFile(captured.rootfs, true);
+  await assertOriginalFile(captured.receipt, false);
+  if ((await readFile(captured.receipt.path, "utf8")) !== captured.receiptBytes)
+    return fail("allocation_identity");
+  await assertOriginalFile(captured.receipt, false);
+  if (custody.signal.aborted || signal.aborted) return fail("parent_custody");
+  const binary = custody.physicalBinary;
+  // Only original, not-yet-used reader state; no persistent adopted allocation.
+  return async (actualSignal: AbortSignal) => {
+    if (custody.signal.aborted || actualSignal.aborted || custody.peerReads.has(record.claimId))
+      return fail("parent_custody");
+    const read = prepareAuthenticatedLinuxOciPeerReader(binary, binding, custody.signal);
+    // Retain the actual closure/child even on UNKNOWN, never a replaceable flag.
+    const settlement = Promise.resolve().then(() => read(actualSignal));
+    custody.peerReads.set(record.claimId, Object.freeze({ read, settlement })); // before sole connector spawn
+    return settlement;
+  };
 }
 
 async function assertOriginalAllocationAbsent(allocation: OriginalOciAllocation) {
@@ -903,7 +1063,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       readonly receipt: LinuxOciArtifactReceipt;
     }
   >();
-  if (parentMode !== undefined && parentMode !== "sealed-original@1")
+  if (
+    parentMode !== undefined &&
+    parentMode !== "sealed-original@1" &&
+    parentMode !== "sealed-peer@1"
+  )
     return fail("parent_selection");
   if (parentMode !== undefined && (!options.configuredInputs || physicalBinary === undefined))
     return fail("parent_selection");
@@ -918,6 +1082,9 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const nativeLifetime = new AbortController();
   originalOciCustodies.set(originalNativeCustody, {
     core,
+    artifactRoot,
+    physicalBinary,
+    peerReads: new Map(),
     sessions: nativeSessions,
     parents,
     bindings: nativeBindings,
@@ -1682,6 +1849,74 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       .catch(() => undefined);
     return running;
   }
+  function readRetainedPeerResults(
+    execution: V2Execution,
+    externalSignal?: AbortSignal,
+  ): Promise<readonly LinuxOciParentHResult[]> {
+    if (closed || parentMode !== "sealed-peer@1")
+      return Promise.reject(new Error("linux_oci_owned_bundle_parent_unavailable"));
+    if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
+      return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
+    const cancel = new AbortController(),
+      abort = () => cancel.abort();
+    cancellation.add(cancel);
+    externalSignal?.addEventListener("abort", abort, { once: true });
+    if (externalSignal?.aborted) abort();
+    const timer = setTimeout(abort, timeout);
+    const running = Promise.resolve().then(() =>
+      core.withExecution(execution, async () => {
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        const accepted = await core.readAcceptedExecution(execution);
+        if (!accepted.retained.length) return fail("parent_unavailable");
+        const observations: LinuxOciParentHResult[] = [];
+        for (const item of accepted.retained) {
+          const { record } = item;
+          if (item.removedAtMs !== null || record.state === "removed")
+            return fail("parent_unavailable");
+          const phase =
+            accepted.action === "delete" || record.intent.policy.generation < accepted.generation
+              ? "remove"
+              : "reconcile";
+          await core.owner.withAuthority(record, phase, async (held) => {
+            const loan = new AbortController(),
+              revoke = () => loan.abort();
+            cancel.signal.addEventListener("abort", revoke, { once: true });
+            held.revocation.addEventListener("abort", revoke, { once: true });
+            if (cancel.signal.aborted || held.revocation.aborted) revoke();
+            try {
+              if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+              const result = await core.readAcceptedParentControl(
+                execution,
+                record,
+                originalNativeCustody,
+                loan.signal,
+              );
+              if (!result || closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
+              observations.push(result);
+            } finally {
+              loan.abort();
+              cancel.signal.removeEventListener("abort", revoke);
+              held.revocation.removeEventListener("abort", revoke);
+            }
+          });
+        }
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        return Object.freeze(observations);
+      }),
+    );
+    scopes.add(running);
+    void running
+      .finally(() => {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener("abort", abort);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+      })
+      .catch(() => undefined);
+    return running;
+  }
   // The normal backend closes over this ORIGINAL creator. Its execution input
   // selects no owner, native session, health callback or publication receipt.
   async function dispatch(
@@ -1829,6 +2064,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const creator = Object.freeze({
     /** Original same-Sql binding readback only; no restart peer/session adoption. */
     readRetainedParentControls,
+    /** Authenticated original peer result data only; no native/removed adoption. */
+    readRetainedPeerResults,
     /** Internal normal Form only; no registration or Node entry activation. */
     formUrl: V2_CONTAINER_F2_FORM,
     retainedForm,
@@ -1874,9 +2111,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         let session: LinuxOciPhysicalSession;
         let observation: LinuxOciStoppedObservation;
         let parent: LinuxOciParentBootstrap | undefined;
-        if (parentMode === "sealed-original@1") {
+        if (parentMode === "sealed-original@1" || parentMode === "sealed-peer@1") {
           parent = createLinuxOciParentBootstrap({
             binary: physicalBinary,
+            ...(parentMode === "sealed-peer@1" ? { peerProfile: "pidfs64@1" as const } : {}),
             claimId: receipt.claimId,
             generation: receipt.generation,
             capability: crypto.getRandomValues(new Uint8Array(32)),
@@ -2268,7 +2506,12 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               if (httpProbes.get(claimId) === probe) httpProbes.delete(claimId);
             }),
           );
-          const rejected = [...original, ...physical, ...http].find(
+          const peers = await Promise.allSettled(
+            [...(originalOciCustodies.get(originalNativeCustody)?.peerReads.values() ?? [])].map(
+              (entry) => entry.settlement,
+            ),
+          );
+          const rejected = [...original, ...physical, ...http, ...peers].find(
             (result) => result.status === "rejected",
           );
           if (rejected?.status === "rejected") throw rejected.reason;
