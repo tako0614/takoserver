@@ -197,6 +197,14 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<void>;
+  /** Original creator's live serving read, independent of a completed
+   * management execution lease. It grants neither caller authorization nor
+   * removal; the binding owner must authorize each application invocation. */
+  observeServingOciHttp(
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<{ readonly native: LinuxOciStartedObservation; readonly httpPort: number }>;
   /** Stop/reap only an original retained init under the accepted UPDATE/DELETE
    * and original remove lease; records exit, never network terminal/deletion. */
   stopRetainedInit(
@@ -3108,6 +3116,44 @@ export function createDockerContainerCoreOwner(
       // SQL may already have published when cancellation wins. Keep that
       // actual fact; no rollback, START/OPEN replay or manufactured completion.
       local();
+    },
+    async observeServingOciHttp(input, originalCustody, signal) {
+      if (
+        !own(input, ["claimId", "intent", "nativeId", "state"]) ||
+        !hex(input.claimId) ||
+        !hex(input.nativeId) ||
+        input.state !== "bound" ||
+        !(signal instanceof AbortSignal) ||
+        signal.aborted
+      )
+        return fail();
+      const captured = Object.freeze({
+        claimId: input.claimId,
+        intent: intentSnapshot(input.intent),
+        nativeId: input.nativeId,
+        state: "bound" as const,
+      });
+      const loaded = await boundStartRecord(captured);
+      if (
+        !usable(loaded.proof, "reconcile") ||
+        loaded.proof.i_serving_generation !== captured.intent.policy.generation ||
+        loaded.proof.v_retention !== "serving" ||
+        loaded.proof.i_retired_at_ms !== null
+      )
+        return fail();
+      const spec = publicSpec(loaded.proof.a_accepted_spec_json);
+      const port = spec[C.fields.httpPort];
+      if (typeof port !== "number") return fail();
+      if ((await boundInitPhase(loaded)) !== "running") return fail();
+      const native = await observeOriginalLinuxOciOwnedRunning(
+        originalCustody,
+        result,
+        captured,
+        signal,
+      );
+      await assertSnapshot(loaded.proof);
+      if (signal.aborted || native.nativeId !== captured.nativeId) return fail();
+      return Object.freeze({ native, httpPort: port });
     },
     async stopRetainedInit(execution, input, originalCustody, signal) {
       if (

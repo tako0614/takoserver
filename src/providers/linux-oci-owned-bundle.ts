@@ -29,6 +29,7 @@ import {
   type DockerRetainedImageArchive,
   withDockerRetainedImageArchive,
 } from "./docker-container-image-supplier.ts";
+import { createLinuxOciContainerHttpRuntime } from "./linux-oci-container-http-runtime.ts";
 import {
   LINUX_OCI_EGRESS_POLICY_FILE,
   type LinuxOciEgressLimits,
@@ -67,6 +68,8 @@ type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
   readonly artifactRoot: string;
   readonly physicalBinary: string | undefined;
+  readonly hostTopology: LinuxOciHostTopology | undefined;
+  readonly httpRecords: ReadonlyMap<string, DockerContainerCreateRecord>;
   readonly peerReads: Map<
     string,
     { readonly custody: object; readonly settlement: Promise<unknown> }
@@ -99,6 +102,34 @@ const originalOciCustodies = new WeakMap<object, OriginalOciCustody>();
 // Only the current original CREATE loan may retain its environment-bearing
 // request. The persistent management record never owns this transient value.
 const originalParentRequests = new WeakMap<object, LinuxOciCreateStoppedRequest>();
+
+/** Internal source lookup only. Endpoint data cannot register an owner: every
+ * read requires the original creator key, same Core, bound original record and
+ * still-held original session. Core separately samples accepted serving SQL. */
+export function originalLinuxOciHttpEndpoint(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  httpPort: number,
+  signal: AbortSignal,
+) {
+  const custody = originalOciCustodies.get(original);
+  if (
+    !custody ||
+    custody.core !== core ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    !custody.hostTopology ||
+    !custody.sessions.has(record.claimId) ||
+    custody.bindings.get(record.claimId) !== record.nativeId ||
+    custody.httpRecords.get(record.claimId) !== record ||
+    !Number.isInteger(httpPort) ||
+    httpPort < 1 ||
+    httpPort > 65535
+  )
+    return fail("http_custody");
+  return `http://${custody.hostTopology.peerIpv4Guest}:${httpPort}/`;
+}
 const observeOriginalOciStarted = LinuxOciPhysicalSession.prototype.observeStarted;
 const stopOriginalOciInit = LinuxOciPhysicalSession.prototype.stopInit;
 const joinOriginalOciInit = LinuxOciPhysicalSession.prototype.joinInit;
@@ -1211,12 +1242,16 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   // A failed join retains this exact request. A fresh call cannot replace it
   // with another GET; original close may only join the original objects.
   const httpProbes = new Map<string, ReturnType<typeof createLinuxOciHttpHealthProbe>>();
+  const httpRecords = new Map<string, DockerContainerCreateRecord>();
+  const httpRuntimes = new Map<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>();
   const originalNativeCustody = Object.freeze({});
   const nativeLifetime = new AbortController();
   originalOciCustodies.set(originalNativeCustody, {
     core,
     artifactRoot,
     physicalBinary,
+    hostTopology,
+    httpRecords,
     peerReads: new Map(),
     sessions: nativeSessions,
     parents,
@@ -2096,6 +2131,12 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             try {
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
+              // Same original creator only. A fresh creator cannot infer a
+              // vanished predecessor's I/O from its empty map; normal removal
+              // remains UNKNOWN. This actual route closes before native STOP.
+              await httpRuntimes.get(record.claimId)?.close();
+              if (closed || loan.signal.aborted || !(await held.stillCurrent()))
+                return fail("revoked");
               const result = await core.manageAcceptedPeerInit(
                 execution,
                 record,
@@ -2280,6 +2321,38 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     }),
   });
   const creator = Object.freeze({
+    /** Internal application transport. Identity is a selector to revalidate,
+     * never caller authorization; a real binding composition must authorize it. */
+    fetchServingHttp(
+      identity: { readonly resourceUid: string; readonly incarnationId: string },
+      request: Request,
+    ) {
+      if (closed || !identity || !(request instanceof Request))
+        return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
+      const selected = [...httpRecords.values()].filter(
+        (record) =>
+          record.intent.resourceUid === identity.resourceUid &&
+          record.intent.incarnationId === identity.incarnationId,
+      );
+      // Core's fresh serving read chooses no fallback generation. If several
+      // original revisions exist, only its actual serving generation can send.
+      return (async () => {
+        let selectedRuntime: ReturnType<typeof createLinuxOciContainerHttpRuntime> | undefined;
+        for (const record of selected) {
+          try {
+            await core.observeServingOciHttp(record, originalNativeCustody, request.signal);
+          } catch {
+            continue;
+          }
+          if (selectedRuntime) return fail("http_custody");
+          const runtime = httpRuntimes.get(record.claimId);
+          if (!runtime) return fail("http_custody");
+          selectedRuntime = runtime;
+        }
+        if (closed || request.signal.aborted || !selectedRuntime) return fail("http_custody");
+        return selectedRuntime.fetch(request);
+      })();
+    },
     /** Original same-Sql binding readback only; no restart peer/session adoption. */
     readRetainedParentControls,
     /** Authenticated original peer result data only; no native/removed adoption. */
@@ -2378,6 +2451,18 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         // Only the actual original process result + original owner CAS updates
         // this private expectation. A callback return/DTO never reaches it.
         nativeBindings.set(bundle.record.claimId, observation.nativeId);
+        const httpRecord = Object.freeze({
+          ...bundle.record,
+          nativeId: observation.nativeId,
+          state: "bound" as const,
+        });
+        httpRecords.set(bundle.record.claimId, httpRecord);
+        // Pure construction before the next await: every possible invocation
+        // and retirement sees THIS already-owned, irreversible admission gate.
+        httpRuntimes.set(
+          bundle.record.claimId,
+          createLinuxOciContainerHttpRuntime(originalNativeCustody, core, httpRecord),
+        );
         await bundle.guard();
         if (parent) finishOriginalParent.call(parent, bundle.signal);
         return observation;
@@ -2706,6 +2791,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       return retainedNamespaceObservations(execution, signal, "allocation");
     },
     close(): Promise<void> {
+      // Fence application admission/cancel real I/O immediately, rather than
+      // waiting for an unrelated native/helper or artifact join to finish.
+      const invocationJoins = Promise.allSettled(
+        [...httpRuntimes.values()].map((runtime) => runtime.close()),
+      );
       const joined = artifact.close();
       if (physicalBinary === undefined) return joined;
       if (!nativeClosing) {
@@ -2731,9 +2821,17 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               (entry) => entry.settlement,
             ),
           );
-          const rejected = [...original, ...physical, ...http, ...peers].find(
-            (result) => result.status === "rejected",
+          const invocations = await Promise.allSettled(
+            [...httpRuntimes.values()].map((runtime) => runtime.close()),
           );
+          const rejected = [
+            ...original,
+            ...physical,
+            ...http,
+            ...peers,
+            ...invocations,
+            ...(await invocationJoins),
+          ].find((result) => result.status === "rejected");
           if (rejected?.status === "rejected") throw rejected.reason;
           if (parents.size) return fail("parent_control_retained"); // P/result reader is a separate next producer.
         })();
