@@ -16,7 +16,10 @@ enum tns_ocip_kind { TNS_OCIP_CREATE = 1, TNS_OCIP_OBSERVE = 2, TNS_OCIP_CANCEL 
                      TNS_OCIP_START = 4, TNS_OCIP_OBSERVE_STARTED = 5,
                      TNS_OCIP_STOP_INIT = 6, TNS_OCIP_JOIN_INIT = 7,
                      TNS_OCIP_RELEASE_NAMESPACE = 8, TNS_OCIP_CONTINUE_NAMESPACE_RELEASE = 9,
-                     TNS_OCIP_OBSERVE_NAMESPACE_LIFETIME = 10 };
+                     TNS_OCIP_OBSERVE_NAMESPACE_LIFETIME = 10,
+                     TNS_OCIP_BEGIN_TRACKED_JOIN = 11, TNS_OCIP_READ_TRACKED_JOIN = 12,
+                     TNS_OCIP_DELETE_BORN = 13, TNS_OCIP_JOIN_BORN_DELETE = 14,
+                     TNS_OCIP_DISPOSE_BORN = 15, TNS_OCIP_CONTINUE_BORN_DISPOSAL = 16 };
 struct tns_ocip_request {
   enum tns_ocip_kind kind;
   struct tns_oci_options options;
@@ -183,6 +186,12 @@ static inline int tns_ocip_decode(unsigned char *data, size_t size,
         else if (!strcmp(s, "linux-oci-release-namespace@1")) request->kind = TNS_OCIP_RELEASE_NAMESPACE;
         else if (!strcmp(s, "linux-oci-continue-namespace-release@1")) request->kind = TNS_OCIP_CONTINUE_NAMESPACE_RELEASE;
         else if (!strcmp(s, "linux-oci-observe-namespace-lifetime@1")) request->kind = TNS_OCIP_OBSERVE_NAMESPACE_LIFETIME;
+        else if (!strcmp(s, "linux-oci-begin-tracked-join@1")) request->kind = TNS_OCIP_BEGIN_TRACKED_JOIN;
+        else if (!strcmp(s, "linux-oci-read-tracked-join@1")) request->kind = TNS_OCIP_READ_TRACKED_JOIN;
+        else if (!strcmp(s, "linux-oci-delete-born@1")) request->kind = TNS_OCIP_DELETE_BORN;
+        else if (!strcmp(s, "linux-oci-join-born-delete@1")) request->kind = TNS_OCIP_JOIN_BORN_DELETE;
+        else if (!strcmp(s, "linux-oci-dispose-born@1")) request->kind = TNS_OCIP_DISPOSE_BORN;
+        else if (!strcmp(s, "linux-oci-continue-born-disposal@1")) request->kind = TNS_OCIP_CONTINUE_BORN_DISPOSAL;
         else return -1;
       } else if (field == 1) request->options.allocation_root = s;
       else if (field == 2) request->options.claim_id = s;
