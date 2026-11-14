@@ -84,6 +84,16 @@ async function fixture(
       | "unknown"
       | "cookie"
       | "regress";
+    readonly peerRetirementFault?:
+      | "begin-retained"
+      | "delete-retained"
+      | "dispose-retained"
+      | "begin-lost"
+      | "delete-lost"
+      | "dispose-lost"
+      | "missing"
+      | "wrong-phase";
+    readonly peerHResultFault?: "stdout" | "stderr" | "nonzero" | "signal" | "unknown";
     readonly parentFault?: "foreign-claim" | "foreign-generation";
     readonly fixedKeys?: { readonly key: CryptoKey; readonly comparison: CryptoKey };
     readonly extraImage?: boolean;
@@ -337,6 +347,9 @@ async function fixture(
     peerKind = 0,
     peerEffects = 0,
     peerBytes = 0;
+  let peerHJoined = false,
+    peerHStdoutEof = false,
+    peerHStderrEof = false;
   const raw = spyOn(childProcess, "spawn").mockImplementation(((
     file: string,
     args: readonly string[],
@@ -384,6 +397,95 @@ async function fixture(
             if (managing && managementReady) {
               managementSent = true;
               const command = JSON.parse(frame.subarray(4).toString("utf8"));
+              const family = [
+                "begin-tracked-join",
+                "read-tracked-join",
+                "delete-born",
+                "join-born-delete",
+                "dispose-born",
+                "continue-born-disposal",
+              ];
+              const familyIndex = family.findIndex((op) => command.kind === `linux-oci-${op}@1`);
+              if (command.kind === "linux-oci-parent-read-result@1") {
+                if (Object.keys(command).length !== 1) throw Error("nonfixed H result read");
+                nativeRequests.push(command.kind);
+                const fault = adversarial.peerHResultFault;
+                const known = peerHJoined && peerHStdoutEof && peerHStderrEof && !fault;
+                reply({
+                  kind: known
+                    ? "linux-oci-parent-h-exited@1"
+                    : "linux-oci-parent-h-result-refused@1",
+                  error: known ? 0 : 11,
+                  barrier: "unproven",
+                });
+                done();
+                queueMicrotask(() => {
+                  stdout.end();
+                  stderr.end();
+                  child.emit("exit", 0, null);
+                  child.emit("close", 0, null);
+                });
+                return;
+              }
+              if (familyIndex !== -1) {
+                if (Object.keys(command).length !== 1 || !(peerEffects & (1 << 8)))
+                  throw Error("nonfixed/early retirement command");
+                const kind = familyIndex + 11,
+                  op = family[familyIndex]!;
+                if ([11, 13, 15].includes(kind) && peerEffects & (1 << kind))
+                  throw Error("retirement effect replay");
+                if (
+                  (kind === 12 && !(peerEffects & (1 << 11))) ||
+                  (kind === 14 && !(peerEffects & (1 << 13))) ||
+                  (kind === 16 && !(peerEffects & (1 << 15)))
+                )
+                  throw Error("retirement observation before original effect");
+                nativeRequests.push(command.kind);
+                peerKind = kind;
+                peerBytes = frame.length;
+                if ([11, 13, 15].includes(kind)) peerEffects |= 1 << kind;
+                const kinds = [
+                  "linux-oci-tracked-join-handoff@1",
+                  "linux-oci-tracked-owner-destruction@1",
+                  "linux-oci-born-delete-observation@1",
+                  "linux-oci-born-delete-join-observation@1",
+                  "linux-oci-local-disposal@1",
+                  "linux-oci-local-disposal-continuation@1",
+                ];
+                const fault = adversarial.peerRetirementFault;
+                const selected =
+                  kind === 11 ? "begin" : kind === 13 ? "delete" : kind === 15 ? "dispose" : "none";
+                const retained = fault === `${selected}-retained`,
+                  lost = fault === `${selected}-lost` || (fault === "missing" && kind === 11);
+                peerReply = retained
+                  ? {
+                      kind: "linux-oci-refused@1",
+                      stage: op,
+                      errno: 11,
+                      custody: "retained",
+                      barrier: "unproven",
+                    }
+                  : { kind: kinds[familyIndex], barrier: "unproven" };
+                if (fault === "wrong-phase" && kind === 11)
+                  peerReply = { kind: kinds[2], barrier: "unproven" };
+                if (fault === "missing" && kind === 11) peerReply = undefined;
+                if (!retained && (kind === 15 || kind === 16)) {
+                  // Raw P/H boundary facts are independent from connector exit.
+                  const h = adversarial.peerHResultFault;
+                  peerHJoined = h !== "unknown";
+                  peerHStdoutEof = h !== "stdout";
+                  peerHStderrEof = h !== "stderr";
+                }
+                if (!lost) reply(peerReply);
+                done();
+                queueMicrotask(() => {
+                  stdout.end();
+                  stderr.end();
+                  child.emit("exit", lost ? 77 : 0, null);
+                  child.emit("close", lost ? 77 : 0, null);
+                });
+                return;
+              }
               if (
                 [
                   "linux-oci-release-namespace@1",

@@ -31,6 +31,16 @@ async function fixture(
       | "unknown"
       | "cookie"
       | "regress";
+    retirementFault?:
+      | "begin-retained"
+      | "delete-retained"
+      | "dispose-retained"
+      | "begin-lost"
+      | "delete-lost"
+      | "dispose-lost"
+      | "missing"
+      | "wrong-phase";
+    hResultFault?: "stdout" | "stderr" | "nonzero" | "signal" | "unknown";
     managementFault?: "incomplete" | "missing-reply" | "lost-reply";
   } = {},
 ) {
@@ -71,6 +81,10 @@ async function fixture(
       ...(options.namespaceFault === undefined
         ? {}
         : { peerNamespaceFault: options.namespaceFault }),
+      ...(options.retirementFault === undefined
+        ? {}
+        : { peerRetirementFault: options.retirementFault }),
+      ...(options.hResultFault === undefined ? {} : { peerHResultFault: options.hResultFault }),
       ...(options.configuredPeer
         ? acceptedHttpSelection()
         : { nativeMode: "retire-pending" as const }),
@@ -694,12 +708,14 @@ test("peer normal configured CREATE reaches original START HTTP publisher comple
 async function originalConfiguredPeerForJoin(
   joinFault?: "foreign" | "refused" | "unknown" | "pidns",
   namespaceFault?: "retained" | "lost" | "foreign" | "malformed" | "unknown" | "cookie" | "regress",
+  retirement?: Pick<NonNullable<Parameters<typeof fixture>[0]>, "retirementFault" | "hResultFault">,
 ) {
   const f = await fixture({
       normal: true,
       configuredPeer: true,
       ...(joinFault === undefined ? {} : { joinFault }),
       ...(namespaceFault === undefined ? {} : { namespaceFault }),
+      ...retirement,
     }),
     raw = acceptedRawHttp();
   raw.onEnd(() => {
@@ -878,8 +894,9 @@ test("peer JOIN changed captured PIDNS cannot supply a stopped record", async ()
 // No old case is invoked and raw H frames are not native namespace execution.
 async function originalJoinedPeer(
   namespaceFault?: Parameters<typeof originalConfiguredPeerForJoin>[1],
+  retirement?: Parameters<typeof originalConfiguredPeerForJoin>[2],
 ) {
-  const x = await originalConfiguredPeerForJoin(undefined, namespaceFault);
+  const x = await originalConfiguredPeerForJoin(undefined, namespaceFault, retirement);
   try {
     expect(await x.fresh.engine.runNext()).toMatchObject({
       status: "reconciling",
@@ -1048,3 +1065,215 @@ test("peer namespace fresh SQL cancel and final awaited execution fence issue no
     }
   }
 });
+
+// New closed retirement-family cohort; all prefix operations use the original
+// normal selfhost/Engine and fresh memorySQL. No prior test case is invoked.
+async function originalNamespaceForRetirement(
+  options?: Parameters<typeof originalConfiguredPeerForJoin>[2],
+) {
+  const x = await originalJoinedPeer(undefined, options);
+  let current = x.next;
+  try {
+    for (let i = 0; i < 2; i++) {
+      expect(await current.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      await current.close();
+      x.f.advanceNormalClock(61_000);
+      current = x.f.reconstructNormal();
+    }
+    expect(releaseCount(x.f)).toBe(1);
+    expect(continueCount(x.f)).toBe(1);
+    return { ...x, current };
+  } catch (e) {
+    await current.close().catch(() => undefined);
+    await x.close();
+    throw e;
+  }
+}
+async function retirementStep(
+  x: Awaited<ReturnType<typeof originalNamespaceForRetirement>>,
+  kind: string,
+) {
+  const prior = x.f.nativeCounts().requests.length;
+  expect(await x.current.engine.runNext()).toMatchObject({
+    status: "reconciling",
+    effect: "unknown",
+  });
+  expect(x.f.nativeCounts().requests.slice(prior)).toContain(`linux-oci-${kind}@1`);
+  await x.current.close().catch(() => undefined);
+  x.f.advanceNormalClock(61_000);
+  x.current = x.f.reconstructNormal();
+}
+const retirementCount = (f: Fixture, op: string) =>
+  f.nativeCounts().requests.filter((k) => k === `linux-oci-${op}@1`).length;
+async function helperResultStep(
+  x: Awaited<ReturnType<typeof originalNamespaceForRetirement>>,
+  known: boolean,
+) {
+  const query = x.f.sql.query.bind(x.f.sql),
+    before = retirementCount(x.f, "parent-read-result");
+  let postResultRows = 0;
+  const spy = spyOn(x.f.sql, "query").mockImplementation(async (sql, params) => {
+    const rows = await query(sql, params);
+    if (controlRead(sql) && retirementCount(x.f, "parent-read-result") > before) postResultRows++;
+    return rows;
+  });
+  try {
+    await retirementStep(x, "parent-read-result");
+    // The actual private H getter fences this Core continuation. UNKNOWN alone
+    // could not distinguish a refused P fact from a falsely accepted H result.
+    expect(postResultRows > 0).toBe(known);
+  } finally {
+    spy.mockRestore();
+  }
+}
+test("peer retirement original whole family and independent P H-result keep ordinary DELETE unknown", async () => {
+  const x = await originalNamespaceForRetirement();
+  try {
+    for (const op of [
+      "begin-tracked-join",
+      "read-tracked-join",
+      "delete-born",
+      "join-born-delete",
+      "dispose-born",
+    ])
+      await retirementStep(x, op);
+    await helperResultStep(x, true);
+    expect(
+      x.f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-bootstrap@2"),
+    ).toHaveLength(1);
+    expect(stopCount(x.f)).toBe(1);
+    expect(releaseCount(x.f)).toBe(1);
+    for (const op of ["begin-tracked-join", "delete-born", "dispose-born"])
+      expect(retirementCount(x.f, op)).toBe(1);
+    expect((await x.f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state).toBe(
+      "bound",
+    );
+    expect((await x.f.sql.query("SELECT phase FROM tf_v2_resources"))[0]?.phase).toBe("deleting");
+    expect(x.f.network).not.toHaveBeenCalled();
+  } finally {
+    await x.current.close().catch(() => undefined);
+    await x.close();
+  }
+});
+for (const fault of [
+  "begin-retained",
+  "delete-retained",
+  "dispose-retained",
+  "begin-lost",
+  "delete-lost",
+  "dispose-lost",
+] as const) {
+  test(`peer retirement ${fault} selects only original read join or continuation`, async () => {
+    const x = await originalNamespaceForRetirement({ retirementFault: fault });
+    try {
+      for (const op of [
+        "begin-tracked-join",
+        "read-tracked-join",
+        "delete-born",
+        "join-born-delete",
+        "dispose-born",
+      ])
+        await retirementStep(x, op);
+      if (fault === "dispose-retained") await retirementStep(x, "continue-born-disposal");
+      await helperResultStep(x, true);
+      for (const op of ["begin-tracked-join", "delete-born", "dispose-born"])
+        expect(retirementCount(x.f, op)).toBe(1);
+    } finally {
+      await x.current.close().catch(() => undefined);
+      await x.close();
+    }
+  });
+}
+for (const fault of ["missing", "wrong-phase"] as const) {
+  test(`peer retirement ${fault} captured original phase refuses new effects`, async () => {
+    const x = await originalNamespaceForRetirement({ retirementFault: fault });
+    try {
+      await retirementStep(x, "begin-tracked-join");
+      expect(await x.current.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(retirementCount(x.f, "begin-tracked-join")).toBe(1);
+      expect(retirementCount(x.f, "read-tracked-join")).toBe(0);
+      expect(retirementCount(x.f, "delete-born")).toBe(0);
+    } finally {
+      await x.current.close().catch(() => undefined);
+      await x.close();
+    }
+  });
+}
+for (const hResultFault of ["stdout", "stderr", "nonzero", "signal", "unknown"] as const) {
+  test(`peer retirement H result ${hResultFault} is not connector exit or removed permission`, async () => {
+    const x = await originalNamespaceForRetirement({ hResultFault });
+    try {
+      for (const op of [
+        "begin-tracked-join",
+        "read-tracked-join",
+        "delete-born",
+        "join-born-delete",
+        "dispose-born",
+      ])
+        await retirementStep(x, op);
+      await helperResultStep(x, false);
+      expect(retirementCount(x.f, "parent-read-result")).toBe(1);
+      expect((await x.f.sql.query("SELECT phase FROM tf_v2_resources"))[0]?.phase).toBe("deleting");
+      expect(
+        (await x.f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state,
+      ).toBe("bound");
+    } finally {
+      await x.current.close().catch(() => undefined);
+      await x.close();
+    }
+  });
+}
+
+for (const fault of ["row", "cancel", "execution"] as const) {
+  test(`peer retirement fresh ${fault} fence after namespace records emits no BEGIN`, async () => {
+    const x = await originalNamespaceForRetirement(),
+      query = x.f.sql.query.bind(x.f.sql);
+    const before = x.f
+      .nativeCounts()
+      .requests.filter((k) => k === "linux-oci-parent-read-outcome@2").length;
+    let armed = false,
+      crossed = false;
+    const spy = spyOn(x.f.sql, "query").mockImplementation(async (sql, params) => {
+      const rows = await query(sql, params);
+      if (
+        !crossed &&
+        controlRead(sql) &&
+        x.f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-read-outcome@2").length >
+          before
+      ) {
+        if (fault === "row") {
+          crossed = true;
+          return [{ native_control: null }];
+        }
+        armed = true;
+      } else if (armed && !crossed && sql.includes(" WHERE i.resource_uid=? AND v.generation=?")) {
+        crossed = true;
+        if (fault === "cancel") void x.current.close().catch(() => undefined);
+        else {
+          const e = x.f.execution;
+          if (!e) throw Error("original execution absent");
+          Reflect.set(e, "leaseToken", "synthetic-retirement-late-lease");
+        }
+      }
+      return rows;
+    });
+    try {
+      expect(await x.current.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(crossed).toBe(true);
+      expect(retirementCount(x.f, "begin-tracked-join")).toBe(0);
+    } finally {
+      spy.mockRestore();
+      await x.current.close().catch(() => undefined);
+      await x.close();
+    }
+  });
+}

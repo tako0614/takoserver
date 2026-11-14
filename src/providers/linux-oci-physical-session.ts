@@ -1769,6 +1769,25 @@ interface OriginalPeerReaderState {
   connector: ChildProcessWithoutNullStreams | undefined;
   unknown: boolean;
 }
+function parseOriginalPeerHResult(body: Buffer): LinuxOciParentHResult {
+  const value = parseStrictJson(body, 512);
+  if (JSON.stringify(value) !== new TextDecoder("utf-8", { fatal: true }).decode(body))
+    throw failure();
+  if (
+    !record(value) ||
+    Reflect.ownKeys(value).length !== 3 ||
+    !["kind", "error", "barrier"].every((k) =>
+      Object.hasOwn(Object.getOwnPropertyDescriptor(value, k) ?? {}, "value"),
+    ) ||
+    (value.kind !== "linux-oci-parent-h-exited@1" &&
+      value.kind !== "linux-oci-parent-h-result-refused@1") ||
+    !integer(value.error, 0, 2147483647) ||
+    value.barrier !== "unproven" ||
+    (value.kind === "linux-oci-parent-h-exited@1" ? value.error !== 0 : value.error === 0)
+  )
+    throw failure();
+  return Object.freeze({ kind: value.kind, error: value.error, barrier: "unproven" });
+}
 function readOriginalPeerResult(
   state: OriginalPeerReaderState,
   signal: AbortSignal,
@@ -1815,25 +1834,7 @@ function readOriginalPeerResult(
         )
           throw failure();
         state.assertBinary();
-        const value = parseStrictJson(buffer.subarray(4), 512);
-        if (
-          JSON.stringify(value) !==
-          new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(4))
-        )
-          throw failure();
-        if (
-          !record(value) ||
-          Reflect.ownKeys(value).length !== 3 ||
-          !["kind", "error", "barrier"].every((k) =>
-            Object.hasOwn(Object.getOwnPropertyDescriptor(value, k) ?? {}, "value"),
-          ) ||
-          (value.kind !== "linux-oci-parent-h-exited@1" &&
-            value.kind !== "linux-oci-parent-h-result-refused@1") ||
-          !integer(value.error, 0, 2147483647) ||
-          value.barrier !== "unproven" ||
-          (value.kind === "linux-oci-parent-h-exited@1" ? value.error !== 0 : value.error === 0)
-        )
-          throw failure();
+        const value = parseOriginalPeerHResult(buffer.subarray(4));
         finished = true;
         clearTimeout(timer);
         signal.removeEventListener("abort", stop);
@@ -2060,8 +2061,10 @@ export interface LinuxOciPeerInitProgress {
     | "stop-init"
     | "join-init"
     | "release-namespace"
-    | "continue-namespace-release";
-  readonly reply: Reply;
+    | "continue-namespace-release"
+    | RetirementOperation
+    | "read-helper-result";
+  readonly reply: Reply | LinuxOciParentHResult;
   readonly barrier: "unproven";
 }
 /** Owning internal two-stage connector. No caller-selected target or command;
@@ -2080,7 +2083,7 @@ export function prepareAuthenticatedLinuxOciPeerInit(
   let buffer = Buffer.alloc(0),
     outcome: LinuxOciPeerInitOutcome | undefined,
     captured: Reply | undefined;
-  let reply: Reply | undefined,
+  let reply: Reply | LinuxOciParentHResult | undefined,
     operation: LinuxOciPeerInitProgress["operation"] | undefined,
     phase: "outcome" | "paused" | "reply" | "done" = "outcome";
   let commandWritten = false,
@@ -2244,20 +2247,27 @@ export function prepareAuthenticatedLinuxOciPeerInit(
         const body = frame();
         if (!body) return;
         if (reply || buffer.length) throw failure();
-        reply = parseReply(body);
-        if (reply.kind === "linux-oci-refused@1") {
-          if (reply.custody !== "retained" || reply.stage !== operation) throw failure();
-        } else if (
-          reply.kind !==
-          (operation === "stop-init"
-            ? "linux-oci-init-reaped@1"
-            : operation === "join-init"
-              ? "linux-oci-init-reaped-observation@1"
-              : operation === "release-namespace"
-                ? "linux-oci-namespace-release-observation@1"
-                : "linux-oci-namespace-release-continuation@1")
-        )
-          throw failure();
+        reply =
+          operation === "read-helper-result" ? parseOriginalPeerHResult(body) : parseReply(body);
+        if (operation !== "read-helper-result") {
+          if (reply.kind === "linux-oci-refused@1") {
+            if (reply.custody !== "retained" || reply.stage !== operation) throw failure();
+          } else {
+            const expected =
+              operation === "stop-init"
+                ? "linux-oci-init-reaped@1"
+                : operation === "join-init"
+                  ? "linux-oci-init-reaped-observation@1"
+                  : operation === "release-namespace"
+                    ? "linux-oci-namespace-release-observation@1"
+                    : operation === "continue-namespace-release"
+                      ? "linux-oci-namespace-release-continuation@1"
+                      : operation && retirementOperation(operation)
+                        ? RETIREMENT[operation][1]
+                        : undefined;
+            if (!expected || reply.kind !== expected) throw failure();
+          }
+        }
         if (
           "nativeId" in reply &&
           (reply.nativeId !== expectedNative ||
@@ -2293,7 +2303,10 @@ export function prepareAuthenticatedLinuxOciPeerInit(
     phase = "reply";
     const body = Buffer.from(
         JSON.stringify({
-          kind: `linux-oci-${operation}@1`,
+          kind:
+            operation === "read-helper-result"
+              ? "linux-oci-parent-read-result@1"
+              : `linux-oci-${operation}@1`,
         }),
       ),
       request = Buffer.alloc(body.length + 4);
@@ -2312,6 +2325,70 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       stop();
     }
     return result;
+  };
+  const advanceRetirement = (nativeId: string, actualSignal: AbortSignal) => {
+    current();
+    if (
+      signal !== actualSignal ||
+      sent ||
+      phase !== "paused" ||
+      !outcome ||
+      !captured ||
+      !CLAIM.test(nativeId) ||
+      outcome.requestBytes === "0" ||
+      outcome.requestBytes !== outcome.issuedBytes
+    )
+      throw failure("parent_peer_phase");
+    const base = (1 << 1) | (1 << 4) | (1 << 6) | (1 << 8);
+    const begin = 1 << 11,
+      deletion = 1 << 13,
+      disposal = 1 << 15;
+    if (
+      outcome.effects & ~(base | begin | deletion | disposal) ||
+      !(outcome.effects & (1 << 6)) ||
+      !(outcome.effects & (1 << 8)) ||
+      (outcome.effects & deletion && !(outcome.effects & begin)) ||
+      (outcome.effects & disposal && !(outcome.effects & deletion))
+    )
+      throw failure("parent_peer_phase");
+    const previous = captured;
+    const matched = (op: RetirementOperation) =>
+      previous.kind === RETIREMENT[op][1] ||
+      (previous.kind === "linux-oci-refused@1" &&
+        previous.custody === "retained" &&
+        previous.stage === op);
+    const known = (op: RetirementOperation) => previous.kind === RETIREMENT[op][1];
+    if (outcome.effects & disposal) {
+      if (
+        !(outcome.requestKind === 15 && matched("dispose-born")) &&
+        !(outcome.requestKind === 16 && matched("continue-born-disposal"))
+      )
+        throw failure("parent_peer_phase");
+      operation =
+        known("dispose-born") || known("continue-born-disposal")
+          ? "read-helper-result"
+          : "continue-born-disposal";
+    } else if (outcome.effects & deletion) {
+      if (outcome.requestKind === 13 && matched("delete-born")) operation = "join-born-delete";
+      else if (outcome.requestKind === 14 && matched("join-born-delete"))
+        operation = known("join-born-delete") ? "dispose-born" : "join-born-delete";
+      else throw failure("parent_peer_phase");
+    } else if (outcome.effects & begin) {
+      if (outcome.requestKind === 11 && matched("begin-tracked-join"))
+        operation = "read-tracked-join";
+      else if (outcome.requestKind === 12 && matched("read-tracked-join"))
+        operation = known("read-tracked-join") ? "delete-born" : "read-tracked-join";
+      else throw failure("parent_peer_phase");
+    } else {
+      if (
+        outcome.requestKind !== 9 ||
+        captured.kind !== "linux-oci-namespace-release-continuation@1" ||
+        captured.nativeId !== nativeId
+      )
+        throw failure("parent_peer_phase");
+      operation = "begin-tracked-join";
+    }
+    return send(nativeId);
   };
   return Object.freeze({
     outcome: observed,
@@ -2448,6 +2525,12 @@ export function prepareAuthenticatedLinuxOciPeerInit(
         outcome.requestBytes !== outcome.issuedBytes
       )
         throw failure("parent_peer_phase");
+      if (
+        (outcome.requestKind === 9 &&
+          captured.kind === "linux-oci-namespace-release-continuation@1") ||
+        outcome.effects & ((1 << 11) | (1 << 13) | (1 << 15))
+      )
+        return advanceRetirement(nativeId, actualSignal);
       const allowed = (1 << 1) | (1 << 4) | (1 << 6) | (1 << 8);
       if (outcome.effects & ~allowed || !(outcome.effects & (1 << 6)))
         throw failure("parent_peer_phase");
@@ -2475,6 +2558,22 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       if ("nativeId" in captured && captured.nativeId !== nativeId)
         throw failure("parent_peer_phase");
       return send(nativeId);
+    },
+    advanceRetirement,
+    /** This exact private connector has read THIS authenticated P's original
+     * consuming H wait + two output EOF result; its own exit is only transport. */
+    observeHelperExited(actualSignal: AbortSignal): LinuxOciParentHResult {
+      current();
+      if (
+        signal !== actualSignal ||
+        phase !== "done" ||
+        !finished ||
+        operation !== "read-helper-result" ||
+        reply?.kind !== "linux-oci-parent-h-exited@1" ||
+        reply.error !== 0
+      )
+        throw failure("parent_peer_phase");
+      return reply;
     },
     /** Read only the observation produced by THIS completed original JOIN.
      * A STOP reply, public progress DTO or connector exit alone cannot supply it. */

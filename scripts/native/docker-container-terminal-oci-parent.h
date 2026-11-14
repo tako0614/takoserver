@@ -761,8 +761,8 @@ static int ocipp_connector_read(struct ocipp_connector *c, const unsigned char *
   return 0;
 }
 /* A fixed two-stage peer connection. Past outcome is never a management
- * permission. Only a later explicit STOP/JOIN frame on original private stdin
- * may issue that fixed command; original P and H still enforce one-use/phase. */
+ * permission. Only a later explicit closed command on original private stdin
+ * may dispatch; original P/H enforce one-use/phase and P alone owns H result. */
 static int ocipp_connector_command(struct ocipp_connector *c, const char *command, int64_t until) {
   size_t size = strlen(command);
   if (size >= 128 || ocipp_connector_current(c) < 0) return -1;
@@ -825,10 +825,24 @@ static int ocipp_connector_init(struct ocipp_connector *c, const unsigned char *
   static const char join[] = "{\"kind\":\"linux-oci-join-init@1\"}";
   static const char release[] = "{\"kind\":\"linux-oci-release-namespace@1\"}";
   static const char resume[] = "{\"kind\":\"linux-oci-continue-namespace-release@1\"}";
+  static const char step0[] = "{\"kind\":\"linux-oci-begin-tracked-join@1\"}";
+  static const char step1[] = "{\"kind\":\"linux-oci-read-tracked-join@1\"}";
+  static const char step2[] = "{\"kind\":\"linux-oci-delete-born@1\"}";
+  static const char step3[] = "{\"kind\":\"linux-oci-join-born-delete@1\"}";
+  static const char step4[] = "{\"kind\":\"linux-oci-dispose-born@1\"}";
+  static const char step5[] = "{\"kind\":\"linux-oci-continue-born-disposal@1\"}";
+  static const char step6[] = "{\"kind\":\"linux-oci-parent-read-result@1\"}";
   const char *command = size == sizeof(stop)-1 && !memcmp(body,stop,size) ? stop :
     size == sizeof(join)-1 && !memcmp(body,join,size) ? join :
     size == sizeof(release)-1 && !memcmp(body,release,size) ? release :
-    size == sizeof(resume)-1 && !memcmp(body,resume,size) ? resume : NULL;
+    size == sizeof(resume)-1 && !memcmp(body,resume,size) ? resume :
+    size == sizeof(step0)-1 && !memcmp(body,step0,size) ? step0 :
+    size == sizeof(step1)-1 && !memcmp(body,step1,size) ? step1 :
+    size == sizeof(step2)-1 && !memcmp(body,step2,size) ? step2 :
+    size == sizeof(step3)-1 && !memcmp(body,step3,size) ? step3 :
+    size == sizeof(step4)-1 && !memcmp(body,step4,size) ? step4 :
+    size == sizeof(step5)-1 && !memcmp(body,step5,size) ? step5 :
+    size == sizeof(step6)-1 && !memcmp(body,step6,size) ? step6 : NULL;
   if (!command || c->outcome_phase != 2 || c->init_attempt || ocipp_connector_current(c) < 0) return -1;
   c->init_attempt = 1; /* consumed before the sole fixed command write */
   int64_t now = ocip_now(); if (now < 0) return -1;

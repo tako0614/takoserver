@@ -38,7 +38,7 @@ static struct {
   size_t frontend_write_chunk;
   unsigned int frontend_reads; int frontend_oversize;
   unsigned int executable_stats; int tamper_after;
-  int manage_mode; struct ocipp_owner *manage_owner;
+  int manage_mode, retirement_refusal; struct ocipp_owner *manage_owner;
   unsigned int manage_writes; unsigned char manage_output[4096], manage_h_reply[512]; size_t manage_output_size;
   int connector, pidfd_unsupported, pidfd_short, old_pidfs, peer_dead, boot_other, boot_short;
   unsigned int self_opens, peer_gets, peer_checks, cap_writes, readonly_writes, connects;
@@ -639,7 +639,14 @@ static int model_management_send(const void *bytes,size_t size) {
   CHECK(!strcmp(command,"{\"kind\":\"linux-oci-parent-read-outcome@1\"}") ||
     !strcmp(command,"{\"kind\":\"linux-oci-stop-init@1\"}") || !strcmp(command,"{\"kind\":\"linux-oci-join-init@1\"}") ||
     !strcmp(command,"{\"kind\":\"linux-oci-release-namespace@1\"}") ||
-    !strcmp(command,"{\"kind\":\"linux-oci-continue-namespace-release@1\"}"));
+    !strcmp(command,"{\"kind\":\"linux-oci-continue-namespace-release@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-begin-tracked-join@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-read-tracked-join@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-delete-born@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-join-born-delete@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-dispose-born@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-continue-born-disposal@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-parent-read-result@1\"}"));
   pm.manage_writes++;pm.frontend_sent_size=0;
   /* Raw process switch: original P has its own controller, not connector PID. */
   pm.connector=0;
@@ -659,6 +666,19 @@ static int model_management_send(const void *bytes,size_t size) {
         "\"referenceReleased\":1,\"netGone\":0,\"poisoned\":0,\"barrier\":\"unproven\"}",
         pm.manage_owner->request_kind==TNS_OCIP_RELEASE_NAMESPACE ?
           "linux-oci-namespace-release-observation@1":"linux-oci-namespace-release-continuation@1",CLAIM);
+      CHECK(n>0 && (size_t)n<sizeof(namespace_reply));reply=namespace_reply;
+    }
+    if(pm.manage_owner->request_kind>=TNS_OCIP_BEGIN_TRACKED_JOIN){
+      static const char *names[]={"linux-oci-tracked-join-handoff@1","linux-oci-tracked-owner-destruction@1",
+        "linux-oci-born-delete-observation@1","linux-oci-born-delete-join-observation@1",
+        "linux-oci-local-disposal@1","linux-oci-local-disposal-continuation@1"};
+      unsigned int kind=(unsigned int)pm.manage_owner->request_kind;
+      CHECK(kind<=TNS_OCIP_CONTINUE_BORN_DISPOSAL);
+      int n;
+      if(pm.retirement_refusal==(int)kind){
+        n=snprintf(namespace_reply,sizeof(namespace_reply),"{\"kind\":\"linux-oci-refused@1\",\"stage\":\"%s\",\"errno\":11,\"custody\":\"retained\",\"barrier\":\"unproven\"}",ocip_retirement_stage(pm.manage_owner->request_kind));
+        pm.retirement_refusal=0;
+      } else n=snprintf(namespace_reply,sizeof(namespace_reply),"{\"kind\":\"%s\",\"barrier\":\"unproven\"}",names[kind-TNS_OCIP_BEGIN_TRACKED_JOIN]);
       CHECK(n>0 && (size_t)n<sizeof(namespace_reply));reply=namespace_reply;
     }
     pm.stream_size[0]=frame_bytes(pm.manage_h_reply,reply);pm.stream[0]=pm.manage_h_reply;pm.stream_at[0]=0;
@@ -738,6 +758,64 @@ static void peer_namespace_only(void) {
   CHECK(pm.clones==1 && !o.joined && !o.eof[0] && !o.eof[1]);
   CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
+/* New family-only selector. Actual P owns clone/pidfd/queue/wait/EOF; raw H
+ * response bytes are serialization/transport data, not OCI function success. */
+static void retirement_parent(struct ocipp_owner *o,unsigned char request[172]) {
+  prepare_peer_parent(o);peer_request(o,request);
+  CHECK(ocipp_first_create(o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
+  CHECK(ocipp_spawn(o)==0 && ocipp_flush_input(o)==0);pm.delivered_size=0;
+  static const char created[]="{\"kind\":\"linux-oci-created-stopped@1\",\"nativeId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"namespaceDevice\":4,\"namespaceInode\":55,\"barrier\":\"unproven\"}";
+  pm.stream_size[0]=frame_bytes(pm.manage_h_reply,created);pm.stream[0]=pm.manage_h_reply;pm.stream_at[0]=0;
+  CHECK(ocipp_step(o)<0 && !o->awaiting);
+}
+static void retirement_command(struct ocipp_owner *o,const unsigned char request[172],const char *op,const char *expected) {
+  char command[128];int n=snprintf(command,sizeof(command),"{\"kind\":\"linux-oci-%s@1\"}",op);
+  CHECK(n>0 && (size_t)n<sizeof(command));pm.manage_output_size=0;
+  namespace_connector(o,request,command,expected);
+}
+static void retirement_h_result(struct ocipp_owner *o,const unsigned char request[172],const char *expected) {
+  pm.connector=0;ocipp_host_lost(o);authenticate_frontend(o,0);pm.manage_output_size=0;
+  pm.connector_size=o->management_size;pm.connector_at=0;pm.connector_auth_at=pm.connector_request_at=0;
+  memcpy(pm.connector_reply,o->management_output,o->management_size);auth_bytes(o,pm.expected_auth);
+  pm.connector=pm.manage_mode=1;pm.manage_owner=o;
+  struct ocipp_connector c={0};unsigned char reply[512];size_t size=0;
+  CHECK(ocipp_connector_open(&c,request,172)==0 && ocipp_connector_outcome(&c,c.deadline)==0);
+  unsigned int writes=pm.writes,waits=pm.waits;
+  static const char command[]="{\"kind\":\"linux-oci-parent-read-result@1\"}";
+  CHECK(ocipp_connector_init(&c,(const unsigned char*)command,strlen(command),reply,&size)==0);
+  CHECK(memmem(reply,size,expected,strlen(expected)) && pm.writes==writes && pm.waits==waits);
+  CHECK(ocipp_connector_init(&c,(const unsigned char*)command,strlen(command),reply,&size)<0 && pm.writes==writes);
+  CHECK(ocipp_connector_close(&c)==0);ocipp_connector_free(&c);pm.connector=0;
+}
+static void peer_retirement_only(void) {
+  struct ocipp_owner o;unsigned char request[172];retirement_parent(&o,request);
+  retirement_command(&o,request,"stop-init","linux-oci-init-reaped@1");
+  retirement_command(&o,request,"join-init","linux-oci-init-reaped-observation@1");
+  retirement_command(&o,request,"release-namespace","linux-oci-namespace-release-observation@1");
+  retirement_command(&o,request,"continue-namespace-release","linux-oci-namespace-release-continuation@1");
+  static const char *ops[]={"begin-tracked-join","read-tracked-join","delete-born","join-born-delete","dispose-born","continue-born-disposal"};
+  for(unsigned int i=0;i<6;++i){
+    int effect=i==0 || i==2 || i==4;
+    if(effect)pm.retirement_refusal=(int)i+TNS_OCIP_BEGIN_TRACKED_JOIN;
+    retirement_command(&o,request,ops[i],effect?"linux-oci-refused@1":i==1?"linux-oci-tracked-owner-destruction@1":i==3?"linux-oci-born-delete-join-observation@1":"linux-oci-local-disposal-continuation@1");
+    if(effect){char command[128];int n=snprintf(command,sizeof(command),"{\"kind\":\"linux-oci-%s@1\"}",ops[i]);CHECK(n>0 && ocipp_queue(&o,(const unsigned char*)command,(uint32_t)n)<0);}
+  }
+  retirement_h_result(&o,request,"linux-oci-parent-h-result-refused@1");
+  pm.wait_kind=1;CHECK(ocipp_wait(&o)==0 && o.joined);unsigned int waits=pm.waits;
+  retirement_h_result(&o,request,"linux-oci-parent-h-result-refused@1");
+  pm.eof[0]=1;CHECK(ocipp_drain(&o,0)==0);retirement_h_result(&o,request,"linux-oci-parent-h-result-refused@1");
+  pm.eof[1]=1;CHECK(ocipp_drain(&o,1)==0);retirement_h_result(&o,request,"linux-oci-parent-h-exited@1");
+  CHECK(ocipp_wait(&o)==0 && pm.waits==waits && pm.clones==1);
+  CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
+  for(int fault=2;fault<=4;++fault){
+    retirement_parent(&o,request);pm.wait_kind=fault;
+    CHECK(ocipp_wait(&o)==(fault==4?-1:0));
+    pm.stream_size[0]=pm.stream_at[0]=0;pm.eof[0]=pm.eof[1]=1;
+    CHECK(ocipp_drain(&o,0)==0 && ocipp_drain(&o,1)==0);
+    retirement_h_result(&o,request,"linux-oci-parent-h-result-refused@1");
+    CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
+  }
+}
 static void peer_instance_only(void) {
   for(int pending=0;pending<2;++pending){
     struct ocipp_owner o;prepare_peer_parent(&o);unsigned char request[172];peer_request(&o,request);peer_server_replies(&o,pending);
@@ -774,6 +852,7 @@ static void peer_instance_only(void) {
   pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"peer-retirement")){peer_retirement_only();printf("new peer retirement only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-namespace")){peer_namespace_only();printf("new peer namespace only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-management")){peer_management_only();printf("new peer management only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-instance")){peer_instance_only();printf("new peer-instance only: %lu checks\n",checks);return 0;}

@@ -2558,6 +2558,11 @@ export function createDockerContainerCoreOwner(
               observation = await (boundPhase === "exited"
                 ? read.advanceNamespace(input.nativeId, signal)
                 : read.advance(input.nativeId, signal));
+              if (observation.operation === "read-helper-result") {
+                // Exact original P's H join/EOF record only; no removed CAS or
+                // allocation cleanup is authorized by this private handoff.
+                read.observeHelperExited(signal);
+              }
               if (observation.operation === "join-init") {
                 // Only the same actual private connector can supply this original
                 // consuming JOIN observation. The public progress is not a witness.
