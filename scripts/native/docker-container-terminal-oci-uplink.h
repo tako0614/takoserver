@@ -73,6 +73,7 @@ struct oci_uplink_owner {
   size_t file_size; char file_bytes[32769];
   char host_name[16], guest_name[16];
   uint32_t host_index, guest_index; unsigned char host_mac[6], guest_mac[6];
+  uint32_t loopback_index;
   unsigned int create_sent, create_known, pair_known, configured, delete_sent, delete_known;
   unsigned int phase, cleaning;
   unsigned int attempt, child_joined, child_ok, kill_attempt, broken, close_unknown;
@@ -830,11 +831,12 @@ fail:
   u->broken = 1; if (!errno) errno = EPROTO; return -1;
 }
 static int oci_uplink_pair(struct oci_uplink_owner *u) {
+  if (!u || !u->loopback_index) { errno = ESTALE; return -1; }
   struct oci_uplink_dump *d = malloc(sizeof(*d)); if (!d) return -1;
   int result = -1; uint32_t indices[2] = {0}, peers[2] = {0};
   for (unsigned int side = 0; side < 2; ++side) {
     if (oci_uplink_dump_side(u, (int)side, RTM_GETLINK, d) < 0) goto done;
-    unsigned int found = 0; size_t at = 0;
+    unsigned int found = 0, loopbacks = 0; size_t at = 0;
     while (at < d->used) {
       struct nlmsghdr n; memcpy(&n, d->bytes + at, sizeof(n));
       const unsigned char *body = d->bytes + at + NLMSG_HDRLEN; struct ifinfomsg h; memcpy(&h, body, sizeof(h));
@@ -846,12 +848,19 @@ static int oci_uplink_pair(struct oci_uplink_owner *u) {
         unsigned char mac[6]; unsigned char *saved = side ? u->guest_mac : u->host_mac;
         int index = oci_uplink_link(body, n.nlmsg_len - NLMSG_HDRLEN, name, expected, mac, &peers[side], 0);
         if (++found != 1 || index < 0 || memcmp(mac, saved, 6) ||
+            (side && (uint32_t)index == u->loopback_index) ||
             (u->configured && !(h.ifi_flags & IFF_UP))) goto done;
         indices[side] = (uint32_t)index;
+      } else if (side) {
+        /* The original namespace began with this sole loopback. runc may
+         * bring it UP; liveness flags are not additional interface paths. */
+        if (++loopbacks != 1 || h.ifi_index <= 0 || (uint32_t)h.ifi_index != u->loopback_index ||
+            h.ifi_type != ARPHRD_LOOPBACK || !(h.ifi_flags & IFF_LOOPBACK) ||
+            oci_uplink_text(&a, IFLA_IFNAME, "lo") < 0) goto done;
       }
       at += NLMSG_ALIGN((size_t)n.nlmsg_len);
     }
-    if (found != 1) goto done;
+    if (found != 1 || (side && loopbacks != 1)) goto done;
   }
   if (peers[0] != indices[1] || peers[1] != indices[0]) goto done;
   u->host_index = indices[0]; u->guest_index = indices[1]; result = oci_uplink_original(u);
@@ -863,13 +872,17 @@ static int oci_uplink_fresh_guest(struct oci_uplink_owner *u) {
   if (oci_uplink_dump_side(u, 1, RTM_GETLINK, d) < 0 || d->records != 1) goto done;
   struct nlmsghdr n; memcpy(&n, d->bytes, sizeof(n)); struct ifinfomsg h;
   memcpy(&h, d->bytes + NLMSG_HDRLEN, sizeof(h)); struct oci_uplink_attrs a;
-  if (h.ifi_type != ARPHRD_LOOPBACK || !(h.ifi_flags & IFF_LOOPBACK) || (h.ifi_flags & IFF_UP) ||
+  if (h.ifi_index <= 0 || h.ifi_type != ARPHRD_LOOPBACK || !(h.ifi_flags & IFF_LOOPBACK) || (h.ifi_flags & IFF_UP) ||
       oci_uplink_attrs(d->bytes + NLMSG_HDRLEN + NLMSG_ALIGN(sizeof(h)), n.nlmsg_len - NLMSG_LENGTH(sizeof(h)), &a) < 0 ||
       oci_uplink_text(&a, IFLA_IFNAME, "lo") < 0) goto done;
   for (unsigned int i = 0; i < 2; ++i)
     if (oci_uplink_dump_side(u, 1, i ? RTM_GETROUTE : RTM_GETADDR, d) < 0 || d->records) goto done;
   if (oci_uplink_dump_side(u, 1, RTM_GETRULE, d) < 0 || oci_uplink_host_rules(d) < 0) goto done;
   result = oci_uplink_original(u);
+  if (!result) {
+    if (u->loopback_index && u->loopback_index != (uint32_t)h.ifi_index) { errno = ESTALE; result = -1; }
+    else u->loopback_index = (uint32_t)h.ifi_index;
+  }
 done:
   free(d); if (result < 0 && !errno) errno = ESTALE; return result;
 }
