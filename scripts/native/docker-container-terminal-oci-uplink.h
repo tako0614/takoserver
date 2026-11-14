@@ -6,6 +6,7 @@
  * supply a physical binding. The kernel gate and birth DROP remain CLOSED.
  * No callback, caller FD/PID, arbitrary command or foreign namespace is used. */
 #include <arpa/inet.h>
+#include <linux/ethtool.h>
 #include <linux/if.h>
 #include <linux/if_addr.h>
 #include <linux/if_arp.h>
@@ -14,6 +15,7 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/veth.h>
+#include <linux/sockios.h>
 #include <sys/socket.h>
 
 #define OCI_UPLINK_FILE ".tako-oci-topology.json"
@@ -31,6 +33,18 @@ struct oci_uplink_dump {
   size_t used;
   unsigned char bytes[OCI_UPLINK_DUMP_MAX];
 };
+/* A bounded GET buffer, not a feature policy or a supported-driver class.
+ * The returned size must fit in full; no feature words are silently omitted. */
+#define OCI_UPLINK_FEATURE_WORDS 8u
+struct oci_uplink_features {
+  uint32_t cmd, size;
+  struct ethtool_get_features_block blocks[OCI_UPLINK_FEATURE_WORDS];
+};
+_Static_assert(offsetof(struct oci_uplink_features, blocks) == sizeof(struct ethtool_gfeatures), "ethtool GET layout");
+struct oci_uplink_driver_facts {
+  struct ethtool_drvinfo driver;
+  struct oci_uplink_features features;
+};
 struct oci_uplink_owner {
   struct tns_oci_owner *original;
   struct oci_uplink_topology expected;
@@ -42,6 +56,8 @@ struct oci_uplink_owner {
   int received_rights[8]; unsigned int received_count;
   uint32_t guest_port, host_port, sequence;
   uint64_t host_cookie;
+  struct oci_uplink_driver_facts driver_facts;
+  unsigned int driver_attempted, driver_captured;
   int file; unsigned int file_selected; struct stat file_identity;
   size_t file_size; char file_bytes[32769];
   char host_name[16], guest_name[16];
@@ -421,6 +437,78 @@ static int oci_uplink_host_channel(struct oci_uplink_owner *u) {
       oci_uplink_socket_identity(u->host, u->host_cookie, &u->host_port) < 0 || oci_uplink_original(u) < 0) return -1;
   return 0;
 }
+/* These GETs use the original Host socket namespace. The ifr_name lookup is
+ * bookended by actual name/index/MAC and socket-cookie observations. Matching
+ * facts do not establish an immutable hardware incarnation or onward path. */
+static int oci_uplink_driver_link(struct oci_uplink_owner *u) {
+  struct ifreq request; uint32_t port = 0;
+  if (u->host < 0 || !u->host_port || !u->host_cookie || !u->child_joined || !u->child_ok ||
+      oci_uplink_original(u) < 0 || oci_uplink_socket_identity(u->host, u->host_cookie, &port) < 0 ||
+      port != u->host_port) { if (!errno) errno = ESTALE; return -1; }
+  memset(&request, 0, sizeof(request)); memcpy(request.ifr_name, u->expected.name, sizeof(request.ifr_name));
+  if (ioctl(u->host, SIOCGIFINDEX, &request) != 0 ||
+      memcmp(request.ifr_name, u->expected.name, sizeof(request.ifr_name)) ||
+      request.ifr_ifindex <= 0 || (uint32_t)request.ifr_ifindex != u->expected.index) { if (!errno) errno = ESTALE; return -1; }
+  memset(&request, 0, sizeof(request)); memcpy(request.ifr_name, u->expected.name, sizeof(request.ifr_name));
+  if (ioctl(u->host, SIOCGIFHWADDR, &request) != 0 ||
+      memcmp(request.ifr_name, u->expected.name, sizeof(request.ifr_name)) ||
+      request.ifr_hwaddr.sa_family != ARPHRD_ETHER || memcmp(request.ifr_hwaddr.sa_data, u->expected.mac, 6)) {
+    if (!errno) errno = ESTALE;
+    return -1;
+  }
+  if (oci_uplink_socket_identity(u->host, u->host_cookie, &port) < 0 || port != u->host_port ||
+      oci_uplink_original(u) < 0) { if (!errno) errno = ESTALE; return -1; }
+  return 0;
+}
+static int oci_uplink_driver_string(char *bytes, size_t size, int required) {
+  char *end = memchr(bytes, 0, size);
+  if (!end || (required && end == bytes)) { errno = EPROTO; return -1; }
+  /* Padding is not a driver fact. Preserve every bounded string byte. */
+  memset(end, 0, size - (size_t)(end - bytes)); return 0;
+}
+static int oci_uplink_driver_current(struct oci_uplink_owner *u) {
+  struct oci_uplink_driver_facts fresh; struct ifreq request;
+  if (!u || u->cleaning || oci_uplink_original(u) < 0) return -1;
+  if (!u->driver_captured) {
+    /* A failed first observation cannot be adopted later after pair effects. */
+    if (u->create_sent || tns_oci_once(&u->driver_attempted) < 0) { errno = EALREADY; return -1; }
+  }
+  if (oci_uplink_driver_link(u) < 0) return -1;
+  memset(&fresh, 0, sizeof(fresh)); fresh.driver.cmd = ETHTOOL_GDRVINFO;
+  memset(&request, 0, sizeof(request)); memcpy(request.ifr_name, u->expected.name, sizeof(request.ifr_name));
+  request.ifr_data = (char *)&fresh.driver;
+  if (ioctl(u->host, SIOCETHTOOL, &request) != 0 || fresh.driver.cmd != ETHTOOL_GDRVINFO ||
+      memcmp(request.ifr_name, u->expected.name, sizeof(request.ifr_name)) || request.ifr_data != (char *)&fresh.driver ||
+      oci_uplink_driver_string(fresh.driver.driver, sizeof(fresh.driver.driver), 1) < 0 ||
+      oci_uplink_driver_string(fresh.driver.version, sizeof(fresh.driver.version), 0) < 0 ||
+      oci_uplink_driver_string(fresh.driver.fw_version, sizeof(fresh.driver.fw_version), 0) < 0 ||
+      oci_uplink_driver_string(fresh.driver.bus_info, sizeof(fresh.driver.bus_info), 0) < 0 ||
+      oci_uplink_driver_string(fresh.driver.erom_version, sizeof(fresh.driver.erom_version), 0) < 0) {
+    if (!errno) errno = EPROTO;
+    return -1;
+  }
+  for (size_t i = 0; i < sizeof(fresh.driver.reserved2); ++i)
+    if (fresh.driver.reserved2[i]) { errno = EPROTO; return -1; }
+  fresh.features.cmd = ETHTOOL_GFEATURES; fresh.features.size = OCI_UPLINK_FEATURE_WORDS;
+  memset(&request, 0, sizeof(request)); memcpy(request.ifr_name, u->expected.name, sizeof(request.ifr_name));
+  request.ifr_data = (char *)&fresh.features;
+  if (oci_uplink_original(u) < 0 || ioctl(u->host, SIOCETHTOOL, &request) != 0 ||
+      fresh.features.cmd != ETHTOOL_GFEATURES || !fresh.features.size || fresh.features.size > OCI_UPLINK_FEATURE_WORDS ||
+      memcmp(request.ifr_name, u->expected.name, sizeof(request.ifr_name)) || request.ifr_data != (char *)&fresh.features ||
+      oci_uplink_driver_link(u) < 0 || oci_uplink_original(u) < 0) { if (!errno) errno = EPROTO; return -1; }
+  /* Linux copies exactly min(input capacity, returned size) complete blocks on
+   * zero. EFAULT, positive returns and a size exceeding capacity all refuse. */
+  for (size_t i = fresh.features.size; i < OCI_UPLINK_FEATURE_WORDS; ++i)
+    if (memcmp(&fresh.features.blocks[i], &(struct ethtool_get_features_block){0}, sizeof(fresh.features.blocks[i]))) {
+      errno = EPROTO; return -1;
+    }
+  if (u->driver_captured) {
+    if (memcmp(&u->driver_facts, &fresh, sizeof(fresh))) { errno = ESTALE; return -1; }
+  } else {
+    u->driver_facts = fresh; u->driver_captured = 1;
+  }
+  return 0;
+}
 /* Cooperating allocation exclusion, not traffic or namespace authority. A
  * single fixed Host-local lock also serializes distinct original namespaces. */
 static int oci_uplink_lock_current(struct oci_uplink_owner *u) {
@@ -620,6 +708,7 @@ static int oci_uplink_preflight(struct oci_uplink_owner *u) {
       i == 2 ? oci_uplink_host_routes(u, d) : oci_uplink_host_rules(d);
     if (valid < 0) { errno = ESTALE; goto done; }
   }
+  if (oci_uplink_driver_current(u) < 0) goto done;
   result = oci_uplink_original(u);
 done:
   free(d); return result;

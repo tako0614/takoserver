@@ -442,6 +442,29 @@ static int raw_waitid(idtype_t type, id_t id, siginfo_t *out, int flags) {
 }
 static int raw_ioctl(int fd, unsigned long request, ...) {
   va_list ap; va_start(ap, request);
+  /* GET-only Host observation data for the original socket; no SET model. */
+  if (request == SIOCGIFINDEX || request == SIOCGIFHWADDR || request == SIOCETHTOOL) {
+    struct oci_uplink_owner *observed = model.oci ? model.oci->uplink : NULL;
+    CHECK(fd == 407 && observed);
+    struct ifreq *in = va_arg(ap, struct ifreq *); va_end(ap);
+    CHECK(!memcmp(in->ifr_name, observed->expected.name, sizeof(in->ifr_name)));
+    if (request == SIOCGIFINDEX) { in->ifr_ifindex = (int)observed->expected.index; return 0; }
+    if (request == SIOCGIFHWADDR) {
+      in->ifr_hwaddr.sa_family = ARPHRD_ETHER;
+      memcpy(in->ifr_hwaddr.sa_data, observed->expected.mac, 6); return 0;
+    }
+    CHECK(in->ifr_data); uint32_t cmd; memcpy(&cmd, in->ifr_data, sizeof(cmd));
+    if (cmd == ETHTOOL_GDRVINFO) {
+      struct ethtool_drvinfo *out = (void *)in->ifr_data;
+      memset(out, 0, sizeof(*out)); out->cmd = ETHTOOL_GDRVINFO;
+      strcpy(out->driver, "raw-original-driver"); strcpy(out->version, "6.12"); return 0;
+    }
+    CHECK(cmd == ETHTOOL_GFEATURES);
+    struct oci_uplink_features *out = (void *)in->ifr_data;
+    CHECK(out->size == OCI_UPLINK_FEATURE_WORDS);
+    memset(out, 0, sizeof(*out)); out->cmd = ETHTOOL_GFEATURES; out->size = 2;
+    out->blocks[0].available = out->blocks[0].requested = out->blocks[0].active = 1; return 0;
+  }
   if (request == NS_GET_NSTYPE) {
     va_end(ap); return fd == 121 || (up.child && fd==3) || fd == 4 || fd == LOAN || fd == NETNS || fd == BIRTH_NS ? CLONE_NEWNET : CLONE_NEWPID;
   }
