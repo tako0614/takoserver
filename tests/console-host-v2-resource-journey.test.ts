@@ -207,7 +207,7 @@ afterAll(() => {
   }
 });
 
-test("Console selection and real SQLite Host resource create/update/unknown delete preserve read authority and original operation", async () => {
+async function resourceJourney(completedBeforeRetry: boolean): Promise<void> {
   const database = migrateSqliteDatabase();
   const root = mkdtempSync(join(tmpdir(), "console-host-v2-resource-journey-"));
   const sql = createSqliteSql(database);
@@ -516,6 +516,30 @@ test("Console selection and real SQLite Host resource create/update/unknown dele
     ).rejects.toMatchObject({ code: "replay_window_expired" });
     expect(requests.filter((row) => row.method !== "GET")).toHaveLength(beforeResend);
 
+    if (completedBeforeRetry) {
+      // The backend completes while the browser still has no accepted handle.
+      // The retained original receipt, not a live Resource or a new key, must
+      // allow the normal exact retry to recover this completed Operation.
+      expect(existsSync(file)).toBe(true);
+      const completedDelete = await app.tickTakoformV2();
+      expect(completedDelete).toMatchObject({
+        id: lostDeleteId,
+        action: "delete",
+        status: "succeeded",
+      });
+      if (completedDelete === null) throw new Error("original delete did not complete");
+      expect(
+        Date.parse(completedDelete.retainUntil) >=
+          Date.parse(NOW) + intent.replayWindowSeconds * 1000,
+      ).toBe(true);
+      expect(existsSync(file)).toBe(false);
+      await expect(state.api.resource(organization.id, first.uid)).rejects.toMatchObject({
+        code: "gone",
+        status: 410,
+      });
+      expect(frame.textContent.includes("Acceptance is unknown")).toBe(true);
+    }
+
     // The dropped raw ACK is a comparison oracle only. The real Console must
     // discover that Operation via its original same-key recovery action.
     button("Retry exact request", frame).click();
@@ -546,13 +570,25 @@ test("Console selection and real SQLite Host resource create/update/unknown dele
           request.originalSession,
       ),
     ).toBe(true);
+    expect(
+      requests
+        .filter((request) => request.method === "DELETE" && request.path.endsWith(first.uid))
+        .map((request) => request.status),
+    ).toEqual([202, completedBeforeRetry ? 200 : 202]);
     expect(await sql.query("SELECT id FROM tf_v2_operations")).toHaveLength(3);
-    expect(existsSync(file)).toBe(true);
-    expect(await app.tickTakoformV2()).toMatchObject({
-      id: recoveredDeleteId,
-      action: "delete",
-      status: "succeeded",
-    });
+    if (completedBeforeRetry) {
+      expect(existsSync(file)).toBe(false);
+      await waitFor("normal completed delete presentation", () =>
+        frame.textContent.includes("Deletion complete"),
+      );
+    } else {
+      expect(existsSync(file)).toBe(true);
+      expect(await app.tickTakoformV2()).toMatchObject({
+        id: recoveredDeleteId,
+        action: "delete",
+        status: "succeeded",
+      });
+    }
     expect(await app.tickTakoformV2()).toBeNull();
     expect(await state.api.resourceOperation(organization.id, recoveredDeleteId)).toMatchObject({
       id: recoveredDeleteId,
@@ -590,4 +626,12 @@ test("Console selection and real SQLite Host resource create/update/unknown dele
     rmSync(root, { recursive: true, force: true });
   }
   expect(existsSync(root)).toBe(false);
-}, 10_000);
+}
+
+for (const completedBeforeRetry of [false, true]) {
+  test(
+    `Console selection and real SQLite Host resource recover a ${completedBeforeRetry ? "completed" : "queued"} delete after its lost ACK`,
+    () => resourceJourney(completedBeforeRetry),
+    10_000,
+  );
+}
