@@ -54,7 +54,9 @@ struct oci_uplink_link_path {
   size_t kind_size;
   unsigned char kind[UINT16_MAX - sizeof(struct rtattr)];
 };
+struct oci_host_path_owner;
 struct oci_uplink_owner {
+  struct oci_host_path_owner *host_path;
   struct tns_oci_owner *original;
   struct oci_uplink_topology expected;
   struct tns_identity identity, creator;
@@ -78,6 +80,10 @@ struct oci_uplink_owner {
   unsigned int phase, cleaning;
   unsigned int attempt, child_joined, child_ok, kill_attempt, broken, close_unknown;
 };
+
+/* Definitions follow in the original policy implementation. */
+static int oci_host_path_install(struct oci_uplink_owner *u);
+static int oci_host_path_close(struct oci_uplink_owner *u);
 
 static int oci_uplink_prefix(const unsigned char *a, const unsigned char *b, unsigned int bits) {
   size_t whole = bits / 8; unsigned int left = bits % 8;
@@ -989,6 +995,8 @@ static int oci_uplink_install(struct tns_oci_owner *o, struct oci_uplink_owner *
   if (!u) return 0;
   if (tns_oci_once(&u->phase) < 0) { errno = EALREADY; return -1; }
   if (oci_uplink_guest_channel(o, u) < 0 || oci_uplink_host_channel(u) < 0 || oci_uplink_lock(u) < 0 || oci_uplink_new_pair(u) < 0) goto fail;
+  /* Bind the actual Host forwarding edge before either new endpoint is UP. */
+  if (oci_host_path_install(u) < 0) goto fail;
   for (unsigned int side = 0; side < 2; ++side) {
     if (oci_uplink_address(u, (int)side, AF_INET) < 0 || oci_uplink_address(u, (int)side, AF_INET6) < 0) goto fail;
     struct ifinfomsg h = {.ifi_family = AF_UNSPEC, .ifi_index = (int)(side ? u->guest_index : u->host_index), .ifi_flags = IFF_UP, .ifi_change = IFF_UP};
@@ -1065,6 +1073,8 @@ static int oci_uplink_cleanup(struct oci_uplink_owner **slot) {
     /* Actual ACK only establishes the requested synchronous veth deletion;
      * it does not certify packet/offload/namespace lifetime or terminal. */
   }
+  /* Keep the forwarding fence until original pair deletion/absence is known. */
+  if (oci_host_path_close(u) < 0) return -1;
   if (oci_uplink_unlock(u) < 0) return -1;
   int *fds[] = {&u->guest, &u->host, &u->netfd, &u->child_pidfd, &u->file, &u->lock, &u->lock_root};
   for (size_t i = 0; i < sizeof(fds)/sizeof(fds[0]); ++i)

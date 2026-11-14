@@ -65,6 +65,12 @@ static struct {
  unsigned int mutations, creates, deletes, closes[600], joins, signals, sockets, dumps, steps;
  int created, removed, assigned[2][2], up[2], routes[2];
  struct nlmsghdr request; unsigned char request_bytes[4096];
+ /* Separate raw Host-command descriptors; reset by original prepare memset. */
+ unsigned int host_cut;
+ unsigned int host_pipes, host_spawns, host_joins[6], host_eof[6], host_signals[6];
+ unsigned int host_closes[24], host_pidcloses[6];
+ size_t host_at[6], host_size[6], host_sent_size[6];
+ char host_output[6][16384], host_sent[6][8192];
 } up;
 #define socket up_socket
 #define socketpair up_socketpair
@@ -74,6 +80,7 @@ static struct {
 #define bind up_bind
 #define sendmsg up_sendmsg
 #define recvmsg up_recvmsg
+static void host_raw_output(unsigned int stage);
 static long raw_syscall(long number, ...);
 static int raw_open(const char *path, int flags, ...);
 static int raw_openat(int dir, const char *path, int flags, ...);
@@ -186,6 +193,39 @@ struct raw_model {
 static struct raw_model model;
 static unsigned long checks;
 #define CHECK(x) do { assert(x); checks++; } while (0)
+
+/* Current-source Host output data only. Independent ABI/script/refusal tests
+ * remain in the new dedicated raw; these bytes extend existing fixture IO. */
+static void host_raw_output(unsigned int stage) {
+ struct oci_host_path_owner *p=model.oci->uplink->host_path;
+ char *out=up.host_output[stage];size_t used=0;
+ if(stage==0 || stage==4){up.host_size[stage]=0;out[0]=0;return;}
+ if(stage==3 || stage==5){
+  int n=stage==3?snprintf(out,16384,"{\"nftables\":[{\"table\":{\"family\":\"inet\",\"name\":\"%s\",\"handle\":7001,\"flags\":[]}}]}",p->table):snprintf(out,16384,"{\"nftables\":[]}");
+  CHECK(n>0 && n<16384);up.host_size[stage]=(size_t)n;return;
+ }
+ const char *in=p->expected;CHECK(!strncmp(in,"{\"nftables\":[",13));
+ memcpy(out,in,13);used=13;size_t at=13;unsigned int objects=0;
+ while(in[at]!=']'){
+  CHECK(in[at]=='{');size_t start=at;int depth=0,string=0;
+  do{char c=in[at++];CHECK(c && at<p->expected_size);
+   if(c=='"')string=!string;
+   if(!string){if(c=='{')depth++;else if(c=='}')depth--;}
+  }while(depth);
+  size_t length=at-start;const char *wrap=objects?"{\"add\":" : "{\"create\":";
+  if(objects)out[used++]=',';
+  if(stage==1){size_t n=strlen(wrap);memcpy(out+used,wrap,n);used+=n;}
+  size_t key=objects==0?10u:objects==1?10u:9u;
+  CHECK(length>key && in[start+key-1]=='{');
+  memcpy(out+used,in+start,key);used+=key;
+  const char *handle="\"handle\":7001,";memcpy(out+used,handle,strlen(handle));used+=strlen(handle);
+  memcpy(out+used,in+start+key,length-key);used+=length-key;
+  if(stage==1)out[used++]='}';
+  objects++;
+  if(in[at]==',')at++;
+ }
+ CHECK(objects==8 && used+3<16384);memcpy(out+used,"]}",3);up.host_size[stage]=used+2;
+}
 
 
 enum { EGFILE=100, EGNFT, HOSTROOT=110, HOSTUSR, HOSTSBIN };
@@ -313,6 +353,16 @@ static int raw_fstatfs(int fd, struct statfs *out) {
   memset(out, 0, sizeof(*out)); out->f_type = (long)NSFS_MAGIC; return 0;
 }
 static int raw_close(int fd) {
+  if(fd>=2000 && fd<2024){
+    unsigned int offset=(unsigned int)(fd-2000),stage=offset/4;CHECK(!up.host_closes[offset]++);
+    if(offset%4==1){struct oci_host_path_owner *p=model.oci->uplink->host_path;
+      const char *want=stage==4?p->deletion:p->script;size_t size=stage<2?p->script_size:stage==4?p->deletion_size:0;
+      CHECK(up.host_sent_size[stage]==size && !memcmp(up.host_sent[stage],want,size));
+      if(stage==4)CHECK(up.removed && !strcmp(want,"delete table inet handle 7001\n"));}
+    return 0;
+  }
+  if(fd>=3000 && fd<3006){CHECK(!up.host_pidcloses[fd-3000]++);return 0;}
+
   if(rt.active && fd>=480 && fd<576){CHECK(rt.closes[fd-480]++==0);if(rt.close_error==fd){errno=EINTR;return -1;}return 0;}
   if(fd==130 || (fd>=430 && fd<=432) || (fd>=450 && fd<=473)){CHECK(fd>=0 && fd<600);up.closes[fd]++;if(pol.active && fd==459)pol.applied=1;return 0;}
   if((fd>=120 && fd<=123) || (fd>=400 && fd<=410) || (up.child && (fd==3 || fd==4))){
@@ -339,6 +389,22 @@ static int raw_close(int fd) {
   CHECK(fd != KERNEL_DEVICE); return 0;
 }
 static long raw_syscall(long number, ...) {
+  /* Exact original Host record, ahead of legacy guest/runtime dispatch. */
+  if(number==SYS_clone3 && model.oci && model.oci->uplink && model.oci->uplink->host_path){
+    va_list ha;va_start(ha,number);struct clone_args *a=va_arg(ha,struct clone_args*);size_t n=va_arg(ha,size_t);va_end(ha);
+    struct oci_host_path_owner *p=model.oci->uplink->host_path;unsigned int stage=0;
+    while(stage<6 && a->pidfd!=(uint64_t)(uintptr_t)&p->pidfd[stage])stage++;
+    if(stage<6){CHECK(n==sizeof(*a) && a->flags==(CLONE_PIDFD|CLONE_CLEAR_SIGHAND) && a->exit_signal==SIGCHLD);
+      CHECK(stage==up.host_spawns && p->attempted[stage] && !p->pid[stage] && lock_taken);
+      CHECK(stage>=3?up.removed:(!up.up[0]&&!up.up[1]));
+      CHECK(up.host_pipes==2*(stage+1));*(int*)(uintptr_t)a->pidfd=3000+(int)stage;
+      host_raw_output(stage);up.host_spawns++;return 60000+(long)stage;}
+  }
+  if(number==SYS_pidfd_send_signal && model.oci && model.oci->uplink && model.oci->uplink->host_path){
+    va_list ha;va_start(ha,number);int fd=va_arg(ha,int),sig=va_arg(ha,int);va_end(ha);
+    if(fd>=3000 && fd<3006){CHECK(sig==SIGKILL && !up.host_signals[fd-3000]++);return 0;}
+  }
+
   if(rt.active && number==SYS_clone3){va_list ap;va_start(ap,number);struct clone_args *a=va_arg(ap,struct clone_args*);CHECK(va_arg(ap,size_t)==sizeof(*a));va_end(ap);CHECK(rt.spawns<16 && a->flags==(CLONE_PIDFD|CLONE_CLEAR_SIGHAND) && a->exit_signal==SIGCHLD && lock_taken);*(int *)(uintptr_t)a->pidfd=480+(int)rt.spawns;rt.read_at=0;pol.readback_size=0;return 7000+(long)rt.spawns++;}
   if(rt.active && number==SYS_pidfd_send_signal){va_list ap;va_start(ap,number);int fd=va_arg(ap,int);if(fd>=480 && fd<496){CHECK(va_arg(ap,int)==SIGKILL && rt.signals[fd-480]++==0);va_end(ap);return 0;}va_end(ap);}
   if(pol.active && number==SYS_clone3){va_list ap;va_start(ap,number);struct clone_args *a=va_arg(ap,struct clone_args*);CHECK(va_arg(ap,size_t)==sizeof(*a));va_end(ap);CHECK(pol.spawns<3 && a->flags==(CLONE_PIDFD|CLONE_CLEAR_SIGHAND) && a->exit_signal==SIGCHLD && lock_taken);*(int *)(uintptr_t)a->pidfd=430+(int)pol.spawns;return 6000+(long)pol.spawns++;}
@@ -387,6 +453,8 @@ static long raw_syscall(long number, ...) {
   model.custodian_exited = 1; return 0;
 }
 static int raw_poll(struct pollfd *p, nfds_t count, int timeout) {
+  if(p->fd>=2000 && p->fd<3006){CHECK((p->fd<2024 || p->fd>=3000) && count==1 && timeout>0);p->revents=p->events;return 1;}
+
   if(rt.active && p->fd>=480 && p->fd<576){CHECK(count==1 && timeout>0);if(rt.fault==4){errno=EINTR;return -1;}p->revents=p->events;return 1;}
   CHECK(count == 1);
   if((p->fd>=430 && p->fd<=432)||(p->fd>=450 && p->fd<=473)){CHECK(timeout>0);p->revents=p->events;return 1;}
@@ -404,6 +472,8 @@ static int raw_poll(struct pollfd *p, nfds_t count, int timeout) {
   p->revents = model.custodian_exited ? POLLIN : 0; return model.custodian_exited ? 1 : 0;
 }
 static int raw_waitid(idtype_t type, id_t id, siginfo_t *out, int flags) {
+  if(id>=3000 && id<3006){unsigned int i=id-3000;CHECK(type==P_PIDFD && flags==(WEXITED|WNOHANG) && up.host_eof[i] && !up.host_joins[i]++);out->si_pid=60000+(int)i;out->si_code=CLD_EXITED;out->si_status=0;return 0;}
+
   if(rt.active && id>=480 && id<496){CHECK(type==P_PIDFD && flags==(WEXITED|WNOHANG));unsigned int i=(unsigned int)id-480;CHECK(rt.joins[i]++==0);out->si_pid=7000+(int)i+(rt.fault==3);out->si_code=CLD_EXITED;out->si_status=0;return 0;}
   CHECK(type == P_PIDFD);
   if(id>=430 && id<=432){CHECK(flags==(WEXITED|WNOHANG));unsigned int i=(unsigned int)id-430;CHECK(!pol.joins[i]);pol.joins[i]++;out->si_pid=6000+(int)i;out->si_code=CLD_EXITED;out->si_status=0;return 0;}
@@ -453,14 +523,18 @@ static int raw_ioctl(int fd, unsigned long request, ...) {
   if (request == NS_GET_NSTYPE) {
     va_end(ap); return fd == 121 || (up.child && fd==3) || fd == 4 || fd == LOAN || fd == NETNS || fd == BIRTH_NS ? CLONE_NEWNET : CLONE_NEWPID;
   }
-  if (request == NS_GET_PARENT) { CHECK(fd == FRESH_PIDNS); va_end(ap); return PARENT_OF_INIT; }
+  if (request == NS_GET_PARENT && fd != KERNEL_DEVICE) { CHECK(fd == FRESH_PIDNS); va_end(ap); return PARENT_OF_INIT; }
   if (request == NS_GET_PID_FROM_PIDNS) {
     CHECK(fd == FRESH_PIDNS && va_arg(ap, int) == 1); va_end(ap); return 3000;
   }
   CHECK(fd == KERNEL_DEVICE);
+  if (request == TAKO_TERMINAL_CUT) {
+    CHECK(va_arg(ap,unsigned long)==0UL && model.birth->cut_attempted && !up.host_cut++);
+    va_end(ap);return 0;
+  }
   if (request == TAKO_TERMINAL_OBSERVE) {
     struct tako_terminal_observation *out = va_arg(ap, struct tako_terminal_observation *);
-    *out = (struct tako_terminal_observation){.net_cookie = 777, .namespace_inum = 77};
+    *out = (struct tako_terminal_observation){.net_cookie = 777, .namespace_inum = 77, .sealed = up.host_cut};
     va_end(ap); return 0;
   }
   if (request == TAKO_TERMINAL_RELEASE_NAMESPACE) {
@@ -514,12 +588,19 @@ static ssize_t raw_pread(int fd, void *out, size_t count, off_t offset) {
   memcpy(out, "fixture" + (size_t)offset, n); return (ssize_t)n;
 }
 static int eg_pipe2(int fd[2], int flags) {
+  if(model.oci && model.oci->uplink && model.oci->uplink->host_path){
+    struct oci_host_path_owner *p=model.oci->uplink->host_path;unsigned int stage=up.host_spawns;
+    if(stage<6 && p->attempted[stage] && !p->pid[stage]){CHECK(flags==(O_CLOEXEC|O_NONBLOCK) && up.host_pipes<12);fd[0]=2000+(int)up.host_pipes*2;fd[1]=fd[0]+1;up.host_pipes++;return 0;}
+  }
+
   if(rt.active){CHECK(flags==(O_CLOEXEC|O_NONBLOCK) && rt.pipes<32);unsigned int at=rt.pipes++;fd[0]=500+(int)(at*2);fd[1]=fd[0]+1;return 0;}
   if(pol.active){CHECK(flags==(O_CLOEXEC|O_NONBLOCK) && pol.pipes<6);unsigned int stage=pol.pipes/2,side=pol.pipes%2;fd[0]=450+(int)(stage*8+side*2);fd[1]=fd[0]+1;pol.pipes++;return 0;}
   CHECK(flags==(O_CLOEXEC | O_NONBLOCK)); CHECK(eg.pipes<6);
   fd[0]=200+(int)(eg.pipes/2)*10+(eg.pipes%2 ? 2 : 0);fd[1]=fd[0]+1;eg.pipes++;return 0;
 }
 static ssize_t eg_write(int fd,const void *bytes,size_t size) {
+  if(fd>=2000 && fd<2024){CHECK((fd-2000)%4==1);unsigned int i=(unsigned int)(fd-2000)/4;size_t n=size>31?31:size;CHECK(n && up.host_sent_size[i]+n<8192);memcpy(up.host_sent[i]+up.host_sent_size[i],bytes,n);up.host_sent_size[i]+=n;return (ssize_t)n;}
+
   if(rt.active && fd>=500 && fd<576){rt.writes++;CHECK(!"read-only observer must not write a script");}
   if(pol.active && (fd==451 || fd==459)){unsigned int i=fd==451?0u:1u;size_t n=size;if(pol.partial && n>137)n=137;CHECK(n<=sizeof(pol.sent[i])-pol.sent_size[i]);memcpy(pol.sent[i]+pol.sent_size[i],bytes,n);pol.sent_size[i]+=n;return (ssize_t)n;}
   CHECK(fd>=201 && fd<=221 && (fd-201)%10==0); size_t stage=(size_t)(fd-201)/10;
@@ -529,6 +610,8 @@ static ssize_t eg_write(int fd,const void *bytes,size_t size) {
   memcpy(eg.sent[stage]+eg.sent_size[stage],bytes,n);eg.sent_size[stage]+=n;return (ssize_t)n;
 }
 static ssize_t eg_read(int fd,void *bytes,size_t size) {
+  if(fd>=2000 && fd<2024){CHECK((fd-2000)%4==2);unsigned int i=(unsigned int)(fd-2000)/4;size_t n=up.host_size[i]-up.host_at[i];if(n>size)n=size;if(n>43)n=43;memcpy(bytes,up.host_output[i]+up.host_at[i],n);up.host_at[i]+=n;if(!n)up.host_eof[i]=1;return (ssize_t)n;}
+
   if(rt.active && fd>=500 && fd<576){CHECK((fd-500)%4==2);if(rt.fault==1){errno=EINTR;return -1;}if(!pol.readback_size){policy_raw_readback();if(rt.fault==2){char *at=strstr(pol.readback,"\"sport\"}},\"right\":8080");CHECK(at);at[strlen("\"sport\"}},\"right\":808")]='1';}}if(rt.read_at==pol.readback_size){if(rt.fault==6)tns_oci_note_cancel();return 0;}size_t n=pol.readback_size-rt.read_at;if(n>size)n=size;if(n>4093)n=4093;memcpy(bytes,pol.readback+rt.read_at,n);rt.read_at+=n;return (ssize_t)n;}
   if(pol.active && (fd==452 || fd==460 || fd==468)){if(pol.fault==1 && fd==460){errno=EINTR;return -1;}if(fd!=468)return 0;if(!pol.readback_size)policy_raw_readback();if(pol.read_at==pol.readback_size)return 0;size_t n=pol.readback_size-pol.read_at;if(n>size)n=size;if(n>4093)n=4093;memcpy(bytes,pol.readback+pol.read_at,n);pol.read_at+=n;return (ssize_t)n;}
   CHECK(fd>=202 && fd<=222 && (fd-202)%10==0);size_t stage=(size_t)(fd-202)/10;eg.reads++;
@@ -606,7 +689,7 @@ static void prepare(struct tns_oci_owner *o,struct tns_owner *b){memset(&up,0,si
  int n=snprintf(up.file,sizeof(up.file),"{\"kind\":\"linux-oci-owned-topology@1\",\"artifact\":%s,\"topology\":{\"interfaceName\":\"eth0\",\"interfaceIndex\":2,\"interfaceMac\":\"02:11:22:33:44:55\",\"ipv4Address\":\"192.0.2.2/24\",\"ipv4Gateway\":\"192.0.2.1\",\"ipv6Address\":\"2001:db8::2/64\",\"ipv6Gateway\":\"2001:db8::1\",\"peerIpv4Host\":\"10.77.0.2\",\"peerIpv4Guest\":\"10.77.0.3\",\"peerIpv6Host\":\"fd77::2\",\"peerIpv6Guest\":\"fd77::3\"}}",eg.artifact);CHECK(n>0 && (size_t)n<sizeof(up.file));up.file_size=(size_t)n;
  CHECK(oci_uplink_select(o,&o->uplink)==0 && o->uplink);subject=o->uplink;
 }
-static void discard(struct tns_oci_owner *o){free(o->uplink);o->uplink=NULL;subject=NULL;}
+static void discard(struct tns_oci_owner *o){if(o->uplink)free(o->uplink->host_path);free(o->uplink);o->uplink=NULL;subject=NULL;}
 static void source_cases(void){struct tns_oci_owner o;struct tns_owner b;
  prepare(&o,&b);struct tns_identity actual;CHECK(tns_owner_observe_creator(&b,&actual)==0 && actual.inode==66);CHECK(oci_uplink_install(&o,o.uplink)==0);CHECK(up.creates==1 && up.mutations==9 && up.joins==1 && !lock_taken && o.uplink->configured);CHECK(oci_uplink_install(&o,o.uplink)<0 && up.creates==1);CHECK(oci_uplink_cleanup(&o.uplink)==0 && !o.uplink && up.deletes==1 && !lock_taken);
  prepare(&o,&b);lock_busy=1;CHECK(oci_uplink_install(&o,o.uplink)<0 && !up.creates && !up.mutations);CHECK(oci_uplink_cleanup(&o.uplink)==0 && !o.uplink);

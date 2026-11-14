@@ -928,4 +928,334 @@ static int oci_policy_close(struct oci_policy_owner **slot){
   *slot=NULL;
   return 0;
 }
+
+/* This record owns one actual Host forwarding object, never guest policy slots.
+ * Its handle is learned only from this create transaction's kernel echo. */
+#define OCI_HOST_PATH_STAGES 6u
+struct oci_host_path_owner {
+  struct oci_uplink_owner *uplink;
+  pid_t controller;
+  struct tns_identity creator;
+  uint64_t cookie, handle;
+  uint32_t host_index, guest_index, uplink_index;
+  char claim[65], table[80], host_name[16], uplink_name[16];
+  char script[8192], expected[16384], deletion[160];
+  size_t script_size, expected_size, deletion_size;
+  int pidfd[OCI_HOST_PATH_STAGES], incoming[OCI_HOST_PATH_STAGES], outgoing[OCI_HOST_PATH_STAGES];
+  pid_t pid[OCI_HOST_PATH_STAGES];
+  unsigned int attempted[OCI_HOST_PATH_STAGES], wait_attempted[OCI_HOST_PATH_STAGES];
+  unsigned int joined[OCI_HOST_PATH_STAGES], ok[OCI_HOST_PATH_STAGES], killed[OCI_HOST_PATH_STAGES];
+  unsigned int verified, removed, unknown, close_unknown;
+};
+static int oci_host_path_current(struct oci_host_path_owner *p, int cleaning) {
+  struct oci_uplink_owner *u = p ? p->uplink : NULL;
+  uint32_t port = 0;
+  if (!u || !u->original || u->host_path != p || p->controller != getpid() || geteuid() != 0 ||
+      memcmp(p->claim, u->original->id, sizeof(p->claim)) ||
+      !tns_identity_equal(&p->creator, &u->creator) || p->cookie != u->host_cookie ||
+      p->host_index != u->host_index || p->guest_index != u->guest_index ||
+      p->uplink_index != u->expected.index || memcmp(p->host_name, u->host_name, 16) ||
+      memcmp(p->uplink_name, u->expected.name, 16) ||
+      !u->create_known || !u->pair_known || !u->lock_held ||
+      (cleaning ? oci_uplink_cleanup_current(u) : oci_uplink_original(u)) < 0 ||
+      oci_uplink_host_current(u) < 0 ||
+      oci_uplink_socket_identity(u->host, p->cookie, &port) < 0 || port != u->host_port ||
+      (cleaning ? (!u->delete_known || oci_uplink_absent(u) < 0) :
+       (oci_uplink_pair(u) < 0 || oci_uplink_driver_link(u) < 0))) {
+    if (!errno) errno = ESTALE;
+    return -1;
+  }
+  return 0;
+}
+static int oci_host_path_program(struct oci_host_path_owner *p) {
+  if (!p->host_index || !p->guest_index || !p->uplink_index || p->host_index == p->uplink_index ||
+      oci_policy_format(p->table, sizeof(p->table), "tako_host_%s", p->claim) < 0 ||
+      oci_policy_format(p->script, sizeof(p->script),
+        "create table inet %s\nadd chain inet %s forward { type filter hook forward priority 0; policy accept; }\n",
+        p->table, p->table) < 0 ||
+      oci_policy_format(p->expected, sizeof(p->expected),
+        "{\"nftables\":[{\"table\":{\"family\":\"inet\",\"name\":\"%s\"}},"
+        "{\"chain\":{\"family\":\"inet\",\"table\":\"%s\",\"name\":\"forward\","
+        "\"type\":\"filter\",\"hook\":\"forward\",\"prio\":0,\"policy\":\"accept\"}}",
+        p->table, p->table) < 0) return -1;
+  p->script_size = strlen(p->script); p->expected_size = strlen(p->expected);
+  /* Neither protocol nor port is restricted here. Host-local service traffic
+   * traverses INPUT/OUTPUT, not this FORWARD-only negative fence. */
+  for (unsigned int i = 0; i < 6; ++i) {
+    const char *first = i < 3 ? "iif" : "oif";
+    const char *second = i == 0 ? "iifname" : i == 1 ? "oif" : i == 2 ? "oifname" :
+                         i == 3 ? "oifname" : i == 4 ? "iif" : "iifname";
+    char value[64], json_value[64], text[1024], json[2048];
+    if (i == 1 || i == 4) {
+      if (oci_policy_format(value, sizeof(value), "%u", p->uplink_index) < 0) return -1;
+      /* v1.1.1 prints ifindex expressions as the current interface name,
+       * including with -n; current() bookends that name/index/MAC tuple. */
+      if (oci_policy_format(json_value, sizeof(json_value), "\"%s\"", p->uplink_name) < 0) return -1;
+    } else {
+      const char *name = i == 0 || i == 3 ? p->host_name : p->uplink_name;
+      if (oci_policy_format(value, sizeof(value), "\"%s\"", name) < 0) return -1;
+      memcpy(json_value, value, strlen(value) + 1);
+    }
+    if (oci_policy_format(text, sizeof(text),
+        "add rule inet %s forward meta %s %u meta %s != %s drop comment \"host_path_%u\"\n",
+        p->table, first, p->host_index, second, value, i) < 0 ||
+        oci_policy_format(json, sizeof(json),
+        ",{\"rule\":{\"family\":\"inet\",\"table\":\"%s\",\"chain\":\"forward\","
+        "\"expr\":[{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"%s\"}},\"right\":\"%s\"}},"
+        "{\"match\":{\"op\":\"!=\",\"left\":{\"meta\":{\"key\":\"%s\"}},\"right\":%s}},"
+        "{\"drop\":null}],\"comment\":\"host_path_%u\"}}",
+        p->table, first, p->host_name, second, json_value, i) < 0 ||
+        oci_policy_append(p->script, &p->script_size, sizeof(p->script), text) < 0 ||
+        oci_policy_append(p->expected, &p->expected_size, sizeof(p->expected), json) < 0) return -1;
+  }
+  return oci_policy_append(p->expected, &p->expected_size, sizeof(p->expected), "]}");
+}
+
+/* echo==1 is accepted only for the original successful create command. GETs
+ * can compare an already retained handle; they can never create ownership. */
+static int oci_host_path_readback(struct oci_host_path_owner *p, const char *bytes, size_t size, int echo) {
+  struct oci_policy_tree actual = {0}, expected = {0};
+  int result = -1; uint64_t handle = 0;
+  if ((echo ? p->handle || !p->joined[1] || !p->ok[1] : !p->handle) ||
+      oci_policy_tree(&actual, bytes, size) < 0 ||
+      oci_policy_tree(&expected, p->expected, p->expected_size) < 0) goto done;
+  unsigned int aa = oci_policy_get(&actual, 1, "nftables"), ea = oci_policy_get(&expected, 1, "nftables");
+  if (!aa || !ea || actual.nodes[1].first != aa || actual.nodes[aa].next ||
+      actual.nodes[aa].kind != OP_ARRAY || expected.nodes[ea].kind != OP_ARRAY) goto done;
+  unsigned int wanted = expected.nodes[ea].first, metadata = 0, objects = 0;
+  for (unsigned int item = actual.nodes[aa].first; item; item = actual.nodes[item].next) {
+    unsigned int body = actual.nodes[item].first;
+    if (actual.nodes[item].kind != OP_OBJECT || !body || actual.nodes[body].next || actual.nodes[body].kind != OP_OBJECT) goto done;
+    if (oci_policy_key(&actual, body, "metainfo")) {
+      if (++metadata > 1 || oci_policy_meta(&actual, body) < 0) goto done;
+      continue;
+    }
+    if (echo) {
+      /* EXCL NEWTABLE is reported as create; chains/rules use add. */
+      if (!wanted || !oci_policy_key(&actual, body,
+          oci_policy_key(&expected, expected.nodes[wanted].first, "table") ? "create" : "add")) goto done;
+      body = actual.nodes[body].first;
+      if (!body || actual.nodes[body].next || actual.nodes[body].kind != OP_OBJECT) goto done;
+    }
+    if (!wanted) goto done;
+    unsigned int eb = expected.nodes[wanted].first;
+    if (actual.nodes[body].key_size != expected.nodes[eb].key_size ||
+        memcmp(actual.strings + actual.nodes[body].key, expected.strings + expected.nodes[eb].key, actual.nodes[body].key_size)) goto done;
+    int table = oci_policy_key(&actual, body, "table");
+    unsigned int *link = &actual.nodes[body].first;
+    while (*link) {
+      unsigned int i = *link;
+      if (oci_policy_key(&actual, i, "handle")) {
+        uint64_t value;
+        if (oci_policy_u64(&actual, i, &value) < 0 || !value) goto done;
+        if (table) handle = value;
+        *link = actual.nodes[i].next;
+      } else if (table && oci_policy_key(&actual, i, "flags")) {
+        if (actual.nodes[i].kind != OP_ARRAY || actual.nodes[i].first) goto done;
+        *link = actual.nodes[i].next;
+      } else link = &actual.nodes[i].next;
+    }
+    if (!oci_policy_equal(&actual, body, &expected, eb)) goto done;
+    objects++; wanted = expected.nodes[wanted].next;
+  }
+  if (wanted || objects != 8 || !handle || (!echo && handle != p->handle)) goto done;
+  if (echo) p->handle = handle; /* Entire original transaction echo validated. */
+  result = 0;
+done:
+  oci_policy_tree_free(&actual); oci_policy_tree_free(&expected);
+  if (result < 0) errno = EPROTO;
+  return result;
+}
+/* Cleanup compares the original transaction's table identity after the pair
+ * has disappeared. Rule ifindex printers can no longer resolve that pair name. */
+static int oci_host_path_tables(struct oci_host_path_owner *p, const char *bytes, size_t size, int present) {
+  struct oci_policy_tree actual = {0}; int result = -1; unsigned int found = 0;
+  if (!p->handle || (!present && (!p->joined[4] || !p->ok[4])) ||
+      oci_policy_tree(&actual, bytes, size) < 0) goto done;
+  unsigned int aa = oci_policy_get(&actual, 1, "nftables"), metadata = 0;
+  if (!aa || actual.nodes[1].first != aa || actual.nodes[aa].next || actual.nodes[aa].kind != OP_ARRAY) goto done;
+  for (unsigned int item = actual.nodes[aa].first; item; item = actual.nodes[item].next) {
+    unsigned int body = actual.nodes[item].first;
+    if (actual.nodes[item].kind != OP_OBJECT || !body || actual.nodes[body].next || actual.nodes[body].kind != OP_OBJECT) goto done;
+    if (oci_policy_key(&actual, body, "metainfo")) {
+      if (++metadata > 1 || oci_policy_meta(&actual, body) < 0) goto done;
+      continue;
+    }
+    if (!oci_policy_key(&actual, body, "table")) goto done;
+    unsigned int family = oci_policy_get(&actual, body, "family"), name = oci_policy_get(&actual, body, "name");
+    uint64_t handle = 0;
+    if (!family || !name || actual.nodes[family].kind != OP_STRING || actual.nodes[name].kind != OP_STRING ||
+        !actual.nodes[family].text_size || !actual.nodes[name].text_size ||
+        oci_policy_u64(&actual, oci_policy_get(&actual, body, "handle"), &handle) < 0 || !handle) goto done;
+    int named = oci_policy_string_is(&actual, family, "inet") && oci_policy_string_is(&actual, name, p->table);
+    if (handle == p->handle || named) {
+      if (!present || handle != p->handle || !named || ++found != 1) goto done;
+    }
+    for (unsigned int i = actual.nodes[body].first; i; i = actual.nodes[i].next) {
+      if (oci_policy_key(&actual, i, "family") || oci_policy_key(&actual, i, "name") || oci_policy_key(&actual, i, "handle")) continue;
+      if (!oci_policy_key(&actual, i, "flags") || actual.nodes[i].kind != OP_ARRAY) goto done;
+      if (named && actual.nodes[i].first) goto done;
+      /* Other tables are not inspected, adopted or altered. */
+    }
+  }
+  if (found != (unsigned int)present) goto done;
+  result = 0;
+done:
+  oci_policy_tree_free(&actual); if (result < 0) errno = EPROTO; return result;
+}
+static int oci_host_path_close_fd(struct oci_host_path_owner *p, int *slot) {
+  if (*slot < 0) return 0;
+  int fd = *slot; *slot = -1;
+  if (close(fd) < 0) { p->close_unknown = 1; return -1; }
+  return 0;
+}
+static int oci_host_path_join(struct oci_host_path_owner *p, unsigned int stage, int timeout) {
+  if (stage >= OCI_HOST_PATH_STAGES || !p->pid[stage]) { errno = EINVAL; return -1; }
+  if (p->joined[stage]) return 0;
+  if (p->wait_attempted[stage]) { errno = EUCLEAN; return -1; }
+  struct pollfd fd = {.fd = p->pidfd[stage], .events = POLLIN};
+  int n = poll(&fd, 1, timeout);
+  if (n != 1 || fd.revents != POLLIN) { if (!errno) errno = n ? EPROTO : ETIMEDOUT; return -1; }
+  siginfo_t info; memset(&info, 0, sizeof(info));
+  p->wait_attempted[stage] = 1;
+  if (waitid(P_PIDFD, (id_t)p->pidfd[stage], &info, WEXITED | WNOHANG) < 0 ||
+      info.si_pid != p->pid[stage] || (info.si_code != CLD_EXITED && info.si_code != CLD_KILLED && info.si_code != CLD_DUMPED)) {
+    p->unknown = 1; return -1;
+  }
+  p->joined[stage] = 1;
+  p->ok[stage] = info.si_code == CLD_EXITED && !info.si_status;
+  return 0;
+}
+static _Noreturn void oci_host_path_child(struct oci_host_path_owner *p, unsigned int stage, int input, int output) {
+  struct tns_oci_owner *o = p->uplink->original;
+  int executable = fcntl(o->egress_binary, F_DUPFD_CLOEXEC, 10), network = fcntl(p->uplink->netfd, F_DUPFD_CLOEXEC, 10);
+  int incoming = fcntl(input, F_DUPFD_CLOEXEC, 10), outgoing = fcntl(output, F_DUPFD_CLOEXEC, 10);
+  if (executable < 0 || network < 0 || incoming < 0 || outgoing < 0 || dup3(executable, 3, O_CLOEXEC) < 0 ||
+      dup3(network, 4, O_CLOEXEC) < 0 || dup2(incoming, 0) != 0 || dup2(outgoing, 1) != 1 ||
+      syscall(SYS_close_range, 2u, 2u, 0u) < 0 || syscall(SYS_close_range, 5u, UINT_MAX, 0u) < 0 ||
+      prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != p->controller) _exit(125);
+  struct stat st; struct statfs fs;
+  if (fstat(4, &st) < 0 || fstatfs(4, &fs) < 0 || (unsigned long)fs.f_type != (unsigned long)NSFS_MAGIC ||
+      ioctl(4, NS_GET_NSTYPE) != CLONE_NEWNET || (uint64_t)st.st_dev != p->creator.device ||
+      (uint64_t)st.st_ino != p->creator.inode || setns(4, CLONE_NEWNET) < 0 || close(4) < 0) _exit(125);
+  int null = open("/dev/null", O_WRONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (null != 2 || fstat(null, &st) < 0 || !S_ISCHR(st.st_mode) || major(st.st_rdev) != 1 || minor(st.st_rdev) != 3) _exit(125);
+  for (int fd = 0; fd < 3; ++fd) {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0 || fcntl(fd, F_SETFD, 0) < 0) _exit(125);
+  }
+  char *const check[] = {"nft", "-c", "-f", "-", NULL};
+  char *const apply[] = {"nft", "-j", "-a", "-n", "-e", "-f", "-", NULL};
+  char *const readback[] = {"nft", "-j", "-a", "-n", "list", "table", "inet", p->table, NULL};
+  char *const remove[] = {"nft", "-f", "-", NULL};
+  char *const absent[] = {"nft", "-j", "-a", "-n", "list", "tables", NULL};
+  char *const environment[] = {"PATH=/usr/sbin:/usr/bin:/sbin:/bin", NULL};
+  char *const *argv = stage == 0 ? check : stage == 1 ? apply : stage == 2 ? readback : stage == 4 ? remove : stage == 3 || stage == 5 ? absent : NULL;
+  if (!argv) _exit(125);
+  umask(077); syscall(SYS_execveat, 3, "", argv, environment, AT_EMPTY_PATH); _exit(125);
+}
+static int oci_host_path_command(struct oci_host_path_owner *p, unsigned int stage, int64_t deadline, char *output, size_t *used) {
+  int cleaning = stage >= 3;
+  if (stage >= OCI_HOST_PATH_STAGES || p->attempted[stage] || p->unknown || p->close_unknown ||
+      (stage && !p->ok[stage - 1]) || oci_host_path_current(p, cleaning) < 0 || oci_egress_left(deadline) < 0) return -1;
+  p->attempted[stage] = 1; /* Each operation is consumed before any dispatch. */
+  int in[2] = {-1, -1}, out[2] = {-1, -1};
+  if (pipe2(in, O_CLOEXEC | O_NONBLOCK) < 0) goto fail;
+  if (pipe2(out, O_CLOEXEC | O_NONBLOCK) < 0) {
+    (void)oci_host_path_close_fd(p, &in[0]); (void)oci_host_path_close_fd(p, &in[1]); goto fail;
+  }
+  p->incoming[stage] = in[1]; p->outgoing[stage] = out[0];
+  struct clone_args args; memset(&args, 0, sizeof(args));
+  args.flags = CLONE_PIDFD | CLONE_CLEAR_SIGHAND; args.exit_signal = SIGCHLD;
+  args.pidfd = (uint64_t)(uintptr_t)&p->pidfd[stage];
+  long child = syscall(SYS_clone3, &args, sizeof(args));
+  if (!child) oci_host_path_child(p, stage, in[0], out[1]);
+  (void)oci_host_path_close_fd(p, &in[0]); (void)oci_host_path_close_fd(p, &out[1]);
+  if (child < 0) goto fail;
+  p->pid[stage] = (pid_t)child;
+  if (p->close_unknown || oci_host_path_current(p, cleaning) < 0) goto fail;
+  size_t at = 0, size = stage < 2 ? p->script_size : stage == 4 ? p->deletion_size : 0;
+  const char *bytes = stage == 4 ? p->deletion : p->script;
+  while (at < size) {
+    int left = oci_egress_left(deadline); struct pollfd fd = {.fd = p->incoming[stage], .events = POLLOUT};
+    if (left < 0 || (!cleaning && oci_not_canceled() < 0) || poll(&fd, 1, left) != 1 || fd.revents != POLLOUT) goto fail;
+    ssize_t n = write(fd.fd, bytes + at, size - at);
+    if (n <= 0 || (size_t)n > size - at) goto fail;
+    at += (size_t)n;
+  }
+  if (oci_host_path_close_fd(p, &p->incoming[stage]) < 0) goto fail;
+  *used = 0;
+  for (;;) {
+    int left = oci_egress_left(deadline); struct pollfd fd = {.fd = p->outgoing[stage], .events = POLLIN};
+    if (left < 0 || (!cleaning && oci_not_canceled() < 0) || *used >= OCI_POLICY_JSON_MAX || poll(&fd, 1, left) != 1 ||
+        (fd.revents != POLLIN && fd.revents != POLLHUP && fd.revents != (POLLIN | POLLHUP))) goto fail;
+    ssize_t n = read(fd.fd, output + *used, OCI_POLICY_JSON_MAX - *used);
+    if (n < 0 || (size_t)n > OCI_POLICY_JSON_MAX - *used) goto fail;
+    if (!n) break;
+    *used += (size_t)n;
+  }
+  if (oci_host_path_close_fd(p, &p->outgoing[stage]) < 0) goto fail;
+  int left = oci_egress_left(deadline);
+  if (left < 0 || oci_host_path_join(p, stage, left) < 0 || !p->ok[stage] || oci_host_path_current(p, cleaning) < 0) goto fail;
+  return 0;
+fail:
+  p->unknown = 1; if (!errno) errno = EPROTO; return -1;
+}
+static int oci_host_path_install(struct oci_uplink_owner *u) {
+  if (!u || u->host_path || !u->pair_known || !u->create_known || u->configured ||
+      !u->lock_held || oci_uplink_original(u) < 0 || oci_uplink_pair(u) < 0) { if (!errno) errno = EALREADY; return -1; }
+  struct oci_host_path_owner *p = calloc(1, sizeof(*p));
+  if (!p) return -1;
+  u->host_path = p; p->uplink = u; p->controller = getpid(); p->creator = u->creator; p->cookie = u->host_cookie;
+  p->host_index = u->host_index; p->guest_index = u->guest_index; p->uplink_index = u->expected.index;
+  memcpy(p->claim, u->original->id, sizeof(p->claim)); memcpy(p->host_name, u->host_name, 16); memcpy(p->uplink_name, u->expected.name, 16);
+  for (unsigned int i = 0; i < OCI_HOST_PATH_STAGES; ++i) p->pidfd[i] = p->incoming[i] = p->outgoing[i] = -1;
+  if (oci_host_path_current(p, 0) < 0 || oci_host_path_program(p) < 0) { p->unknown = 1; return -1; }
+  char *output = malloc(OCI_POLICY_JSON_MAX); if (!output) { p->unknown = 1; return -1; }
+  int result = -1; int64_t now = oci_now(); if (now < 0) goto done;
+  int64_t deadline = now + 10000; size_t used = 0;
+  if (oci_host_path_command(p, 0, deadline, output, &used) < 0 || used ||
+      oci_host_path_command(p, 1, deadline, output, &used) < 0 || oci_host_path_readback(p, output, used, 1) < 0 ||
+      oci_host_path_command(p, 2, deadline, output, &used) < 0 || oci_host_path_readback(p, output, used, 0) < 0 ||
+      oci_host_path_current(p, 0) < 0) goto done;
+  p->verified = 1; result = 0;
+done:
+  free(output); if (result < 0) { p->unknown = 1; if (!errno) errno = EPROTO; } return result;
+}
+static int oci_host_path_close(struct oci_uplink_owner *u) {
+  struct oci_host_path_owner *p = u ? u->host_path : NULL;
+  if (!p) return 0;
+  if (p->uplink != u || p->controller != getpid() || u->controller != getpid() || u->original->controller_pid != getpid()) { errno = EPERM; return -1; }
+  for (unsigned int i = 0; i < OCI_HOST_PATH_STAGES; ++i) {
+    if (p->pid[i] && !p->joined[i]) {
+      if (!p->killed[i]) {
+        p->killed[i] = 1;
+        if (syscall(SYS_pidfd_send_signal, p->pidfd[i], SIGKILL, NULL, 0) < 0 && errno != ESRCH) p->unknown = 1;
+      }
+      if (oci_host_path_join(p, i, 1000) < 0) return -1;
+    }
+    if (oci_host_path_close_fd(p, &p->incoming[i]) < 0 || oci_host_path_close_fd(p, &p->outgoing[i]) < 0) return -1;
+  }
+  if (p->pid[1]) {
+    if (p->unknown || p->close_unknown || !p->verified || !p->handle || !p->ok[1] || oci_host_path_current(p, 1) < 0) { errno = EUCLEAN; return -1; }
+    if (!p->removed) {
+      char *output = malloc(OCI_POLICY_JSON_MAX); if (!output) return -1;
+      int result = -1; int64_t now = oci_now(); size_t used = 0;
+      if (now >= 0 && oci_policy_format(p->deletion, sizeof(p->deletion), "delete table inet handle %llu\n", (unsigned long long)p->handle) == 0) {
+        p->deletion_size = strlen(p->deletion);
+        if (oci_host_path_command(p, 3, now + 10000, output, &used) == 0 && oci_host_path_tables(p, output, used, 1) == 0 &&
+            oci_host_path_command(p, 4, now + 10000, output, &used) == 0 && !used &&
+            oci_host_path_command(p, 5, now + 10000, output, &used) == 0 && oci_host_path_tables(p, output, used, 0) == 0 &&
+            oci_host_path_current(p, 1) == 0) { p->removed = 1; result = 0; }
+      }
+      free(output); if (result < 0) { p->unknown = 1; if (!errno) errno = EPROTO; return -1; }
+    }
+  }
+  for (unsigned int i = 0; i < OCI_HOST_PATH_STAGES; ++i) {
+    if (p->pid[i] && !p->joined[i]) { errno = EUCLEAN; return -1; }
+    if (oci_host_path_close_fd(p, &p->pidfd[i]) < 0) return -1;
+  }
+  if (p->close_unknown) { errno = EUCLEAN; return -1; }
+  explicit_bzero(p, sizeof(*p)); free(p); u->host_path = NULL; return 0;
+}
 #endif
