@@ -76,6 +76,7 @@ type OriginalOciCustody = {
   readonly physicalBinary: string | undefined;
   readonly hostTopology: LinuxOciHostTopology | undefined;
   readonly httpRecords: ReadonlyMap<string, DockerContainerCreateRecord>;
+  readonly httpRuntimes: ReadonlyMap<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>;
   readonly peerReads: Map<string, OriginalPeerRead>;
   readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
   readonly parents: ReadonlyMap<
@@ -133,6 +134,27 @@ export function originalLinuxOciHttpEndpoint(
     return fail("http_custody");
   return `http://${custody.hostTopology.peerIpv4Guest}:${httpPort}/`;
 }
+/** Internal source lookup only. This is the already-owned application runtime,
+ * never a replacement created from a claim or a positive retirement witness. */
+export function originalLinuxOciHttpRetirementSource(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+) {
+  const custody = originalOciCustodies.get(original);
+  if (!custody || custody.core !== core || custody.signal.aborted || signal.aborted)
+    return fail("http_custody");
+  const captured = custody.httpRecords.get(record.claimId);
+  const runtime = custody.httpRuntimes.get(record.claimId);
+  // A fresh creator has no old application-I/O source. Preserve its safe
+  // physical progress; absence never supplies an application join.
+  if (!captured && !runtime) return;
+  if (!captured || !runtime || canonicalJson(captured) !== canonicalJson(record))
+    return fail("http_custody");
+  return runtime;
+}
+
 const observeOriginalOciStarted = LinuxOciPhysicalSession.prototype.observeStarted;
 const stopOriginalOciInit = LinuxOciPhysicalSession.prototype.stopInit;
 const joinOriginalOciInit = LinuxOciPhysicalSession.prototype.joinInit;
@@ -1286,6 +1308,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     physicalBinary,
     hostTopology,
     httpRecords,
+    httpRuntimes,
     peerReads: new Map(),
     sessions: nativeSessions,
     parents,

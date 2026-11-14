@@ -48,6 +48,7 @@ import {
   observeOriginalLinuxOciOwnedInitReaped,
   observeOriginalLinuxOciOwnedNamespaceLifetime,
   observeOriginalLinuxOciOwnedRunning,
+  originalLinuxOciHttpRetirementSource,
   originalLinuxOciParentControlSource,
   prepareOriginalLinuxOciAllocationDisposal,
   prepareOriginalLinuxOciPeerInit,
@@ -2570,7 +2571,58 @@ export function createDockerContainerCoreOwner(
               if (observation.operation === "read-helper-result") {
                 // Exact original P's H join/EOF record only; no removed CAS or
                 // allocation cleanup is authorized by this private handoff.
-                read.observeHelperExited(signal);
+                const helper = read.observeHelperExited(signal);
+                const application = originalLinuxOciHttpRetirementSource(
+                  originalCustody,
+                  result,
+                  input,
+                  signal,
+                );
+                if (application) {
+                  // This exact live creator's application I/O, not P/H pipes.
+                  // Join its original irreversible close Promise; no count,
+                  // public progress or this necessary join grants removal.
+                  const localApplication = () => {
+                    if (
+                      signal.aborted ||
+                      !lease.active ||
+                      lease.controller.signal.aborted ||
+                      !leases.has(lease)
+                    )
+                      return fail();
+                    executionScope(execution);
+                    if (
+                      originalLinuxOciHttpRetirementSource(
+                        originalCustody,
+                        result,
+                        input,
+                        signal,
+                      ) !== application ||
+                      read.observeHelperExited(signal) !== helper
+                    )
+                      return fail();
+                  };
+                  const currentApplication = async () => {
+                    await assertSnapshot(loaded.proof);
+                    await assertExecution(execution);
+                    const row = await sql.query(
+                      "SELECT native_control FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=?",
+                      [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
+                    );
+                    if (
+                      row.length !== 1 ||
+                      row[0]?.native_control !== raw ||
+                      !(await current(lease))
+                    )
+                      return fail();
+                    localApplication();
+                  };
+                  await currentApplication();
+                  localApplication(); // no await before the actual close effect
+                  await application.close(); // same Promise owned from original admission closure
+                  await currentApplication();
+                  localApplication();
+                }
                 if (await inspectV2ContainerOwnerAllocationSchema(sql)) {
                   const cleanup = await sql.query(
                     "SELECT allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=?",
