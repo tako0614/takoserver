@@ -43,7 +43,7 @@ static struct {
   int connector, pidfd_unsupported, pidfd_short, old_pidfs, peer_dead, boot_other, boot_short;
   unsigned int self_opens, peer_gets, peer_checks, cap_writes, readonly_writes, connects;
   uint64_t self_inode, peer_inode; size_t boot_at;
-  unsigned char connector_reply[1024], expected_auth[124]; size_t connector_size, connector_at;
+  unsigned char connector_reply[2048], expected_auth[124]; size_t connector_size, connector_at;
   size_t connector_auth_at, connector_request_at;
 
 } pm;
@@ -637,7 +637,9 @@ static int model_management_send(const void *bytes,size_t size) {
   CHECK(frame[0]==0 && frame[1]==0 && frame[2]==0 && frame[3]==size-4);
   char command[256];memcpy(command,frame+4,size-4);command[size-4]=0;
   CHECK(!strcmp(command,"{\"kind\":\"linux-oci-parent-read-outcome@1\"}") ||
-    !strcmp(command,"{\"kind\":\"linux-oci-stop-init@1\"}") || !strcmp(command,"{\"kind\":\"linux-oci-join-init@1\"}"));
+    !strcmp(command,"{\"kind\":\"linux-oci-stop-init@1\"}") || !strcmp(command,"{\"kind\":\"linux-oci-join-init@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-release-namespace@1\"}") ||
+    !strcmp(command,"{\"kind\":\"linux-oci-continue-namespace-release@1\"}"));
   pm.manage_writes++;pm.frontend_sent_size=0;
   /* Raw process switch: original P has its own controller, not connector PID. */
   pm.connector=0;
@@ -647,6 +649,18 @@ static int model_management_send(const void *bytes,size_t size) {
     const char *reply=pm.manage_owner->request_kind==TNS_OCIP_STOP_INIT ?
       "{\"kind\":\"linux-oci-init-reaped@1\",\"nativeId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"namespaceDevice\":4,\"namespaceInode\":55,\"pidNamespaceDevice\":6,\"pidNamespaceInode\":77,\"barrier\":\"unproven\"}" :
       "{\"kind\":\"linux-oci-init-reaped-observation@1\",\"nativeId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"namespaceDevice\":4,\"namespaceInode\":55,\"pidNamespaceDevice\":6,\"pidNamespaceInode\":77,\"barrier\":\"unproven\"}";
+    char namespace_reply[512];
+    if(pm.manage_owner->request_kind==TNS_OCIP_RELEASE_NAMESPACE ||
+       pm.manage_owner->request_kind==TNS_OCIP_CONTINUE_NAMESPACE_RELEASE){
+      int n=snprintf(namespace_reply,sizeof(namespace_reply),
+        "{\"kind\":\"%s\",\"nativeId\":\"%s\",\"namespaceDevice\":4,\"namespaceInode\":55,"
+        "\"netCookie\":\"18446744073709551615\",\"fullIpSockets\":\"2\",\"requests\":\"0\","
+        "\"timewait\":\"1\",\"packetGroups\":\"3\",\"born\":1,\"releaseAttempted\":1,"
+        "\"referenceReleased\":1,\"netGone\":0,\"poisoned\":0,\"barrier\":\"unproven\"}",
+        pm.manage_owner->request_kind==TNS_OCIP_RELEASE_NAMESPACE ?
+          "linux-oci-namespace-release-observation@1":"linux-oci-namespace-release-continuation@1",CLAIM);
+      CHECK(n>0 && (size_t)n<sizeof(namespace_reply));reply=namespace_reply;
+    }
     pm.stream_size[0]=frame_bytes(pm.manage_h_reply,reply);pm.stream[0]=pm.manage_h_reply;pm.stream_at[0]=0;
     CHECK(ocipp_step(pm.manage_owner)<0 && !pm.manage_owner->awaiting);
   }
@@ -681,6 +695,48 @@ static void peer_management_only(void) {
   CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
   const char *bad[]={"{}","{\"kind\":\"linux-oci-parent-outcome@1\",\"requestKind\":00}","{\"kind\":\"linux-oci-parent-outcome@1\",\"requestKind\":999999999999999999999999999999}"};
   for(size_t i=0;i<sizeof(bad)/sizeof(bad[0]);++i){size_t amount=0;CHECK(ocipp_connector_outcome_size((const unsigned char*)bad[i],strlen(bad[i]),&amount)<0);}
+}
+/* New selector only: actual parent bootstrap/queue/loop/auth and connector
+ * bodies; fixed raw H replies do not stand in for actual namespace syscalls. */
+static void namespace_connector(struct ocipp_owner *o,const unsigned char request[172],const char *command,const char *expected) {
+  pm.connector=0;ocipp_host_lost(o);authenticate_frontend(o,0);
+  pm.connector_size=o->management_size;pm.connector_at=0;pm.connector_auth_at=pm.connector_request_at=0;
+  memcpy(pm.connector_reply,o->management_output,o->management_size);auth_bytes(o,pm.expected_auth);
+  pm.connector=pm.manage_mode=1;pm.manage_owner=o;
+  struct ocipp_connector c={0};unsigned char reply[512];size_t size=0;
+  CHECK(ocipp_connector_open(&c,request,172)==0);
+  unsigned int writes=pm.writes;
+  CHECK(ocipp_connector_init(&c,(const unsigned char*)command,strlen(command),reply,&size)<0 && pm.writes==writes);
+  CHECK(ocipp_connector_outcome(&c,c.deadline)==0 && pm.writes==writes);
+  static const char extra[]="{\"kind\":\"linux-oci-release-namespace@1\",\"target\":1}";
+  CHECK(ocipp_connector_init(&c,(const unsigned char*)extra,strlen(extra),reply,&size)<0 && pm.writes==writes);
+  CHECK(ocipp_connector_init(&c,(const unsigned char*)command,strlen(command),reply,&size)==0);
+  CHECK(pm.writes==writes+1 && memmem(reply,size,expected,strlen(expected)));
+  CHECK(ocipp_connector_init(&c,(const unsigned char*)command,strlen(command),reply,&size)<0 && pm.writes==writes+1);
+  CHECK(ocipp_connector_close(&c)==0);ocipp_connector_free(&c);pm.connector=0;
+}
+static void peer_namespace_only(void) {
+  struct ocipp_owner o;prepare_peer_parent(&o);unsigned char request[172];peer_request(&o,request);
+  CHECK(ocipp_first_create(&o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
+  CHECK(ocipp_spawn(&o)==0 && ocipp_flush_input(&o)==0);
+  pm.delivered_size=0; /* Bootstrap bytes were already delivered to the original Host. */
+  static const char created[]="{\"kind\":\"linux-oci-created-stopped@1\",\"nativeId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"namespaceDevice\":4,\"namespaceInode\":55,\"barrier\":\"unproven\"}";
+  pm.stream_size[0]=frame_bytes(pm.manage_h_reply,created);pm.stream[0]=pm.manage_h_reply;pm.stream_at[0]=0;
+  CHECK(ocipp_step(&o)<0 && !o.awaiting);
+  static const char stop[]="{\"kind\":\"linux-oci-stop-init@1\"}";
+  static const char join[]="{\"kind\":\"linux-oci-join-init@1\"}";
+  static const char release[]="{\"kind\":\"linux-oci-release-namespace@1\"}";
+  static const char resume[]="{\"kind\":\"linux-oci-continue-namespace-release@1\"}";
+  CHECK(ocipp_queue(&o,(const unsigned char*)resume,(uint32_t)strlen(resume))<0);
+  namespace_connector(&o,request,stop,"linux-oci-init-reaped@1");
+  namespace_connector(&o,request,join,"linux-oci-init-reaped-observation@1");
+  namespace_connector(&o,request,release,"linux-oci-namespace-release-observation@1");
+  unsigned int writes=pm.writes;
+  CHECK(ocipp_queue(&o,(const unsigned char*)release,(uint32_t)strlen(release))<0 && pm.writes==writes);
+  CHECK(ocipp_queue(&o,(const unsigned char*)stop,(uint32_t)strlen(stop))<0 && pm.writes==writes);
+  namespace_connector(&o,request,resume,"linux-oci-namespace-release-continuation@1");
+  CHECK(pm.clones==1 && !o.joined && !o.eof[0] && !o.eof[1]);
+  CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 static void peer_instance_only(void) {
   for(int pending=0;pending<2;++pending){
@@ -718,6 +774,7 @@ static void peer_instance_only(void) {
   pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"peer-namespace")){peer_namespace_only();printf("new peer namespace only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-management")){peer_management_only();printf("new peer management only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-instance")){peer_instance_only();printf("new peer-instance only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"authentication-bounds")) {

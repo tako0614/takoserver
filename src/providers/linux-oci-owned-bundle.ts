@@ -485,6 +485,19 @@ export async function prepareOriginalLinuxOciPeerInit(
   const control = prepareAuthenticatedLinuxOciPeerInit(binary, binding, custody.signal);
   return Object.freeze({
     ...control,
+    advanceNamespace(nativeId: string, actualSignal: AbortSignal) {
+      const held = custody.peerReads.get(record.claimId);
+      if (
+        signal !== actualSignal ||
+        signal.aborted ||
+        custody.signal.aborted ||
+        !held ||
+        held.custody !== control ||
+        held.settlement !== control.settlement
+      )
+        return fail("parent_custody");
+      return control.advanceNamespace(nativeId, actualSignal);
+    },
     observeJoined(actualSignal: AbortSignal) {
       const held = custody.peerReads.get(record.claimId);
       if (

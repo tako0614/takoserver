@@ -23,6 +23,14 @@ async function fixture(
     normal?: boolean;
     configuredPeer?: boolean;
     joinFault?: "foreign" | "refused" | "unknown" | "pidns";
+    namespaceFault?:
+      | "retained"
+      | "lost"
+      | "foreign"
+      | "malformed"
+      | "unknown"
+      | "cookie"
+      | "regress";
     managementFault?: "incomplete" | "missing-reply" | "lost-reply";
   } = {},
 ) {
@@ -60,6 +68,9 @@ async function fixture(
         ? {}
         : { peerManagementFault: options.managementFault }),
       ...(options.joinFault === undefined ? {} : { peerJoinFault: options.joinFault }),
+      ...(options.namespaceFault === undefined
+        ? {}
+        : { peerNamespaceFault: options.namespaceFault }),
       ...(options.configuredPeer
         ? acceptedHttpSelection()
         : { nativeMode: "retire-pending" as const }),
@@ -682,11 +693,13 @@ test("peer normal configured CREATE reaches original START HTTP publisher comple
 // private connector closure; modeled H frames do not qualify native/kernel flow.
 async function originalConfiguredPeerForJoin(
   joinFault?: "foreign" | "refused" | "unknown" | "pidns",
+  namespaceFault?: "retained" | "lost" | "foreign" | "malformed" | "unknown" | "cookie" | "regress",
 ) {
   const f = await fixture({
       normal: true,
       configuredPeer: true,
       ...(joinFault === undefined ? {} : { joinFault }),
+      ...(namespaceFault === undefined ? {} : { namespaceFault }),
     }),
     raw = acceptedRawHttp();
   raw.onEnd(() => {
@@ -858,5 +871,180 @@ test("peer JOIN changed captured PIDNS cannot supply a stopped record", async ()
   } finally {
     await x.fresh.close().catch(() => undefined);
     await x.close();
+  }
+});
+
+// New namespace cohort uses actual configured CREATE/STOP/JOIN and memorySQL.
+// No old case is invoked and raw H frames are not native namespace execution.
+async function originalJoinedPeer(
+  namespaceFault?: Parameters<typeof originalConfiguredPeerForJoin>[1],
+) {
+  const x = await originalConfiguredPeerForJoin(undefined, namespaceFault);
+  try {
+    expect(await x.fresh.engine.runNext()).toMatchObject({
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(await x.f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "exited" },
+    ]);
+    await x.fresh.close();
+    x.f.advanceNormalClock(61_000);
+    return { ...x, next: x.f.reconstructNormal() };
+  } catch (e) {
+    await x.fresh.close().catch(() => undefined);
+    await x.close();
+    throw e;
+  }
+}
+const releaseCount = (f: Fixture) =>
+  f.nativeCounts().requests.filter((k) => k === "linux-oci-release-namespace@1").length;
+const continueCount = (f: Fixture) =>
+  f.nativeCounts().requests.filter((k) => k === "linux-oci-continue-namespace-release@1").length;
+async function nextNamespace(x: Awaited<ReturnType<typeof originalJoinedPeer>>) {
+  await x.next.close().catch(() => undefined);
+  x.f.advanceNormalClock(61_000);
+  return x.f.reconstructNormal();
+}
+test("peer namespace exact original JOIN and SQL exited route RELEASE then same P CONTINUE only", async () => {
+  const x = await originalJoinedPeer();
+  try {
+    expect(await x.next.engine.runNext()).toMatchObject({
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(releaseCount(x.f)).toBe(1);
+    expect(continueCount(x.f)).toBe(0);
+    const later = await nextNamespace(x);
+    try {
+      expect(await later.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(releaseCount(x.f)).toBe(1);
+      expect(continueCount(x.f)).toBe(1);
+      expect(stopCount(x.f)).toBe(1);
+      expect(x.f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(
+        1,
+      );
+      expect(
+        x.f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-bootstrap@2"),
+      ).toHaveLength(1);
+      expect(
+        (await x.f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state,
+      ).toBe("bound");
+      expect((await x.f.sql.query("SELECT phase FROM tf_v2_resources"))[0]?.phase).toBe("deleting");
+      expect(x.f.network).not.toHaveBeenCalled();
+      await later.close();
+    } finally {
+      await later.close().catch(() => undefined);
+    }
+  } finally {
+    await x.next.close().catch(() => undefined);
+    await x.close();
+  }
+});
+test("peer namespace retained refusal or lost delivery continues captured original phase without RELEASE replay", async () => {
+  for (const fault of ["retained", "lost"] as const) {
+    const x = await originalJoinedPeer(fault);
+    try {
+      expect(await x.next.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(releaseCount(x.f)).toBe(1);
+      const later = await nextNamespace(x);
+      try {
+        expect(await later.engine.runNext()).toMatchObject({
+          status: "reconciling",
+          effect: "unknown",
+        });
+        expect(releaseCount(x.f)).toBe(1);
+        expect(continueCount(x.f)).toBe(1);
+        expect(stopCount(x.f)).toBe(1);
+      } finally {
+        await later.close().catch(() => undefined);
+      }
+    } finally {
+      await x.next.close().catch(() => undefined);
+      await x.close();
+    }
+  }
+});
+for (const fault of ["unknown", "foreign", "malformed", "cookie", "regress"] as const) {
+  test(`peer namespace rejects ${fault} original namespace facts`, async () => {
+    const x = await originalJoinedPeer(fault);
+    try {
+      expect(await x.next.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(releaseCount(x.f)).toBe(1);
+      const later = await nextNamespace(x);
+      try {
+        expect(await later.engine.runNext()).toMatchObject({
+          status: "reconciling",
+          effect: "unknown",
+        });
+        expect(releaseCount(x.f)).toBe(1);
+        expect(continueCount(x.f)).toBe(fault === "cookie" || fault === "regress" ? 1 : 0);
+        // Rejected connector custody cannot make close a success.
+        await expect(later.close()).rejects.toThrow();
+      } finally {
+        await later.close().catch(() => undefined);
+      }
+    } finally {
+      await x.next.close().catch(() => undefined);
+      await x.close();
+    }
+  });
+}
+test("peer namespace fresh SQL cancel and final awaited execution fence issue no RELEASE", async () => {
+  for (const fault of ["row", "cancel", "execution"]) {
+    const x = await originalJoinedPeer(),
+      query = x.f.sql.query.bind(x.f.sql);
+    let seen = false,
+      armed = false;
+    const spy = spyOn(x.f.sql, "query").mockImplementation(async (sql, params) => {
+      const rows = await query(sql, params);
+      if (
+        !seen &&
+        controlRead(sql) &&
+        x.f.nativeCounts().requests.filter((k) => k === "linux-oci-parent-read-outcome@2").length >=
+          3
+      ) {
+        if (fault === "row") {
+          seen = true;
+          return [{ native_control: null }];
+        }
+        armed = true;
+      } else if (armed && !seen && sql.includes(" WHERE i.resource_uid=? AND v.generation=?")) {
+        armed = false;
+        seen = true;
+        if (fault === "cancel") void x.next.close().catch(() => undefined);
+        else {
+          const e = x.f.execution;
+          if (!e) throw Error("original execution absent");
+          Reflect.set(e, "leaseToken", "synthetic-namespace-late-lease");
+        }
+      }
+      return rows;
+    });
+    try {
+      expect(await x.next.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(seen).toBe(true);
+      expect(releaseCount(x.f)).toBe(0);
+      expect(stopCount(x.f)).toBe(1);
+      expect(await query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+        { state: "exited" },
+      ]);
+    } finally {
+      spy.mockRestore();
+      await x.next.close().catch(() => undefined);
+      await x.close();
+    }
   }
 });

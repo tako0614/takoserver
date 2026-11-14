@@ -823,8 +823,12 @@ static int ocipp_connector_init(struct ocipp_connector *c, const unsigned char *
                                  unsigned char reply[512], size_t *reply_size) {
   static const char stop[] = "{\"kind\":\"linux-oci-stop-init@1\"}";
   static const char join[] = "{\"kind\":\"linux-oci-join-init@1\"}";
+  static const char release[] = "{\"kind\":\"linux-oci-release-namespace@1\"}";
+  static const char resume[] = "{\"kind\":\"linux-oci-continue-namespace-release@1\"}";
   const char *command = size == sizeof(stop)-1 && !memcmp(body,stop,size) ? stop :
-    size == sizeof(join)-1 && !memcmp(body,join,size) ? join : NULL;
+    size == sizeof(join)-1 && !memcmp(body,join,size) ? join :
+    size == sizeof(release)-1 && !memcmp(body,release,size) ? release :
+    size == sizeof(resume)-1 && !memcmp(body,resume,size) ? resume : NULL;
   if (!command || c->outcome_phase != 2 || c->init_attempt || ocipp_connector_current(c) < 0) return -1;
   c->init_attempt = 1; /* consumed before the sole fixed command write */
   int64_t now = ocip_now(); if (now < 0) return -1;

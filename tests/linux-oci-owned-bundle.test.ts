@@ -76,6 +76,14 @@ async function fixture(
     readonly peerPending?: boolean;
     readonly peerManagementFault?: "incomplete" | "missing-reply" | "lost-reply";
     readonly peerJoinFault?: "foreign" | "refused" | "unknown" | "pidns";
+    readonly peerNamespaceFault?:
+      | "retained"
+      | "lost"
+      | "foreign"
+      | "malformed"
+      | "unknown"
+      | "cookie"
+      | "regress";
     readonly parentFault?: "foreign-claim" | "foreign-generation";
     readonly fixedKeys?: { readonly key: CryptoKey; readonly comparison: CryptoKey };
     readonly extraImage?: boolean;
@@ -377,6 +385,63 @@ async function fixture(
               managementSent = true;
               const command = JSON.parse(frame.subarray(4).toString("utf8"));
               if (
+                [
+                  "linux-oci-release-namespace@1",
+                  "linux-oci-continue-namespace-release@1",
+                ].includes(command.kind)
+              ) {
+                if (Object.keys(command).length !== 1 || !(peerEffects & (1 << 6)))
+                  throw Error("namespace before original STOP/JOIN");
+                const release = command.kind === "linux-oci-release-namespace@1";
+                if (release ? peerEffects & (1 << 8) : !(peerEffects & (1 << 8)))
+                  throw Error("namespace effect replay or missing RELEASE");
+                nativeRequests.push(command.kind);
+                peerKind = release ? 8 : 9;
+                peerEffects |= 1 << 8;
+                peerBytes = frame.length;
+                if (!originalCreate || typeof originalCreate.claimId !== "string")
+                  throw Error("original peer native absent");
+                const fault = adversarial.peerNamespaceFault;
+                peerReply = {
+                  kind: release
+                    ? "linux-oci-namespace-release-observation@1"
+                    : "linux-oci-namespace-release-continuation@1",
+                  nativeId: fault === "foreign" ? "f".repeat(64) : originalCreate.claimId,
+                  namespaceDevice: 4,
+                  namespaceInode: 55,
+                  netCookie: !release && fault === "cookie" ? "2" : "18446744073709551615",
+                  fullIpSockets: "2",
+                  requests: fault === "malformed" ? 0 : "0",
+                  timewait: "1",
+                  packetGroups: "3",
+                  born: 1,
+                  releaseAttempted: 1,
+                  referenceReleased: !release && fault === "regress" ? 0 : 1,
+                  netGone: 0,
+                  poisoned: 0,
+                  barrier: "unproven",
+                };
+                if (release && fault === "retained")
+                  peerReply = {
+                    kind: "linux-oci-refused@1",
+                    stage: "release-namespace",
+                    errno: 11,
+                    custody: "retained",
+                    barrier: "unproven",
+                  };
+                const lost = release && (fault === "lost" || fault === "unknown");
+                if (release && fault === "unknown") peerReply = undefined;
+                if (!lost) reply(peerReply);
+                done();
+                queueMicrotask(() => {
+                  stdout.end();
+                  stderr.end();
+                  child.emit("exit", lost ? 77 : 0, null);
+                  child.emit("close", lost ? 77 : 0, null);
+                });
+                return;
+              }
+              if (
                 Object.keys(command).length !== 1 ||
                 !["linux-oci-stop-init@1", "linux-oci-join-init@1"].includes(command.kind)
               )
@@ -439,10 +504,13 @@ async function fixture(
                 frame.readBigUInt64BE(132) === 0x123456789abcdef0n &&
                 frame.subarray(140).equals(Buffer.from("11111111-2222-4333-8444-555555555555"));
               if (valid && managing) {
-                const body = Buffer.from(JSON.stringify(peerReply)),
-                  captured = Buffer.alloc(body.length + 4);
-                captured.writeUInt32BE(body.length);
-                body.copy(captured, 4);
+                const body =
+                    peerReply === undefined ? undefined : Buffer.from(JSON.stringify(peerReply)),
+                  captured = body ? Buffer.alloc(body.length + 4) : Buffer.alloc(0);
+                if (body) {
+                  captured.writeUInt32BE(body.length);
+                  body.copy(captured, 4);
+                }
                 const missing = adversarial.peerManagementFault === "missing-reply";
                 reply({
                   kind: "linux-oci-parent-outcome@1",

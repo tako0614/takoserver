@@ -1422,6 +1422,39 @@ export function createDockerContainerCoreOwner(
     if (saved.state !== "bound" || saved.nativeId !== input.nativeId) return fail();
     return { ...loaded, record: saved };
   }
+  async function boundInitPhase(loaded: BoundStart) {
+    const rows = await sql.query(
+      "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
+      [loaded.intent.resourceUid, loaded.intent.policy.generation],
+    );
+    if (rows.length === 0) return "unclaimed";
+    const row = rows[0];
+    if (rows.length !== 1 || !row) return fail();
+    const claimed = row.claimed_at_ms,
+      running = row.confirmed_running_at_ms,
+      exited = row.confirmed_exited_at_ms;
+    if (
+      row.attempt !== 1 ||
+      row.create_claim_id !== loaded.record.claimId ||
+      row.native_id !== loaded.record.nativeId ||
+      typeof claimed !== "number" ||
+      !Number.isSafeInteger(claimed) ||
+      claimed < 0 ||
+      typeof running !== "number" ||
+      !Number.isSafeInteger(running) ||
+      running < claimed
+    )
+      return fail();
+    if (row.state === "running" && exited === null) return "running";
+    if (
+      row.state === "exited" &&
+      typeof exited === "number" &&
+      Number.isSafeInteger(exited) &&
+      exited >= running
+    )
+      return "exited";
+    return fail();
+  }
   async function startState(loaded: BoundStart) {
     const rows = await sql.query(
       "SELECT resource_uid,generation,attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
@@ -2309,36 +2342,8 @@ export function createDockerContainerCoreOwner(
       executionScope(execution);
     };
     const startPhase = async () => {
-      const rows = await sql.query(
-        "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
-        [loaded.intent.resourceUid, loaded.intent.policy.generation],
-      );
-      const row = rows[0];
-      if (rows.length !== 1 || !row) return fail();
-      const claimed = row.claimed_at_ms,
-        running = row.confirmed_running_at_ms,
-        exited = row.confirmed_exited_at_ms;
-      if (
-        row.attempt !== 1 ||
-        row.create_claim_id !== captured.claimId ||
-        row.native_id !== captured.nativeId ||
-        typeof claimed !== "number" ||
-        !Number.isSafeInteger(claimed) ||
-        claimed < 0 ||
-        typeof running !== "number" ||
-        !Number.isSafeInteger(running) ||
-        running < claimed
-      )
-        return fail();
-      if (row.state === "running" && exited === null) return "running";
-      if (
-        row.state === "exited" &&
-        typeof exited === "number" &&
-        Number.isSafeInteger(exited) &&
-        exited >= running
-      )
-        return "exited";
-      return fail();
+      const phase = await boundInitPhase(loaded);
+      return phase === "unclaimed" ? fail() : phase;
     };
     await guard();
     const phase = await startPhase();
@@ -2533,6 +2538,7 @@ export function createDockerContainerCoreOwner(
               await read.begin(signal); // original P outcome only; H writes still zero
               await assertSnapshot(loaded.proof);
               await assertExecution(execution);
+              const boundPhase = await boundInitPhase(await boundStartRecord(input));
               const guarded = await sql.query(
                 "SELECT native_control FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=?",
                 [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
@@ -2549,7 +2555,9 @@ export function createDockerContainerCoreOwner(
                 return fail();
               executionScope(execution);
               read.assertCurrent();
-              observation = await read.advance(input.nativeId, signal);
+              observation = await (boundPhase === "exited"
+                ? read.advanceNamespace(input.nativeId, signal)
+                : read.advance(input.nativeId, signal));
               if (observation.operation === "join-init") {
                 // Only the same actual private connector can supply this original
                 // consuming JOIN observation. The public progress is not a witness.

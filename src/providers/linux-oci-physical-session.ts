@@ -2056,12 +2056,17 @@ export interface LinuxOciPeerInitOutcome {
 }
 export interface LinuxOciPeerInitProgress {
   readonly kind: "linux-oci-peer-init-progress@1";
-  readonly operation: "stop-init" | "join-init";
+  readonly operation:
+    | "stop-init"
+    | "join-init"
+    | "release-namespace"
+    | "continue-namespace-release";
   readonly reply: Reply;
   readonly barrier: "unproven";
 }
 /** Owning internal two-stage connector. No caller-selected target or command;
- * advance selects only original STOP/JOIN from this connection's past facts. */
+ * The owning Core selects init or namespace routing after its fresh SQL guard.
+ * Each route selects a fixed command from this connection's original past facts. */
 export function prepareAuthenticatedLinuxOciPeerInit(
   binary: string,
   binding: unknown,
@@ -2076,7 +2081,7 @@ export function prepareAuthenticatedLinuxOciPeerInit(
     outcome: LinuxOciPeerInitOutcome | undefined,
     captured: Reply | undefined;
   let reply: Reply | undefined,
-    operation: "stop-init" | "join-init" | undefined,
+    operation: LinuxOciPeerInitProgress["operation"] | undefined,
     phase: "outcome" | "paused" | "reply" | "done" = "outcome";
   let commandWritten = false,
     written = false,
@@ -2246,7 +2251,11 @@ export function prepareAuthenticatedLinuxOciPeerInit(
           reply.kind !==
           (operation === "stop-init"
             ? "linux-oci-init-reaped@1"
-            : "linux-oci-init-reaped-observation@1")
+            : operation === "join-init"
+              ? "linux-oci-init-reaped-observation@1"
+              : operation === "release-namespace"
+                ? "linux-oci-namespace-release-observation@1"
+                : "linux-oci-namespace-release-continuation@1")
         )
           throw failure();
         if (
@@ -2258,6 +2267,17 @@ export function prepareAuthenticatedLinuxOciPeerInit(
                 reply.namespaceInode !== captured.namespaceInode)))
         )
           throw failure();
+        if (
+          "netCookie" in reply &&
+          captured &&
+          "netCookie" in captured &&
+          (reply.netCookie !== captured.netCookie ||
+            reply.releaseAttempted < captured.releaseAttempted ||
+            reply.referenceReleased < captured.referenceReleased ||
+            reply.netGone < captured.netGone ||
+            reply.poisoned < captured.poisoned)
+        )
+          throw failure();
         check();
         return;
       }
@@ -2267,6 +2287,32 @@ export function prepareAuthenticatedLinuxOciPeerInit(
     }
   };
   let expectedNative: string | undefined;
+  const send = (nativeId: string) => {
+    expectedNative = nativeId;
+    sent = true;
+    phase = "reply";
+    const body = Buffer.from(
+        JSON.stringify({
+          kind: `linux-oci-${operation}@1`,
+        }),
+      ),
+      request = Buffer.alloc(body.length + 4);
+    request.writeUInt32BE(body.length);
+    body.copy(request, 4);
+    try {
+      current();
+      state.connector!.stdin.write(request, (error) => {
+        if (error) stop();
+        else {
+          commandWritten = true;
+          check();
+        }
+      });
+    } catch {
+      stop();
+    }
+    return result;
+  };
   return Object.freeze({
     outcome: observed,
     settlement: result,
@@ -2387,30 +2433,48 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       }
       if ("nativeId" in captured && captured.nativeId !== nativeId)
         throw failure("parent_peer_phase");
-      expectedNative = nativeId;
-      sent = true;
-      phase = "reply";
-      const body = Buffer.from(
-          JSON.stringify({
-            kind: operation === "stop-init" ? "linux-oci-stop-init@1" : "linux-oci-join-init@1",
-          }),
-        ),
-        request = Buffer.alloc(body.length + 4);
-      request.writeUInt32BE(body.length);
-      body.copy(request, 4);
-      try {
-        current();
-        state.connector!.stdin.write(request, (error) => {
-          if (error) stop();
-          else {
-            commandWritten = true;
-            check();
-          }
-        });
-      } catch {
-        stop();
+      return send(nativeId);
+    },
+    advanceNamespace(nativeId: string, actualSignal: AbortSignal) {
+      current();
+      if (
+        signal !== actualSignal ||
+        sent ||
+        phase !== "paused" ||
+        !outcome ||
+        !captured ||
+        !CLAIM.test(nativeId) ||
+        outcome.requestBytes === "0" ||
+        outcome.requestBytes !== outcome.issuedBytes
+      )
+        throw failure("parent_peer_phase");
+      const allowed = (1 << 1) | (1 << 4) | (1 << 6) | (1 << 8);
+      if (outcome.effects & ~allowed || !(outcome.effects & (1 << 6)))
+        throw failure("parent_peer_phase");
+      if (outcome.effects & (1 << 8)) {
+        if (
+          ![8, 9].includes(outcome.requestKind) ||
+          !(
+            captured.kind ===
+              (outcome.requestKind === 8
+                ? "linux-oci-namespace-release-observation@1"
+                : "linux-oci-namespace-release-continuation@1") ||
+            (captured.kind === "linux-oci-refused@1" &&
+              captured.custody === "retained" &&
+              captured.stage ===
+                (outcome.requestKind === 8 ? "release-namespace" : "continue-namespace-release"))
+          )
+        )
+          throw failure("parent_peer_phase");
+        operation = "continue-namespace-release";
+      } else {
+        if (outcome.requestKind !== 7 || captured.kind !== "linux-oci-init-reaped-observation@1")
+          throw failure("parent_peer_phase");
+        operation = "release-namespace";
       }
-      return result;
+      if ("nativeId" in captured && captured.nativeId !== nativeId)
+        throw failure("parent_peer_phase");
+      return send(nativeId);
     },
     /** Read only the observation produced by THIS completed original JOIN.
      * A STOP reply, public progress DTO or connector exit alone cannot supply it. */
