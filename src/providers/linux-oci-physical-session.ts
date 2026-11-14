@@ -1170,3 +1170,206 @@ export function createLinuxOciPhysicalSession(options: {
 }): LinuxOciPhysicalSession {
   return new LinuxOciPhysicalSession(options);
 }
+
+/** Original P bootstrap facts only. The cookie is lossless, not H identity,
+ * an accepted claim, a CREATE permission, or an authenticated reconnect. */
+export interface LinuxOciParentBootstrapInfo {
+  readonly kind: "linux-oci-parent-bootstrap@1";
+  readonly claimId: string;
+  readonly generation: number;
+  readonly listenerCookie: string;
+  readonly barrier: "unproven";
+}
+interface ParentBootstrapPending {
+  readonly resolve: (info: LinuxOciParentBootstrapInfo) => void;
+  readonly reject: (error: Error) => void;
+  readonly timer: ReturnType<typeof setTimeout>;
+  readonly signal: AbortSignal;
+  readonly abort: () => void;
+}
+
+/** Internal opt-in transport for a fresh original P only. Retain this object
+ * even on failure: it owns that original child, and never kills, replaces,
+ * closes its stdin, or turns P exit into the direct H exit oracle. This unit
+ * intentionally supplies no CREATE, reconnect, management or SQL operation. */
+export class LinuxOciParentBootstrap {
+  readonly #child: ChildProcessWithoutNullStreams;
+  readonly #assertBinary: () => void;
+  readonly #timeout: number;
+  readonly #claim: string;
+  readonly #generation: number;
+  readonly #capability: Buffer;
+  #buffer = Buffer.alloc(0);
+  #pending: ParentBootstrapPending | undefined;
+  #signal: AbortSignal | undefined;
+  #info: LinuxOciParentBootstrapInfo | undefined;
+  #attempted = false;
+  #usable = true;
+  #written = false;
+  #bootstrapped = false;
+  #stderr = 0;
+
+  constructor(options: {
+    readonly binary: string;
+    readonly claimId: string;
+    readonly generation: number;
+    readonly capability: Uint8Array;
+    readonly timeoutMs?: number;
+  }) {
+    this.#claim = options.claimId;
+    this.#generation = options.generation;
+    this.#timeout = options.timeoutMs ?? 20_000;
+    if (
+      typeof this.#claim !== "string" ||
+      !CLAIM.test(this.#claim) ||
+      !integer(this.#generation, 1) ||
+      !integer(this.#timeout, 1, 60_000) ||
+      !(options.capability instanceof Uint8Array) ||
+      options.capability.length !== 32
+    )
+      throw failure("parent_binding");
+    this.#capability = Buffer.from(options.capability);
+    if (!this.#capability.some((byte) => byte !== 0)) throw failure("parent_binding");
+    const binary = options.binary;
+    this.#assertBinary = ownedExecutable(binary);
+    this.#assertBinary();
+    this.#child = spawn(binary, ["--persistent-parent"], {
+      env: Object.create(null),
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    this.#child.stdout.on("data", (chunk: Buffer) => this.#data(chunk));
+    this.#child.stderr.on("data", (chunk: Buffer) => {
+      if (!Buffer.isBuffer(chunk) || chunk.length > STDERR_LIMIT - this.#stderr) this.#break();
+      else this.#stderr += chunk.length;
+    });
+    this.#child.stdin.on("error", () => this.#break());
+    this.#child.stdout.on("error", () => this.#break());
+    this.#child.stderr.on("error", () => this.#break());
+    this.#child.stdout.on("end", () => this.#break());
+    this.#child.stderr.on("end", () => this.#break());
+    this.#child.on("error", () => this.#break());
+    this.#child.on("exit", () => this.#break());
+    this.#child.on("close", () => this.#break());
+  }
+
+  async bootstrap(signal: AbortSignal): Promise<LinuxOciParentBootstrapInfo> {
+    if (this.#attempted) throw failure("one_use");
+    this.#attempted = true;
+    this.#signal = signal;
+    this.#current(signal);
+    const body = Buffer.alloc(112);
+    body.write("TKOBIND1", 0, "ascii");
+    body.write(this.#claim, 8, "ascii");
+    body.writeBigUInt64BE(BigInt(this.#generation), 72);
+    this.#capability.copy(body, 80);
+    const frame = Buffer.alloc(body.length + 4);
+    frame.writeUInt32BE(body.length);
+    body.copy(frame, 4);
+    body.fill(0);
+    const info = await new Promise<LinuxOciParentBootstrapInfo>((resolve, reject) => {
+      const abort = () => this.#break();
+      const timer = setTimeout(abort, this.#timeout);
+      this.#pending = { resolve, reject, timer, signal, abort };
+      signal.addEventListener("abort", abort, { once: true });
+      try {
+        this.#current(signal);
+        this.#child.stdin.write(frame, (error) => {
+          frame.fill(0);
+          if (error) this.#break();
+          else {
+            this.#written = true;
+            this.#finish();
+          }
+        });
+      } catch {
+        frame.fill(0);
+        this.#break();
+      }
+    });
+    // A synchronous trailing frame/EOF/P-exit/abort after resolve still wins
+    // before this async return. The caller must check again after its save.
+    this.#current(signal);
+    this.#bootstrapped = true;
+    return info;
+  }
+
+  /** Original transport/current executable only, never an SQL/fresh-claim gate.
+   * A later creator must call after durable save and before any first effect. */
+  assertCurrent(signal: AbortSignal): void {
+    this.#current(signal);
+    if (!this.#bootstrapped) throw failure("parent_unprepared");
+  }
+
+  #current(signal: AbortSignal): void {
+    if (!this.#usable || signal.aborted || this.#signal?.aborted) throw failure("parent_retained");
+    try {
+      this.#assertBinary();
+    } catch {
+      this.#break();
+      throw failure("parent_binary");
+    }
+  }
+
+  #break(): void {
+    this.#usable = false;
+    const pending = this.#pending;
+    if (!pending) return;
+    this.#pending = undefined;
+    clearTimeout(pending.timer);
+    pending.signal.removeEventListener("abort", pending.abort);
+    pending.reject(failure("parent_retained"));
+  }
+
+  #data(chunk: Buffer): void {
+    if (!this.#usable) return;
+    try {
+      if (!this.#pending || !Buffer.isBuffer(chunk) || chunk.length > 92 - this.#buffer.length)
+        throw failure();
+      this.#buffer = Buffer.concat([this.#buffer, chunk]);
+      if (this.#buffer.length < 4) return;
+      if (this.#buffer.readUInt32BE(0) !== 88) throw failure();
+      if (this.#buffer.length !== 92) return;
+      const body = this.#buffer.subarray(4);
+      const cookie = body.readBigUInt64BE(80);
+      if (
+        !body.subarray(0, 8).equals(Buffer.from("TKOINFO1", "ascii")) ||
+        !body.subarray(8, 72).equals(Buffer.from(this.#claim, "ascii")) ||
+        body.readBigUInt64BE(72) !== BigInt(this.#generation) ||
+        cookie === 0n
+      )
+        throw failure();
+      this.#info = Object.freeze({
+        kind: "linux-oci-parent-bootstrap@1",
+        claimId: this.#claim,
+        generation: this.#generation,
+        listenerCookie: cookie.toString(10),
+        barrier: "unproven",
+      });
+      this.#finish();
+    } catch {
+      this.#break();
+    }
+  }
+
+  #finish(): void {
+    const pending = this.#pending;
+    if (!pending || !this.#info || !this.#written) return;
+    try {
+      this.#current(pending.signal);
+    } catch {
+      this.#break();
+      return;
+    }
+    this.#pending = undefined;
+    clearTimeout(pending.timer);
+    pending.signal.removeEventListener("abort", pending.abort);
+    pending.resolve(this.#info);
+  }
+}
+
+export function createLinuxOciParentBootstrap(
+  options: ConstructorParameters<typeof LinuxOciParentBootstrap>[0],
+): LinuxOciParentBootstrap {
+  return new LinuxOciParentBootstrap(options);
+}
