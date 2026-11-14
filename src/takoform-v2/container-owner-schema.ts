@@ -529,10 +529,12 @@ const expectedRows = Object.freeze(
 );
 const readyPredicate = (
   encodeValue: (value: string, rowIndex: number, columnIndex: number) => string,
+  selectedRows = expectedRows,
+  selectedNames = names,
 ): string => `(
-  ${expectedRows.map((row, rowIndex) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`).join("\n  AND ")}
+  ${selectedRows.map((row, rowIndex) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`).join("\n  AND ")}
   AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE sql IS NOT NULL
-    AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${tableNames})) AND name NOT IN (${names}))
+    AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${tableNames})) AND name NOT IN (${selectedNames}))
   AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata')  AND source.sql IS NOT NULL AND instr(upper(source.sql), 'REFERENCES') = 0 THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
      WHERE  source.type = 'table' AND lower(fk."table") IN (${tableNames}) AND source.name NOT IN (${tableNames})) END)
   AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" IN (${tableNames}))
@@ -558,14 +560,100 @@ export async function inspectV2ContainerOwnerSchema(sql: Sql): Promise<boolean> 
   }
 }
 
+/** Explicit additive expand candidate only. Unregistered: not an applied
+ * migration, not part of the immutable legacy recipe, and never auto-applied.
+ * Old NULL rows cannot acquire a control binding. Only a fresh selected INSERT
+ * reserves this column, and only its one original pending save may seal it. */
+export const V2_CONTAINER_CONTROL_RESERVED = '{"kind":"linux-oci-control-reserved@1"}';
+const controlColumn =
+  "native_control TEXT CHECK (native_control IS NULL OR (typeof(native_control) = 'text' AND length(native_control) BETWEEN 1 AND 65536 AND json_valid(native_control)))";
+const controlGuards = Object.freeze([
+  trigger(
+    "native_control_insert",
+    Q,
+    "BEFORE INSERT",
+    refuse(
+      `NEW.native_control IS NULL OR (NEW.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)} AND NEW.state = 'pending' AND NEW.native_id IS NULL)`,
+    ),
+  ),
+  trigger(
+    "native_control_transition",
+    Q,
+    "BEFORE UPDATE",
+    refuse(`
+    (NEW.native_control IS OLD.native_control OR
+      (OLD.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)} AND OLD.state = 'pending' AND NEW.state = 'pending'
+       AND NEW.native_id IS NULL AND NEW.bound_at_ms IS NULL AND NEW.removed_at_ms IS NULL
+       AND json_valid(NEW.native_control) AND json_extract(NEW.native_control,'$.kind') = 'linux-oci-sealed-control@1'
+       AND json_extract(NEW.native_control,'$.scope.claimId') = OLD.claim_id
+       AND json_extract(NEW.native_control,'$.scope.resourceUid') = OLD.resource_uid
+       AND json_extract(NEW.native_control,'$.scope.generation') = OLD.generation
+       AND json_extract(NEW.native_control,'$.scope.installationId') = OLD.installation_id))
+    AND (NEW.state = 'pending' OR NEW.native_control IS NOT ${literal(V2_CONTAINER_CONTROL_RESERVED)})`),
+  ),
+]);
+const controlObjects = Object.freeze([
+  ...objects.map((item) =>
+    item.name === Q
+      ? object(
+          item.type,
+          item.name,
+          item.table,
+          item.sql.replace(
+            ",\n  PRIMARY KEY (resource_uid, generation),",
+            ", " + controlColumn + ",\n  PRIMARY KEY (resource_uid, generation),",
+          ),
+        )
+      : item,
+  ),
+  ...controlGuards,
+]);
+export const V2_CONTAINER_OWNER_CONTROL_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_RECIPE,
+  statements: Object.freeze([
+    `ALTER TABLE ${Q} ADD COLUMN ${controlColumn}`,
+    ...controlGuards.map((item) => item.sql),
+  ]),
+  objects: controlObjects,
+});
+const controlRows = Object.freeze(
+  controlObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const controlNames = controlObjects.map((item) => literal(item.name)).join(", ");
+const controlReadyParams = Object.freeze([JSON.stringify(controlRows)]);
+const controlReady =
+  "(WITH container_owner_control_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, rowIndex, columnIndex) =>
+      `json_extract((SELECT document FROM container_owner_control_values), '$[${rowIndex}][${columnIndex}]')`,
+    controlRows,
+    controlNames,
+  ) +
+  ")";
+export async function inspectV2ContainerOwnerControlSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(`SELECT ${controlReady} AS ready`, controlReadyParams);
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+
 /** Internal construction only. No request DTO, SQL claim or callback mints native authority. */
 export function createV2ContainerHostAcceptance(options: {
   readonly sql: Sql;
   readonly installationId: string;
   readonly backendId: string;
   readonly targetKey: string;
+  readonly ociParentControl?: "sealed-original@1";
 }): V2HostAcceptance {
   const { sql, installationId, backendId, targetKey } = options;
+  const selectedReady =
+    options.ociParentControl === "sealed-original@1" ? controlReady : runtimeReady;
+  const selectedReadyParams =
+    options.ociParentControl === "sealed-original@1" ? controlReadyParams : runtimeReadyParams;
   if (
     !sql ||
     typeof sql.query !== "function" ||
@@ -701,7 +789,7 @@ export function createV2ContainerHostAcceptance(options: {
           ]
         : [];
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${
+        sql: `${selectedReady} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
@@ -709,7 +797,7 @@ export function createV2ContainerHostAcceptance(options: {
             AND desired_generation = ? AND retired_at_ms IS NULL)`
         })${retainedMaterialGuard}`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           ...(c.action === "create"
             ? [c.resourceUid]
             : [
@@ -815,11 +903,11 @@ export function createV2ContainerHostAcceptance(options: {
       if (typeof workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload))
         throw new TypeError("invalid Container F2 workload revision");
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+        sql: `${selectedReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           c.resourceUid,
           installationId,
           c.principal,
@@ -932,7 +1020,7 @@ export function createV2ContainerHostAcceptance(options: {
             ).join("")
           : null;
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${
+        sql: `${selectedReady} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
@@ -940,7 +1028,7 @@ export function createV2ContainerHostAcceptance(options: {
             AND desired_generation = ? AND retired_at_ms IS NULL)`
         })`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           ...(c.action === "create"
             ? [c.resourceUid]
             : [
@@ -1040,11 +1128,11 @@ export function createV2ContainerHostAcceptance(options: {
       )
         throw new TypeError("frozen Container Form cannot accept sensitive inputs");
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+        sql: `${selectedReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           ...[
             c.resourceUid,
             installationId,

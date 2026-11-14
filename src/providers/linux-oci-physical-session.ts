@@ -1,6 +1,13 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { accessSync, constants, lstatSync } from "node:fs";
 import { isAbsolute, join, parse } from "node:path";
+import { canonicalDigest } from "../json.ts";
+import type { V2PrivateInputKey } from "../takoform-v2/private-inputs.ts";
+import {
+  encodeContainerSecretBytes,
+  encryptContainerSecretBytes,
+  isContainerSecretKey,
+} from "./container-secret-codec.ts";
 
 const LIMIT = 1_048_576;
 const STDERR_LIMIT = 65_536;
@@ -291,6 +298,7 @@ function project(request: LinuxOciCreateStoppedRequest) {
     kind: "linux-oci-create-stopped@1",
     ...data,
     claimId: data.claimId,
+    generation: data.generation,
     args,
     env,
   };
@@ -482,6 +490,13 @@ function ownedExecutable(binary: string) {
   };
 }
 
+// Only the original P method below may install this synchronous one-use
+// handoff. No caller-supplied ChildProcess/observation is accepted.
+const parentHandoffs = new WeakMap<
+  object,
+  { readonly child: ChildProcessWithoutNullStreams; readonly current: () => void }
+>();
+
 /** Holds its ORIGINAL child even when protocol/custody becomes unknown.
  * Its owner must retain this object; close cannot manufacture runtime deletion. */
 export class LinuxOciPhysicalSession {
@@ -524,19 +539,29 @@ export class LinuxOciPhysicalSession {
   #closePromise: Promise<void> | undefined;
   readonly #exitWaiters = new Set<() => void>();
 
-  constructor(options: {
-    readonly binary: string;
-    readonly timeoutMs?: number;
-  }) {
+  constructor(
+    options: {
+      readonly binary: string;
+      readonly timeoutMs?: number;
+    },
+    originalParent?: object,
+  ) {
+    const handoff = originalParent === undefined ? undefined : parentHandoffs.get(originalParent);
+    if (originalParent !== undefined) {
+      if (!handoff) throw failure("parent_handoff");
+      parentHandoffs.delete(originalParent);
+    }
     this.#timeout = options.timeoutMs ?? 20_000;
     if (!integer(this.#timeout, 1, 60_000)) throw failure();
-    this.#assertBinary = ownedExecutable(options.binary);
+    this.#assertBinary = handoff?.current ?? ownedExecutable(options.binary);
     this.#assertBinary();
-    this.#child = spawn(options.binary, [], {
-      env: Object.create(null),
-      shell: false,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    this.#child =
+      handoff?.child ??
+      spawn(options.binary, [], {
+        env: Object.create(null),
+        shell: false,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
     this.#child.stdout.on("data", (chunk: Buffer) => this.#data(chunk));
     this.#child.stderr.on("data", (chunk: Buffer) => {
       if (chunk.length > STDERR_LIMIT - this.#stderr) this.#break();
@@ -548,11 +573,19 @@ export class LinuxOciPhysicalSession {
     this.#child.stdout.on("end", () => this.#end());
     this.#child.on("error", () => this.#break());
     this.#child.on("exit", (code, signal) => {
+      if (handoff) {
+        this.#break();
+        return;
+      } // P is never the H exit oracle.
       this.#exit = { code, signal };
       if (code === 0 && signal === null) this.#end();
       else this.#break();
     });
     this.#child.on("close", () => {
+      if (handoff) {
+        this.#break();
+        return;
+      }
       this.#closed = true;
       this.#end();
       for (const done of this.#exitWaiters) done();
@@ -1191,7 +1224,8 @@ interface ParentBootstrapPending {
 /** Internal opt-in transport for a fresh original P only. Retain this object
  * even on failure: it owns that original child, and never kills, replaces,
  * closes its stdin, or turns P exit into the direct H exit oracle. This unit
- * intentionally supplies no CREATE, reconnect, management or SQL operation. */
+ * supplies same-P CREATE after the original creator seals its claim. It
+ * supplies no authenticated reconnect, result reader or SQL operation. */
 export class LinuxOciParentBootstrap {
   readonly #child: ChildProcessWithoutNullStreams;
   readonly #assertBinary: () => void;
@@ -1199,6 +1233,19 @@ export class LinuxOciParentBootstrap {
   readonly #claim: string;
   readonly #generation: number;
   readonly #capability: Buffer;
+  readonly #binary: string;
+  readonly #binaryIdentity: Readonly<{
+    path: string;
+    dev: number;
+    ino: number;
+    uid: number;
+    mode: number;
+  }>;
+  readonly #lifetime: AbortSignal | undefined;
+  #handoff = false;
+  #createAttempted = false;
+  #created = false;
+  #sealAttempted = false;
   #buffer = Buffer.alloc(0);
   #pending: ParentBootstrapPending | undefined;
   #signal: AbortSignal | undefined;
@@ -1215,6 +1262,7 @@ export class LinuxOciParentBootstrap {
     readonly generation: number;
     readonly capability: Uint8Array;
     readonly timeoutMs?: number;
+    readonly lifetimeSignal?: AbortSignal;
   }) {
     this.#claim = options.claimId;
     this.#generation = options.generation;
@@ -1231,7 +1279,19 @@ export class LinuxOciParentBootstrap {
     this.#capability = Buffer.from(options.capability);
     if (!this.#capability.some((byte) => byte !== 0)) throw failure("parent_binding");
     const binary = options.binary;
+    this.#binary = binary;
+    this.#lifetime = options.lifetimeSignal;
+    if (this.#lifetime?.aborted) throw failure("parent_retained");
     this.#assertBinary = ownedExecutable(binary);
+    this.#assertBinary();
+    const stat = lstatSync(binary);
+    this.#binaryIdentity = Object.freeze({
+      path: binary,
+      dev: stat.dev,
+      ino: stat.ino,
+      uid: stat.uid,
+      mode: stat.mode,
+    });
     this.#assertBinary();
     this.#child = spawn(binary, ["--persistent-parent"], {
       env: Object.create(null),
@@ -1301,8 +1361,99 @@ export class LinuxOciParentBootstrap {
     if (!this.#bootstrapped) throw failure("parent_unprepared");
   }
 
+  /** Ciphertext from THIS actual bootstrap/capability/executable only. A seal
+   * is not a SQL save or CREATE grant; the original creator must await both. */
+  async sealControlBinding(
+    key: V2PrivateInputKey,
+    scope: string,
+    signal: AbortSignal,
+    originalCreate: LinuxOciCreateStoppedRequest,
+  ) {
+    this.assertCurrent(signal);
+    if (
+      this.#sealAttempted ||
+      !isContainerSecretKey(key.key) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(key.id)
+    )
+      throw failure("parent_seal");
+    this.#sealAttempted = true;
+    const actual = project(originalCreate);
+    if (actual.claimId !== this.#claim || actual.generation !== this.#generation)
+      throw failure("parent_binding");
+    const keyId = key.id,
+      actualKey = key.key;
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const plaintext = encoder.encode(
+      JSON.stringify({
+        kind: "linux-oci-original-control@1",
+        claimId: this.#claim,
+        generation: this.#generation,
+        listenerCookie: this.#info?.listenerCookie,
+        capability: encodeContainerSecretBytes(this.#capability),
+        executable: this.#binaryIdentity,
+        // The request includes original loan secrets. Its unkeyed digest
+        // belongs only inside this ciphertext, never in public AAD/Sql scope.
+        createDigest: await canonicalDigest(actual),
+      }),
+    );
+    try {
+      const ciphertext = await encryptContainerSecretBytes(
+        actualKey,
+        nonce,
+        plaintext,
+        encoder.encode(scope),
+      );
+      this.assertCurrent(signal);
+      return Object.freeze({
+        keyId,
+        nonce: encodeContainerSecretBytes(nonce),
+        ciphertext: encodeContainerSecretBytes(new Uint8Array(ciphertext)),
+      });
+    } finally {
+      plaintext.fill(0);
+    }
+  }
+
+  async createStopped(request: LinuxOciCreateStoppedRequest, signal: AbortSignal) {
+    this.assertCurrent(signal);
+    if (this.#createAttempted) throw failure("one_use");
+    this.#createAttempted = true;
+    const actual = project(request);
+    if (actual.claimId !== this.#claim || actual.generation !== this.#generation)
+      throw failure("parent_binding");
+    this.#handoff = true;
+    parentHandoffs.set(this, {
+      child: this.#child,
+      current: () => this.#current(this.#lifetime ?? signal),
+    });
+    let session: LinuxOciPhysicalSession;
+    try {
+      session = new LinuxOciPhysicalSession(
+        { binary: this.#binary, timeoutMs: this.#timeout },
+        this,
+      );
+    } finally {
+      parentHandoffs.delete(this);
+    }
+    const observation = await session.createStopped(request, signal);
+    this.assertCurrent(signal);
+    this.#created = true;
+    return Object.freeze({ session, observation });
+  }
+
+  /** Only after original CREATE, bindNative and fresh same-Sql guard. This
+   * detaches the completed temporary loan, never creator-lifetime cancellation.
+   * Failed/aborted CREATE cannot get here or reset any one-use/UNKNOWN latch. */
+  finishCreateScope(signal: AbortSignal): void {
+    this.assertCurrent(signal);
+    if (!this.#created || !this.#lifetime || this.#lifetime.aborted)
+      throw failure("parent_retained");
+    this.#signal = undefined;
+  }
+
   #current(signal: AbortSignal): void {
-    if (!this.#usable || signal.aborted || this.#signal?.aborted) throw failure("parent_retained");
+    if (!this.#usable || signal.aborted || this.#signal?.aborted || this.#lifetime?.aborted)
+      throw failure("parent_retained");
     try {
       this.#assertBinary();
     } catch {
@@ -1322,7 +1473,7 @@ export class LinuxOciParentBootstrap {
   }
 
   #data(chunk: Buffer): void {
-    if (!this.#usable) return;
+    if (!this.#usable || this.#handoff) return;
     try {
       if (!this.#pending || !Buffer.isBuffer(chunk) || chunk.length > 92 - this.#buffer.length)
         throw failure();

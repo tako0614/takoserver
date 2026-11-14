@@ -48,6 +48,7 @@ import { createSelfhostLinuxOciCore } from "../src/selfhost-linux-oci-core.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
+import { V2_CONTAINER_OWNER_CONTROL_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2BackendResult, V2Execution } from "../src/takoform-v2/types.ts";
 
@@ -70,6 +71,9 @@ const digest = (bytes: Uint8Array) => `sha256:${createHash("sha256").update(byte
 async function fixture(
   corrupt = false,
   adversarial: {
+    readonly parentControl?: boolean;
+    readonly parentFault?: "foreign-claim" | "foreign-generation";
+    readonly fixedKeys?: { readonly key: CryptoKey; readonly comparison: CryptoKey };
     readonly extraImage?: boolean;
     readonly unsafeUnpackerParent?: boolean;
     readonly holdUnpacker?: boolean;
@@ -132,15 +136,20 @@ async function fixture(
     frameHostMigrationSql(additiveV2ConfiguredUpdateInputsDDL).map((sql) => ({ sql })),
   );
   await sql.batch(v2ContainerOwnerMigrationCandidate());
-  const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
-    "encrypt",
-    "decrypt",
-  ]);
-  const comparison = await crypto.subtle.generateKey(
-    { name: "HMAC", hash: "SHA-256", length: 256 },
-    false,
-    ["sign", "verify"],
-  );
+  if (adversarial.parentControl)
+    await sql.batch(V2_CONTAINER_OWNER_CONTROL_EXPAND.statements.map((sql) => ({ sql })));
+  const key =
+    adversarial.fixedKeys?.key ??
+    (await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+      "encrypt",
+      "decrypt",
+    ]));
+  const comparison =
+    adversarial.fixedKeys?.comparison ??
+    (await crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-256", length: 256 }, false, [
+      "sign",
+      "verify",
+    ]));
   const config = new TextEncoder().encode(
     JSON.stringify({
       architecture: "amd64",
@@ -245,6 +254,7 @@ async function fixture(
       backendId: "synthetic-oci-backend",
       targetKey: "synthetic-oci-target",
       configuredInputs,
+      ...(adversarial.parentControl ? { ociParentControl: "sealed-original@1" as const } : {}),
       artifactRoot,
       umociBinary: unpacker,
       ...(adversarial.nativeMode !== undefined && !adversarial.noPhysicalBinary
@@ -305,7 +315,7 @@ async function fixture(
     options: childProcess.SpawnOptions,
   ) => {
     if (file === physicalBinary) {
-      expect(args).toEqual([]);
+      expect(args).toEqual(adversarial.parentControl ? ["--persistent-parent"] : []);
       nativeProcesses++;
       if (adversarial.nativeMode === "closed-during-spawn") {
         nativeClosing = composition.close();
@@ -329,6 +339,21 @@ async function fixture(
         write(frame: Buffer, _encoding, done) {
           void (async () => {
             expect(frame.readUInt32BE(0)).toBe(frame.length - 4);
+            if (adversarial.parentControl && frame.readUInt32BE(0) === 112) {
+              expect(frame.subarray(4, 12).equals(Buffer.from("TKOBIND1"))).toBe(true);
+              nativeRequests.push("linux-oci-parent-bootstrap@1");
+              const response = Buffer.alloc(92);
+              response.writeUInt32BE(88);
+              response.write("TKOINFO1", 4, "ascii");
+              frame.copy(response, 12, 12, 84);
+              response.writeBigUInt64BE(0xfedcba9876543210n, 84);
+              if (adversarial.parentFault === "foreign-claim") response.fill(0x66, 12, 76);
+              if (adversarial.parentFault === "foreign-generation")
+                response.writeBigUInt64BE(2n, 76);
+              stdout.write(response);
+              done();
+              return;
+            }
             const request: unknown = JSON.parse(frame.subarray(4).toString("utf8"));
             if (!isJsonObject(request) || typeof request.kind !== "string")
               throw new Error("malformed raw request");
@@ -4668,3 +4693,6 @@ test("original allocation last SQL fence loses the real Engine lease without del
     await f.close();
   }
 });
+
+// Reuse the genuine engine/Sql/artifact/raw-stream fixture without calling its old cases.
+export { fixture as originalOwnedOciFixture };

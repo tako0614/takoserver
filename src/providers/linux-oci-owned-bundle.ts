@@ -42,10 +42,13 @@ import {
 } from "./linux-oci-host-topology.ts";
 import { createLinuxOciHttpHealthProbe } from "./linux-oci-http-health.ts";
 import {
+  createLinuxOciParentBootstrap,
   createLinuxOciPhysicalSession,
+  type LinuxOciCreateStoppedRequest,
   type LinuxOciDisposedHelperObservation,
   type LinuxOciInitReapedObservation,
   type LinuxOciNamespaceLifetimeObservation,
+  LinuxOciParentBootstrap,
   LinuxOciPhysicalSession,
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
@@ -58,6 +61,15 @@ import {
 type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
   readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
+  readonly parents: ReadonlyMap<
+    string,
+    {
+      readonly parent: LinuxOciParentBootstrap;
+      readonly record: DockerContainerCreateRecord;
+      readonly receipt: LinuxOciArtifactReceipt;
+    }
+  >;
+
   readonly bindings: ReadonlyMap<string, string>;
   readonly signal: AbortSignal;
   readonly initStops: Set<string>;
@@ -73,6 +85,9 @@ type OriginalOciCustody = {
 // Populated ONLY inside the real creator below. There is no registration API
 // and its opaque keys are never returned to a caller or serialized.
 const originalOciCustodies = new WeakMap<object, OriginalOciCustody>();
+// Only the current original CREATE loan may retain its environment-bearing
+// request. The persistent management record never owns this transient value.
+const originalParentRequests = new WeakMap<object, LinuxOciCreateStoppedRequest>();
 const observeOriginalOciStarted = LinuxOciPhysicalSession.prototype.observeStarted;
 const stopOriginalOciInit = LinuxOciPhysicalSession.prototype.stopInit;
 const joinOriginalOciInit = LinuxOciPhysicalSession.prototype.joinInit;
@@ -89,6 +104,50 @@ const joinOriginalOciDisposedHelper = LinuxOciPhysicalSession.prototype.joinDisp
 const closeOriginalOciDisposedHelper = LinuxOciPhysicalSession.prototype.closeDisposedHelper;
 const assertOriginalOciDisposedHelperClosed =
   LinuxOciPhysicalSession.prototype.assertDisposedHelperClosed;
+
+const assertOriginalParent = LinuxOciParentBootstrap.prototype.assertCurrent;
+const sealOriginalParent = LinuxOciParentBootstrap.prototype.sealControlBinding;
+const createOriginalParent = LinuxOciParentBootstrap.prototype.createStopped;
+const finishOriginalParent = LinuxOciParentBootstrap.prototype.finishCreateScope;
+
+/** Source-only same-key lookup for the Core's original won-claim save. No
+ * caller registration, foreign parent/receipt or positive observation is used. */
+export function originalLinuxOciParentControlSource(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+) {
+  const custody = originalOciCustodies.get(original),
+    entry = custody?.parents.get(record.claimId);
+  if (
+    !custody ||
+    custody.core !== core ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    !entry ||
+    entry.record !== record
+  )
+    return fail("parent_custody");
+  assertOriginalParent.call(entry.parent, signal);
+  return entry;
+}
+export async function sealOriginalLinuxOciParentControl(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  key: Parameters<LinuxOciParentBootstrap["sealControlBinding"]>[0],
+  scope: string,
+  signal: AbortSignal,
+) {
+  const entry = originalLinuxOciParentControlSource(original, core, record, signal);
+  const request = originalParentRequests.get(entry);
+  if (!request) return fail("parent_custody");
+  const sealed = await sealOriginalParent.call(entry.parent, key, scope, signal, request);
+  if (originalLinuxOciParentControlSource(original, core, record, signal) !== entry)
+    return fail("parent_custody");
+  return sealed;
+}
 
 type OriginalFileIdentity = {
   readonly path: string;
@@ -766,8 +825,21 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     return fail("invalid_request");
   if (physicalBinary !== undefined && (!text(physicalBinary) || !isAbsolute(physicalBinary)))
     return fail("invalid_request");
+  const parentMode = options.ociParentControl;
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
+  const parents = new Map<
+    string,
+    {
+      readonly parent: LinuxOciParentBootstrap;
+      readonly record: DockerContainerCreateRecord;
+      readonly receipt: LinuxOciArtifactReceipt;
+    }
+  >();
+  if (parentMode !== undefined && parentMode !== "sealed-original@1")
+    return fail("parent_selection");
+  if (parentMode !== undefined && (!options.configuredInputs || physicalBinary === undefined))
+    return fail("parent_selection");
   const disposedHelpers = new WeakSet<LinuxOciPhysicalSession>();
   const allocations = new Map<string, OriginalOciAllocation>();
   const sql = options.sql;
@@ -780,6 +852,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   originalOciCustodies.set(originalNativeCustody, {
     core,
     sessions: nativeSessions,
+    parents,
     bindings: nativeBindings,
     signal: nativeLifetime.signal,
     initStops: new Set<string>(),
@@ -1638,39 +1711,79 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         allocations.set(bundle.record.claimId, allocation);
         // This exact original factory constructs the transport; callers cannot
         // supply an owner, process, physical observation or verification port.
-        const session = createLinuxOciPhysicalSession({ binary: physicalBinary });
-        nativeSessions.set(bundle.record.claimId, session);
         const { receipt } = bundle;
-        const observation = await session.createStopped(
-          {
-            allocationRoot: bundle.allocationRoot,
+        const request: LinuxOciCreateStoppedRequest = {
+          allocationRoot: bundle.allocationRoot,
+          claimId: receipt.claimId,
+          installationId: receipt.installationId,
+          resourceUid: receipt.resourceUid,
+          incarnationId: receipt.incarnationId,
+          generation: receipt.generation,
+          revision: receipt.revision,
+          sourceDigest: receipt.sourceDigest,
+          manifestDigest: receipt.manifestDigest,
+          configDigest: receipt.configDigest,
+          archiveDigest: receipt.archiveDigest,
+          args: bundle.argv,
+          env: bundle.environment,
+          cwd: bundle.cwd,
+          uid: bundle.uid,
+          gid: bundle.gid,
+          memoryBytes: bundle.memoryBytes,
+          nanoCpus: bundle.nanoCpus,
+          pidsLimit: bundle.pidsLimit,
+        };
+        let session: LinuxOciPhysicalSession;
+        let observation: LinuxOciStoppedObservation;
+        let parent: LinuxOciParentBootstrap | undefined;
+        if (parentMode === "sealed-original@1") {
+          parent = createLinuxOciParentBootstrap({
+            binary: physicalBinary,
             claimId: receipt.claimId,
-            installationId: receipt.installationId,
-            resourceUid: receipt.resourceUid,
-            incarnationId: receipt.incarnationId,
             generation: receipt.generation,
-            revision: receipt.revision,
-            sourceDigest: receipt.sourceDigest,
-            manifestDigest: receipt.manifestDigest,
-            configDigest: receipt.configDigest,
-            archiveDigest: receipt.archiveDigest,
-            args: bundle.argv,
-            env: bundle.environment,
-            cwd: bundle.cwd,
-            uid: bundle.uid,
-            gid: bundle.gid,
-            memoryBytes: bundle.memoryBytes,
-            nanoCpus: bundle.nanoCpus,
-            pidsLimit: bundle.pidsLimit,
-          },
-          bundle.signal,
-        );
+            capability: crypto.getRandomValues(new Uint8Array(32)),
+            lifetimeSignal: nativeLifetime.signal,
+          });
+          const entry = Object.freeze({
+            parent,
+            record: bundle.record,
+            receipt,
+          });
+          parents.set(bundle.record.claimId, entry);
+          originalParentRequests.set(entry, Object.freeze(request));
+          try {
+            await parent.bootstrap(bundle.signal);
+            await bundle.guard();
+            await core.saveAcceptedParentControl(
+              bundle.record,
+              originalNativeCustody,
+              bundle.signal,
+            );
+            await bundle.guard();
+            assertOriginalParent.call(parent, bundle.signal);
+            if (closed || bundle.signal.aborted) return fail("closed");
+            const actual = await createOriginalParent.call(parent, request, bundle.signal);
+            session = actual.session;
+            observation = actual.observation;
+          } finally {
+            // Success, save failure, cancellation and unknown CREATE all end
+            // the original environment loan without extending it to P lifetime.
+            originalParentRequests.delete(entry);
+          }
+        } else {
+          session = createLinuxOciPhysicalSession({ binary: physicalBinary });
+          nativeSessions.set(bundle.record.claimId, session);
+          observation = await session.createStopped(request, bundle.signal);
+        }
+        nativeSessions.set(bundle.record.claimId, session);
         await bundle.guard();
+        if (parent) assertOriginalParent.call(parent, bundle.signal);
         await core.owner.bindNative(bundle.record, observation.nativeId);
         // Only the actual original process result + original owner CAS updates
         // this private expectation. A callback return/DTO never reaches it.
         nativeBindings.set(bundle.record.claimId, observation.nativeId);
         await bundle.guard();
+        if (parent) finishOriginalParent.call(parent, bundle.signal);
         return observation;
       });
     },
@@ -2021,6 +2134,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             (result) => result.status === "rejected",
           );
           if (rejected?.status === "rejected") throw rejected.reason;
+          if (parents.size) return fail("parent_control_retained"); // P/result reader is a separate next producer.
         })();
         nativeClosing = attempt;
         void attempt.catch(() => {

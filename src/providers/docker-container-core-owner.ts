@@ -5,7 +5,9 @@ import { parseStrictJson } from "../strict-json.ts";
 import { readV2ConfiguredPrivateInputs } from "../takoform-v2/configured-private-inputs.ts";
 import {
   createV2ContainerHostAcceptance,
+  inspectV2ContainerOwnerControlSchema,
   serializeV2ContainerConfiguredPrivateInputs,
+  V2_CONTAINER_CONTROL_RESERVED,
   V2_CONTAINER_F2_FORM,
   validateV2ContainerF2SensitiveNames,
 } from "../takoform-v2/container-owner-schema.ts";
@@ -40,8 +42,10 @@ import {
   observeOriginalLinuxOciOwnedInitReaped,
   observeOriginalLinuxOciOwnedNamespaceLifetime,
   observeOriginalLinuxOciOwnedRunning,
+  originalLinuxOciParentControlSource,
   prepareOriginalLinuxOciAllocationDisposal,
   releaseOriginalLinuxOciOwnedNamespace,
+  sealOriginalLinuxOciParentControl,
   stopOriginalLinuxOciOwnedInit,
 } from "./linux-oci-owned-bundle.ts";
 import type {
@@ -116,6 +120,8 @@ export interface DockerContainerCoreOwnerOptions {
   readonly installationId: string;
   readonly backendId: string;
   readonly targetKey: string;
+  /** Explicit private mode, never selected by a request or old claim. */
+  readonly ociParentControl?: "sealed-original@1";
   readonly configuredInputs?: {
     readonly keyring: HostedContainerSecretKeyring;
     readonly maxSecretBytes: number;
@@ -124,6 +130,11 @@ export interface DockerContainerCoreOwnerOptions {
 export interface DockerContainerCoreOwner {
   readonly acceptance: V2HostAcceptance;
   readonly owner: DockerPhysicalCoreOwnerPort;
+  saveAcceptedParentControl(
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<void>;
   createCustody(
     policy: DockerContainerRuntimePolicy,
     requiredSecretNames: readonly string[],
@@ -482,7 +493,16 @@ export function createDockerContainerCoreOwner(
   options: DockerContainerCoreOwnerOptions,
 ): DockerContainerCoreOwner {
   const { sql, clock, installationId, backendId, targetKey } = options;
-  const original = createV2ContainerHostAcceptance({ sql, installationId, backendId, targetKey });
+  const parentMode = options.ociParentControl;
+  if (parentMode !== undefined && parentMode !== "sealed-original@1") return fail();
+  const original = createV2ContainerHostAcceptance({
+    sql,
+    installationId,
+    backendId,
+    targetKey,
+    ...(parentMode === undefined ? {} : { ociParentControl: parentMode }),
+  });
+  const freshControlClaims = new WeakSet<DockerContainerCreateRecord>();
   if (typeof clock !== "function") return fail();
   const executions = new Set<ExecutionScope>();
   const deleteExecutions = new Set<ExecutionScope>();
@@ -1872,7 +1892,11 @@ export function createDockerContainerCoreOwner(
       const guard = fence(expected);
       statements.push({
         sql:
-          "INSERT INTO tf_v2_container_create_claims(resource_uid,generation,installation_id,claim_id,state,native_id,claimed_at_ms,bound_at_ms,removed_at_ms) SELECT ?,?,?,?,'pending',NULL,?,NULL,NULL WHERE " +
+          (parentMode === "sealed-original@1"
+            ? "INSERT INTO tf_v2_container_create_claims(resource_uid,generation,installation_id,claim_id,state,native_id,claimed_at_ms,bound_at_ms,removed_at_ms,native_control) SELECT ?,?,?,?,'pending',NULL,?,NULL,NULL,'" +
+              V2_CONTAINER_CONTROL_RESERVED +
+              "' WHERE "
+            : "INSERT INTO tf_v2_container_create_claims(resource_uid,generation,installation_id,claim_id,state,native_id,claimed_at_ms,bound_at_ms,removed_at_ms) SELECT ?,?,?,?,'pending',NULL,?,NULL,NULL WHERE ") +
           guard.sql +
           " ON CONFLICT(resource_uid,generation) DO NOTHING",
         params: [
@@ -1893,15 +1917,14 @@ export function createDockerContainerCoreOwner(
       const after = await load(intent);
       const saved = record(after.intent, after.proof);
       if (!saved) return fail();
-      return {
-        status:
-          saved.claimId === claimId && writes.at(-1)!.changes === 1
-            ? "won"
-            : saved.state === "pending"
-              ? "unknown"
-              : "existing",
-        record: saved,
-      };
+      const status =
+        saved.claimId === claimId && writes.at(-1)!.changes === 1
+          ? "won"
+          : saved.state === "pending"
+            ? "unknown"
+            : "existing";
+      if (status === "won" && parentMode === "sealed-original@1") freshControlClaims.add(saved);
+      return { status, record: saved };
     },
     async withAuthority(input, phase, use) {
       if (!["reconcile", "observe", "remove"].includes(phase) || typeof use !== "function")
@@ -2295,6 +2318,90 @@ export function createDockerContainerCoreOwner(
     return observation;
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
+    async saveAcceptedParentControl(input, originalCustody, signal) {
+      if (
+        parentMode !== "sealed-original@1" ||
+        !freshControlClaims.has(input) ||
+        !options.configuredInputs ||
+        signal.aborted
+      )
+        return fail();
+      const lease = await activeRecord(input, "reconcile");
+      if (!(await current(lease)) || !(await inspectV2ContainerOwnerControlSchema(sql)))
+        return fail();
+      const entry = originalLinuxOciParentControlSource(originalCustody, result, input, signal);
+      const loaded = await load(input.intent),
+        saved = sameRecord(input, record(loaded.intent, loaded.proof));
+      if (
+        saved.state !== "pending" ||
+        saved.nativeId !== null ||
+        !usable(loaded.proof, "reconcile")
+      )
+        return fail();
+      const scope = Object.freeze({
+        purpose: "takoserver.linux-oci-parent-control@1",
+        claimId: input.claimId,
+        installationId,
+        resourceUid: input.intent.resourceUid,
+        incarnationId: input.intent.incarnationId,
+        generation: input.intent.policy.generation,
+        revision: input.intent.revision,
+        operationId: loaded.proof.a_operation_id,
+        principal: loaded.proof.i_principal,
+        space: loaded.proof.i_space,
+        form: loaded.proof.i_form_url,
+        backendId,
+        targetKey,
+        action: loaded.proof.a_action,
+        acceptedFingerprint: loaded.proof.a_fingerprint,
+        policyDigest: input.intent.policy.policyDigest,
+        artifact: entry.receipt,
+      });
+      freshControlClaims.delete(input); // consumed before async sealing/save, never a retry grant
+      const sealed = await sealOriginalLinuxOciParentControl(
+        originalCustody,
+        result,
+        input,
+        options.configuredInputs.keyring.current,
+        canonicalJson(scope),
+        signal,
+      );
+      if (
+        !(await current(lease)) ||
+        signal.aborted ||
+        originalLinuxOciParentControlSource(originalCustody, result, input, signal) !== entry
+      )
+        return fail();
+      const fresh = await load(input.intent),
+        guard = fence(fresh.proof);
+      sameRecord(input, record(fresh.intent, fresh.proof));
+      const document = canonicalJson({ kind: "linux-oci-sealed-control@1", scope, ...sealed });
+      if (!lease.active || lease.controller.signal.aborted || signal.aborted) return fail();
+      const write = await sql.run(
+        "UPDATE tf_v2_container_create_claims SET native_control=? WHERE resource_uid=? AND generation=? AND claim_id=? AND state='pending' AND native_id IS NULL AND native_control=? AND " +
+          guard.sql,
+        [
+          document,
+          input.intent.resourceUid,
+          input.intent.policy.generation,
+          input.claimId,
+          V2_CONTAINER_CONTROL_RESERVED,
+          ...guard.params,
+        ],
+      );
+      if (write.changes !== 1 || !(await current(lease)) || signal.aborted) return fail();
+      const rows = await sql.query(
+        "SELECT native_control FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='pending' AND native_id IS NULL",
+        [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
+      );
+      if (
+        rows.length !== 1 ||
+        rows[0]?.native_control !== document ||
+        originalLinuxOciParentControlSource(originalCustody, result, input, signal) !== entry ||
+        !(await current(lease))
+      )
+        return fail();
+    },
     async claimAcceptedTopology(execution, input) {
       const intent = intentSnapshot(input);
       const accepted = await result.readAcceptedExecution(execution);
