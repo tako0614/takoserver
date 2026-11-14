@@ -15,6 +15,7 @@ import {
   type DockerContainerAcceptedExecution,
   type DockerContainerCoreOwner,
   type DockerContainerCoreOwnerOptions,
+  type LinuxOciAllocationDisposalObservation,
   type LinuxOciDisposalProgress,
 } from "./docker-container-core-owner.ts";
 import type {
@@ -62,6 +63,8 @@ type OriginalOciCustody = {
   readonly initStops: Set<string>;
   readonly namespaceReleases: Set<string>;
   readonly disposedHelpers: WeakSet<LinuxOciPhysicalSession>;
+  readonly helperJoins: Map<string, LinuxOciDisposedHelperObservation>;
+  readonly allocations: Map<string, OriginalOciAllocation>;
   readonly disposalSteps: Map<
     string,
     "begin" | "read" | "delete" | "join-delete" | "dispose" | "continue-dispose" | "join-helper"
@@ -84,6 +87,166 @@ const disposeOriginalOciBorn = LinuxOciPhysicalSession.prototype.disposeBorn;
 const continueOriginalOciDisposal = LinuxOciPhysicalSession.prototype.continueBornDisposal;
 const joinOriginalOciDisposedHelper = LinuxOciPhysicalSession.prototype.joinDisposedHelper;
 const closeOriginalOciDisposedHelper = LinuxOciPhysicalSession.prototype.closeDisposedHelper;
+const assertOriginalOciDisposedHelperClosed =
+  LinuxOciPhysicalSession.prototype.assertDisposedHelperClosed;
+
+type OriginalFileIdentity = {
+  readonly path: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly uid: bigint;
+};
+type OriginalOciAllocation = {
+  readonly intent: string;
+  readonly parents: readonly OriginalFileIdentity[];
+  readonly root: OriginalFileIdentity;
+  readonly rootfs: OriginalFileIdentity;
+  readonly receipt: OriginalFileIdentity;
+  readonly receiptBytes: string;
+  cleanup: "untouched" | "prepared" | "unknown" | "removed";
+};
+
+async function originalFileIdentity(path: string, directory: boolean) {
+  const stat = await lstat(path, { bigint: true });
+  const uid = process.getuid?.();
+  if (
+    uid === undefined ||
+    stat.uid !== BigInt(uid) ||
+    stat.isSymbolicLink() ||
+    (directory ? !stat.isDirectory() : !stat.isFile())
+  )
+    return fail("allocation_identity");
+  return Object.freeze({ path, dev: stat.dev, ino: stat.ino, uid: stat.uid });
+}
+
+async function assertOriginalFile(expected: OriginalFileIdentity, directory: boolean) {
+  const current = await originalFileIdentity(expected.path, directory);
+  if (current.dev !== expected.dev || current.ino !== expected.ino || current.uid !== expected.uid)
+    return fail("allocation_identity");
+}
+
+async function captureOriginalAllocation(artifactRoot: string, bundle: LinuxOciBorrowedBundle) {
+  if (bundle.allocationRoot !== join(artifactRoot, bundle.record.claimId))
+    return fail("allocation_identity");
+  await privateDirectory(artifactRoot);
+  const parents: OriginalFileIdentity[] = [];
+  let current = parse(artifactRoot).root;
+  parents.push(await originalFileIdentity(current, true));
+  for (const part of artifactRoot.slice(current.length).split("/").filter(Boolean)) {
+    current = join(current, part);
+    parents.push(await originalFileIdentity(current, true));
+  }
+  await privateDirectory(bundle.allocationRoot);
+  const root = await originalFileIdentity(bundle.allocationRoot, true),
+    rootfs = await originalFileIdentity(join(bundle.allocationRoot, "rootfs"), true),
+    receipt = await originalFileIdentity(
+      join(bundle.allocationRoot, ".tako-oci-artifact.json"),
+      false,
+    ),
+    receiptBytes = JSON.stringify(bundle.receipt);
+  if ((await readFile(receipt.path, "utf8")) !== receiptBytes) return fail("allocation_identity");
+  const allocation: OriginalOciAllocation = {
+    intent: canonicalJson(bundle.record.intent),
+    parents: Object.freeze(parents),
+    root,
+    rootfs,
+    receipt,
+    receiptBytes,
+    cleanup: "untouched",
+  };
+  return allocation;
+}
+
+async function assertOriginalAllocationParents(allocation: OriginalOciAllocation) {
+  for (const parent of allocation.parents) await assertOriginalFile(parent, true);
+  await privateDirectory(allocation.parents.at(-1)?.path ?? "");
+}
+
+async function assertOriginalAllocationAbsent(allocation: OriginalOciAllocation) {
+  await assertOriginalAllocationParents(allocation);
+  try {
+    await lstat(allocation.root.path);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")
+      return;
+    throw error;
+  }
+  return fail("allocation_present");
+}
+
+function originalAllocation(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+) {
+  const custody = originalOciCustodies.get(original),
+    allocation = custody?.allocations.get(record.claimId),
+    session = custody?.sessions.get(record.claimId);
+  if (
+    !custody ||
+    custody.core !== core ||
+    !allocation ||
+    !session ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    !custody.disposedHelpers.has(session) ||
+    custody.bindings.get(record.claimId) !== record.nativeId ||
+    allocation.intent !== canonicalJson(record.intent) ||
+    allocation.cleanup === "unknown"
+  )
+    return fail("allocation_custody_unknown");
+  return { custody, allocation, session };
+}
+
+/** Internal original-key bridge. This preflight is not an authorization receipt. */
+export async function prepareOriginalLinuxOciAllocationDisposal(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+) {
+  const { allocation, session } = originalAllocation(original, core, record, signal);
+  await closeOriginalOciDisposedHelper.call(session);
+  if (allocation.cleanup === "removed") await assertOriginalAllocationAbsent(allocation);
+  else {
+    await assertOriginalAllocationParents(allocation);
+    await privateDirectory(allocation.root.path);
+    await assertOriginalFile(allocation.root, true);
+    await assertOriginalFile(allocation.rootfs, true);
+    await assertOriginalFile(allocation.receipt, false);
+    if ((await readFile(allocation.receipt.path, "utf8")) !== allocation.receiptBytes)
+      return fail("allocation_identity");
+  }
+  originalAllocation(original, core, record, signal);
+  if (allocation.cleanup === "untouched") allocation.cleanup = "prepared";
+}
+
+/** Only the original prepared allocation may be removed once. A failed or
+ * interrupted original removal stays unknown, even if its path later is absent. */
+export async function disposeOriginalLinuxOciAllocation(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+): Promise<LinuxOciAllocationDisposalObservation> {
+  const { allocation, session } = originalAllocation(original, core, record, signal);
+  if (allocation.cleanup !== "prepared" && allocation.cleanup !== "removed")
+    return fail("allocation_custody_unknown");
+  assertOriginalOciDisposedHelperClosed.call(session);
+  originalAllocation(original, core, record, signal);
+  if (allocation.cleanup === "prepared") {
+    // Consumed before the first destructive await. Error/cancel/partial result
+    // cannot be repaired by absence or another rm on a later Engine lease.
+    allocation.cleanup = "unknown";
+    await rm(allocation.root.path, { recursive: true, force: false });
+    if (signal.aborted) return fail("revoked");
+    await assertOriginalAllocationAbsent(allocation);
+    allocation.cleanup = "removed";
+  } else await assertOriginalAllocationAbsent(allocation);
+  originalAllocation(original, core, record, signal);
+  return Object.freeze({ kind: "linux-oci-original-allocation-disposal@1", barrier: "unproven" });
+}
 
 /** Exactly one next original operation per Core lease/currentness check.
  * The private route only prevents replay; every fact comes from the original
@@ -137,10 +300,18 @@ export async function advanceOriginalLinuxOciOwnedDisposal(
     observation = await continueOriginalOciDisposal.call(session, signal);
     custody.disposalSteps.set(record.claimId, "join-helper");
   } else {
-    observation = await joinOriginalOciDisposedHelper.call(session, signal);
-    // Only the captured original method's actual child join records this
-    // session. Local close will independently recheck its private facts.
-    custody.disposedHelpers.add(session);
+    const joined = custody.helperJoins.get(record.claimId);
+    if (joined) {
+      // Local allocation cleanup may already have sealed the session. Reassert
+      // the original private child facts; never re-enter the old join/wire path.
+      await closeOriginalOciDisposedHelper.call(session);
+      observation = joined;
+    } else {
+      const originalJoin = await joinOriginalOciDisposedHelper.call(session, signal);
+      observation = originalJoin;
+      custody.disposedHelpers.add(session);
+      custody.helperJoins.set(record.claimId, originalJoin);
+    }
   }
   // Record consumed effects before refusing a cancelled return, so a later
   // genuine lease can only continue the original phase, never resend it.
@@ -598,6 +769,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
   const disposedHelpers = new WeakSet<LinuxOciPhysicalSession>();
+  const allocations = new Map<string, OriginalOciAllocation>();
   const sql = options.sql;
   core.acceptance.assertSql(sql);
   // A failed join retains this exact request. A fresh call cannot replace it
@@ -613,6 +785,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     initStops: new Set<string>(),
     namespaceReleases: new Set<string>(),
     disposedHelpers,
+    helperJoins: new Map(),
+    allocations,
     disposalSteps: new Map(),
   });
   let nativeClosing: Promise<void> | undefined;
@@ -655,9 +829,18 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   function retainedNamespaceObservations(
     execution: V2Execution,
     externalSignal: AbortSignal | undefined,
-    mode: "release" | "observe" | "dispose",
+    mode: "allocation",
+  ): Promise<readonly LinuxOciAllocationDisposalObservation[]>;
+  function retainedNamespaceObservations(
+    execution: V2Execution,
+    externalSignal: AbortSignal | undefined,
+    mode: "release" | "observe" | "dispose" | "allocation",
   ): Promise<
-    readonly (LinuxOciNamespaceLifetimeObservation | LinuxOciDisposedHelperObservation)[]
+    readonly (
+      | LinuxOciNamespaceLifetimeObservation
+      | LinuxOciDisposedHelperObservation
+      | LinuxOciAllocationDisposalObservation
+    )[]
   > {
     if (closed) return Promise.reject(new Error("linux_oci_owned_bundle_closed"));
     if (physicalBinary === undefined)
@@ -699,6 +882,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         const observations: (
           | LinuxOciNamespaceLifetimeObservation
           | LinuxOciDisposedHelperObservation
+          | LinuxOciAllocationDisposalObservation
         )[] = [];
         for (const { record } of retained) {
           if (closed || cancel.signal.aborted) return fail("revoked");
@@ -713,8 +897,16 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                 return fail("revoked");
               let observation:
                 | LinuxOciNamespaceLifetimeObservation
-                | LinuxOciDisposedHelperObservation;
-              if (mode === "dispose") {
+                | LinuxOciDisposedHelperObservation
+                | LinuxOciAllocationDisposalObservation;
+              if (mode === "allocation") {
+                observation = await core.disposeRetainedAllocation(
+                  execution,
+                  record,
+                  originalNativeCustody,
+                  loan.signal,
+                );
+              } else if (mode === "dispose") {
                 for (;;) {
                   // Each step re-enters the genuine Core current/START gate;
                   // the private creator route alone cannot authorize an effect.
@@ -1310,6 +1502,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       if (accepted.action === "delete") {
         await creator.disposeRetainedBornOwners(execution, cancel.signal);
         local();
+        await creator.disposeRetainedAllocations(execution, cancel.signal);
+        local();
         // Original tracked destruction/local disposal/helper join are factual.
         // Full lifetime retirement and removed CAS are not supplied here.
         return unknown();
@@ -1435,9 +1629,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       return artifact.withAcceptedBundle(execution, async (bundle) => {
         await bundle.guard();
         if (nativeSessions.has(bundle.record.claimId)) return fail("retained_create_unknown");
+        const allocation = await captureOriginalAllocation(artifactRoot, bundle);
+        await bundle.guard();
         // The preceding guard awaited Sql. Recheck synchronously before the
         // constructor's first process effect; registration below has no await.
         if (closed || bundle.signal.aborted) return fail("closed");
+        if (allocations.has(bundle.record.claimId)) return fail("retained_create_unknown");
+        allocations.set(bundle.record.claimId, allocation);
         // This exact original factory constructs the transport; callers cannot
         // supply an owner, process, physical observation or verification port.
         const session = createLinuxOciPhysicalSession({ binary: physicalBinary });
@@ -1793,6 +1991,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     /** Original accepted/remove custody only. No returned fact grants removal. */
     disposeRetainedBornOwners(execution: V2Execution, signal?: AbortSignal) {
       return retainedNamespaceObservations(execution, signal, "dispose");
+    },
+    /** Local original allocation only; neither a claim tombstone nor slot reuse. */
+    disposeRetainedAllocations(execution: V2Execution, signal?: AbortSignal) {
+      return retainedNamespaceObservations(execution, signal, "allocation");
     },
     close(): Promise<void> {
       const joined = artifact.close();

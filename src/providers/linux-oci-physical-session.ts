@@ -903,6 +903,22 @@ export class LinuxOciPhysicalSession {
     this.#admissionClosed = true;
   }
 
+  /** No-effect synchronous bookend for the original controller after its last
+   * awaited lease guard. Neither the local seal nor a returned DTO is a fact. */
+  assertDisposedHelperClosed(): void {
+    if (
+      !this.#disposedLocalClosed ||
+      !this.#admissionClosed ||
+      !this.#localDisposalObserved ||
+      !this.#localDisposalReply ||
+      this.#pending !== undefined ||
+      !this.#closed ||
+      this.#exit?.code !== 0 ||
+      this.#exit.signal !== null
+    )
+      throw failure("custody_retained");
+  }
+
   cancel(): Promise<LinuxOciCancelObservation> {
     this.#admissionClosed = true;
     this.#cancelPromise ??= (async () => {

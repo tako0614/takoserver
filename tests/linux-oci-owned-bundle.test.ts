@@ -4,6 +4,7 @@ import * as childProcess from "node:child_process";
 import { spawn as importedSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
+import * as filesystem from "node:fs/promises";
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as http from "node:http";
 import { request as importedRequest } from "node:http";
@@ -100,6 +101,7 @@ async function fixture(
       | "dispose-retained"
       | "unknown";
     readonly disposalExit?: "nonzero" | "close-only";
+    readonly allocationDisposal?: boolean;
     readonly egressLimits?: LinuxOciEgressLimits;
     readonly hostTopology?: LinuxOciHostTopology;
     readonly outboundInternet?: boolean;
@@ -291,6 +293,7 @@ async function fixture(
   let originalCreate: JsonObject | undefined;
   let nativeClosing: Promise<void> | undefined;
   let rawChild: EventEmitter | undefined;
+  let originalNativeStdout: PassThrough | undefined;
   const unpackEnvironments: unknown[] = [];
   let unpackerStarted = () => {};
   const unpackerEntered = new Promise<void>((resolve) => {
@@ -314,6 +317,7 @@ async function fixture(
       const child = new EventEmitter();
       const stdout = new PassThrough(),
         stderr = new PassThrough();
+      if (nativeProcesses === 1) originalNativeStdout = stdout;
       const reply = (value: unknown) => {
         const body = Buffer.from(JSON.stringify(value)),
           frame = Buffer.alloc(body.length + 4);
@@ -622,6 +626,8 @@ async function fixture(
   const reaped: unknown[] = [];
   const namespaces: unknown[] = [];
   const disposals: unknown[] = [];
+  const allocations: unknown[] = [];
+  let beforeAllocation: ((execution: V2Execution) => Promise<void>) | undefined;
   let retireSignal: AbortSignal | undefined;
   let beforeRetire: ((execution: V2Execution) => Promise<void>) | undefined;
   let afterRetire: ((execution: V2Execution) => Promise<void>) | undefined;
@@ -642,6 +648,12 @@ async function fixture(
             disposals.push(
               ...(await composition.disposeRetainedBornOwners(execution, retireSignal)),
             );
+            if (adversarial.allocationDisposal) {
+              await beforeAllocation?.(execution);
+              allocations.push(
+                ...(await composition.disposeRetainedAllocations(execution, retireSignal)),
+              );
+            }
             await afterRetire?.(execution);
           } else if (adversarial.namespaceMode) {
             namespaces.push(
@@ -841,6 +853,10 @@ async function fixture(
     reaped,
     namespaces,
     disposals,
+    allocations,
+    beforeAllocation(callback: typeof beforeAllocation) {
+      beforeAllocation = callback;
+    },
     retireSignal(signal: AbortSignal) {
       retireSignal = signal;
     },
@@ -858,6 +874,10 @@ async function fixture(
     },
     nativeCounts: () => ({ processes: nativeProcesses, requests: [...nativeRequests] }),
     nativeExits: () => nativeExits,
+    nativeTrailingByte() {
+      if (!originalNativeStdout) throw new Error("original raw native stream absent");
+      originalNativeStdout.emit("data", Buffer.from([0]));
+    },
     nativeClosing: () => nativeClosing,
     unpackerEntered,
     unpackEnvironments,
@@ -4172,6 +4192,476 @@ test("disposed creator local close cannot lend original custody to a reconstruct
     await assertNamespaceRetained(f);
     expect(raw.calls).toHaveLength(1);
   } finally {
+    await reconstructed?.close();
+    raw.join();
+    raw.restore();
+    await f.close();
+  }
+});
+
+test("original allocation cleanup removes only the captured root once and keeps Core bound across a new genuine lease", async () => {
+  const f = await fixture(false, {
+    nativeMode: "start-retire",
+    namespaceMode: "success",
+    disposalMode: "success",
+    allocationDisposal: true,
+  });
+  const actualRm = filesystem.rm.bind(filesystem);
+  let restore = () => {};
+  try {
+    const sibling = join(f.artifactRoot, "unowned-sibling");
+    await mkdir(sibling, { mode: 0o700 });
+    await writeFile(join(sibling, "preserved"), "unowned");
+    const deletion = await acceptNamespaceDelete(f),
+      root = f.recordedCreate().allocationRoot;
+    let removals = 0;
+    const removing = spyOn(filesystem, "rm").mockImplementation((path, options) => {
+      if (path === root) removals++;
+      return actualRm(path, options);
+    });
+    restore = () => removing.mockRestore();
+    expect(Object.is(rm, removing)).toBe(true);
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(f.allocations).toEqual([
+      { kind: "linux-oci-original-allocation-disposal@1", barrier: "unproven" },
+    ]);
+    expect(removals).toBe(1);
+    await expect(filesystem.lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(join(sibling, "preserved"), "utf8")).toBe("unowned");
+    const native = f.nativeCounts();
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+      [deletion.id],
+    );
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(f.allocations).toHaveLength(2);
+    expect(removals).toBe(1);
+    expect(f.nativeCounts()).toEqual(native);
+    await assertNamespaceRetained(f);
+  } finally {
+    restore();
+    await f.close();
+  }
+});
+
+for (const tamper of ["root", "rootfs", "receipt"] as const) {
+  test(`original allocation cleanup rejects captured ${tamper} tampering before removal and preserves its original sibling`, async () => {
+    const f = await fixture(false, {
+      nativeMode: "start-retire",
+      namespaceMode: "success",
+      disposalMode: "success",
+      allocationDisposal: true,
+    });
+    const actualRm = filesystem.rm.bind(filesystem);
+    let restore = () => {};
+    try {
+      const deletion = await acceptNamespaceDelete(f),
+        root = f.recordedCreate().allocationRoot;
+      let altered = false,
+        removals = 0;
+      f.beforeAllocation(async () => {
+        if (altered) return;
+        altered = true;
+        if (tamper === "receipt")
+          await writeFile(join(root, ".tako-oci-artifact.json"), "tampered");
+        else {
+          const path = tamper === "root" ? root : join(root, "rootfs");
+          await filesystem.rename(path, `${path}.original`);
+          await mkdir(path, { mode: 0o700 });
+          await writeFile(join(path, "unowned"), "preserved");
+        }
+      });
+      const removing = spyOn(filesystem, "rm").mockImplementation((path, options) => {
+        if (path === root) removals++;
+        return actualRm(path, options);
+      });
+      restore = () => removing.mockRestore();
+      await f.engine.runNext();
+      expect(f.failures).toHaveLength(1);
+      expect(f.allocations).toEqual([]);
+      expect(removals).toBe(0);
+      await f.sql.run(
+        "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+        [deletion.id],
+      );
+      await f.engine.runNext();
+      expect(f.failures).toHaveLength(2);
+      expect(removals).toBe(0);
+      expect(f.allocations).toEqual([]);
+      if (tamper !== "receipt") {
+        const path = tamper === "root" ? root : join(root, "rootfs");
+        expect(await readFile(join(path, "unowned"), "utf8")).toBe("preserved");
+        expect((await filesystem.lstat(`${path}.original`)).isDirectory()).toBe(true);
+      }
+      await assertNamespaceRetained(f);
+    } finally {
+      restore();
+      await f.close();
+    }
+  });
+}
+
+test("original allocation cleanup refuses a real sameSql foreign owner and fake key before filesystem effects", async () => {
+  const f = await fixture(false, {
+    nativeMode: "start-retire",
+    namespaceMode: "success",
+    disposalMode: "success",
+    allocationDisposal: true,
+  });
+  const foreign = createDockerContainerCoreOwner({
+    sql: f.sql,
+    clock: () => new Date(),
+    installationId: "synthetic-oci-installation",
+    backendId: "synthetic-oci-backend",
+    targetKey: "synthetic-oci-target",
+    configuredInputs: f.configuredInputs,
+  });
+  let visited = false;
+  f.beforeAllocation(async (execution) => {
+    const before = f.nativeCounts(),
+      root = f.recordedCreate().allocationRoot;
+    await foreign.withExecution(execution, async () => {
+      const accepted = await foreign.readAcceptedExecution(execution),
+        old = accepted.retained[0];
+      if (!old) throw new Error("original retained record absent");
+      await foreign.owner.withAuthority(old.record, "remove", async () => {
+        await expect(
+          foreign.disposeRetainedAllocation(
+            execution,
+            old.record,
+            Object.freeze({}),
+            new AbortController().signal,
+          ),
+        ).rejects.toThrow();
+      });
+    });
+    expect((await filesystem.lstat(root)).isDirectory()).toBe(true);
+    expect(f.nativeCounts()).toEqual(before);
+    visited = true;
+  });
+  try {
+    await acceptNamespaceDelete(f);
+    await f.engine.runNext();
+    expect(visited).toBe(true);
+    expect(f.failures).toEqual([]);
+    expect(f.allocations).toHaveLength(1);
+    await assertNamespaceRetained(f);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const partial of ["partial", "absent-after-error"] as const) {
+  test(`original allocation cleanup ${partial} remains sticky unknown without replay or absence-only success`, async () => {
+    const f = await fixture(false, {
+      nativeMode: "start-retire",
+      namespaceMode: "success",
+      disposalMode: "success",
+      allocationDisposal: true,
+    });
+    const actualRm = filesystem.rm.bind(filesystem);
+    let restore = () => {};
+    try {
+      const deletion = await acceptNamespaceDelete(f),
+        root = f.recordedCreate().allocationRoot;
+      let removals = 0;
+      const removing = spyOn(filesystem, "rm").mockImplementation(async (path, options) => {
+        if (path !== root) return actualRm(path, options);
+        removals++;
+        if (partial === "partial") await actualRm(join(root, "rootfs", "synthetic-file"));
+        else await actualRm(path, options);
+        throw new Error("modeled original partial removal failure");
+      });
+      restore = () => removing.mockRestore();
+      await f.engine.runNext();
+      expect(removals).toBe(1);
+      expect(f.failures).toHaveLength(1);
+      expect(f.allocations).toEqual([]);
+      if (partial === "partial") expect((await filesystem.lstat(root)).isDirectory()).toBe(true);
+      else await expect(filesystem.lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+      const native = f.nativeCounts();
+      await f.sql.run(
+        "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+        [deletion.id],
+      );
+      await f.engine.runNext();
+      expect(f.failures).toHaveLength(2);
+      expect(f.allocations).toEqual([]);
+      expect(removals).toBe(1);
+      expect(f.nativeCounts()).toEqual(native);
+      await assertNamespaceRetained(f);
+    } finally {
+      restore();
+      await f.close();
+    }
+  });
+}
+
+test("original allocation cleanup cancellation after original rm stays unknown across a new genuine lease", async () => {
+  const f = await fixture(false, {
+      nativeMode: "start-retire",
+      namespaceMode: "success",
+      disposalMode: "success",
+      allocationDisposal: true,
+    }),
+    cancel = new AbortController();
+  f.retireSignal(cancel.signal);
+  const actualRm = filesystem.rm.bind(filesystem);
+  let restore = () => {};
+  try {
+    const deletion = await acceptNamespaceDelete(f),
+      root = f.recordedCreate().allocationRoot;
+    let removals = 0;
+    const removing = spyOn(filesystem, "rm").mockImplementation(async (path, options) => {
+      if (path !== root) return actualRm(path, options);
+      removals++;
+      await actualRm(path, options);
+      cancel.abort();
+    });
+    restore = () => removing.mockRestore();
+    await f.engine.runNext();
+    expect(f.allocations).toEqual([]);
+    expect(removals).toBe(1);
+    await expect(filesystem.lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    f.retireSignal(new AbortController().signal);
+    await f.sql.run(
+      "UPDATE tf_v2_operations SET next_attempt_at_ms=0 WHERE id=? AND status='reconciling'",
+      [deletion.id],
+    );
+    await f.engine.runNext();
+    expect(f.allocations).toEqual([]);
+    expect(removals).toBe(1);
+    await assertNamespaceRetained(f);
+  } finally {
+    restore();
+    await f.close();
+  }
+});
+
+test("original allocation cleanup normal DELETE rejects reconstructed custody before the original controller removes its root", async () => {
+  const f = await fixture(false, {
+      ...acceptedHttpSelection(),
+      normalBackend: true,
+      namespaceMode: "success",
+      disposalMode: "begin-retained",
+    }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let reconstructed: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ effect: "complete", status: "succeeded" });
+    const root = f.recordedCreate().allocationRoot;
+    const deletion = await f.engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    await f.engine.runNext();
+    expect((await filesystem.lstat(root)).isDirectory()).toBe(true);
+    const before = f.nativeCounts();
+    reconstructed = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    expect(await reconstructed.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      effect: "unknown",
+      status: "reconciling",
+    });
+    expect(f.nativeCounts()).toEqual(before);
+    expect((await filesystem.lstat(root)).isDirectory()).toBe(true);
+    f.advanceNormalClock(61_000);
+    expect(await f.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      effect: "unknown",
+      status: "reconciling",
+    });
+    await expect(filesystem.lstat(root)).rejects.toMatchObject({ code: "ENOENT" });
+    await assertNamespaceRetained(f);
+  } finally {
+    await reconstructed?.close();
+    raw.join();
+    raw.restore();
+    await f.close();
+  }
+});
+
+for (const action of ["cancel", "late-byte"] as const) {
+  test(`original allocation last SQL fence ${action} refuses destructive removal after private preflight`, async () => {
+    const f = await fixture(false, {
+        nativeMode: "start-retire",
+        namespaceMode: "success",
+        disposalMode: "success",
+        allocationDisposal: true,
+      }),
+      cancel = new AbortController();
+    f.retireSignal(cancel.signal);
+    let ready = false,
+      held = false,
+      entered = () => {},
+      release = () => {};
+    const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      }),
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    const actualRead = filesystem.readFile.bind(filesystem),
+      actualRm = filesystem.rm.bind(filesystem),
+      actualQuery = f.sql.query.bind(f.sql);
+    let restore = () => {};
+    try {
+      await acceptNamespaceDelete(f);
+      const root = f.recordedCreate().allocationRoot;
+      let removals = 0;
+      const reading = spyOn(filesystem, "readFile").mockImplementation(
+        new Proxy(actualRead, {
+          apply(target, thisArg, args) {
+            return Reflect.apply(target, thisArg, args).then((value: unknown) => {
+              if (args[0] === join(root, ".tako-oci-artifact.json")) ready = true;
+              return value;
+            });
+          },
+        }),
+      );
+      const removing = spyOn(filesystem, "rm").mockImplementation((path, options) => {
+        if (path === root) removals++;
+        return actualRm(path, options);
+      });
+      const query = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+        const rows = await actualQuery(statement, params);
+        if (ready && !held && statement.includes(" FROM tf_v2_container_instances i JOIN ")) {
+          held = true;
+          entered();
+          await gate;
+        }
+        return rows;
+      });
+      restore = () => {
+        reading.mockRestore();
+        removing.mockRestore();
+        query.mockRestore();
+      };
+      const pending = f.engine.runNext();
+      await Promise.race([
+        reached,
+        pending.then(() => {
+          throw new Error("last Core current Sql fence absent");
+        }),
+      ]);
+      if (action === "cancel") cancel.abort();
+      else f.nativeTrailingByte();
+      release();
+      expect((await pending)?.effect).not.toBe("complete");
+      expect(held).toBe(true);
+      expect(removals).toBe(0);
+      expect(f.allocations).toEqual([]);
+      expect((await filesystem.lstat(root)).isDirectory()).toBe(true);
+      await assertNamespaceRetained(f);
+    } finally {
+      release();
+      restore();
+      if (action === "late-byte") await expect(f.close()).rejects.toThrow("custody_retained");
+      else await f.close();
+    }
+  });
+}
+
+test("original allocation last SQL fence loses the real Engine lease without deleting or replaying original custody", async () => {
+  const f = await fixture(false, {
+      ...acceptedHttpSelection(),
+      normalBackend: true,
+      namespaceMode: "success",
+      disposalMode: "success",
+    }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let reconstructed: ReturnType<typeof f.reconstructNormal> | undefined;
+  let ready = false,
+    held = false,
+    entered = () => {},
+    release = () => {};
+  const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    }),
+    gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  const actualRead = filesystem.readFile.bind(filesystem),
+    actualRm = filesystem.rm.bind(filesystem),
+    actualQuery = f.sql.query.bind(f.sql);
+  let restore = () => {};
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+    const root = f.recordedCreate().allocationRoot;
+    const deletion = await f.engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    let removals = 0;
+    const reading = spyOn(filesystem, "readFile").mockImplementation(
+      new Proxy(actualRead, {
+        apply(target, thisArg, args) {
+          return Reflect.apply(target, thisArg, args).then((value: unknown) => {
+            if (args[0] === join(root, ".tako-oci-artifact.json")) ready = true;
+            return value;
+          });
+        },
+      }),
+    );
+    const removing = spyOn(filesystem, "rm").mockImplementation((path, options) => {
+      if (path === root) removals++;
+      return actualRm(path, options);
+    });
+    const query = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+      const rows = await actualQuery(statement, params);
+      if (ready && !held && statement.includes(" FROM tf_v2_container_instances i JOIN ")) {
+        held = true;
+        entered();
+        await gate;
+      }
+      return rows;
+    });
+    restore = () => {
+      reading.mockRestore();
+      removing.mockRestore();
+      query.mockRestore();
+    };
+    const pending = f.engine.runNext();
+    await Promise.race([
+      reached,
+      pending.then(() => {
+        throw new Error("original allocation Sql fence absent");
+      }),
+    ]);
+    const native = f.nativeCounts();
+    reconstructed = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    expect(await reconstructed.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      effect: "unknown",
+      status: "reconciling",
+    });
+    release();
+    expect((await pending)?.effect).not.toBe("complete");
+    expect(removals).toBe(0);
+    expect(f.nativeCounts()).toEqual(native);
+    expect((await filesystem.lstat(root)).isDirectory()).toBe(true);
+    await assertNamespaceRetained(f);
+  } finally {
+    release();
+    restore();
     await reconstructed?.close();
     raw.join();
     raw.restore();

@@ -36,9 +36,11 @@ import {
 import { LinuxDockerRuntimePreparation } from "./linux-docker-runtime-preparation.ts";
 import {
   advanceOriginalLinuxOciOwnedDisposal,
+  disposeOriginalLinuxOciAllocation,
   observeOriginalLinuxOciOwnedInitReaped,
   observeOriginalLinuxOciOwnedNamespaceLifetime,
   observeOriginalLinuxOciOwnedRunning,
+  prepareOriginalLinuxOciAllocationDisposal,
   releaseOriginalLinuxOciOwnedNamespace,
   stopOriginalLinuxOciOwnedInit,
 } from "./linux-oci-owned-bundle.ts";
@@ -56,6 +58,11 @@ export type LinuxOciDisposalProgress =
   | LinuxOciNamespaceLifetimeObservation
   | LinuxOciRetirementObservation
   | LinuxOciDisposedHelperObservation;
+
+export interface LinuxOciAllocationDisposalObservation {
+  readonly kind: "linux-oci-original-allocation-disposal@1";
+  readonly barrier: "unproven";
+}
 
 export interface DockerPhysicalCoreOwnerPort extends DockerContainerCreateOwnerPort {
   publishServing(
@@ -182,6 +189,12 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciDisposalProgress>;
+  disposeRetainedAllocation(
+    execution: V2Execution,
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciAllocationDisposalObservation>;
   withExecution<T>(execution: V2Execution, work: () => Promise<T>): Promise<T>;
 }
 export interface DockerContainerAcceptedExecution {
@@ -2148,13 +2161,20 @@ export function createDockerContainerCoreOwner(
     signal: AbortSignal,
     mode: "dispose",
   ): Promise<LinuxOciDisposalProgress>;
+  function retainedNamespace(
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    mode: "allocation",
+  ): Promise<LinuxOciAllocationDisposalObservation>;
   async function retainedNamespace(
     execution: V2Execution,
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-    mode: "release" | "observe" | "dispose",
-  ): Promise<LinuxOciDisposalProgress> {
+    mode: "release" | "observe" | "dispose" | "allocation",
+  ): Promise<LinuxOciDisposalProgress | LinuxOciAllocationDisposalObservation> {
     if (
       !own(input, ["claimId", "intent", "nativeId", "state"]) ||
       !hex(input.claimId) ||
@@ -2230,7 +2250,7 @@ export function createDockerContainerCoreOwner(
     const phase = await startPhase();
     await guard();
     if (phase === "running") {
-      if (mode === "observe") return fail();
+      if (mode === "observe" || mode === "allocation") return fail();
       // The existing original reap producer owns STOP/JOIN and the exit CAS.
       // Neither this read nor a namespace snapshot can manufacture an exit.
       await result.stopRetainedInit(execution, captured, originalCustody, signal);
@@ -2238,11 +2258,35 @@ export function createDockerContainerCoreOwner(
       if ((await startPhase()) !== "exited") return fail();
       await guard();
     }
-    const observation = await (mode === "dispose"
-      ? advanceOriginalLinuxOciOwnedDisposal(originalCustody, result, captured, signal)
-      : mode === "release"
-        ? releaseOriginalLinuxOciOwnedNamespace(originalCustody, result, captured, signal)
-        : observeOriginalLinuxOciOwnedNamespaceLifetime(originalCustody, result, captured, signal));
+    let observation: LinuxOciDisposalProgress | LinuxOciAllocationDisposalObservation;
+    if (mode === "allocation") {
+      await prepareOriginalLinuxOciAllocationDisposal(originalCustody, result, captured, signal);
+      await guard();
+      // A delayed remove-current read may have started before a new Engine
+      // lease replaced this execution. Reread the original execution itself.
+      await assertExecution(execution);
+      // No await from this actual Core fence through the original class's
+      // synchronous private-fact check and the first filesystem dispatch.
+      if (signal.aborted || !lease.active || lease.controller.signal.aborted || !leases.has(lease))
+        return fail();
+      executionScope(execution);
+      observation = await disposeOriginalLinuxOciAllocation(
+        originalCustody,
+        result,
+        captured,
+        signal,
+      );
+    } else
+      observation = await (mode === "dispose"
+        ? advanceOriginalLinuxOciOwnedDisposal(originalCustody, result, captured, signal)
+        : mode === "release"
+          ? releaseOriginalLinuxOciOwnedNamespace(originalCustody, result, captured, signal)
+          : observeOriginalLinuxOciOwnedNamespaceLifetime(
+              originalCustody,
+              result,
+              captured,
+              signal,
+            ));
     await guard();
     // No final await after the local execution/lease/cancel fence.
     if (signal.aborted || !lease.active || lease.controller.signal.aborted || !leases.has(lease))
@@ -2348,6 +2392,9 @@ export function createDockerContainerCoreOwner(
     },
     advanceRetainedBornDisposal(execution, record, originalCustody, signal) {
       return retainedNamespace(execution, record, originalCustody, signal, "dispose");
+    },
+    disposeRetainedAllocation(execution, record, originalCustody, signal) {
+      return retainedNamespace(execution, record, originalCustody, signal, "allocation");
     },
     async claimAcceptedStart(input: DockerContainerCreateRecord) {
       // Snapshot data before the first await. Accessors or a later caller edit
