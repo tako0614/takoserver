@@ -409,7 +409,11 @@ static _Noreturn void ocip_retain(struct tns_oci_owner **owner,
   }
 }
 
+/* The existing argc1 owner below remains the direct H in either invocation. */
+#include "docker-container-terminal-oci-parent.h"
+
 int main(int argc, char **argv) {
+  if (argc == 2 && !strcmp(argv[1], "--persistent-parent")) return ocipp_main();
   (void)argv;
   if (argc != 1 || geteuid() != 0 || fcntl(2, F_GETFD) < 0 ||
       ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
