@@ -71,6 +71,11 @@ const ACTOR_INBOUND_COUNT = 256;
 const SOCKET_ID_LIMIT = 10_000;
 const SOCKET_ATTACHMENT_PREFIX = "__takoserver_actor_socket_attachment_v1:";
 const SOCKET_ATTACHMENT_GC_PAGE = 32;
+// Host-owned pending handoff policy. Preserve the portable byte ceiling while
+// bounding empty frames and keeping each temporary KV value below 128 KiB.
+const SOCKET_PENDING_FRAME_COUNT = 256;
+const SOCKET_PENDING_CHUNK_BYTES = 64 * 1024;
+const SOCKET_PENDING_CHUNKS = 512;
 const ALARM_RETRY_MS = 1_000;
 const ALARM_WATCHDOG_MS = 35_000;
 const ALARM_HANDLER_MS = 30_000;
@@ -1058,14 +1063,15 @@ export function createActorNativeOwner(
         if (this.suppressedCloses.has(socket)) continue;
         const metadata = socketMetadata(socket);
         if (!metadata || metadata.socketId !== socketId) continue;
+        const custody = this.readSocketCustody(metadata, socket);
         const record: SocketRecord = {
           socketId,
           actorId: metadata.actorId,
           nonce: "",
           protocol: "",
-          attachment: this.readSocketAttachment(metadata, socket),
-          queued: [],
-          queuedBytes: 0,
+          attachment: custody.attachment,
+          queued: custody.queued,
+          queuedBytes: custody.queuedBytes,
           status:
             metadata.reservationBearer === undefined
               ? profile.kind === "v2" && this.closingInbound.has(socket)
@@ -1084,23 +1090,27 @@ export function createActorNativeOwner(
       }
       return undefined;
     }
-    private readSocketAttachment(
+    private readSocketCustody(
       metadata: SocketAttachment,
       socket: NativeActorWebSocket,
-    ): Uint8Array | null {
+    ): { attachment: Uint8Array | null; queued: (string | Uint8Array)[]; queuedBytes: number } {
       try {
         if (metadata.attachmentFormat === undefined) {
           const bytes = decodeAttachment(metadata.attachment);
           if (bytes !== null && bytes.byteLength > profile.socketAttachmentBytes)
             throw new Error("Actor socket attachment exceeds its ABI");
-          return bytes;
+          return { attachment: bytes, queued: [], queuedBytes: 0 };
         }
         const kv = this.requireStorage().kv;
         if (!kv) throw new Error("Actor socket attachment storage unavailable");
         const value = kv.get(socketAttachmentKey(metadata.socketId));
         if (typeof value !== "object" || value === null || SafeArrayIsArray(value))
           throw new Error("Actor socket attachment unavailable");
-        const payload = value as { readonly actorId?: unknown; readonly bytes?: unknown };
+        const payload = value as {
+          readonly actorId?: unknown;
+          readonly bytes?: unknown;
+          readonly pending?: unknown;
+        };
         if (
           payload.actorId !== metadata.actorId ||
           (payload.bytes !== null &&
@@ -1108,7 +1118,76 @@ export function createActorNativeOwner(
               payload.bytes.byteLength > profile.socketAttachmentBytes))
         )
           throw new Error("Actor socket attachment unavailable");
-        return payload.bytes === null ? null : payload.bytes.slice();
+        const attachment = payload.bytes === null ? null : payload.bytes.slice();
+        if (metadata.reservationBearer === undefined)
+          return { attachment, queued: [], queuedBytes: 0 };
+        const pending = payload.pending;
+        if (!pending || typeof pending !== "object" || SafeArrayIsArray(pending))
+          throw new Error("Actor pending socket queue unavailable");
+        const queue = pending as Record<string, unknown>;
+        if (
+          Object.keys(queue).sort().join() !==
+            "bearer,epoch,expiresAt,frames,generationKey,queuedBytes,schema,variantKey" ||
+          queue.schema !== "owner-kv-pending-v1" ||
+          queue.bearer !== metadata.reservationBearer ||
+          queue.expiresAt !== metadata.reservationExpiresAt ||
+          queue.generationKey !== metadata.reservationGenerationKey ||
+          queue.epoch !== metadata.reservationEpoch ||
+          queue.variantKey !== metadata.reservationVariantKey ||
+          !SafeArrayIsArray(queue.frames) ||
+          queue.frames.length > SOCKET_PENDING_FRAME_COUNT ||
+          !SafeIsSafeInteger(queue.queuedBytes) ||
+          (queue.queuedBytes as number) < 0 ||
+          (queue.queuedBytes as number) > profile.socketOutboundQueueBytes
+        )
+          throw new Error("Actor pending socket queue unavailable");
+        const frames: { kind: "text" | "binary"; length: number }[] = [];
+        let total = 0;
+        for (const entry of queue.frames) {
+          if (!entry || typeof entry !== "object" || SafeArrayIsArray(entry))
+            throw new Error("Actor pending socket frame unavailable");
+          const frame = entry as Record<string, unknown>;
+          if (
+            Object.keys(frame).sort().join() !== "kind,length" ||
+            (frame.kind !== "text" && frame.kind !== "binary") ||
+            !SafeIsSafeInteger(frame.length) ||
+            (frame.length as number) < 0 ||
+            (frame.length as number) > profile.socketMessageBytes
+          )
+            throw new Error("Actor pending socket frame unavailable");
+          total += frame.length as number;
+          if (!SafeIsSafeInteger(total) || total > profile.socketOutboundQueueBytes)
+            throw new Error("Actor pending socket queue exceeds its ABI");
+          frames.push({ kind: frame.kind, length: frame.length as number });
+        }
+        if (total !== queue.queuedBytes) throw new Error("Actor pending socket byte count changed");
+        const bytes = new SafeUint8Array(total);
+        const prefix = `${socketAttachmentKey(metadata.socketId)}:pending:`;
+        for (
+          let offset = 0, index = 0;
+          offset < total;
+          offset += SOCKET_PENDING_CHUNK_BYTES, index++
+        ) {
+          const chunk = kv.get(`${prefix}${index}`);
+          if (
+            !(chunk instanceof SafeUint8Array) ||
+            chunk.byteLength !== Math.min(SOCKET_PENDING_CHUNK_BYTES, total - offset)
+          )
+            throw new Error("Actor pending socket chunk unavailable");
+          bytes.set(chunk, offset);
+        }
+        const queued: (string | Uint8Array)[] = [];
+        let offset = 0;
+        for (const frame of frames) {
+          const data = bytes.slice(offset, offset + frame.length);
+          queued.push(
+            frame.kind === "text"
+              ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(data)
+              : data,
+          );
+          offset += frame.length;
+        }
+        return { attachment, queued, queuedBytes: total };
       } catch (error) {
         // Never substitute empty bytes or invoke another Actor with corrupt or
         // missing custody. There is no admitted callback at this read boundary.
@@ -1128,8 +1207,17 @@ export function createActorNativeOwner(
       }
     }
     private deleteSocketAttachment(socketId: string): void {
-      if (validSocketAttachmentId(socketId))
-        this.state.storage?.kv?.delete(socketAttachmentKey(socketId));
+      if (!validSocketAttachmentId(socketId)) return;
+      this.deletePendingSocketChunks(socketId);
+      this.state.storage?.kv?.delete(socketAttachmentKey(socketId));
+    }
+    private deletePendingSocketChunks(socketId: string): void {
+      const kv = this.state.storage?.kv;
+      if (!kv) return;
+      const prefix = `${socketAttachmentKey(socketId)}:pending:`;
+      const keys: string[] = [];
+      for (const [key] of kv.list({ prefix, limit: SOCKET_PENDING_CHUNKS })) keys.push(key);
+      for (const key of keys) kv.delete(key);
     }
     private cleanupTerminalAttachment(socket: NativeActorWebSocket): void {
       if (
@@ -1156,9 +1244,67 @@ export function createActorNativeOwner(
         // The owner and the tenant Facet have separate storage namespaces.
         // Copy the complete bytes; a 16 KiB portable payload must not compete
         // with native identity/reservation metadata for the 16 KiB envelope.
-        kv.put(socketAttachmentKey(record.socketId), {
+        const key = socketAttachmentKey(record.socketId);
+        let pending: Record<string, unknown> | undefined;
+        if (record.status === "transport-pending") {
+          if (record.queued.length > SOCKET_PENDING_FRAME_COUNT)
+            throw new Error("Actor pending socket frame count exceeded");
+          const frames: { kind: "text" | "binary"; length: number }[] = [];
+          const encoded: Uint8Array[] = [];
+          let total = 0;
+          for (const frame of record.queued) {
+            const bytes =
+              typeof frame === "string"
+                ? (SafeReflectApply(SafeEncode, SafeEncoder, [frame]) as Uint8Array)
+                : frame;
+            total += bytes.byteLength;
+            if (
+              !SafeIsSafeInteger(total) ||
+              total > profile.socketOutboundQueueBytes ||
+              bytes.byteLength > profile.socketMessageBytes
+            )
+              throw new Error("Actor pending socket queue exceeds its ABI");
+            frames.push({
+              kind: typeof frame === "string" ? "text" : "binary",
+              length: bytes.byteLength,
+            });
+            encoded.push(bytes);
+          }
+          if (total !== record.queuedBytes)
+            throw new Error("Actor pending socket byte count changed");
+          const bytes = new SafeUint8Array(total);
+          let offset = 0;
+          for (const frame of encoded) {
+            bytes.set(frame, offset);
+            offset += frame.byteLength;
+          }
+          for (
+            let offset = 0, index = 0;
+            offset < total;
+            offset += SOCKET_PENDING_CHUNK_BYTES, index++
+          )
+            kv.put(
+              `${key}:pending:${index}`,
+              bytes.slice(offset, offset + SOCKET_PENDING_CHUNK_BYTES),
+            );
+          pending = {
+            schema: "owner-kv-pending-v1",
+            bearer: record.reservationBearer,
+            expiresAt: record.reservationExpiresAt,
+            generationKey: record.reservationGenerationKey,
+            epoch: record.reservationEpoch,
+            variantKey: record.reservationVariantKey,
+            frames,
+            queuedBytes: total,
+          };
+        } else {
+          // Clear before native send. A crash/ambiguous send never replays frames.
+          this.deletePendingSocketChunks(record.socketId);
+        }
+        kv.put(key, {
           actorId: record.actorId,
           bytes: record.attachment === null ? null : record.attachment.slice(),
+          ...(pending ? { pending } : {}),
         });
       }
       const metadata: SocketAttachment = {
@@ -1556,7 +1702,11 @@ export function createActorNativeOwner(
           return new Response(null, { status: 413 });
         if (this.activeSocketInvocation !== active) return new Response(null, { status: 404 });
         const data =
-          kind === "text" ? new TextDecoder("utf-8", { fatal: true }).decode(bytes) : bytes;
+          kind === "text"
+            ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: profile.kind === "v2" }).decode(
+                bytes,
+              )
+            : bytes;
         if (record.status === "provisional") {
           let pendingForActor = 0;
           for (const pending of this.sockets.values())
@@ -1564,6 +1714,7 @@ export function createActorNativeOwner(
               pendingForActor += pending.queuedBytes;
           if (
             record.queuedBytes + bytes.byteLength > profile.socketOutboundQueueBytes ||
+            (profile.kind === "v2" && record.queued.length >= SOCKET_PENDING_FRAME_COUNT) ||
             (profile.kind === "legacy" && pendingForActor + bytes.byteLength > 64 * 1024 * 1024)
           ) {
             if (profile.kind === "legacy") {
@@ -2080,7 +2231,7 @@ export function createActorNativeOwner(
           actorId,
           nonce: "",
           protocol: "",
-          attachment: this.readSocketAttachment(metadata, socket),
+          attachment: this.readSocketCustody(metadata, socket).attachment,
           queued: [],
           queuedBytes: 0,
           status: profile.kind === "v2" ? "terminal" : "live",
