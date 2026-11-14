@@ -61,6 +61,7 @@ type OriginalOciCustody = {
   readonly signal: AbortSignal;
   readonly initStops: Set<string>;
   readonly namespaceReleases: Set<string>;
+  readonly disposedHelpers: WeakSet<LinuxOciPhysicalSession>;
   readonly disposalSteps: Map<
     string,
     "begin" | "read" | "delete" | "join-delete" | "dispose" | "continue-dispose" | "join-helper"
@@ -82,6 +83,7 @@ const joinOriginalOciBornDelete = LinuxOciPhysicalSession.prototype.joinBornDele
 const disposeOriginalOciBorn = LinuxOciPhysicalSession.prototype.disposeBorn;
 const continueOriginalOciDisposal = LinuxOciPhysicalSession.prototype.continueBornDisposal;
 const joinOriginalOciDisposedHelper = LinuxOciPhysicalSession.prototype.joinDisposedHelper;
+const closeOriginalOciDisposedHelper = LinuxOciPhysicalSession.prototype.closeDisposedHelper;
 
 /** Exactly one next original operation per Core lease/currentness check.
  * The private route only prevents replay; every fact comes from the original
@@ -134,7 +136,12 @@ export async function advanceOriginalLinuxOciOwnedDisposal(
   } else if (step === "continue-dispose") {
     observation = await continueOriginalOciDisposal.call(session, signal);
     custody.disposalSteps.set(record.claimId, "join-helper");
-  } else observation = await joinOriginalOciDisposedHelper.call(session, signal);
+  } else {
+    observation = await joinOriginalOciDisposedHelper.call(session, signal);
+    // Only the captured original method's actual child join records this
+    // session. Local close will independently recheck its private facts.
+    custody.disposedHelpers.add(session);
+  }
   // Record consumed effects before refusing a cancelled return, so a later
   // genuine lease can only continue the original phase, never resend it.
   local();
@@ -590,6 +597,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     return fail("invalid_request");
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
+  const disposedHelpers = new WeakSet<LinuxOciPhysicalSession>();
   const sql = options.sql;
   core.acceptance.assertSql(sql);
   // A failed join retains this exact request. A fresh call cannot replace it
@@ -604,6 +612,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     signal: nativeLifetime.signal,
     initStops: new Set<string>(),
     namespaceReleases: new Set<string>(),
+    disposedHelpers,
     disposalSteps: new Map(),
   });
   let nativeClosing: Promise<void> | undefined;
@@ -1794,7 +1803,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           // A constructor can reenter close through its raw spawn boundary.
           // Collect only AFTER original scopes join, never an initial empty map.
           const physical = await Promise.allSettled(
-            [...nativeSessions.values()].map((session) => session.close()),
+            [...nativeSessions.values()].map((session) =>
+              disposedHelpers.has(session)
+                ? closeOriginalOciDisposedHelper.call(session)
+                : session.close(),
+            ),
           );
           const http = await Promise.allSettled(
             [...httpProbes].map(async ([claimId, probe]) => {

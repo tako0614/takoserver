@@ -99,6 +99,7 @@ async function fixture(
       | "delete-retained"
       | "dispose-retained"
       | "unknown";
+    readonly disposalExit?: "nonzero" | "close-only";
     readonly egressLimits?: LinuxOciEgressLimits;
     readonly hostTopology?: LinuxOciHostTopology;
     readonly outboundInternet?: boolean;
@@ -526,9 +527,11 @@ async function fixture(
                   kind === "linux-oci-dispose-born@1" ||
                   kind === "linux-oci-continue-born-disposal@1"
                 ) {
-                  nativeExits++;
                   stdout.end();
-                  child.emit("exit", 0, null);
+                  if (adversarial.disposalExit !== "close-only") {
+                    nativeExits++;
+                    child.emit("exit", adversarial.disposalExit === "nonzero" ? 1 : 0, null);
+                  }
                   child.emit("close", 0, null);
                 }
               }
@@ -3829,7 +3832,7 @@ test("original OCI disposal binds genuine accepted exit to same original owner p
     await assertNamespaceRetained(f);
     expect(outcome?.effect).not.toBe("complete");
   } finally {
-    await expect(f.close()).rejects.toThrow("custody_retained");
+    await f.close();
   }
 });
 
@@ -3871,7 +3874,7 @@ for (const disposalMode of ["begin-retained", "delete-retained", "dispose-retain
       ]);
       await assertNamespaceRetained(f);
     } finally {
-      await expect(f.close()).rejects.toThrow("custody_retained");
+      await f.close();
     }
   });
 }
@@ -3944,7 +3947,7 @@ test("original OCI disposal rejects foreign opaque custody even with real sameSq
     expect(f.disposals).toHaveLength(1);
     await assertNamespaceRetained(f);
   } finally {
-    await expect(f.close()).rejects.toThrow("custody_retained");
+    await f.close();
   }
 });
 
@@ -4068,6 +4071,110 @@ test("original OCI disposal normal DELETE rejects a reconstructed creator and re
     await reconstructed?.close();
     raw.join();
     raw.restore();
-    await expect(f.close()).rejects.toThrow("custody_retained");
+    await f.close();
+  }
+});
+
+test("disposed creator local close joins the original helper without wire and retains allocation and Core claim", async () => {
+  const f = await fixture(false, {
+    nativeMode: "start-retire",
+    namespaceMode: "success",
+    disposalMode: "success",
+  });
+  try {
+    await acceptNamespaceDelete(f);
+    expect((await f.engine.runNext())?.effect).not.toBe("complete");
+    expect(f.failures).toEqual([]);
+    expect(f.disposals).toEqual([
+      { kind: "linux-oci-disposed-helper-exit@1", barrier: "unproven" },
+    ]);
+    const before = f.nativeCounts(),
+      files = await readdir(f.artifactRoot),
+      original = f.recordedCreate();
+    expect(files).toContain(original.claimId);
+    await f.composition.close();
+    await f.composition.close();
+    expect(f.nativeCounts()).toEqual(before);
+    expect(f.nativeExits()).toBe(1);
+    expect(await readdir(f.artifactRoot)).toEqual(files);
+    expect(await readFile(join(original.allocationRoot, "rootfs", "synthetic-file"), "utf8")).toBe(
+      "verified-image-model",
+    );
+    await assertNamespaceRetained(f);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const mode of ["unknown", "nonzero", "close-only"] as const) {
+  test(`disposed creator local close retains ${mode} original child without legacy IO escape`, async () => {
+    const f = await fixture(false, {
+      nativeMode: "start-retire",
+      namespaceMode: "success",
+      disposalMode: mode === "unknown" ? "unknown" : "success",
+      ...(mode === "unknown" ? {} : { disposalExit: mode }),
+    });
+    try {
+      await acceptNamespaceDelete(f);
+      expect((await f.engine.runNext())?.effect).not.toBe("complete");
+      expect(f.failures).toHaveLength(1);
+      expect(f.disposals).toEqual([]);
+      const before = f.nativeCounts();
+      await expect(f.composition.close()).rejects.toThrow("custody_retained");
+      expect(f.nativeCounts()).toEqual(before);
+      await assertNamespaceRetained(f);
+    } finally {
+      await expect(f.close()).rejects.toThrow("custody_retained");
+    }
+  });
+}
+
+test("disposed creator local close cannot lend original custody to a reconstructed normal backend", async () => {
+  const f = await fixture(false, {
+      ...acceptedHttpSelection(),
+      normalBackend: true,
+      namespaceMode: "success",
+      disposalMode: "success",
+    }),
+    raw = acceptedRawHttp();
+  raw.onEnd(() => {
+    raw.reply();
+    raw.join();
+  });
+  let reconstructed: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+    const deletion = await f.engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect(await f.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    const before = f.nativeCounts();
+    reconstructed = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    expect(await reconstructed.engine.runNext()).toMatchObject({
+      id: deletion.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    // The new creator closes its own empty graph, not the original helper.
+    await reconstructed.close();
+    expect(f.nativeCounts()).toEqual(before);
+    await f.composition.close();
+    expect(f.nativeCounts()).toEqual(before);
+    await assertNamespaceRetained(f);
+    expect(raw.calls).toHaveLength(1);
+  } finally {
+    await reconstructed?.close();
+    raw.join();
+    raw.restore();
+    await f.close();
   }
 });

@@ -512,6 +512,7 @@ export class LinuxOciPhysicalSession {
   #bornDisposalSent = false;
   #localDisposalReply = false;
   #localDisposalObserved = false;
+  #disposedLocalClosed = false;
   #claim: string | undefined;
   #identity: LinuxOciStoppedObservation | undefined;
   #mustRetain = false;
@@ -881,6 +882,25 @@ export class LinuxOciPhysicalSession {
     )
       throw failure("custody_retained");
     return Object.freeze({ kind: "linux-oci-disposed-helper-exit@1", barrier: "unproven" });
+  }
+
+  /** Local closure of this same disposed child only. Rechecks the private
+   * disposal and actual exit/close facts on every call; no wire or child action. */
+  async closeDisposedHelper(): Promise<void> {
+    if (
+      (!this.#disposedLocalClosed && this.#admissionClosed) ||
+      !this.#localDisposalObserved ||
+      !this.#localDisposalReply ||
+      this.#pending !== undefined ||
+      !this.#closed ||
+      this.#exit?.code !== 0 ||
+      this.#exit.signal !== null
+    )
+      throw failure("custody_retained");
+    // No await after the original private facts. This seal only permits a
+    // repeated local close, and never substitutes for those facts above.
+    this.#disposedLocalClosed = true;
+    this.#admissionClosed = true;
   }
 
   cancel(): Promise<LinuxOciCancelObservation> {

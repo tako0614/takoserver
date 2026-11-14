@@ -1056,3 +1056,116 @@ test("retirement helper join cannot consume a reply before the public disposal f
     f.cleanup();
   }
 });
+
+test("disposed local close reasserts the original successful child facts without any additional IO", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 4);
+    await session.disposeBorn(signal());
+    f.child.emit("exit", 0, null);
+    f.child.emit("close", 0, null);
+    await session.joinDisposedHelper(signal());
+    const sent = f.writes.length;
+    await session.closeDisposedHelper();
+    await session.closeDisposedHelper();
+    expect(f.writes).toHaveLength(sent);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+    expect(f.counts()).toEqual({ kills: 0, unrefs: 0 });
+    // The separate born-disposal API does not weaken the old close contract.
+    await expect(session.close()).rejects.toThrow("custody_retained");
+    expect(f.writes).toHaveLength(sent);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("disposed local close rejects unjoined wrong or unknown same-child facts without IO", async () => {
+  for (const mode of [
+    "no-dispose",
+    "no-exit-or-close",
+    "exit-only",
+    "close-only",
+    "nonzero",
+    "signal",
+    "stream-error",
+  ]) {
+    const f = fixture();
+    try {
+      const session = await retirementReady(f, 4);
+      if (mode !== "no-dispose") await session.disposeBorn(signal());
+      if (mode !== "close-only" && mode !== "no-exit-or-close")
+        f.child.emit(
+          "exit",
+          mode === "nonzero" ? 1 : mode === "signal" ? null : 0,
+          mode === "signal" ? "SIGTERM" : null,
+        );
+      if (mode !== "exit-only" && mode !== "no-exit-or-close") f.child.emit("close", 0, null);
+      if (mode === "stream-error") f.child.stdout.emit("error", new Error("raw stdout"));
+      const sent = f.writes.length;
+      await expect(session.closeDisposedHelper()).rejects.toThrow("custody_retained");
+      expect(f.writes).toHaveLength(sent);
+      expect(f.raw).toHaveBeenCalledTimes(1);
+      expect(f.counts()).toEqual({ kills: 0, unrefs: 0 });
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("disposed local close does not turn its own repeat seal into a fact after trailing bytes", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 4);
+    await session.disposeBorn(signal());
+    f.child.emit("exit", 0, null);
+    f.child.emit("close", 0, null);
+    await session.joinDisposedHelper(signal());
+    await session.closeDisposedHelper();
+    const sent = f.writes.length;
+    f.child.stdout.emit("data", Buffer.from([0]));
+    await expect(session.closeDisposedHelper()).rejects.toThrow("custody_retained");
+    expect(f.writes).toHaveLength(sent);
+    expect(f.counts()).toEqual({ kills: 0, unrefs: 0 });
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("disposed local close cannot precede the original disposal final observation", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 4);
+    let premature: Promise<void> | undefined;
+    f.onRequest(() => {
+      f.reply(retirementFact(retirementOperations[4][2]));
+      f.child.emit("exit", 0, null);
+      f.child.emit("close", 0, null);
+      premature = session.closeDisposedHelper();
+      premature.catch(() => {});
+    });
+    await session.disposeBorn(signal());
+    if (!premature) throw new Error("no raw reentrant close");
+    await expect(premature).rejects.toThrow("custody_retained");
+    const sent = f.writes.length;
+    await session.closeDisposedHelper();
+    expect(f.writes).toHaveLength(sent);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("disposed local close preserves an earlier legacy-close admission refusal", async () => {
+  const f = fixture();
+  try {
+    const session = await retirementReady(f, 4);
+    await session.disposeBorn(signal());
+    f.child.emit("exit", 0, null);
+    f.child.emit("close", 0, null);
+    const sent = f.writes.length;
+    await expect(session.close()).rejects.toThrow("custody_retained");
+    await expect(session.closeDisposedHelper()).rejects.toThrow("custody_retained");
+    expect(f.writes).toHaveLength(sent);
+  } finally {
+    f.cleanup();
+  }
+});
