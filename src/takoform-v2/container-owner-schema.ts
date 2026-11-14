@@ -702,11 +702,109 @@ const allocationReady =
     allocationNames,
   ) +
   ")";
-const selectedControlReady = "(" + controlReady + " OR " + allocationReady + ")";
-const selectedControlReadyParams = Object.freeze([...controlReadyParams, ...allocationReadyParams]);
+/** Third optional additive expand. Historical NULL is never a close fact.
+ * Reserve only with the original pending peer-control save; seal only the
+ * original bound application's completed close. No runtime is reconstructed. */
+export const V2_CONTAINER_APPLICATION_IO_RESERVED =
+  '{"kind":"linux-oci-application-io-reserved@1"}';
+const applicationIoColumn =
+  "application_io_cleanup TEXT CHECK (application_io_cleanup IS NULL OR (typeof(application_io_cleanup) = 'text' AND length(application_io_cleanup) BETWEEN 1 AND 65536 AND json_valid(application_io_cleanup)))";
+const applicationIoGuards = Object.freeze([
+  trigger(
+    "application_io_cleanup_insert",
+    Q,
+    "BEFORE INSERT",
+    refuse("NEW.application_io_cleanup IS NULL"),
+  ),
+  trigger(
+    "application_io_cleanup_transition",
+    Q,
+    "BEFORE UPDATE",
+    refuse(`
+    NEW.application_io_cleanup IS OLD.application_io_cleanup OR
+    (OLD.application_io_cleanup IS NULL AND NEW.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+      AND OLD.state = 'pending' AND NEW.state = 'pending' AND NEW.native_id IS NULL
+      AND NEW.bound_at_ms IS NULL AND NEW.removed_at_ms IS NULL
+      AND OLD.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)}
+      AND NEW.allocation_cleanup = 'untouched'
+      AND json_extract(NEW.native_control,'$.kind') = 'linux-oci-sealed-control@1'
+      AND json_extract(NEW.native_control,'$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1') OR
+    (OLD.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+      AND OLD.state = 'bound' AND NEW.state = 'bound' AND NEW.native_id IS OLD.native_id
+      AND NEW.native_control IS OLD.native_control
+      AND json_extract(NEW.application_io_cleanup,'$.kind') = 'linux-oci-sealed-application-io-close@1'
+      AND json_extract(NEW.application_io_cleanup,'$.scope.purpose') = 'takoserver.linux-oci-application-io-close@1'
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.claimId') = OLD.claim_id
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.resourceUid') = OLD.resource_uid
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.generation') = OLD.generation
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.installationId') = OLD.installation_id
+      AND json_extract(NEW.application_io_cleanup,'$.scope.nativeId') = OLD.native_id)`),
+  ),
+]);
+const applicationIoObjects = Object.freeze([
+  ...allocationObjects.map((item) =>
+    item.name === Q
+      ? object(
+          item.type,
+          item.name,
+          item.table,
+          item.sql.replace(
+            ",\n  PRIMARY KEY (resource_uid, generation),",
+            ", " + applicationIoColumn + ",\n  PRIMARY KEY (resource_uid, generation),",
+          ),
+        )
+      : item,
+  ),
+  ...applicationIoGuards,
+]);
+export const V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+  statements: Object.freeze([
+    `ALTER TABLE ${Q} ADD COLUMN ${applicationIoColumn}`,
+    ...applicationIoGuards.map((item) => item.sql),
+  ]),
+  objects: applicationIoObjects,
+});
+const applicationIoRows = Object.freeze(
+  applicationIoObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const applicationIoNames = applicationIoObjects.map((item) => literal(item.name)).join(", ");
+const applicationIoReadyParams = Object.freeze([JSON.stringify(applicationIoRows)]);
+const applicationIoReady =
+  "(WITH container_owner_application_io_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, rowIndex, columnIndex) =>
+      `json_extract((SELECT document FROM container_owner_application_io_values), '$[${rowIndex}][${columnIndex}]')`,
+    applicationIoRows,
+    applicationIoNames,
+  ) +
+  ")";
+export async function inspectV2ContainerOwnerApplicationIoSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(`SELECT ${applicationIoReady} AS ready`, applicationIoReadyParams);
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+const selectedAllocationReady = "(" + allocationReady + " OR " + applicationIoReady + ")";
+const selectedAllocationReadyParams = Object.freeze([
+  ...allocationReadyParams,
+  ...applicationIoReadyParams,
+]);
+const selectedControlReady = "(" + controlReady + " OR " + selectedAllocationReady + ")";
+const selectedControlReadyParams = Object.freeze([
+  ...controlReadyParams,
+  ...selectedAllocationReadyParams,
+]);
 export async function inspectV2ContainerOwnerAllocationSchema(sql: Sql): Promise<boolean> {
   try {
-    const rows = await sql.query(`SELECT ${allocationReady} AS ready`, allocationReadyParams);
+    const rows = await sql.query(
+      `SELECT ${selectedAllocationReady} AS ready`,
+      selectedAllocationReadyParams,
+    );
     return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
   } catch {
     return false;
