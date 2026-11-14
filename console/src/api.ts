@@ -661,6 +661,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+/** Discovery must name a route this Console understands, rather than look unconfigured. */
+function isSupportedIdentityProvider(value: unknown): value is IdentityProvider {
+  if (
+    !isRecord(value) ||
+    typeof value.displayName !== "string" ||
+    value.displayName.trim() === "" ||
+    (value.clientId !== undefined &&
+      (typeof value.clientId !== "string" || value.clientId.trim() === "")) ||
+    (value.issuer !== undefined && (typeof value.issuer !== "string" || value.issuer.trim() === ""))
+  )
+    return false;
+  if (value.method === "operator-assertion") return value.id === "google" || value.id === "github";
+  if (value.method !== "oidc" || typeof value.clientId !== "string") return false;
+  return value.id === "google" || (value.id === "takos-id" && typeof value.issuer === "string");
+}
+
 function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return (
     isRecord(value) &&
@@ -1139,8 +1155,18 @@ export function createApi(options: ApiOptions) {
         return unknown;
       }
     },
-    identityProviders: () =>
-      call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),
+    async identityProviders(): Promise<{ providers: readonly IdentityProvider[] }> {
+      const path = "/v1/identity/providers";
+      const { payload, status } = await request<unknown>("GET", path);
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        !Array.isArray(payload.providers) ||
+        !payload.providers.every(isSupportedIdentityProvider)
+      )
+        throw new ApiError("invalid_response", status, path);
+      return { providers: payload.providers };
+    },
 
     /** Reads a Hosted-selected continuation using only the real shared-session cookie. */
     async hostedBillingContinuation(selector: string): Promise<HostedBillingContinuation> {
