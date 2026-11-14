@@ -1472,3 +1472,6 @@ test("peer allocation historical sealed NULL never becomes fresh untouched after
     await x.close();
   }
 });
+
+// Original closed raw sources reused by the same-creator DELETE regression.
+export { fixture as originalPeerDeleteFixture, normalCreate, acceptNormalDelete };

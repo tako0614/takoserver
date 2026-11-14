@@ -64,16 +64,19 @@ import {
   serializeLinuxOciServicePolicy,
 } from "./linux-oci-service-policy.ts";
 
+type OriginalPeerRead = {
+  readonly custody: object;
+  readonly settlement: Promise<unknown>;
+  /** Actual management producer, absent for a one-use readonly reader. */
+  readonly management?: ReturnType<typeof prepareAuthenticatedLinuxOciPeerInit>;
+};
 type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
   readonly artifactRoot: string;
   readonly physicalBinary: string | undefined;
   readonly hostTopology: LinuxOciHostTopology | undefined;
   readonly httpRecords: ReadonlyMap<string, DockerContainerCreateRecord>;
-  readonly peerReads: Map<
-    string,
-    { readonly custody: object; readonly settlement: Promise<unknown> }
-  >;
+  readonly peerReads: Map<string, OriginalPeerRead>;
   readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
   readonly parents: ReadonlyMap<
     string,
@@ -366,6 +369,7 @@ async function authenticatedOriginalPeerSource(
   artifact: unknown,
   binding: unknown,
   signal: AbortSignal,
+  previous?: OriginalPeerRead,
 ) {
   const custody = originalOciCustodies.get(original);
   if (
@@ -374,7 +378,7 @@ async function authenticatedOriginalPeerSource(
     !custody.physicalBinary ||
     custody.signal.aborted ||
     signal.aborted ||
-    custody.peerReads.has(record.claimId)
+    custody.peerReads.get(record.claimId) !== previous
   )
     return fail("parent_custody");
   const exact = (v: unknown, keys: readonly string[]): v is Record<string, unknown> =>
@@ -464,7 +468,12 @@ async function authenticatedOriginalPeerSource(
   if ((await readFile(captured.receipt.path, "utf8")) !== captured.receiptBytes)
     return fail("allocation_identity");
   await assertOriginalFile(captured.receipt, false);
-  if (custody.signal.aborted || signal.aborted) return fail("parent_custody");
+  if (
+    custody.signal.aborted ||
+    signal.aborted ||
+    custody.peerReads.get(record.claimId) !== previous
+  )
+    return fail("parent_custody");
   return { custody, binary: custody.physicalBinary, allocation: captured };
 }
 export async function prepareOriginalLinuxOciPeerRead(
@@ -503,6 +512,21 @@ export async function prepareOriginalLinuxOciPeerInit(
   binding: unknown,
   signal: AbortSignal,
 ) {
+  const previous = originalOciCustodies.get(original)?.peerReads.get(record.claimId);
+  if (previous) {
+    if (
+      !previous.management ||
+      previous.custody !== previous.management ||
+      previous.settlement !== previous.management.settlement
+    )
+      return fail("parent_custody");
+    // Join the ORIGINAL connector's actual wait/dual-EOF/close result. The
+    // old operation loan is normally aborted on scope exit; it cannot grant
+    // current authority. Pending/rejected/UNKNOWN never replaces its slot.
+    const pending = Symbol("pending-original-connector");
+    const joined = await Promise.race([previous.management.settlement, Promise.resolve(pending)]);
+    if (joined === pending) return fail("parent_custody");
+  }
   const { custody, binary, allocation } = await authenticatedOriginalPeerSource(
     original,
     core,
@@ -510,8 +534,13 @@ export async function prepareOriginalLinuxOciPeerInit(
     artifact,
     binding,
     signal,
+    previous,
   );
-  if (custody.peerReads.has(record.claimId) || signal.aborted || custody.signal.aborted)
+  if (
+    custody.peerReads.get(record.claimId) !== previous ||
+    signal.aborted ||
+    custody.signal.aborted
+  )
     return fail("parent_custody");
   const control = prepareAuthenticatedLinuxOciPeerInit(binary, binding, custody.signal);
   let preparedHelper: LinuxOciParentHResult | undefined;
@@ -592,11 +621,16 @@ export async function prepareOriginalLinuxOciPeerInit(
       return control.observeJoined(actualSignal);
     },
     begin(actualSignal: AbortSignal) {
-      if (custody.peerReads.has(record.claimId) || actualSignal.aborted || custody.signal.aborted)
+      if (
+        signal !== actualSignal ||
+        custody.peerReads.get(record.claimId) !== previous ||
+        actualSignal.aborted ||
+        custody.signal.aborted
+      )
         return fail("parent_custody");
       custody.peerReads.set(
         record.claimId,
-        Object.freeze({ custody: control, settlement: control.settlement }),
+        Object.freeze({ custody: control, settlement: control.settlement, management: control }),
       );
       return control.begin(actualSignal);
     },
