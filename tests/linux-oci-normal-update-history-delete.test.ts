@@ -366,3 +366,9 @@ test("normal-update-history lease lost during original coordinate read refuses n
     await f.cleanup();
   }
 });
+
+export {
+  alternate as normalUpdateAlternateTopology,
+  step as runNormalUpdateStep,
+  update as acceptNormalUpdate,
+};

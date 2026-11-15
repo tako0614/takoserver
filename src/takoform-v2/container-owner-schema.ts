@@ -907,6 +907,125 @@ export async function inspectV2ContainerOwnerControlSchema(sql: Sql): Promise<bo
   }
 }
 
+// Optional exact successor. Original final-delete DDL/inspectors remain exact:
+// only consumers selecting this full shape may recognize a past UPDATE close.
+const historicalUpdateClose = `EXISTS (
+  SELECT 1 FROM ${A} ha JOIN tf_v2_operations ho ON ho.id=ha.operation_id
+  JOIN ${R} hv ON hv.operation_id=ha.operation_id AND hv.resource_uid=ha.resource_uid
+    AND hv.generation=ha.generation AND hv.revision=ha.revision
+  WHERE ha.operation_id=json_extract(claim.application_io_cleanup,'$.scope.operation.operationId')
+    AND ha.resource_uid=resource.uid AND ha.installation_id=instance.installation_id
+    AND ha.incarnation_id=instance.incarnation_id AND ha.principal=resource.principal
+    AND ha.space=resource.space AND ha.name=resource.name AND ha.form_url=resource.form_url
+    AND ha.backend_id=resource.backend_id AND ha.target_key=resource.target_key
+    AND ha.action='update' AND ha.generation>claim.generation AND ha.generation<op.generation
+    AND ho.status='succeeded' AND ho.effect='complete'
+    AND ho.resource_uid=ha.resource_uid AND ho.principal=ha.principal AND ho.action=ha.action
+    AND ho.generation=ha.generation AND ho.replay_key=ha.replay_key
+    AND ho.request_fingerprint=ha.fingerprint AND ho.created_at=ha.accepted_at
+    AND ho.backend_id=ha.backend_id AND ho.target_key=ha.target_key AND ho.backend_key=ha.backend_key
+    AND ho.accepted_spec_json=ha.accepted_spec_json AND julianday(ho.retain_until)>=julianday(ha.retain_until)
+    AND ha.revision=CAST(ha.generation AS TEXT)||'-'||json_extract(ha.accepted_spec_json,'$.${C.fields.workloadRevision}')
+    AND json_extract(claim.application_io_cleanup,'$.scope.original') IS json_extract(claim.native_control,'$.scope')
+    AND json_extract(claim.application_io_cleanup,'$.scope.nativeId') IS claim.native_id
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.action') IS ha.action
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.generation') IS ha.generation
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.resourceUid') IS ha.resource_uid
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.principal') IS ha.principal
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.space') IS ha.space
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.name') IS ha.name
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.form') IS ha.form_url
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.backendId') IS ha.backend_id
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.targetKey') IS ha.target_key
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.backendKey') IS ha.backend_key
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.acceptedFingerprint') IS ha.fingerprint
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.revision') IS ha.revision)`;
+const historicalDeleteAcceptance = Object.freeze({
+  ...finalDeleteAcceptance,
+  sql: finalDeleteAcceptance.sql.replace(
+    "json_extract(claim.application_io_cleanup,'$.scope.operation.operationId') IS NOT op.id",
+    "NOT (json_extract(claim.application_io_cleanup,'$.scope.operation.operationId') IS op.id OR " +
+      historicalUpdateClose +
+      ")",
+  ),
+});
+const historicalDeleteObjects = Object.freeze(
+  finalDeleteObjects.map((item) =>
+    item.name === historicalDeleteAcceptance.name ? historicalDeleteAcceptance : item,
+  ),
+);
+const historicalDeleteRows = Object.freeze(
+  historicalDeleteObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const historicalDeleteNames = historicalDeleteObjects.map((item) => literal(item.name)).join(", ");
+const historicalDeleteParams = Object.freeze([JSON.stringify(historicalDeleteRows)]);
+const historicalDeleteReady =
+  "(WITH container_owner_historical_delete_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, row, column) =>
+      `json_extract((SELECT document FROM container_owner_historical_delete_values), '$[${row}][${column}]')`,
+    historicalDeleteRows,
+    historicalDeleteNames,
+  ) +
+  ")";
+export const V2_CONTAINER_OWNER_HISTORICAL_DELETE_EXPAND = Object.freeze({
+  objects: historicalDeleteObjects,
+  statements: Object.freeze([
+    {
+      sql: "CREATE TABLE __tako_container_historical_delete_transition (ok INTEGER NOT NULL CHECK(ok=1))",
+    },
+    {
+      sql: `INSERT INTO __tako_container_historical_delete_transition VALUES (${finalDeleteReady})`,
+      params: finalDeleteReadyParams,
+    },
+    { sql: `DROP TRIGGER ${historicalDeleteAcceptance.name}` },
+    { sql: historicalDeleteAcceptance.sql },
+    { sql: "DROP TABLE __tako_container_historical_delete_transition" },
+  ]),
+});
+export async function inspectV2ContainerOwnerHistoricalDeleteSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(
+      `SELECT ${historicalDeleteReady} AS ready`,
+      historicalDeleteParams,
+    );
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+/** Exact negative readiness only; optional successor does not alter old readers. */
+export async function inspectV2ContainerOwnerSelectedSchema(
+  sql: Sql,
+  layer: "control" | "allocation" | "application-io" | "final-delete",
+): Promise<boolean> {
+  const original =
+    layer === "control"
+      ? ([selectedControlReady, selectedControlReadyParams] as const)
+      : layer === "allocation"
+        ? ([selectedAllocationReady, selectedAllocationReadyParams] as const)
+        : layer === "application-io"
+          ? ([selectedApplicationIoReady, selectedApplicationIoReadyParams] as const)
+          : ([finalDeleteReady, finalDeleteReadyParams] as const);
+  try {
+    const rows = await sql.query(`SELECT (${original[0]} OR ${historicalDeleteReady}) AS ready`, [
+      ...original[1],
+      ...historicalDeleteParams,
+    ]);
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+const historicalSelectedControlReady =
+  "(" + selectedControlReady + " OR " + historicalDeleteReady + ")";
+const historicalSelectedControlParams = Object.freeze([
+  ...selectedControlReadyParams,
+  ...historicalDeleteParams,
+]);
+
 /** Internal construction only. No request DTO, SQL claim or callback mints native authority. */
 export function createV2ContainerHostAcceptance(options: {
   readonly sql: Sql;
@@ -917,10 +1036,12 @@ export function createV2ContainerHostAcceptance(options: {
 }): V2HostAcceptance {
   const { sql, installationId, backendId, targetKey } = options;
   const selectedReady =
-    options.ociParentControl === "sealed-original@1" ? selectedControlReady : runtimeReady;
+    options.ociParentControl === "sealed-original@1"
+      ? historicalSelectedControlReady
+      : runtimeReady;
   const selectedReadyParams =
     options.ociParentControl === "sealed-original@1"
-      ? selectedControlReadyParams
+      ? historicalSelectedControlParams
       : runtimeReadyParams;
   if (
     !sql ||
