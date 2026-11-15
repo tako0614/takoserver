@@ -2630,7 +2630,8 @@ export function createDockerContainerCoreOwner(
       if (fresh.length !== 1 || fresh[0]?.native_control !== raw || signal.aborted) return fail();
       let missingApplicationDocument: string | null | undefined;
       if (
-        (parentMode === "sealed-peer-local-cleanup@1" ||
+        (parentMode === "sealed-peer-runtime@1" ||
+          parentMode === "sealed-peer-local-cleanup@1" ||
           parentMode === "sealed-peer-application-owner@1") &&
         phase === "remove" &&
         (await inspectV2ContainerOwnerApplicationIoSchema(sql))
