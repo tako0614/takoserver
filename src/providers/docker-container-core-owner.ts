@@ -3239,6 +3239,172 @@ export function createDockerContainerCoreOwner(
           if (management) {
             if (typeof read === "function") return fail();
             let complete = false;
+            const application = originalLinuxOciHttpRetirementSource(
+              originalCustody,
+              result,
+              input,
+              signal,
+            );
+            const applicationSchema = await inspectV2ContainerOwnerSelectedSchema(
+              sql,
+              "application-io",
+            );
+            let applicationFactCurrent: (() => void) | undefined;
+            const applicationLeaseSql = applicationSchema
+              ? " AND EXISTS (SELECT 1 FROM tf_v2_operations WHERE id=? AND resource_uid=? AND lease_token=? AND lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000 AND status='reconciling' AND effect='unknown' AND dispatch_possible=1)"
+              : "";
+            const applicationLeaseParams = applicationSchema
+              ? [execution.operationId, execution.resourceUid, execution.leaseToken]
+              : [];
+            const localIo = () => {
+              if (
+                !controlDecryptionKey ||
+                controlDecryptionKey(originalControlKeyId) !== key ||
+                signal.aborted ||
+                !lease.active ||
+                lease.controller.signal.aborted ||
+                !leases.has(lease)
+              )
+                return fail();
+              executionScope(execution);
+              if (
+                originalLinuxOciHttpRetirementSource(originalCustody, result, input, signal) !==
+                application
+              )
+                return fail();
+            };
+            const currentApplication = async (expected?: string) => {
+              await assertSnapshot(loaded.proof);
+              await assertExecution(execution);
+              const row = await sql.query(
+                "SELECT native_control" +
+                  (applicationSchema ? ",application_io_cleanup" : "") +
+                  " FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=?",
+                [
+                  input.intent.resourceUid,
+                  input.intent.policy.generation,
+                  input.claimId,
+                  input.nativeId,
+                ],
+              );
+              if (
+                row.length !== 1 ||
+                row[0]?.native_control !== raw ||
+                (expected !== undefined && row[0]?.application_io_cleanup !== expected) ||
+                !(await current(lease))
+              )
+                return fail();
+              localIo();
+              return row[0]?.application_io_cleanup;
+            };
+            let helper: ReturnType<typeof read.observeHelperExited> | undefined;
+            const localApplication = () => {
+              localIo();
+              if (helper === undefined || read.observeHelperExited(signal) !== helper)
+                return fail();
+            };
+            const persistApplication = async () => {
+              if (applicationSchema) {
+                // Original a/o identity is already authenticated above. Today's
+                // accepted operation is separate; leaseToken is checked live.
+                localIo();
+                const ioScope = await applicationCloseScope(
+                  scope,
+                  loaded.proof,
+                  execution,
+                  input,
+                  raw,
+                );
+                const aad = new TextEncoder().encode(canonicalJson(ioScope));
+                let document = await currentApplication();
+                if (document === V2_CONTAINER_APPLICATION_IO_RESERVED) {
+                  // An absent/fresh runtime never initializes a missing fact.
+                  if (!application || !controlKeyring) return fail();
+                  localIo();
+                  await application.close(); // exact original irreversible cached Promise
+                  await currentApplication(V2_CONTAINER_APPLICATION_IO_RESERVED);
+                  const currentKey = controlKeyring.current,
+                    keyId = currentKey.id,
+                    actualKey = currentKey.key;
+                  if (
+                    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(keyId) ||
+                    !isContainerSecretKey(actualKey) ||
+                    controlDecryptionKey(keyId) !== actualKey
+                  )
+                    return fail();
+                  const nonce = crypto.getRandomValues(new Uint8Array(12));
+                  const closed = new TextEncoder().encode(
+                    '{"kind":"linux-oci-original-application-io-closed@1"}',
+                  );
+                  let ciphertext: Uint8Array<ArrayBuffer>;
+                  try {
+                    ciphertext = new Uint8Array(
+                      await encryptContainerSecretBytes(actualKey, nonce, closed, aad),
+                    );
+                  } finally {
+                    closed.fill(0);
+                  }
+                  await currentApplication(V2_CONTAINER_APPLICATION_IO_RESERVED);
+                  if (controlDecryptionKey(keyId) !== actualKey) return fail();
+                  const sealedDocument = canonicalJson({
+                    kind: "linux-oci-sealed-application-io-close@1",
+                    scope: ioScope,
+                    keyId,
+                    nonce: encodeContainerSecretBytes(nonce),
+                    ciphertext: encodeContainerSecretBytes(ciphertext),
+                  });
+                  document = sealedDocument;
+                  const beforeSave = await boundStartRecord(input);
+                  if (!usable(beforeSave.proof, "remove") || !(await current(lease))) return fail();
+                  const saveGuard = fence(beforeSave.proof);
+                  if (controlDecryptionKey(keyId) !== actualKey) return fail();
+                  localIo(); // no await between the original local fence and CAS
+                  const saved = await sql.run(
+                    "UPDATE tf_v2_container_create_claims SET application_io_cleanup=? WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=? AND application_io_cleanup=? AND " +
+                      saveGuard.sql +
+                      applicationLeaseSql,
+                    [
+                      sealedDocument,
+                      input.intent.resourceUid,
+                      input.intent.policy.generation,
+                      input.claimId,
+                      input.nativeId,
+                      raw,
+                      V2_CONTAINER_APPLICATION_IO_RESERVED,
+                      ...saveGuard.params,
+                      ...applicationLeaseParams,
+                    ],
+                  );
+                  if (saved.changes !== 1) return fail(); // lost ACK never advances this caller
+                  await currentApplication(sealedDocument); // consume only the actual committed bytes
+                }
+                const factCurrent = await readApplicationCloseFact(document, ioScope);
+                await currentApplication(typeof document === "string" ? document : fail());
+                factCurrent();
+                applicationFactCurrent = () => {
+                  localIo();
+                  factCurrent();
+                };
+                applicationFactCurrent();
+              } else if (application) {
+                // Exact old schema behavior; absence remains no new fact.
+                await currentApplication();
+                localIo();
+                await application.close();
+                await currentApplication();
+                localIo();
+              }
+              return applicationFactCurrent;
+            };
+            let applicationSave: ReturnType<typeof persistApplication> | undefined;
+            const beginApplicationSave = () => {
+              if (!applicationSave) {
+                applicationSave = persistApplication();
+                void applicationSave.catch(() => undefined);
+              }
+              return applicationSave;
+            };
+            let watchingClose = false;
             try {
               await read.begin(signal); // original P outcome only; H writes still zero
               await assertSnapshot(loaded.proof);
@@ -3260,161 +3426,28 @@ export function createDockerContainerCoreOwner(
                 return fail();
               executionScope(execution);
               read.assertCurrent();
+              // This stage owns only the save begun after actual cached close
+              // fulfillment. Pending close never delays STOP/JOIN advancement.
+              watchingClose = true;
+              const terminal = application?.close();
+              void terminal?.then(
+                () => {
+                  if (watchingClose && !signal.aborted) beginApplicationSave();
+                },
+                () => undefined,
+              );
               observation = await (boundPhase === "exited"
                 ? read.advanceNamespace(input.nativeId, signal)
                 : read.advance(input.nativeId, signal));
               if (observation.operation === "read-helper-result") {
                 // Exact original P's H join/EOF record only; no removed CAS or
                 // allocation cleanup is authorized by this private handoff.
-                const helper = read.observeHelperExited(signal);
-                const application = originalLinuxOciHttpRetirementSource(
-                  originalCustody,
-                  result,
-                  input,
-                  signal,
-                );
-                const applicationSchema = await inspectV2ContainerOwnerSelectedSchema(
-                  sql,
-                  "application-io",
-                );
-                let applicationFactCurrent: (() => void) | undefined;
-                const applicationLeaseSql = applicationSchema
-                  ? " AND EXISTS (SELECT 1 FROM tf_v2_operations WHERE id=? AND resource_uid=? AND lease_token=? AND lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000 AND status='reconciling' AND effect='unknown' AND dispatch_possible=1)"
-                  : "";
-                const applicationLeaseParams = applicationSchema
-                  ? [execution.operationId, execution.resourceUid, execution.leaseToken]
-                  : [];
-                const localApplication = () => {
-                  if (
-                    signal.aborted ||
-                    !lease.active ||
-                    lease.controller.signal.aborted ||
-                    !leases.has(lease)
-                  )
-                    return fail();
-                  executionScope(execution);
-                  if (
-                    originalLinuxOciHttpRetirementSource(originalCustody, result, input, signal) !==
-                      application ||
-                    read.observeHelperExited(signal) !== helper
-                  )
-                    return fail();
-                };
-                const currentApplication = async (expected?: string) => {
-                  await assertSnapshot(loaded.proof);
-                  await assertExecution(execution);
-                  const row = await sql.query(
-                    "SELECT native_control" +
-                      (applicationSchema ? ",application_io_cleanup" : "") +
-                      " FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=?",
-                    [
-                      input.intent.resourceUid,
-                      input.intent.policy.generation,
-                      input.claimId,
-                      input.nativeId,
-                    ],
-                  );
-                  if (
-                    row.length !== 1 ||
-                    row[0]?.native_control !== raw ||
-                    (expected !== undefined && row[0]?.application_io_cleanup !== expected) ||
-                    !(await current(lease))
-                  )
-                    return fail();
-                  localApplication();
-                  return row[0]?.application_io_cleanup;
-                };
-                if (applicationSchema) {
-                  // Original a/o identity is already authenticated above. Today's
-                  // accepted operation is separate; leaseToken is checked live.
-                  localApplication();
-                  const ioScope = await applicationCloseScope(
-                    scope,
-                    loaded.proof,
-                    execution,
-                    input,
-                    raw,
-                  );
-                  const aad = new TextEncoder().encode(canonicalJson(ioScope));
-                  let document = await currentApplication();
-                  if (document === V2_CONTAINER_APPLICATION_IO_RESERVED) {
-                    // An absent/fresh runtime never initializes a missing fact.
-                    if (!application || !controlKeyring) return fail();
-                    localApplication();
-                    await application.close(); // exact original irreversible cached Promise
-                    await currentApplication(V2_CONTAINER_APPLICATION_IO_RESERVED);
-                    const currentKey = controlKeyring.current,
-                      keyId = currentKey.id,
-                      actualKey = currentKey.key;
-                    if (
-                      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(keyId) ||
-                      !isContainerSecretKey(actualKey) ||
-                      controlDecryptionKey(keyId) !== actualKey
-                    )
-                      return fail();
-                    const nonce = crypto.getRandomValues(new Uint8Array(12));
-                    const closed = new TextEncoder().encode(
-                      '{"kind":"linux-oci-original-application-io-closed@1"}',
-                    );
-                    let ciphertext: Uint8Array<ArrayBuffer>;
-                    try {
-                      ciphertext = new Uint8Array(
-                        await encryptContainerSecretBytes(actualKey, nonce, closed, aad),
-                      );
-                    } finally {
-                      closed.fill(0);
-                    }
-                    await currentApplication(V2_CONTAINER_APPLICATION_IO_RESERVED);
-                    if (controlDecryptionKey(keyId) !== actualKey) return fail();
-                    const sealedDocument = canonicalJson({
-                      kind: "linux-oci-sealed-application-io-close@1",
-                      scope: ioScope,
-                      keyId,
-                      nonce: encodeContainerSecretBytes(nonce),
-                      ciphertext: encodeContainerSecretBytes(ciphertext),
-                    });
-                    document = sealedDocument;
-                    const beforeSave = await boundStartRecord(input);
-                    if (!usable(beforeSave.proof, "remove") || !(await current(lease)))
-                      return fail();
-                    const saveGuard = fence(beforeSave.proof);
-                    if (controlDecryptionKey(keyId) !== actualKey) return fail();
-                    localApplication(); // no await between the original local fence and CAS
-                    const saved = await sql.run(
-                      "UPDATE tf_v2_container_create_claims SET application_io_cleanup=? WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=? AND application_io_cleanup=? AND " +
-                        saveGuard.sql +
-                        applicationLeaseSql,
-                      [
-                        sealedDocument,
-                        input.intent.resourceUid,
-                        input.intent.policy.generation,
-                        input.claimId,
-                        input.nativeId,
-                        raw,
-                        V2_CONTAINER_APPLICATION_IO_RESERVED,
-                        ...saveGuard.params,
-                        ...applicationLeaseParams,
-                      ],
-                    );
-                    if (saved.changes !== 1) return fail(); // lost ACK never advances this caller
-                    await currentApplication(sealedDocument); // consume only the actual committed bytes
-                  }
-                  const factCurrent = await readApplicationCloseFact(document, ioScope);
-                  await currentApplication(typeof document === "string" ? document : fail());
-                  factCurrent();
-                  applicationFactCurrent = () => {
-                    localApplication();
-                    factCurrent();
-                  };
-                  applicationFactCurrent();
-                } else if (application) {
-                  // Exact old schema behavior; absence remains no new fact.
-                  await currentApplication();
-                  localApplication();
-                  await application.close();
-                  await currentApplication();
-                  localApplication();
-                }
+                helper = read.observeHelperExited(signal);
+                // H result remains separate from the I/O-only saved fact.
+                // The last native stage still joins a pending original close.
+                if (application) await application.close();
+                applicationFactCurrent = await beginApplicationSave();
+                localApplication();
                 if (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")) {
                   const cleanup = await sql.query(
                     "SELECT allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=?",
@@ -3578,7 +3611,14 @@ export function createDockerContainerCoreOwner(
               }
               complete = true;
             } finally {
-              if (!complete) read.cancel();
+              watchingClose = false;
+              try {
+                // No detached SQL: only work that already started is joined.
+                // An unresolved close is rearmed by the next legitimate stage.
+                if (applicationSave) await applicationSave;
+              } finally {
+                if (!complete) read.cancel();
+              }
             }
           } else {
             if (typeof read !== "function") return fail();

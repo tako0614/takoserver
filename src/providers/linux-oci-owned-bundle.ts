@@ -2298,8 +2298,9 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               // Close admission and start cancellation before native STOP.
               // An unjoined/unknown application stream must not block init
               // retirement. The same runtime retains its cached terminal
-              // Promise; Core joins it at the genuine H-result handoff before
-              // allocation cleanup. Fresh creators gain no missing I/O fact.
+              // Promise; Core can save its fulfillment in the current stage
+              // before H result, which still gates allocation cleanup.
+              // Fresh creators gain no missing I/O fact.
               const applicationClose = httpRuntimes.get(record.claimId)?.close();
               void applicationClose?.catch(() => undefined);
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))

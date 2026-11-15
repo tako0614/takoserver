@@ -369,6 +369,8 @@ async function fixture(
   let nativeClosing: Promise<void> | undefined;
   let rawChild: EventEmitter | undefined;
   let originalNativeStdout: PassThrough | undefined;
+  let heldPeerCommand: "linux-oci-stop-init@1" | "linux-oci-join-init@1" | undefined;
+  let heldPeerReply: (() => void) | undefined;
   const unpackEnvironments: unknown[] = [];
   let unpackerStarted = () => {};
   const unpackerEntered = new Promise<void>((resolve) => {
@@ -663,6 +665,21 @@ async function fixture(
               const lost =
                 (stop && adversarial.peerManagementFault === "lost-reply") ||
                 (!stop && adversarial.peerJoinFault === "unknown");
+              if (heldPeerCommand === command.kind) {
+                heldPeerCommand = undefined;
+                const originalReply = peer.peerReply;
+                heldPeerReply = () => {
+                  if (!lost) reply(originalReply);
+                  queueMicrotask(() => {
+                    stdout.end();
+                    stderr.end();
+                    child.emit("exit", lost ? 77 : 0, null);
+                    child.emit("close", lost ? 77 : 0, null);
+                  });
+                };
+                done();
+                return;
+              }
               if (!lost) reply(peer.peerReply);
               done();
               queueMicrotask(() => {
@@ -1459,6 +1476,15 @@ async function fixture(
       applicationOwnerFault = fault;
     },
     nativeCounts: () => ({ processes: nativeProcesses, requests: [...nativeRequests] }),
+    holdPeerManagementReply(kind: "linux-oci-stop-init@1" | "linux-oci-join-init@1") {
+      if (heldPeerCommand || heldPeerReply) throw Error("NONSECRET raw reply already held");
+      heldPeerCommand = kind;
+    },
+    releasePeerManagementReply() {
+      const original = heldPeerReply;
+      heldPeerReply = undefined;
+      original?.();
+    },
     nativeExits: () => nativeExits,
     nativeTrailingByte() {
       if (!originalNativeStdout) throw new Error("original raw native stream absent");
