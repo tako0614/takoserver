@@ -392,6 +392,7 @@ async function authenticatedOriginalPeerSource(
   binding: unknown,
   signal: AbortSignal,
   previous?: OriginalPeerRead,
+  allocationState: "present" | "closed" = "present",
 ) {
   const custody = originalOciCustodies.get(original);
   if (
@@ -482,14 +483,21 @@ async function authenticatedOriginalPeerSource(
     captured.receipt.path !== join(root, ".tako-oci-artifact.json")
   )
     return fail("allocation_identity");
-  await assertOriginalAllocationParents(captured);
-  await privateDirectory(root);
-  await assertOriginalFile(captured.root, true);
-  await assertOriginalFile(captured.rootfs, true);
-  await assertOriginalFile(captured.receipt, false);
-  if ((await readFile(captured.receipt.path, "utf8")) !== captured.receiptBytes)
-    return fail("allocation_identity");
-  await assertOriginalFile(captured.receipt, false);
+  if (allocationState === "closed") {
+    // Core has authenticated both durable bindings for the same remove
+    // operation. Absence is only a negative foreign-replacement fence; the
+    // original executable/actual peer still supplies the read-only result.
+    await assertOriginalAllocationAbsent(captured);
+  } else {
+    await assertOriginalAllocationParents(captured);
+    await privateDirectory(root);
+    await assertOriginalFile(captured.root, true);
+    await assertOriginalFile(captured.rootfs, true);
+    await assertOriginalFile(captured.receipt, false);
+    if ((await readFile(captured.receipt.path, "utf8")) !== captured.receiptBytes)
+      return fail("allocation_identity");
+    await assertOriginalFile(captured.receipt, false);
+  }
   if (
     custody.signal.aborted ||
     signal.aborted ||
@@ -505,6 +513,7 @@ export async function prepareOriginalLinuxOciPeerRead(
   artifact: unknown,
   binding: unknown,
   signal: AbortSignal,
+  allocationState: "present" | "closed" = "present",
 ) {
   const { custody, binary } = await authenticatedOriginalPeerSource(
     original,
@@ -513,6 +522,8 @@ export async function prepareOriginalLinuxOciPeerRead(
     artifact,
     binding,
     signal,
+    undefined,
+    allocationState,
   );
   // Only original, not-yet-used reader state; no persistent adopted allocation.
   return async (actualSignal: AbortSignal) => {
@@ -2145,7 +2156,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   function manageRetainedPeerInit(
     execution: V2Execution,
     externalSignal?: AbortSignal,
-  ): Promise<readonly LinuxOciPeerInitProgress[]> {
+  ): Promise<readonly (LinuxOciPeerInitProgress | LinuxOciParentHResult)[]> {
     if (closed || !peerMode)
       return Promise.reject(new Error("linux_oci_owned_bundle_parent_unavailable"));
     if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
@@ -2165,7 +2176,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           !accepted.retained.length
         )
           return fail("parent_unavailable");
-        const observations: LinuxOciPeerInitProgress[] = [];
+        const observations: (LinuxOciPeerInitProgress | LinuxOciParentHResult)[] = [];
         for (const item of accepted.retained) {
           const { record } = item;
           if (

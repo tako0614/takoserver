@@ -169,7 +169,7 @@ export interface DockerContainerCoreOwner {
     record: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-  ): Promise<LinuxOciPeerInitProgress>;
+  ): Promise<LinuxOciPeerInitProgress | LinuxOciParentHResult>;
   createCustody(
     policy: DockerContainerRuntimePolicy,
     requiredSecretNames: readonly string[],
@@ -2419,6 +2419,87 @@ export function createDockerContainerCoreOwner(
     executionScope(execution);
     return observation;
   }
+  async function applicationCloseScope(
+    original: unknown,
+    proof: Proof,
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    raw: string,
+  ) {
+    const operation = Object.freeze({
+      operationId: execution.operationId,
+      action: execution.action,
+      generation: execution.generation,
+      resourceUid: execution.resourceUid,
+      principal: proof.la_principal,
+      space: proof.la_space,
+      name: proof.la_name,
+      form: proof.la_form_url,
+      backendId: proof.la_backend_id,
+      targetKey: proof.la_target_key,
+      backendKey: proof.la_backend_key,
+      acceptedFingerprint: proof.la_fingerprint,
+      revision: proof.la_revision,
+    });
+    return Object.freeze({
+      purpose: "takoserver.linux-oci-application-io-close@1",
+      original,
+      nativeId: input.nativeId,
+      controlDigest: await canonicalDigest(raw),
+      operation,
+    });
+  }
+  async function readApplicationCloseFact(document: unknown, ioScope: unknown) {
+    if (
+      !controlDecryptionKey ||
+      typeof document !== "string" ||
+      document === V2_CONTAINER_APPLICATION_IO_RESERVED ||
+      document.length > 65536
+    )
+      return fail();
+    const lookup = controlDecryptionKey;
+    const sealed = parseStrictJson(new TextEncoder().encode(document), 65536);
+    if (
+      !own(sealed, ["kind", "scope", "keyId", "nonce", "ciphertext"]) ||
+      sealed.kind !== "linux-oci-sealed-application-io-close@1" ||
+      canonicalJson(sealed) !== document ||
+      canonicalJson(sealed.scope) !== canonicalJson(ioScope) ||
+      typeof sealed.keyId !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(sealed.keyId) ||
+      typeof sealed.nonce !== "string" ||
+      typeof sealed.ciphertext !== "string"
+    )
+      return fail();
+    const keyId = sealed.keyId,
+      key = lookup(keyId),
+      nonce = decodeContainerSecretBytes(sealed.nonce),
+      encrypted = decodeContainerSecretBytes(sealed.ciphertext);
+    if (
+      !isContainerSecretKey(key) ||
+      nonce.length !== 12 ||
+      encrypted.length < 16 ||
+      encrypted.length > 65536
+    )
+      return fail();
+    const closed = await decryptContainerSecretBytes(
+      key,
+      nonce,
+      encrypted,
+      new TextEncoder().encode(canonicalJson(ioScope)),
+    );
+    try {
+      if (
+        new TextDecoder("utf-8", { fatal: true }).decode(closed) !==
+        '{"kind":"linux-oci-original-application-io-closed@1"}'
+      )
+        return fail();
+    } finally {
+      closed.fill(0);
+    }
+    return () => {
+      if (lookup(keyId) !== key) return fail();
+    };
+  }
   async function acceptedParentControl(
     execution: V2Execution,
     input: DockerContainerCreateRecord,
@@ -2534,6 +2615,78 @@ export function createDockerContainerCoreOwner(
         [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
       );
       if (fresh.length !== 1 || fresh[0]?.native_control !== raw || signal.aborted) return fail();
+      if (
+        parentMode === "sealed-peer-local-cleanup@1" &&
+        phase === "remove" &&
+        (await inspectV2ContainerOwnerApplicationIoSchema(sql))
+      ) {
+        const closed = await sql.query(
+          "SELECT allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=?",
+          [
+            input.intent.resourceUid,
+            input.intent.policy.generation,
+            input.claimId,
+            input.nativeId,
+            raw,
+          ],
+        );
+        if (closed.length !== 1) return fail();
+        if (closed[0]?.allocation_cleanup === "closed") {
+          // Historical same-operation facts select a read-only transport, not
+          // a replacement allocation/session or permission to repeat cleanup.
+          const document = closed[0]?.application_io_cleanup;
+          const ioScope = await applicationCloseScope(scope, loaded.proof, execution, input, raw);
+          const factCurrent = await readApplicationCloseFact(document, ioScope);
+          const controlKeyId = envelope.keyId;
+          const guard = async () => {
+            await assertSnapshot(loaded.proof);
+            const row = await sql.query(
+              "SELECT native_control,allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=?",
+              [
+                input.intent.resourceUid,
+                input.intent.policy.generation,
+                input.claimId,
+                input.nativeId,
+              ],
+            );
+            if (
+              row.length !== 1 ||
+              row[0]?.native_control !== raw ||
+              row[0]?.allocation_cleanup !== "closed" ||
+              row[0]?.application_io_cleanup !== document ||
+              !(await current(lease))
+            )
+              return fail();
+            await assertExecution(execution);
+            if (!controlDecryptionKey || controlDecryptionKey(controlKeyId) !== key) return fail();
+            factCurrent();
+            if (
+              signal.aborted ||
+              !lease.active ||
+              lease.controller.signal.aborted ||
+              !leases.has(lease)
+            )
+              return fail();
+            executionScope(execution);
+          };
+          await guard();
+          const read = await prepareOriginalLinuxOciPeerRead(
+            originalCustody,
+            result,
+            input,
+            artifact,
+            binding,
+            signal,
+            "closed",
+          );
+          await guard(); // last await before the original one-use reader starts
+          const observation = await read(signal);
+          if (observation.kind !== "linux-oci-parent-h-exited@1" || observation.error !== 0)
+            return fail();
+          await guard();
+          return observation; // original P's result only; no allocation/removed CAS
+        }
+      }
       let observation: LinuxOciParentHResult | LinuxOciPeerInitProgress | undefined;
       if (peerMode) {
         const prepare = management
@@ -2642,29 +2795,14 @@ export function createDockerContainerCoreOwner(
                 if (applicationSchema) {
                   // Original a/o identity is already authenticated above. Today's
                   // accepted operation is separate; leaseToken is checked live.
-                  const operation = Object.freeze({
-                    operationId: execution.operationId,
-                    action: execution.action,
-                    generation: execution.generation,
-                    resourceUid: execution.resourceUid,
-                    principal: loaded.proof.la_principal,
-                    space: loaded.proof.la_space,
-                    name: loaded.proof.la_name,
-                    form: loaded.proof.la_form_url,
-                    backendId: loaded.proof.la_backend_id,
-                    targetKey: loaded.proof.la_target_key,
-                    backendKey: loaded.proof.la_backend_key,
-                    acceptedFingerprint: loaded.proof.la_fingerprint,
-                    revision: loaded.proof.la_revision,
-                  });
                   localApplication();
-                  const ioScope = Object.freeze({
-                    purpose: "takoserver.linux-oci-application-io-close@1",
-                    original: scope,
-                    nativeId: input.nativeId,
-                    controlDigest: await canonicalDigest(raw),
-                    operation,
-                  });
+                  const ioScope = await applicationCloseScope(
+                    scope,
+                    loaded.proof,
+                    execution,
+                    input,
+                    raw,
+                  );
                   const aad = new TextEncoder().encode(canonicalJson(ioScope));
                   let document = await currentApplication();
                   if (document === V2_CONTAINER_APPLICATION_IO_RESERVED) {
@@ -2729,50 +2867,12 @@ export function createDockerContainerCoreOwner(
                     if (saved.changes !== 1) return fail(); // lost ACK never advances this caller
                     await currentApplication(sealedDocument); // consume only the actual committed bytes
                   }
-                  if (
-                    typeof document !== "string" ||
-                    document === V2_CONTAINER_APPLICATION_IO_RESERVED ||
-                    document.length > 65536
-                  )
-                    return fail();
-                  const sealed = parseStrictJson(new TextEncoder().encode(document), 65536);
-                  if (
-                    !own(sealed, ["kind", "scope", "keyId", "nonce", "ciphertext"]) ||
-                    sealed.kind !== "linux-oci-sealed-application-io-close@1" ||
-                    canonicalJson(sealed) !== document ||
-                    canonicalJson(sealed.scope) !== canonicalJson(ioScope) ||
-                    typeof sealed.keyId !== "string" ||
-                    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(sealed.keyId) ||
-                    typeof sealed.nonce !== "string" ||
-                    typeof sealed.ciphertext !== "string"
-                  )
-                    return fail();
-                  const ioKeyId = sealed.keyId;
-                  const ioKey = controlDecryptionKey(ioKeyId),
-                    nonce = decodeContainerSecretBytes(sealed.nonce),
-                    encrypted = decodeContainerSecretBytes(sealed.ciphertext);
-                  if (
-                    !isContainerSecretKey(ioKey) ||
-                    nonce.length !== 12 ||
-                    encrypted.length < 16 ||
-                    encrypted.length > 65536
-                  )
-                    return fail();
-                  const closed = await decryptContainerSecretBytes(ioKey, nonce, encrypted, aad);
-                  try {
-                    if (
-                      new TextDecoder("utf-8", { fatal: true }).decode(closed) !==
-                      '{"kind":"linux-oci-original-application-io-closed@1"}'
-                    )
-                      return fail();
-                    await currentApplication(document);
-                    if (controlDecryptionKey(ioKeyId) !== ioKey) return fail();
-                  } finally {
-                    closed.fill(0);
-                  }
+                  const factCurrent = await readApplicationCloseFact(document, ioScope);
+                  await currentApplication(typeof document === "string" ? document : fail());
+                  factCurrent();
                   applicationFactCurrent = () => {
                     localApplication();
-                    if (controlDecryptionKey(ioKeyId) !== ioKey) return fail();
+                    factCurrent();
                   };
                   applicationFactCurrent();
                 } else if (application) {
@@ -3052,7 +3152,12 @@ export function createDockerContainerCoreOwner(
         signal,
         true,
       );
-      if (!observation || observation.kind !== "linux-oci-peer-init-progress@1") return fail();
+      if (
+        !observation ||
+        (observation.kind !== "linux-oci-peer-init-progress@1" &&
+          (observation.kind !== "linux-oci-parent-h-exited@1" || observation.error !== 0))
+      )
+        return fail();
       return observation;
     },
     async claimAcceptedTopology(execution, input) {
