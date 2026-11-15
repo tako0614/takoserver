@@ -167,12 +167,12 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<undefined | LinuxOciParentHResult>;
-  readAcceptedApplicationOwnerExit(
+  readAcceptedApplicationRecovery(
     execution: V2Execution,
     record: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-  ): Promise<LinuxOciApplicationOwnerExit>;
+  ): Promise<LinuxOciApplicationOwnerExit | LinuxOciParentHResult>;
   manageAcceptedPeerInit(
     execution: V2Execution,
     record: DockerContainerCreateRecord,
@@ -2517,7 +2517,7 @@ export function createDockerContainerCoreOwner(
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-    management: boolean | "application-owner" = false,
+    management: boolean | "application-recovery" = false,
   ) {
     if (parentMode === undefined || !controlDecryptionKey || signal.aborted) return fail();
     await assertExecution(execution);
@@ -2628,60 +2628,7 @@ export function createDockerContainerCoreOwner(
         [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
       );
       if (fresh.length !== 1 || fresh[0]?.native_control !== raw || signal.aborted) return fail();
-      if (management === "application-owner") {
-        if (
-          parentMode !== "sealed-peer-application-owner@1" ||
-          phase !== "remove" ||
-          !(await inspectV2ContainerOwnerAllocationSchema(sql))
-        )
-          return fail();
-        // No application_io_closed is inferred or written. This is the fresh
-        // owner's missing-before-save input; all original files must still match.
-        const currentOwner = async () => {
-          await assertSnapshot(loaded.proof);
-          await assertExecution(execution);
-          const row = await sql.query(
-            "SELECT native_control,allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=?",
-            [
-              input.intent.resourceUid,
-              input.intent.policy.generation,
-              input.claimId,
-              input.nativeId,
-            ],
-          );
-          if (
-            row.length !== 1 ||
-            row[0]?.native_control !== raw ||
-            row[0]?.allocation_cleanup !== "untouched" ||
-            !(await current(lease))
-          )
-            return fail();
-          await assertExecution(execution);
-          if (
-            !controlDecryptionKey ||
-            controlDecryptionKey(originalControlKeyId) !== key ||
-            signal.aborted ||
-            !lease.active ||
-            lease.controller.signal.aborted ||
-            !leases.has(lease)
-          )
-            return fail();
-          executionScope(execution);
-        };
-        await currentOwner();
-        const read = await prepareOriginalLinuxOciApplicationOwnerRead(
-          originalCustody,
-          result,
-          input,
-          artifact,
-          binding,
-          signal,
-        );
-        await currentOwner();
-        const observation = await read(signal);
-        await currentOwner();
-        return observation; // nonconsuming original process exit; no H/I/O/removed grant
-      }
+      let missingApplicationDocument: string | null | undefined;
       if (
         (parentMode === "sealed-peer-local-cleanup@1" ||
           parentMode === "sealed-peer-application-owner@1") &&
@@ -2699,6 +2646,14 @@ export function createDockerContainerCoreOwner(
           ],
         );
         if (closed.length !== 1) return fail();
+        if (management === "application-recovery") {
+          const document = closed[0]?.application_io_cleanup;
+          if (document === null || document === V2_CONTAINER_APPLICATION_IO_RESERVED)
+            missingApplicationDocument = document;
+          else if (closed[0]?.allocation_cleanup !== "closed") return fail();
+          // A present/invalid/foreign saved fact cannot fall back to process exit.
+          // The closed branch below authenticates the full same-operation AEAD.
+        }
         if (closed[0]?.allocation_cleanup === "closed") {
           // Historical same-operation facts select a read-only transport, not
           // a replacement allocation/session or permission to repeat cleanup.
@@ -2754,6 +2709,65 @@ export function createDockerContainerCoreOwner(
           await guard();
           return observation; // original P's result only; no allocation/removed CAS
         }
+      }
+      if (management === "application-recovery") {
+        if (
+          parentMode !== "sealed-peer-application-owner@1" ||
+          phase !== "remove" ||
+          missingApplicationDocument === undefined ||
+          !(await inspectV2ContainerOwnerAllocationSchema(sql))
+        )
+          return fail();
+        // Only the successful exact schema+row read above proves missing.
+        // Inspector false (old shape or query failure) is UNKNOWN here.
+        const missingDocument = missingApplicationDocument;
+        // No application_io_closed is inferred or written. This is the fresh
+        // owner's missing-before-save input; all original files must still match.
+        const currentOwner = async () => {
+          await assertSnapshot(loaded.proof);
+          await assertExecution(execution);
+          const row = await sql.query(
+            "SELECT native_control,allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND application_io_cleanup IS ?",
+            [
+              input.intent.resourceUid,
+              input.intent.policy.generation,
+              input.claimId,
+              input.nativeId,
+              missingDocument,
+            ],
+          );
+          if (
+            row.length !== 1 ||
+            row[0]?.native_control !== raw ||
+            row[0]?.allocation_cleanup !== "untouched" ||
+            !(await current(lease))
+          )
+            return fail();
+          await assertExecution(execution);
+          if (
+            !controlDecryptionKey ||
+            controlDecryptionKey(originalControlKeyId) !== key ||
+            signal.aborted ||
+            !lease.active ||
+            lease.controller.signal.aborted ||
+            !leases.has(lease)
+          )
+            return fail();
+          executionScope(execution);
+        };
+        await currentOwner();
+        const read = await prepareOriginalLinuxOciApplicationOwnerRead(
+          originalCustody,
+          result,
+          input,
+          artifact,
+          binding,
+          signal,
+        );
+        await currentOwner();
+        const observation = await read(signal);
+        await currentOwner();
+        return observation; // nonconsuming original process exit; no H/I/O/removed grant
       }
       let observation: LinuxOciParentHResult | LinuxOciPeerInitProgress | undefined;
       if (peerMode) {
@@ -3217,15 +3231,20 @@ export function createDockerContainerCoreOwner(
         return fail();
       return observation;
     },
-    async readAcceptedApplicationOwnerExit(execution, input, originalCustody, signal) {
+    async readAcceptedApplicationRecovery(execution, input, originalCustody, signal) {
       const observation = await acceptedParentControl(
         execution,
         input,
         originalCustody,
         signal,
-        "application-owner",
+        "application-recovery",
       );
-      if (observation?.kind !== "linux-oci-parent-application-owner-exited@1") return fail();
+      if (
+        !observation ||
+        (observation.kind !== "linux-oci-parent-application-owner-exited@1" &&
+          (observation.kind !== "linux-oci-parent-h-exited@1" || observation.error !== 0))
+      )
+        return fail();
       return observation;
     },
     async manageAcceptedPeerInit(execution, input, originalCustody, signal) {

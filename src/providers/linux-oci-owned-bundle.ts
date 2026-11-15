@@ -2259,11 +2259,12 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               void applicationClose?.catch(() => undefined);
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
-              // Missing local runtime is only a recovery selector. It supplies
-              // no closed-I/O fact: original P must attest its captured process.
+              // Missing local runtime only selects recovery. Core authenticates
+              // a saved same-operation close first, or reads the original process
+              // only while that close fact is genuinely missing. Neither is a grant.
               const result = await (parentMode === "sealed-peer-application-owner@1" &&
               !httpRuntimes.has(record.claimId)
-                ? core.readAcceptedApplicationOwnerExit(
+                ? core.readAcceptedApplicationRecovery(
                     execution,
                     record,
                     originalNativeCustody,
