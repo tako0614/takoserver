@@ -2,6 +2,7 @@ import type { Sql } from "../ports.ts";
 import {
   v2ConfiguredUpdateDiscardObjects,
   v2ConfiguredUpdateDiscardSchema,
+  v2FinalDeleteConfiguredUpdateDiscardSchema,
 } from "./configured-update-inputs-schema.ts";
 
 /** Opaque Form-sealed configured material, distinct from expiring transfer custody. */
@@ -186,10 +187,25 @@ const DISCARD_SCHEMA = Object.freeze([
 const schemaReadySql = `SELECT name, type, tbl_name, sql FROM sqlite_schema
   WHERE name IN (?, ?, ?, ?, ?)`;
 
-function schemaReady(rows: readonly Record<string, unknown>[]): boolean {
+type DiscardSchema = readonly (readonly [string, string, string, string])[];
+const FINAL_DISCARD_SCHEMA: DiscardSchema = DISCARD_SCHEMA.map(([name, type, table, ddl]) => [
+  name,
+  type,
+  table,
+  name === DISCARD_GATE
+    ? v2FinalDeleteConfiguredUpdateDiscardSchema.gate
+    : name === v2ConfiguredUpdateDiscardObjects.insertGuard
+      ? v2FinalDeleteConfiguredUpdateDiscardSchema.insertGuard
+      : ddl,
+]);
+
+function schemaReady(
+  rows: readonly Record<string, unknown>[],
+  schema: DiscardSchema = DISCARD_SCHEMA,
+): boolean {
   return (
-    rows.length === DISCARD_SCHEMA.length &&
-    DISCARD_SCHEMA.every(([name, type, table, ddl]) =>
+    rows.length === schema.length &&
+    schema.every(([name, type, table, ddl]) =>
       rows.some(
         (row) =>
           row.name === name && row.type === type && row.tbl_name === table && row.sql === ddl,
@@ -226,8 +242,12 @@ export function createV2RetiredConfiguredUpdateDiscard(options: {
     async discard(value: V2RetiredConfiguredUpdateInput): Promise<void> {
       const input = captureDiscardInput(value);
       const schemaNames = DISCARD_SCHEMA.map(([name]) => name);
+      let selectedSchema: DiscardSchema;
       try {
-        if (!schemaReady(await query(schemaReadySql, schemaNames))) discardUnavailable();
+        const rows = await query(schemaReadySql, schemaNames);
+        if (schemaReady(rows)) selectedSchema = DISCARD_SCHEMA;
+        else if (schemaReady(rows, FINAL_DISCARD_SCHEMA)) selectedSchema = FINAL_DISCARD_SCHEMA;
+        else discardUnavailable();
       } catch {
         discardUnavailable();
       }
@@ -262,7 +282,7 @@ export function createV2RetiredConfiguredUpdateDiscard(options: {
               (name = ? AND type = 'trigger' AND tbl_name = ? AND sql = ?)) = 5`,
             params: [
               ...params,
-              ...DISCARD_SCHEMA.flatMap(([name, _type, table, ddl]) => [name, table, ddl]),
+              ...selectedSchema.flatMap(([name, _type, table, ddl]) => [name, table, ddl]),
             ],
           },
           {
@@ -286,6 +306,136 @@ export function createV2RetiredConfiguredUpdateDiscard(options: {
         discardUnavailable();
       }
       if (writes.length !== 3 || writes[0]?.changes !== 1 || writes[1]?.changes !== 1)
+        discardUnavailable();
+    },
+  });
+}
+
+/** Latest-map discard is a separate purpose from superseded UPDATE cleanup.
+ * The trusted owning verifier must establish retirement for this exact original
+ * generation and current DELETE; the operation/lease fields are SQL fences,
+ * not native evidence. No Native producer is connected by this helper. */
+export interface V2FinalDeleteConfiguredUpdateInput extends V2RetiredConfiguredUpdateInput {
+  readonly deleteOperationId: string;
+  readonly deleteGeneration: number;
+  readonly leaseToken: string;
+}
+
+export function createV2FinalDeleteConfiguredUpdateDiscard(options: {
+  readonly sql: Sql;
+  readonly assertRetired: (
+    input: V2FinalDeleteConfiguredUpdateInput,
+    signal: AbortSignal,
+  ) => Promise<void>;
+}): {
+  readonly discard: (
+    input: V2FinalDeleteConfiguredUpdateInput,
+    signal: AbortSignal,
+  ) => Promise<void>;
+} {
+  if (
+    !options?.sql ||
+    typeof options.sql.query !== "function" ||
+    typeof options.sql.batch !== "function" ||
+    typeof options.assertRetired !== "function"
+  )
+    discardUnavailable();
+  const query = options.sql.query.bind(options.sql),
+    batch = options.sql.batch.bind(options.sql),
+    assertRetired = options.assertRetired.bind(options);
+  return Object.freeze({
+    async discard(value: V2FinalDeleteConfiguredUpdateInput, signal: AbortSignal): Promise<void> {
+      if (!value || typeof value !== "object" || !(signal instanceof AbortSignal) || signal.aborted)
+        discardUnavailable();
+      const { deleteOperationId, deleteGeneration, leaseToken, ...material } = value;
+      const original = captureDiscardInput(material);
+      if (
+        !validDiscardToken(deleteOperationId) ||
+        !validDiscardToken(leaseToken) ||
+        !Number.isSafeInteger(deleteGeneration) ||
+        deleteGeneration <= original.generation
+      )
+        discardUnavailable();
+      const input = Object.freeze({ ...original, deleteOperationId, deleteGeneration, leaseToken });
+      const finalScope = JSON.stringify({
+        purpose: "final-resource-delete@1",
+        operationId: deleteOperationId,
+        generation: deleteGeneration,
+        leaseToken,
+      });
+      try {
+        if (
+          !schemaReady(
+            await query(
+              schemaReadySql,
+              FINAL_DISCARD_SCHEMA.map(([name]) => name),
+            ),
+            FINAL_DISCARD_SCHEMA,
+          )
+        )
+          discardUnavailable();
+        if (signal.aborted || (await assertRetired(input, signal)) !== undefined || signal.aborted)
+          discardUnavailable();
+      } catch {
+        discardUnavailable();
+      }
+      const params = [
+        input.operationId,
+        input.resourceUid,
+        input.generation,
+        input.principal,
+        input.space,
+        input.name,
+        input.form,
+        input.backendId,
+        input.targetKey,
+      ] as const;
+      let writes: Awaited<ReturnType<Sql["batch"]>>;
+      try {
+        if (signal.aborted) discardUnavailable();
+        writes = await batch([
+          {
+            sql: `INSERT INTO ${DISCARD_GATE}
+              (operation_id, resource_uid, generation, principal, space, name, form_url, backend_id, target_key, final_delete)
+              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+              WHERE (SELECT COUNT(*) FROM sqlite_schema WHERE
+                (name = ? AND type = 'table' AND tbl_name = ? AND sql = ?) OR
+                (name = ? AND type = 'index' AND tbl_name = ? AND sql = ?) OR
+                (name = ? AND type = 'trigger' AND tbl_name = ? AND sql = ?) OR
+                (name = ? AND type = 'trigger' AND tbl_name = ? AND sql = ?) OR
+                (name = ? AND type = 'trigger' AND tbl_name = ? AND sql = ?)) = 5`,
+            params: [
+              ...params,
+              finalScope,
+              ...FINAL_DISCARD_SCHEMA.flatMap(([name, _type, table, ddl]) => [name, table, ddl]),
+            ],
+          },
+          {
+            sql: `DELETE FROM ${DISCARD_TABLE}
+              WHERE operation_id = ? AND resource_uid = ? AND generation = ?
+                AND EXISTS (SELECT 1 FROM ${DISCARD_GATE} gate
+                  WHERE gate.operation_id = ? AND gate.resource_uid = ? AND gate.generation = ?
+                    AND gate.principal = ? AND gate.space = ? AND gate.name = ?
+                    AND gate.form_url = ? AND gate.backend_id = ? AND gate.target_key = ?
+                    AND gate.final_delete = ?)`,
+            params: [input.operationId, input.resourceUid, input.generation, ...params, finalScope],
+          },
+          {
+            sql: `INSERT INTO ${DISCARD_GATE} (operation_id) SELECT NULL
+              WHERE EXISTS (SELECT 1 FROM ${DISCARD_GATE}
+                WHERE operation_id = ? AND resource_uid = ? AND generation = ?)`,
+            params: [input.operationId, input.resourceUid, input.generation],
+          },
+        ]);
+      } catch {
+        discardUnavailable();
+      }
+      if (
+        signal.aborted ||
+        writes.length !== 3 ||
+        writes[0]?.changes !== 1 ||
+        writes[1]?.changes !== 1
+      )
         discardUnavailable();
     },
   });
