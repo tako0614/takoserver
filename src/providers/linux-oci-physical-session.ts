@@ -1209,7 +1209,10 @@ export function createLinuxOciPhysicalSession(options: {
 /** Original P bootstrap facts only. The cookie is lossless, not H identity,
  * an accepted claim, a CREATE permission, or an authenticated reconnect. */
 export interface LinuxOciParentBootstrapInfo {
-  readonly kind: "linux-oci-parent-bootstrap@1" | "linux-oci-parent-bootstrap@2";
+  readonly kind:
+    | "linux-oci-parent-bootstrap@1"
+    | "linux-oci-parent-bootstrap@2"
+    | "linux-oci-parent-bootstrap@3";
   readonly peer?: LinuxOciParentPeerIdentity;
   readonly claimId: string;
   readonly generation: number;
@@ -1258,6 +1261,7 @@ export class LinuxOciParentBootstrap {
   }>;
   readonly #lifetime: AbortSignal | undefined;
   readonly #peerProfile: boolean;
+  readonly #runtimeFirst: boolean;
   #peer: LinuxOciParentPeerIdentity | undefined;
   #peerConnector: ChildProcessWithoutNullStreams | undefined;
   #peerReadUnknown = false;
@@ -1278,16 +1282,21 @@ export class LinuxOciParentBootstrap {
 
   constructor(options: {
     readonly binary: string;
-    readonly peerProfile?: "pidfs64@1";
+    readonly peerProfile?: "pidfs64@1" | "pidfs64-runtime@1";
     readonly claimId: string;
     readonly generation: number;
     readonly capability: Uint8Array;
     readonly timeoutMs?: number;
     readonly lifetimeSignal?: AbortSignal;
   }) {
-    if (options.peerProfile !== undefined && options.peerProfile !== "pidfs64@1")
+    if (
+      options.peerProfile !== undefined &&
+      options.peerProfile !== "pidfs64@1" &&
+      options.peerProfile !== "pidfs64-runtime@1"
+    )
       throw failure("parent_binding");
-    this.#peerProfile = options.peerProfile === "pidfs64@1";
+    this.#peerProfile = options.peerProfile !== undefined;
+    this.#runtimeFirst = options.peerProfile === "pidfs64-runtime@1";
     this.#claim = options.claimId;
     this.#generation = options.generation;
     this.#timeout = options.timeoutMs ?? 20_000;
@@ -1319,7 +1328,13 @@ export class LinuxOciParentBootstrap {
     this.#assertBinary();
     this.#child = spawn(
       binary,
-      [this.#peerProfile ? "--persistent-parent-peer" : "--persistent-parent"],
+      [
+        this.#runtimeFirst
+          ? "--persistent-parent-peer-runtime"
+          : this.#peerProfile
+            ? "--persistent-parent-peer"
+            : "--persistent-parent",
+      ],
       {
         env: Object.create(null),
         shell: false,
@@ -1356,7 +1371,11 @@ export class LinuxOciParentBootstrap {
     this.#signal = signal;
     this.#current(signal);
     const body = Buffer.alloc(112);
-    body.write(this.#peerProfile ? "TKOBIND2" : "TKOBIND1", 0, "ascii");
+    body.write(
+      this.#runtimeFirst ? "TKOBIND3" : this.#peerProfile ? "TKOBIND2" : "TKOBIND1",
+      0,
+      "ascii",
+    );
     body.write(this.#claim, 8, "ascii");
     body.writeBigUInt64BE(BigInt(this.#generation), 72);
     this.#capability.copy(body, 80);
@@ -1492,7 +1511,9 @@ export class LinuxOciParentBootstrap {
         ...(originalAllocation === undefined
           ? {}
           : {
-              purpose: "takoserver.linux-oci-peer-reconstruction@1",
+              purpose: this.#runtimeFirst
+                ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
+                : "takoserver.linux-oci-peer-reconstruction@1",
               allocation: originalAllocation,
             }),
       }),
@@ -1534,6 +1555,7 @@ export class LinuxOciParentBootstrap {
     const owner = this;
     return readOriginalPeerResult(
       {
+        runtimeFirst: this.#runtimeFirst,
         binary: this.#binary,
         claim: this.#claim,
         generation: this.#generation,
@@ -1693,7 +1715,12 @@ export class LinuxOciParentBootstrap {
       if (
         !body
           .subarray(0, 8)
-          .equals(Buffer.from(this.#peerProfile ? "TKOINFO2" : "TKOINFO1", "ascii")) ||
+          .equals(
+            Buffer.from(
+              this.#runtimeFirst ? "TKOINFO3" : this.#peerProfile ? "TKOINFO2" : "TKOINFO1",
+              "ascii",
+            ),
+          ) ||
         !body.subarray(8, 72).equals(Buffer.from(this.#claim, "ascii")) ||
         body.readBigUInt64BE(72) !== BigInt(this.#generation) ||
         cookie === 0n
@@ -1717,7 +1744,11 @@ export class LinuxOciParentBootstrap {
         });
       }
       this.#info = Object.freeze({
-        kind: this.#peerProfile ? "linux-oci-parent-bootstrap@2" : "linux-oci-parent-bootstrap@1",
+        kind: this.#runtimeFirst
+          ? "linux-oci-parent-bootstrap@3"
+          : this.#peerProfile
+            ? "linux-oci-parent-bootstrap@2"
+            : "linux-oci-parent-bootstrap@1",
         ...(this.#peer ? { peer: this.#peer } : {}),
         claimId: this.#claim,
         generation: this.#generation,
@@ -1756,6 +1787,7 @@ export function createLinuxOciParentBootstrap(
  * the owning Core's authenticated capture + actual-file bridge. Neither this
  * type nor the returned unproven result is an accepted/removed authority. */
 interface OriginalPeerReaderState {
+  readonly runtimeFirst: boolean;
   readonly binary: string;
   readonly claim: string;
   readonly generation: number;
@@ -1949,7 +1981,8 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
   if (
     !exact(value, keys) ||
     value.kind !== "linux-oci-original-peer-control@1" ||
-    value.purpose !== "takoserver.linux-oci-peer-reconstruction@1" ||
+    (value.purpose !== "takoserver.linux-oci-peer-reconstruction@1" &&
+      value.purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1") ||
     typeof value.claimId !== "string" ||
     !CLAIM.test(value.claimId) ||
     !integer(value.generation, 1) ||
@@ -1991,6 +2024,7 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     bootId: value.peer.bootId,
   });
   const state: OriginalPeerReaderState = {
+    runtimeFirst: value.purpose === "takoserver.linux-oci-peer-runtime-reconstruction@1",
     binary,
     claim: value.claimId,
     generation: value.generation,
@@ -2343,6 +2377,58 @@ export function prepareAuthenticatedLinuxOciPeerInit(
     const begin = 1 << 11,
       deletion = 1 << 13,
       disposal = 1 << 15;
+    if (state.runtimeFirst) {
+      const previous = captured;
+      if (
+        outcome.effects & ~(base | begin | deletion | disposal) ||
+        !(outcome.effects & (1 << 6)) ||
+        !(outcome.effects & (1 << 8)) ||
+        (outcome.effects & begin && !(outcome.effects & deletion)) ||
+        (outcome.effects & disposal && !(outcome.effects & begin))
+      )
+        throw failure("parent_peer_phase");
+      const matched = (op: RetirementOperation) =>
+        previous.kind === RETIREMENT[op][1] ||
+        (previous.kind === "linux-oci-refused@1" &&
+          previous.custody === "retained" &&
+          previous.stage === op);
+      const known = (op: RetirementOperation) => previous.kind === RETIREMENT[op][1];
+      if (outcome.effects & disposal) {
+        if (
+          !(outcome.requestKind === 15 && matched("dispose-born")) &&
+          !(outcome.requestKind === 16 && matched("continue-born-disposal"))
+        )
+          throw failure("parent_peer_phase");
+        operation =
+          known("dispose-born") || known("continue-born-disposal")
+            ? "read-helper-result"
+            : "continue-born-disposal";
+      } else if (outcome.effects & begin) {
+        if (outcome.requestKind === 11 && matched("begin-tracked-join"))
+          operation = "read-tracked-join";
+        else if (outcome.requestKind === 12 && matched("read-tracked-join"))
+          operation = known("read-tracked-join") ? "dispose-born" : "read-tracked-join";
+        else throw failure("parent_peer_phase");
+      } else if (outcome.effects & deletion) {
+        if (outcome.requestKind === 13 && matched("delete-born")) operation = "join-born-delete";
+        else if (outcome.requestKind === 14 && matched("join-born-delete"))
+          operation = known("join-born-delete") ? "begin-tracked-join" : "join-born-delete";
+        else throw failure("parent_peer_phase");
+      } else {
+        if (
+          ![8, 9].includes(outcome.requestKind) ||
+          ![
+            "linux-oci-namespace-release-observation@1",
+            "linux-oci-namespace-release-continuation@1",
+          ].includes(captured.kind) ||
+          !("nativeId" in captured) ||
+          captured.nativeId !== nativeId
+        )
+          throw failure("parent_peer_phase");
+        operation = "delete-born";
+      }
+      return send(nativeId);
+    }
     if (
       outcome.effects & ~(base | begin | deletion | disposal) ||
       !(outcome.effects & (1 << 6)) ||
@@ -2526,6 +2612,9 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       )
         throw failure("parent_peer_phase");
       if (
+        (state.runtimeFirst &&
+          outcome.requestKind === 8 &&
+          captured.kind === "linux-oci-namespace-release-observation@1") ||
         (outcome.requestKind === 9 &&
           captured.kind === "linux-oci-namespace-release-continuation@1") ||
         outcome.effects & ((1 << 11) | (1 << 13) | (1 << 15))

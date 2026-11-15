@@ -138,7 +138,7 @@ export interface DockerContainerCoreOwnerOptions {
   readonly backendId: string;
   readonly targetKey: string;
   /** Explicit private mode, never selected by a request or old claim. */
-  readonly ociParentControl?: "sealed-original@1" | "sealed-peer@1";
+  readonly ociParentControl?: "sealed-original@1" | "sealed-peer@1" | "sealed-peer-runtime@1";
   readonly configuredInputs?: {
     readonly keyring: HostedContainerSecretKeyring;
     readonly maxSecretBytes: number;
@@ -568,12 +568,15 @@ export function createDockerContainerCoreOwner(
 ): DockerContainerCoreOwner {
   const { sql, clock, installationId, backendId, targetKey } = options;
   const parentMode = options.ociParentControl;
-  if (
-    parentMode !== undefined &&
-    parentMode !== "sealed-original@1" &&
-    parentMode !== "sealed-peer@1"
-  )
-    return fail();
+  const peerMode = parentMode === "sealed-peer@1" || parentMode === "sealed-peer-runtime@1";
+  // Keep the existing durable peer domain/shape. The authenticated inner
+  // purpose below fixes the original pre-CREATE profile without DDL retrofit.
+  const peerPurpose = "takoserver.linux-oci-parent-peer-control@1";
+  const peerReconstructionPurpose =
+    parentMode === "sealed-peer-runtime@1"
+      ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
+      : "takoserver.linux-oci-peer-reconstruction@1";
+  if (parentMode !== undefined && parentMode !== "sealed-original@1" && !peerMode) return fail();
   const original = createV2ContainerHostAcceptance({
     sql,
     installationId,
@@ -2417,8 +2420,7 @@ export function createDockerContainerCoreOwner(
     if (parentMode === undefined || !controlDecryptionKey || signal.aborted) return fail();
     await assertExecution(execution);
     if (management) {
-      if (parentMode !== "sealed-peer@1" || input.state !== "bound" || !hex(input.nativeId))
-        return fail();
+      if (!peerMode || input.state !== "bound" || !hex(input.nativeId)) return fail();
       const accepted = await result.readAcceptedExecution(execution);
       const retained = accepted.retained.find((item) => item.record.claimId === input.claimId);
       if (
@@ -2462,17 +2464,13 @@ export function createDockerContainerCoreOwner(
       canonicalJson(envelope) !== raw
     )
       return fail();
-    const artifact =
-      parentMode === "sealed-peer@1"
-        ? peerArtifact(envelope.scope, input)
-        : await readOriginalLinuxOciControlArtifact(originalCustody, result, input, signal);
+    const artifact = peerMode
+      ? peerArtifact(envelope.scope, input)
+      : await readOriginalLinuxOciControlArtifact(originalCustody, result, input, signal);
     // a/o describe the ORIGINAL accepted CREATE/UPDATE for this generation.
     // la/lo describe today's operation, which may be DELETE; never substitute it.
     const scope = Object.freeze({
-      purpose:
-        parentMode === "sealed-peer@1"
-          ? "takoserver.linux-oci-parent-peer-control@1"
-          : "takoserver.linux-oci-parent-control@1",
+      purpose: peerMode ? peerPurpose : "takoserver.linux-oci-parent-control@1",
       claimId: input.claimId,
       installationId,
       resourceUid: input.intent.resourceUid,
@@ -2515,6 +2513,8 @@ export function createDockerContainerCoreOwner(
         new TextEncoder().encode(canonicalJson(scope)),
       );
       const binding = parseStrictJson(plaintext, 65536);
+      if (peerMode && (!isJsonObject(binding) || binding.purpose !== peerReconstructionPurpose))
+        return fail();
       if (JSON.stringify(binding) !== new TextDecoder("utf-8", { fatal: true }).decode(plaintext))
         return fail();
       await assertSnapshot(loaded.proof);
@@ -2526,7 +2526,7 @@ export function createDockerContainerCoreOwner(
       );
       if (fresh.length !== 1 || fresh[0]?.native_control !== raw || signal.aborted) return fail();
       let observation: LinuxOciParentHResult | LinuxOciPeerInitProgress | undefined;
-      if (parentMode === "sealed-peer@1") {
+      if (peerMode) {
         const prepare = management
           ? prepareOriginalLinuxOciPeerInit
           : prepareOriginalLinuxOciPeerRead;
@@ -2954,10 +2954,7 @@ export function createDockerContainerCoreOwner(
       )
         return fail();
       const scope = Object.freeze({
-        purpose:
-          parentMode === "sealed-peer@1"
-            ? "takoserver.linux-oci-parent-peer-control@1"
-            : "takoserver.linux-oci-parent-control@1",
+        purpose: peerMode ? peerPurpose : "takoserver.linux-oci-parent-control@1",
         claimId: input.claimId,
         installationId,
         resourceUid: input.intent.resourceUid,
@@ -2975,10 +2972,9 @@ export function createDockerContainerCoreOwner(
         policyDigest: input.intent.policy.policyDigest,
         artifact: entry.receipt,
       });
-      const initializeAllocation =
-        parentMode === "sealed-peer@1" && (await inspectV2ContainerOwnerAllocationSchema(sql));
+      const initializeAllocation = peerMode && (await inspectV2ContainerOwnerAllocationSchema(sql));
       const initializeApplicationIo =
-        parentMode === "sealed-peer@1" && (await inspectV2ContainerOwnerApplicationIoSchema(sql));
+        peerMode && (await inspectV2ContainerOwnerApplicationIoSchema(sql));
       freshControlClaims.delete(input); // consumed before async sealing/save, never a retry grant
       const sealed = await sealOriginalLinuxOciParentControl(
         originalCustody,
@@ -2987,7 +2983,7 @@ export function createDockerContainerCoreOwner(
         options.configuredInputs.keyring.current,
         canonicalJson(scope),
         signal,
-        parentMode === "sealed-peer@1",
+        peerMode,
       );
       if (
         !(await current(lease)) ||

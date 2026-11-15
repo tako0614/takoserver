@@ -269,6 +269,7 @@ static int ocip_namespace_retained_error(struct ocip_namespace_state *state,
 struct ocip_retirement_state {
   int entered, unusable, begin_requested, read_known;
   int delete_requested, delete_known, dispose_requested, disposed;
+  int runtime_first; /* fixed original H mode, not a decoded request */
 };
 
 static const char *ocip_retirement_stage(enum tns_ocip_kind kind) {
@@ -369,7 +370,8 @@ static int ocip_cleanup_routed(struct tns_oci_owner **owner,
     result = tns_oci_dispose_born(owner);
     if (!result && !*owner) state->disposed = 1;
   } else if (state->delete_requested && !state->delete_known) {
-    result = tns_oci_join_born_delete(*owner);
+    result = state->runtime_first ? tns_oci_join_selected_runtime_delete(*owner) :
+                                   tns_oci_join_born_delete(*owner);
     if (!result) state->delete_known = 1;
   } else if (state->begin_requested && !state->read_known) {
     result = tns_oci_read_tracked_join(*owner);
@@ -412,13 +414,67 @@ static _Noreturn void ocip_retain(struct tns_oci_owner **owner,
 /* The existing argc1 owner below remains the direct H in either invocation. */
 #include "docker-container-terminal-oci-parent.h"
 
+/* Runtime-first is a fixed H mode chosen by its original P before CREATE.
+ * Old command IDs/replies are reused; old router/default remain unchanged. */
+static int ocip_runtime_retirement_command(enum tns_ocip_kind kind,
+                                            struct tns_oci_owner **owner,
+                                            const struct ocip_namespace_state *ns,
+                                            struct ocip_retirement_state *state) {
+  if (!state || !state->runtime_first || !owner || !*owner || state->unusable || state->disposed ||
+      !ocip_retirement_stage(kind)) { errno = EPROTO; return -3; }
+  state->entered = 1;
+  if (interrupted) { state->unusable = 1; errno = ECANCELED; return -2; }
+  int result;
+  if (state->dispose_requested && kind != TNS_OCIP_CONTINUE_BORN_DISPOSAL)
+    goto wrong_order;
+  if (kind == TNS_OCIP_DELETE_BORN) {
+    if (state->delete_requested) { errno = EALREADY; return -1; }
+    if (!ns || !ns->release_requested || ns->unusable || state->begin_requested)
+      goto wrong_order;
+    state->delete_requested = 1;
+    result = tns_oci_delete_selected_runtime(*owner);
+    if (!result) state->delete_known = 1;
+  } else if (kind == TNS_OCIP_JOIN_BORN_DELETE) {
+    if (!state->delete_requested || state->begin_requested || state->dispose_requested)
+      goto wrong_order;
+    result = tns_oci_join_selected_runtime_delete(*owner);
+    if (!result) state->delete_known = 1;
+  } else if (kind == TNS_OCIP_BEGIN_TRACKED_JOIN) {
+    if (state->begin_requested) { errno = EALREADY; return -1; }
+    if (!state->delete_known || !ns || !ns->release_requested || ns->unusable)
+      goto wrong_order;
+    state->begin_requested = 1;
+    result = tns_oci_begin_tracked_join(*owner);
+  } else if (kind == TNS_OCIP_READ_TRACKED_JOIN) {
+    if (!state->begin_requested || state->dispose_requested) goto wrong_order;
+    result = tns_oci_read_tracked_join(*owner);
+    if (!result) state->read_known = 1;
+  } else {
+    if (kind == TNS_OCIP_DISPOSE_BORN) {
+      if (state->dispose_requested) { errno = EALREADY; return -1; }
+      if (!state->delete_known || !state->read_known) goto wrong_order;
+      state->dispose_requested = 1;
+    } else if (!state->dispose_requested) goto wrong_order;
+    result = tns_oci_dispose_born(owner);
+    if (!result && !*owner) state->disposed = 1;
+  }
+  if (interrupted) { state->unusable = 1; errno = ECANCELED; return -2; }
+  if (result < 0) return -1;
+  if (result || (state->dispose_requested && !state->disposed)) goto wrong_order;
+  if (ocip_retirement_reply(kind) < 0) { state->unusable = 1; return -2; }
+  return state->disposed ? 1 : 0;
+wrong_order:
+  state->unusable = 1; errno = EPROTO; return -3;
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent")) return ocipp_main();
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer")) return ocipp_peer_main();
+  if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer-runtime")) return ocipp_runtime_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-result")) return ocipp_connector_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-manage-init")) return ocipp_connector_management_main();
-  (void)argv;
-  if (argc != 1 || geteuid() != 0 || fcntl(2, F_GETFD) < 0 ||
+  int runtime_first = argc == 2 && !strcmp(argv[1], "--selected-runtime-owner");
+  if ((argc != 1 && !runtime_first) || geteuid() != 0 || fcntl(2, F_GETFD) < 0 ||
       ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
   int input_flags = fcntl(0, F_GETFL), output_flags = fcntl(1, F_GETFL);
   if (input_flags < 0 || output_flags < 0 ||
@@ -442,7 +498,7 @@ int main(int argc, char **argv) {
   struct tns_oci_owner *owner = NULL;
   unsigned int attempt = 0; int sealed = 0;
   struct ocip_namespace_state namespace_state = {0};
-  struct ocip_retirement_state retirement_state = {0};
+  struct ocip_retirement_state retirement_state = {.runtime_first = runtime_first};
   int cleanup_done = 0;
   for (;;) {
     unsigned char *body = NULL; uint32_t size = 0;
@@ -463,7 +519,8 @@ int main(int argc, char **argv) {
     const char *stage = "request"; int failure = EPROTO;
     if (!result && !interrupted && request->kind == TNS_OCIP_CREATE && first && !sealed && !retirement_state.entered) {
       stage = "create";
-      result = tns_oci_create(&request->options, &owner);
+      result = runtime_first ? tns_oci_create_selected_runtime(&request->options, &owner) :
+                               tns_oci_create(&request->options, &owner);
       if (result < 0) failure = errno ? errno : EPROTO;
       else {
         result = ocip_observed("linux-oci-created-stopped@1", owner);
@@ -503,7 +560,9 @@ int main(int argc, char **argv) {
                ocip_retirement_stage(request->kind)) {
       sealed = 1;
       stage = ocip_retirement_stage(request->kind);
-      result = ocip_retirement_command(request->kind, &owner, &namespace_state, &retirement_state);
+      result = runtime_first ?
+        ocip_runtime_retirement_command(request->kind, &owner, &namespace_state, &retirement_state) :
+        ocip_retirement_command(request->kind, &owner, &namespace_state, &retirement_state);
       if (result < 0) failure = errno ? errno : EPROTO;
     } else if (!result && request->kind == TNS_OCIP_CANCEL && retirement_state.entered) {
       retirement_state.unusable = 1;

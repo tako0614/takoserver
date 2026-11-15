@@ -76,6 +76,7 @@ async function fixture(
   adversarial: {
     readonly parentControl?: boolean;
     readonly parentPeer?: boolean;
+    readonly parentPeerRuntime?: boolean;
     readonly peerPending?: boolean;
     readonly peerManagementFault?: "incomplete" | "missing-reply" | "lost-reply";
     readonly peerJoinFault?: "foreign" | "refused" | "unknown" | "pidns";
@@ -290,7 +291,11 @@ async function fixture(
       targetKey: "synthetic-oci-target",
       configuredInputs,
       ...(adversarial.parentPeer
-        ? { ociParentControl: "sealed-peer@1" as const }
+        ? {
+            ociParentControl: adversarial.parentPeerRuntime
+              ? ("sealed-peer-runtime@1" as const)
+              : ("sealed-peer@1" as const),
+          }
         : adversarial.parentControl
           ? { ociParentControl: "sealed-original@1" as const }
           : {}),
@@ -369,7 +374,11 @@ async function fixture(
         connector
           ? [managing ? "--parent-peer-manage-init" : "--parent-peer-read-result"]
           : adversarial.parentPeer
-            ? ["--persistent-parent-peer"]
+            ? [
+                adversarial.parentPeerRuntime
+                  ? "--persistent-parent-peer-runtime"
+                  : "--persistent-parent-peer",
+              ]
             : adversarial.parentControl
               ? ["--persistent-parent"]
               : [],
@@ -657,12 +666,20 @@ async function fixture(
               return;
             }
             if (adversarial.parentPeer && frame.readUInt32BE(0) === 112) {
-              expect(frame.subarray(4, 12).equals(Buffer.from("TKOBIND2"))).toBe(true);
+              expect(
+                frame
+                  .subarray(4, 12)
+                  .equals(Buffer.from(adversarial.parentPeerRuntime ? "TKOBIND3" : "TKOBIND2")),
+              ).toBe(true);
               originalPeerBootstrap = Buffer.from(frame);
-              nativeRequests.push("linux-oci-parent-bootstrap@2");
+              nativeRequests.push(
+                adversarial.parentPeerRuntime
+                  ? "linux-oci-parent-bootstrap@3"
+                  : "linux-oci-parent-bootstrap@2",
+              );
               const response = Buffer.alloc(144);
               response.writeUInt32BE(140);
-              response.write("TKOINFO2", 4, "ascii");
+              response.write(adversarial.parentPeerRuntime ? "TKOINFO3" : "TKOINFO2", 4, "ascii");
               frame.copy(response, 12, 12, 84);
               response.writeBigUInt64BE(0xfedcba9876543210n, 84);
               response.writeBigUInt64BE(5n, 92);

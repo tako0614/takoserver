@@ -37,7 +37,11 @@
 struct oci_uplink_owner;
 struct oci_policy_owner;
 struct oci_admission_owner;
+/* Chosen only by a fixed private constructor before any original effect.
+ * This profile changes runtime-delete ordering, never terminal permission. */
+enum oci_retirement_profile { OCI_RETIREMENT_TRACKED, OCI_RETIREMENT_RUNTIME_FIRST };
 struct tns_oci_owner {
+  enum oci_retirement_profile retirement_profile;
   struct oci_uplink_owner *uplink;
   struct oci_policy_owner *policy;
   struct oci_admission_owner *admission;
@@ -70,6 +74,8 @@ struct tns_oci_owner {
   unsigned int init_stop_attempt;
   unsigned int namespace_release_attempt;
   int namespace_release_dispatched;
+  /* Set only by the successful actual release/readback path, not dispatch. */
+  int runtime_first_namespace_known;
   int namespace_loan_close_unknown;
   struct stat parent_pidns_identity, init_pidns_identity;
   int root, rootfs, receipt, runtime, bundle, state, network, command_pidfd;
@@ -717,7 +723,9 @@ fail:
 #include "docker-container-terminal-oci-policy.h"
 #include "docker-container-terminal-oci-admission.h"
 
-int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner **slot) {
+static int oci_create_profile(const struct tns_oci_options *options,
+                                struct tns_oci_owner **slot,
+                                enum oci_retirement_profile profile) {
   if (!slot) { errno = EINVAL; return -1; }
   if (*slot) { errno = EALREADY; return -1; }
   struct tns_oci_owner *o = calloc(1, sizeof(*o));
@@ -729,6 +737,7 @@ int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner *
   for (size_t i = 0; i < 3; ++i)
     o->egress_pidfd[i] = o->egress_in[i] = o->egress_out[i] = -1;
   o->controller_pid = getpid();
+  o->retirement_profile = profile;
   *slot = o;
   if (tns_oci_once(&o->attempt) < 0 || tns_oci_data(options) < 0 ||
       tns_oci_metadata(options) < 0 || geteuid() != 0) { errno = EINVAL; goto fail; }
@@ -823,6 +832,16 @@ fail:
   /* No replay, blind runc delete, secret logging, or custody release. A pending
    * command can only be canceled/joined through this original private owner. */
   return -1;
+}
+
+int tns_oci_create(const struct tns_oci_options *options, struct tns_oci_owner **slot) {
+  return oci_create_profile(options, slot, OCI_RETIREMENT_TRACKED);
+}
+
+/* Fixed opt-in owner, never an adoption or a setter on a preexisting claim. */
+int tns_oci_create_selected_runtime(const struct tns_oci_options *options,
+                                     struct tns_oci_owner **slot) {
+  return oci_create_profile(options, slot, OCI_RETIREMENT_RUNTIME_FIRST);
 }
 
 int tns_oci_cancel(struct tns_oci_owner *o) {
@@ -945,7 +964,12 @@ static int oci_namespace_release_progress(struct tns_oci_owner *o,
   } else result = tns_owner_continue_namespace_release(o->birth, &released);
   if (result < 0) return -1;
   if (o->namespace_loan_close_unknown) { errno = EUCLEAN; return -1; }
-  return tns_oci_observe_namespace_lifetime(o, lifetime);
+  int observed = tns_oci_observe_namespace_lifetime(o, lifetime);
+  if (!observed && o->retirement_profile == OCI_RETIREMENT_RUNTIME_FIRST &&
+      lifetime->lifetime.release_attempted == 1 &&
+      lifetime->lifetime.reference_released == 1 && !lifetime->lifetime.poisoned)
+    o->runtime_first_namespace_known = 1;
+  return observed;
 }
 
 int tns_oci_release_namespace(struct tns_oci_owner *o,
@@ -1093,6 +1117,78 @@ int tns_oci_delete_born(struct tns_oci_owner *o) {
   if (elapsed < 0 || elapsed - now >= 10000) { errno = ETIMEDOUT; return -1; }
   if (oci_join_born_delete_command(o, 10000 - (int)(elapsed - now)) < 0) return -1;
   return oci_born_delete_observed(o);
+}
+
+
+/* Only the explicit original runtime-first constructor can enter here.
+ * Completion is minted by actual own policy/uplink/loan/custodian/release
+ * readback above. No tracked READ, counter, netGone or caller result is used.
+ * Generic cancellation cannot erase cleanup custody; identity remains required. */
+static int oci_selected_runtime_delete_current(struct tns_oci_owner *o) {
+  if (!o || !o->birth || o->retirement_profile != OCI_RETIREMENT_RUNTIME_FIRST ||
+      !o->runtime_first_namespace_known || !o->namespace_release_attempt ||
+      !o->namespace_release_dispatched || o->network >= 0 ||
+      o->namespace_loan_close_unknown || o->egress_close_unknown ||
+      o->admission || o->policy || o->uplink) { errno = EUCLEAN; return -1; }
+  if (oci_namespace_release_current(o) < 0) return -1;
+  char path[sizeof(o->statepath)];
+  if (oci_fd_path(path, sizeof(path), o->state) < 0 ||
+      strcmp(path, o->statepath) || tns_oci_claim(o->id) < 0) {
+    errno = ESTALE; return -1;
+  }
+  return 0;
+}
+
+static int oci_selected_runtime_delete_observed(struct tns_oci_owner *o) {
+  if (!o->delete_joined || !o->delete_ok || !o->delete_state_pinned) {
+    errno = EUCLEAN; return -1;
+  }
+  if (oci_selected_runtime_delete_current(o) < 0) return -1;
+  struct stat held, named;
+  if (fstat(o->delete_state_fd, &held) < 0 ||
+      !oci_same(&held, &o->delete_state_identity)) { errno = ESTALE; return -1; }
+  if (fstatat(o->state, o->id, &named, AT_SYMLINK_NOFOLLOW) == 0) {
+    errno = EEXIST; return -1;
+  }
+  if (errno != ENOENT) return -1;
+  /* Zero is only joined-zero runtime DELETE plus fresh exact-state absence.
+   * No remaining config/FD is released and no network/Core permit is created. */
+  return oci_selected_runtime_delete_current(o);
+}
+
+int tns_oci_join_selected_runtime_delete(struct tns_oci_owner *o) {
+  if (!o || !o->delete_attempt) { errno = EINVAL; return -1; }
+  if (oci_selected_runtime_delete_current(o) < 0 ||
+      oci_join_born_delete_command(o, 10000) < 0) return -1;
+  return oci_selected_runtime_delete_observed(o);
+}
+
+int tns_oci_delete_selected_runtime(struct tns_oci_owner *o) {
+  if (!o) { errno = EINVAL; return -1; }
+  if (o->delete_attempt) { errno = EALREADY; return -1; }
+  if (oci_selected_runtime_delete_current(o) < 0) return -1;
+  if (tns_oci_once(&o->delete_attempt) < 0) { errno = EALREADY; return -1; }
+  o->delete_pidfd = o->delete_state_fd = -1;
+  o->delete_state_fd = openat(o->state, o->id,
+                            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  if (o->delete_state_fd < 0 || oci_owned(o->delete_state_fd, 1, 0700) < 0 ||
+      fstat(o->delete_state_fd, &o->delete_state_identity) < 0) return -1;
+  o->delete_state_pinned = 1;
+  if (oci_born_delete_state_current(o) < 0 || oci_selected_runtime_delete_current(o) < 0)
+    return -1;
+  int64_t now = oci_now();
+  if (now < 0) return -1;
+  struct clone_args args; memset(&args, 0, sizeof(args));
+  args.flags = CLONE_PIDFD | CLONE_CLEAR_SIGHAND;
+  args.pidfd = (uintptr_t)&o->delete_pidfd; args.exit_signal = SIGCHLD;
+  long child = syscall(SYS_clone3, &args, sizeof(args));
+  if (child < 0) return -1;
+  if (!child) oci_command_child(o, o->controller_pid, OCI_COMMAND_DELETE);
+  o->delete_pid = (pid_t)child;
+  int64_t elapsed = oci_now();
+  if (elapsed < 0 || elapsed - now >= 10000) { errno = ETIMEDOUT; return -1; }
+  if (oci_join_born_delete_command(o, 10000 - (int)(elapsed - now)) < 0) return -1;
+  return oci_selected_runtime_delete_observed(o);
 }
 
 

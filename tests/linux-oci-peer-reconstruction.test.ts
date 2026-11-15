@@ -23,6 +23,7 @@ async function fixture(
     pending?: boolean;
     v1?: boolean;
     normal?: boolean;
+    runtimeFirst?: boolean;
     configuredPeer?: boolean;
     joinFault?: "foreign" | "refused" | "unknown" | "pidns";
     namespaceFault?:
@@ -75,6 +76,7 @@ async function fixture(
   try {
     const f = await originalOwnedOciFixture(false, {
       ...(options.v1 ? { parentControl: true } : { parentPeer: true }),
+      ...(options.runtimeFirst ? { parentPeerRuntime: true } : {}),
       ...(options.pending === undefined ? {} : { peerPending: options.pending }),
       ...(options.normal === undefined ? {} : { normalBackend: options.normal }),
       ...(options.managementFault === undefined

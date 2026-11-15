@@ -1273,6 +1273,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   if (physicalBinary !== undefined && (!text(physicalBinary) || !isAbsolute(physicalBinary)))
     return fail("invalid_request");
   const parentMode = options.ociParentControl;
+  const peerMode = parentMode === "sealed-peer@1" || parentMode === "sealed-peer-runtime@1";
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
   const parents = new Map<
@@ -1283,11 +1284,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       readonly receipt: LinuxOciArtifactReceipt;
     }
   >();
-  if (
-    parentMode !== undefined &&
-    parentMode !== "sealed-original@1" &&
-    parentMode !== "sealed-peer@1"
-  )
+  if (parentMode !== undefined && parentMode !== "sealed-original@1" && !peerMode)
     return fail("parent_selection");
   if (parentMode !== undefined && (!options.configuredInputs || physicalBinary === undefined))
     return fail("parent_selection");
@@ -2078,7 +2075,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     execution: V2Execution,
     externalSignal?: AbortSignal,
   ): Promise<readonly LinuxOciParentHResult[]> {
-    if (closed || parentMode !== "sealed-peer@1")
+    if (closed || !peerMode)
       return Promise.reject(new Error("linux_oci_owned_bundle_parent_unavailable"));
     if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
       return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
@@ -2146,7 +2143,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     execution: V2Execution,
     externalSignal?: AbortSignal,
   ): Promise<readonly LinuxOciPeerInitProgress[]> {
-    if (closed || parentMode !== "sealed-peer@1")
+    if (closed || !peerMode)
       return Promise.reject(new Error("linux_oci_owned_bundle_parent_unavailable"));
     if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
       return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
@@ -2255,7 +2252,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         local();
       }
       if (
-        parentMode === "sealed-peer@1" &&
+        peerMode &&
         accepted.retained.some((item) => item.record.intent.policy.generation < accepted.generation)
       ) {
         await creator.manageRetainedPeerInit(execution, cancel.signal);
@@ -2480,10 +2477,17 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         let session: LinuxOciPhysicalSession;
         let observation: LinuxOciStoppedObservation;
         let parent: LinuxOciParentBootstrap | undefined;
-        if (parentMode === "sealed-original@1" || parentMode === "sealed-peer@1") {
+        if (parentMode === "sealed-original@1" || peerMode) {
           parent = createLinuxOciParentBootstrap({
             binary: physicalBinary,
-            ...(parentMode === "sealed-peer@1" ? { peerProfile: "pidfs64@1" as const } : {}),
+            ...(peerMode
+              ? {
+                  peerProfile:
+                    parentMode === "sealed-peer-runtime@1"
+                      ? ("pidfs64-runtime@1" as const)
+                      : ("pidfs64@1" as const),
+                }
+              : {}),
             claimId: receipt.claimId,
             generation: receipt.generation,
             capability: crypto.getRandomValues(new Uint8Array(32)),

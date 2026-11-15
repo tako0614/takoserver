@@ -54,6 +54,11 @@ struct tns_oci_started {
  * internally owned fresh namespace and exact runc CREATE. */
 int tns_oci_create(const struct tns_oci_options *options,
                     struct tns_oci_owner **slot);
+/* Explicit fresh owner only: runtime deletion may precede tracked join, after
+ * actual original init/command joins and all own namespace-route cleanup.
+ * Final tracked disposal/UNKNOWN/removed contracts are unchanged. */
+int tns_oci_create_selected_runtime(const struct tns_oci_options *options,
+                                     struct tns_oci_owner **slot);
 int tns_oci_observe(struct tns_oci_owner *owner, struct tns_oci_created *created);
 /* Same original owner only, one attempt before spawn. Success is an observed
  * executable transition of the same live init plus fresh original namespace;
@@ -122,6 +127,9 @@ int tns_oci_read_tracked_join(struct tns_oci_owner *owner);
  * fact, never full traffic terminal, Core removal, or complete FD cleanup. */
 int tns_oci_delete_born(struct tns_oci_owner *owner);
 int tns_oci_join_born_delete(struct tns_oci_owner *owner);
+/* Same consumed original child slots; never available to a legacy owner. */
+int tns_oci_delete_selected_runtime(struct tns_oci_owner *owner);
+int tns_oci_join_selected_runtime_delete(struct tns_oci_owner *owner);
 
 /* Original born local cleanup only, after actual joined-zero DELETE/fresh
  * state absence and tracked READ/currentness. One exact config unlink, actual
