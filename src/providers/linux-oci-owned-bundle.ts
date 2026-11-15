@@ -39,8 +39,10 @@ import {
 import {
   LINUX_OCI_HOST_TOPOLOGY_FILE,
   type LinuxOciHostTopology,
+  linuxOciGenerationTopology,
   serializeLinuxOciHostTopology,
   snapshotLinuxOciHostTopology,
+  snapshotLinuxOciTopologyPair,
 } from "./linux-oci-host-topology.ts";
 import { createLinuxOciHttpHealthProbe } from "./linux-oci-http-health.ts";
 import {
@@ -77,6 +79,7 @@ type OriginalOciCustody = {
   readonly artifactRoot: string;
   readonly physicalBinary: string | undefined;
   readonly hostTopology: LinuxOciHostTopology | undefined;
+  readonly alternateHostTopology: LinuxOciHostTopology | undefined;
   readonly httpRecords: ReadonlyMap<string, DockerContainerCreateRecord>;
   readonly httpRuntimes: ReadonlyMap<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>;
   readonly peerReads: Map<string, OriginalPeerRead>;
@@ -134,7 +137,9 @@ export function originalLinuxOciHttpEndpoint(
     httpPort > 65535
   )
     return fail("http_custody");
-  return `http://${custody.hostTopology.peerIpv4Guest}:${httpPort}/`;
+  const captured = custody.allocations.get(record.claimId)?.topology;
+  if (!captured && custody.alternateHostTopology !== undefined) return fail("http_custody");
+  return `http://${(captured ?? custody.hostTopology).peerIpv4Guest}:${httpPort}/`;
 }
 /** Internal source lookup only. This is the already-owned application runtime,
  * never a replacement created from a claim or a positive retirement witness. */
@@ -305,6 +310,7 @@ type OriginalFileIdentity = {
   readonly uid: bigint;
 };
 type OriginalOciAllocation = {
+  readonly topology?: Readonly<LinuxOciHostTopology>;
   readonly intent: string;
   readonly parents: readonly OriginalFileIdentity[];
   readonly root: OriginalFileIdentity;
@@ -333,7 +339,11 @@ async function assertOriginalFile(expected: OriginalFileIdentity, directory: boo
     return fail("allocation_identity");
 }
 
-async function captureOriginalAllocation(artifactRoot: string, bundle: LinuxOciBorrowedBundle) {
+async function captureOriginalAllocation(
+  artifactRoot: string,
+  bundle: LinuxOciBorrowedBundle,
+  topology?: Readonly<LinuxOciHostTopology>,
+) {
   if (bundle.allocationRoot !== join(artifactRoot, bundle.record.claimId))
     return fail("allocation_identity");
   await privateDirectory(artifactRoot);
@@ -353,7 +363,14 @@ async function captureOriginalAllocation(artifactRoot: string, bundle: LinuxOciB
     ),
     receiptBytes = JSON.stringify(bundle.receipt);
   if ((await readFile(receipt.path, "utf8")) !== receiptBytes) return fail("allocation_identity");
+  if (
+    topology !== undefined &&
+    (await readFile(join(bundle.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE), "utf8")) !==
+      serializeLinuxOciHostTopology(bundle.receipt, bundle.record, topology)
+  )
+    return fail("allocation_identity");
   const allocation: OriginalOciAllocation = {
+    ...(topology === undefined ? {} : { topology }),
     intent: canonicalJson(bundle.record.intent),
     parents: Object.freeze(parents),
     root,
@@ -376,6 +393,7 @@ function capturedAllocationData(allocation: OriginalOciAllocation) {
     Object.freeze({ path: v.path, dev: String(v.dev), ino: String(v.ino), uid: String(v.uid) });
   return Object.freeze({
     kind: "linux-oci-original-allocation@1",
+    ...(allocation.topology === undefined ? {} : { topology: allocation.topology }),
     intent: allocation.intent,
     parents: allocation.parents.map(file),
     root: file(allocation.root),
@@ -422,6 +440,9 @@ async function authenticatedOriginalPeerSource(
       "rootfs",
       "receipt",
       "receiptBytes",
+      ...(isJsonObject(binding.allocation) && Object.hasOwn(binding.allocation, "topology")
+        ? ["topology"]
+        : []),
     ])
   )
     return fail("parent_custody");
@@ -461,6 +482,7 @@ async function authenticatedOriginalPeerSource(
     });
   };
   const captured: OriginalOciAllocation = {
+    ...(a.topology === undefined ? {} : { topology: snapshotLinuxOciHostTopology(a.topology) }),
     intent: canonicalJson(record.intent),
     parents: a.parents.map(file),
     root: file(a.root),
@@ -1298,11 +1320,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     selectedEgressLimits === undefined
       ? undefined
       : snapshotLinuxOciEgressLimits(selectedEgressLimits);
-  const selectedHostTopology = options.hostTopology;
-  const hostTopology =
-    selectedHostTopology === undefined
-      ? undefined
-      : snapshotLinuxOciHostTopology(selectedHostTopology);
+  const topologies = snapshotLinuxOciTopologyPair(
+    options.hostTopology,
+    options.alternateHostTopology,
+  );
+  const hostTopology = topologies?.primary;
   if (hostTopology !== undefined && egressLimits === undefined)
     return fail("host_topology_requires_egress");
   const core = createDockerContainerCoreOwner(options);
@@ -1363,6 +1385,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     artifactRoot,
     physicalBinary,
     hostTopology,
+    alternateHostTopology: topologies?.alternate,
     httpRecords,
     httpRuntimes,
     peerReads: new Map(),
@@ -1584,6 +1607,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         const current = accepted.retained.find(
           ({ record }) => record.intent.policy.generation === accepted.generation,
         );
+        const healthTopology =
+          allocations.get(current?.record.claimId ?? "")?.topology ??
+          (topologies?.alternate === undefined ? hostTopology : undefined);
+        if (!healthTopology) return fail("http_custody");
         if (
           !current ||
           current.removedAtMs !== null ||
@@ -1680,7 +1707,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               if (loan.signal.aborted) return fail("revoked");
               if (httpProbes.has(record.claimId)) return fail("http_custody_retained");
               probe = createLinuxOciHttpHealthProbe({
-                address: hostTopology.peerIpv4Guest,
+                address: healthTopology.peerIpv4Guest,
                 httpPort,
                 healthPath,
                 timeoutMs: Math.min(timeout, 10_000),
@@ -1791,7 +1818,12 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           // that pending claim permanently; no empty-map/restart replay.
           let topologyClaim: Awaited<ReturnType<typeof core.owner.claim>> | undefined;
           if (hostTopology !== undefined) {
-            topologyClaim = await core.claimAcceptedTopology(execution, intent);
+            topologyClaim = await core.claimAcceptedTopology(
+              execution,
+              intent,
+              originalNativeCustody,
+              cancel.signal,
+            );
             await guard();
           }
           const image = accepted.spec.image;
@@ -1917,9 +1949,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                       await heldGuard();
                     }
                     if (hostTopology !== undefined) {
+                      if (topologies === undefined) return fail("http_custody");
                       await writeFile(
                         join(allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE),
-                        serializeLinuxOciHostTopology(receipt, record, hostTopology),
+                        serializeLinuxOciHostTopology(
+                          receipt,
+                          record,
+                          linuxOciGenerationTopology(topologies, record.intent.policy.generation),
+                        ),
                         { flag: "wx", mode: 0o600 },
                       );
                       await heldGuard();
@@ -2230,9 +2267,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         )[] = [];
         for (const item of accepted.retained) {
           const { record } = item;
+          if (record.intent.policy.generation >= accepted.generation) continue;
           if (
             parentMode === "sealed-peer-runtime@1" &&
-            accepted.action === "delete" &&
+            (accepted.action === "delete" || accepted.action === "update") &&
             record.state === "removed" &&
             item.removedAtMs !== null
           )
@@ -2336,7 +2374,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       }
       if (
         peerMode &&
-        accepted.retained.some((item) => item.record.intent.policy.generation < accepted.generation)
+        accepted.retained.some(
+          (item) => item.record.intent.policy.generation < accepted.generation,
+        ) &&
+        (accepted.action === "delete" ||
+          (accepted.action === "update" && accepted.servingConfirmedAtMs !== null))
       ) {
         await creator.manageRetainedPeerInit(execution, cancel.signal);
         local();
@@ -2347,7 +2389,20 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           local();
           return { kind: "complete", observed: {}, output: {} };
         }
-        return unknown();
+        if (parentMode !== "sealed-peer-runtime@1" || accepted.action !== "update")
+          return unknown();
+        const after = await core.withExecution(execution, () =>
+          core.readAcceptedExecution(execution),
+        );
+        local();
+        if (
+          after.retained.some(
+            (item) =>
+              item.record.intent.policy.generation < after.generation &&
+              item.record.state !== "removed",
+          )
+        )
+          return unknown();
       }
       if (accepted.action === "delete") {
         await creator.disposeRetainedBornOwners(execution, cancel.signal);
@@ -2364,7 +2419,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       if (!current) {
         // A reconcile lease cannot infer that an earlier send cannot arrive.
         // Original CREATE and START run only on this first unsent dispatch.
-        if (mode !== "execute") return unknown();
+        if (
+          mode !== "execute" &&
+          !(parentMode === "sealed-peer-runtime@1" && accepted.action === "update")
+        )
+          return unknown();
         await creator.createAcceptedStopped(execution);
         local();
         await creator.startAccepted(execution);
@@ -2381,6 +2440,16 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       // creator's actual running attempt can pass the original HTTP publisher.
       await creator.publishAcceptedServing(execution, cancel.signal);
       local();
+      if (
+        parentMode === "sealed-peer-runtime@1" &&
+        accepted.action === "update" &&
+        accepted.retained.some(
+          (item) =>
+            item.record.intent.policy.generation < accepted.generation &&
+            item.record.state !== "removed",
+        )
+      )
+        return unknown();
       const result = await core.withExecution(execution, async (): Promise<V2BackendResult> => {
         const fresh = await core.readAcceptedExecution(execution);
         const serving = fresh.retained.find(
@@ -2533,7 +2602,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       return artifact.withAcceptedBundle(execution, async (bundle) => {
         await bundle.guard();
         if (nativeSessions.has(bundle.record.claimId)) return fail("retained_create_unknown");
-        const allocation = await captureOriginalAllocation(artifactRoot, bundle);
+        const allocation = await captureOriginalAllocation(
+          artifactRoot,
+          bundle,
+          topologies === undefined
+            ? undefined
+            : linuxOciGenerationTopology(topologies, bundle.record.intent.policy.generation),
+        );
         await bundle.guard();
         // The preceding guard awaited Sql. Recheck synchronously before the
         // constructor's first process effect; registration below has no await.

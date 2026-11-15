@@ -52,6 +52,13 @@ import {
 } from "./docker-container-runtime-preparation.ts";
 import { LinuxDockerRuntimePreparation } from "./linux-docker-runtime-preparation.ts";
 import {
+  type LinuxOciHostTopology,
+  linuxOciGenerationTopology,
+  linuxOciPeerNetworksDisjoint,
+  snapshotLinuxOciHostTopology,
+  snapshotLinuxOciTopologyPair,
+} from "./linux-oci-host-topology.ts";
+import {
   advanceOriginalLinuxOciOwnedDisposal,
   disposeOriginalLinuxOciAllocation,
   observeOriginalLinuxOciOwnedInitReaped,
@@ -139,6 +146,8 @@ type Lease = {
 };
 
 export interface DockerContainerCoreOwnerOptions {
+  readonly hostTopology?: LinuxOciHostTopology;
+  readonly alternateHostTopology?: LinuxOciHostTopology;
   readonly sql: Sql;
   readonly clock: () => Date;
   readonly installationId: string;
@@ -204,6 +213,8 @@ export interface DockerContainerCoreOwner {
   claimAcceptedTopology(
     execution: V2Execution,
     intent: DockerContainerCreateIntent,
+    originalCustody: object,
+    signal: AbortSignal,
   ): ReturnType<DockerContainerCreateOwnerPort["claim"]>;
 
   /** Consume the ORIGINAL one-use START ledger for an already bound accepted
@@ -596,6 +607,15 @@ export function createDockerContainerCoreOwner(
   const { sql, clock, installationId, backendId, targetKey } = options;
   const parentMode = options.ociParentControl;
   const qualifiedPhysicalDigest = options.qualifiedPhysicalDigest;
+  const topologies = snapshotLinuxOciTopologyPair(
+    options.hostTopology,
+    options.alternateHostTopology,
+  );
+  if (
+    topologies?.alternate !== undefined &&
+    (parentMode !== "sealed-peer-runtime@1" || qualifiedPhysicalDigest === undefined)
+  )
+    return fail();
   if (
     qualifiedPhysicalDigest !== undefined &&
     !/^sha256:[a-f0-9]{64}$/u.test(qualifiedPhysicalDigest)
@@ -2583,7 +2603,7 @@ export function createDockerContainerCoreOwner(
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-    management: "retired",
+    management: "retired" | "coordinates",
   ): Promise<() => Promise<() => void>>;
   async function acceptedParentControl(
     execution: V2Execution,
@@ -2599,7 +2619,7 @@ export function createDockerContainerCoreOwner(
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-    management: boolean | "application-recovery" | "retired" = false,
+    management: boolean | "application-recovery" | "retired" | "coordinates" = false,
   ): Promise<
     | LinuxOciParentHResult
     | LinuxOciPeerInitProgress
@@ -2612,7 +2632,9 @@ export function createDockerContainerCoreOwner(
     if (management) {
       if (
         !peerMode ||
-        input.state !== (management === "retired" ? "removed" : "bound") ||
+        (management === "coordinates"
+          ? !["bound", "removed"].includes(input.state)
+          : input.state !== (management === "retired" ? "removed" : "bound")) ||
         !hex(input.nativeId)
       )
         return fail();
@@ -2621,7 +2643,7 @@ export function createDockerContainerCoreOwner(
       if (
         (accepted.action !== "delete" && accepted.action !== "update") ||
         !retained ||
-        (management === "retired"
+        (management === "retired" || (management === "coordinates" && input.state === "removed")
           ? retained.removedAtMs === null
           : retained.removedAtMs !== null) ||
         input.intent.policy.generation >= accepted.generation ||
@@ -2630,9 +2652,11 @@ export function createDockerContainerCoreOwner(
         return fail();
     }
     const phase =
-      execution.action === "delete" || input.intent.policy.generation < execution.generation
-        ? "remove"
-        : "reconcile";
+      management === "coordinates" && input.state === "bound"
+        ? "observe"
+        : execution.action === "delete" || input.intent.policy.generation < execution.generation
+          ? "remove"
+          : "reconcile";
     const lease = await activeRecord(input, phase),
       loaded = await load(input.intent);
     sameRecord(input, record(loaded.intent, loaded.proof));
@@ -2730,11 +2754,56 @@ export function createDockerContainerCoreOwner(
         [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
       );
       if (fresh.length !== 1 || fresh[0]?.native_control !== raw || signal.aborted) return fail();
+      if (management === "coordinates") {
+        if (
+          !finalProducer ||
+          topologies?.alternate === undefined ||
+          !isJsonObject(binding) ||
+          !isJsonObject(binding.allocation) ||
+          !Object.hasOwn(binding.allocation, "topology") ||
+          canonicalJson(snapshotLinuxOciHostTopology(binding.allocation.topology)) !==
+            canonicalJson(linuxOciGenerationTopology(topologies, input.intent.policy.generation))
+        )
+          return fail();
+        const local = () => {
+          if (
+            !controlDecryptionKey ||
+            controlDecryptionKey(originalControlKeyId) !== key ||
+            signal.aborted ||
+            !lease.active ||
+            lease.controller.signal.aborted ||
+            !leases.has(lease)
+          )
+            return fail();
+          executionScope(execution);
+        };
+        const refresh = async () => {
+          await assertSnapshot(loaded.proof);
+          const exact = await sql.query(
+            "SELECT native_control FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state=? AND native_id=?",
+            [
+              input.intent.resourceUid,
+              input.intent.policy.generation,
+              input.claimId,
+              input.state,
+              input.nativeId,
+            ],
+          );
+          if (exact.length !== 1 || exact[0]?.native_control !== raw || !(await current(lease)))
+            return fail();
+          await assertExecution(execution);
+          local();
+          return local;
+        };
+        await refresh();
+        return refresh;
+      }
       if (management === "retired") {
         if (
           !finalProducer ||
-          execution.action !== "delete" ||
-          !retiredDeleteProof(loaded.proof, "a") ||
+          (execution.action === "delete"
+            ? !retiredDeleteProof(loaded.proof, "a")
+            : execution.action !== "update") ||
           !(await inspectV2ContainerOwnerFinalDeleteSchema(sql))
         )
           return fail();
@@ -2890,7 +2959,7 @@ export function createDockerContainerCoreOwner(
           if (
             management &&
             finalProducer &&
-            execution.action === "delete" &&
+            (execution.action === "delete" || execution.action === "update") &&
             (await inspectV2ContainerOwnerFinalDeleteSchema(sql))
           ) {
             await guard();
@@ -3267,7 +3336,7 @@ export function createDockerContainerCoreOwner(
                 }
                 if (
                   finalProducer &&
-                  execution.action === "delete" &&
+                  (execution.action === "delete" || execution.action === "update") &&
                   applicationFactCurrent &&
                   (await inspectV2ContainerOwnerFinalDeleteSchema(sql))
                 ) {
@@ -3673,7 +3742,7 @@ export function createDockerContainerCoreOwner(
       };
       await finish(0);
     },
-    async claimAcceptedTopology(execution, input) {
+    async claimAcceptedTopology(execution, input, originalCustody, signal) {
       const intent = intentSnapshot(input);
       const accepted = await result.readAcceptedExecution(execution);
       if (
@@ -3695,6 +3764,7 @@ export function createDockerContainerCoreOwner(
       );
       if (rows.length < 1 || rows.length > 4096) return fail();
       let foundOriginal = false;
+      const previous: DockerContainerCreateRecord[] = [];
       for (const row of rows) {
         const claimedAt = row.claimed_at_ms,
           boundAt = row.bound_at_ms,
@@ -3728,38 +3798,100 @@ export function createDockerContainerCoreOwner(
           )
         )
           return fail();
-        // Existing schema has no immutable per-claim coordinates. Neither a
-        // private map nor current Host settings can reinterpret another claim.
-        // Even a removed tombstone supplies no topology-specific full-lifetime
-        // release here: no singleton slot is reclaimed by this read-only fence.
         if (
-          foundOriginal ||
-          row.claim_id !== captured.claimId ||
+          row.claim_id === captured.claimId &&
+          row.resource_uid === captured.intent.resourceUid &&
+          row.generation === captured.intent.policy.generation &&
+          row.installation_id === captured.intent.installationId &&
+          row.state === "pending" &&
+          row.native_id === null
+        ) {
+          if (foundOriginal) return fail();
+          foundOriginal = true;
+          continue;
+        }
+        // The optional two-tuple source permits only this same Resource's
+        // original generations. Missing old AEAD coordinates never come from
+        // today's configuration; another Resource remains a hard collision.
+        if (
+          topologies?.alternate === undefined ||
           row.resource_uid !== captured.intent.resourceUid ||
-          row.generation !== captured.intent.policy.generation ||
           row.installation_id !== captured.intent.installationId ||
-          row.state !== "pending" ||
-          row.native_id !== null
+          row.state === "pending" ||
+          Number(row.generation) >= captured.intent.policy.generation
         )
           return fail();
-        foundOriginal = true;
+        const old = accepted.retained.find(
+          (item) =>
+            item.record.claimId === row.claim_id &&
+            item.record.intent.policy.generation === row.generation,
+        );
+        if (
+          !old ||
+          old.record.state !== row.state ||
+          old.record.nativeId !== row.native_id ||
+          old.removedAtMs !== row.removed_at_ms
+        )
+          return fail();
+        if (
+          old.record.state !== "removed" &&
+          !linuxOciPeerNetworksDisjoint(
+            linuxOciGenerationTopology(topologies, old.record.intent.policy.generation),
+            linuxOciGenerationTopology(topologies, captured.intent.policy.generation),
+          )
+        )
+          return fail();
+        previous.push(old.record);
       }
       if (!foundOriginal) return fail();
-      const fresh = await result.readAcceptedExecution(execution);
-      const saved = fresh.retained.find(({ record }) => record.claimId === captured.claimId);
-      if (
-        fresh.action === "delete" ||
-        fresh.resourceUid !== captured.intent.resourceUid ||
-        fresh.generation !== captured.intent.policy.generation ||
-        !saved ||
-        saved.removedAtMs !== null ||
-        canonicalJson(saved.record) !== canonicalJson(captured)
-      )
-        return fail();
-      // The caller's existing local cancellation fence follows this await.
-      // This final synchronous scope check cannot reopen an expired execution.
-      executionScope(execution);
-      return claimed;
+      const held: (() => void)[] = [];
+      const check = async (index: number): Promise<Awaited<ReturnType<typeof owner.claim>>> => {
+        const old = previous[index];
+        if (old)
+          return owner.withAuthority(
+            old,
+            old.state === "removed" ? "remove" : "observe",
+            async () => {
+              const coordinates = await acceptedParentControl(
+                execution,
+                old,
+                originalCustody,
+                signal,
+                "coordinates",
+              );
+              const localCoordinates = await coordinates();
+              held.push(localCoordinates);
+              if (old.state === "removed") {
+                const retired = await acceptedParentControl(
+                  execution,
+                  old,
+                  originalCustody,
+                  signal,
+                  "retired",
+                );
+                held.push(await retired());
+              }
+              return check(index + 1);
+            },
+          );
+        const fresh = await result.readAcceptedExecution(execution);
+        const saved = fresh.retained.find(({ record }) => record.claimId === captured.claimId);
+        if (
+          fresh.action === "delete" ||
+          fresh.resourceUid !== captured.intent.resourceUid ||
+          fresh.generation !== captured.intent.policy.generation ||
+          !saved ||
+          saved.removedAtMs !== null ||
+          canonicalJson(saved.record) !== canonicalJson(captured)
+        )
+          return fail();
+        await assertExecution(execution);
+        if (signal.aborted) return fail();
+        for (const local of held) local();
+        executionScope(execution);
+        return claimed;
+      };
+      return check(0);
     },
 
     releaseRetainedNamespace(execution, record, originalCustody, signal) {

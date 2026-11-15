@@ -22,6 +22,7 @@ export type SelfhostLinuxOciCoreSelection = Pick<
   | "pidsLimit"
   | "egressLimits"
   | "hostTopology"
+  | "alternateHostTopology"
   | "ociParentControl"
 > & {
   readonly configuredInputs: NonNullable<LinuxOciOwnedBundleOptions["configuredInputs"]>;
@@ -85,6 +86,7 @@ export function createSelfhostLinuxOciCore(input: {
       "qualifiedPhysicalDigest",
       "egressLimits",
       "hostTopology",
+      "alternateHostTopology",
       "ociParentControl",
     ],
     required,
@@ -153,6 +155,10 @@ export function createSelfhostLinuxOciCore(input: {
       : {}),
     ...(Object.hasOwn(selection, "hostTopology") && selection.hostTopology !== undefined
       ? { hostTopology: selection.hostTopology }
+      : {}),
+    ...(Object.hasOwn(selection, "alternateHostTopology") &&
+    selection.alternateHostTopology !== undefined
+      ? { alternateHostTopology: selection.alternateHostTopology }
       : {}),
     ...(Object.hasOwn(selection, "ociParentControl") && selection.ociParentControl !== undefined
       ? { ociParentControl: selection.ociParentControl }

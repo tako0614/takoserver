@@ -140,6 +140,7 @@ async function fixture(
     readonly allocationDisposal?: boolean;
     readonly egressLimits?: LinuxOciEgressLimits;
     readonly hostTopology?: LinuxOciHostTopology;
+    readonly alternateHostTopology?: LinuxOciHostTopology;
     readonly outboundInternet?: boolean;
     readonly viaHostCreator?: boolean;
     readonly normalBackend?: boolean;
@@ -326,6 +327,9 @@ async function fixture(
       pidsLimit: 128,
       ...(adversarial.egressLimits === undefined ? {} : { egressLimits: adversarial.egressLimits }),
       ...(adversarial.hostTopology === undefined ? {} : { hostTopology: adversarial.hostTopology }),
+      ...(adversarial.alternateHostTopology === undefined
+        ? {}
+        : { alternateHostTopology: adversarial.alternateHostTopology }),
       images: Object.assign(
         {
           limits,
@@ -370,16 +374,32 @@ async function fixture(
   const unpackerEntered = new Promise<void>((resolve) => {
     unpackerStarted = resolve;
   });
-  let originalPeerBootstrap: Buffer | undefined;
-  let peerReply: unknown,
-    peerKind = 0,
-    peerEffects = 0,
-    peerBytes = 0;
+  type RawPeer = {
+    originalPeerBootstrap?: Buffer;
+    originalCreate?: JsonObject;
+    peerReply: unknown;
+    peerKind: number;
+    peerEffects: number;
+    peerBytes: number;
+    peerHJoined: boolean;
+    peerHStdoutEof: boolean;
+    peerHStderrEof: boolean;
+    inode: bigint;
+  };
+  const newPeer = (inode: bigint): RawPeer => ({
+    peerReply: undefined,
+    peerKind: 0,
+    peerEffects: 0,
+    peerBytes: 0,
+    peerHJoined: false,
+    peerHStdoutEof: false,
+    peerHStderrEof: false,
+    inode,
+  });
+  const legacyPeer = newPeer(0x123456789abcdef0n);
+  const originalPeers = new Map<string, RawPeer>();
   let applicationOwnerExited = false;
   let applicationOwnerFault: "foreign" | "boot" | "lost" | "exit" | undefined;
-  let peerHJoined = false,
-    peerHStdoutEof = false,
-    peerHStderrEof = false;
   const raw = spyOn(childProcess, "spawn").mockImplementation(((
     file: string,
     args: readonly string[],
@@ -416,6 +436,10 @@ async function fixture(
               ? ["--persistent-parent"]
               : [],
       );
+      let peer =
+        adversarial.alternateHostTopology === undefined || connector
+          ? legacyPeer
+          : newPeer(0x123456789abcdef0n + BigInt(originalPeers.size));
       nativeProcesses++;
       if (adversarial.nativeMode === "closed-during-spawn") {
         nativeClosing = composition.close();
@@ -431,7 +455,7 @@ async function fixture(
         stderr = new PassThrough();
       if (nativeProcesses === 1) originalNativeStdout = stdout;
       const reply = (value: unknown) => {
-        if (adversarial.parentPeer && !connector) peerReply = value;
+        if (adversarial.parentPeer && !connector) peer.peerReply = value;
         const body = Buffer.from(JSON.stringify(value)),
           frame = Buffer.alloc(body.length + 4);
         frame.writeUInt32BE(body.length);
@@ -458,7 +482,8 @@ async function fixture(
                 if (Object.keys(command).length !== 1) throw Error("nonfixed H result read");
                 nativeRequests.push(command.kind);
                 const fault = adversarial.peerHResultFault;
-                const known = peerHJoined && peerHStdoutEof && peerHStderrEof && !fault;
+                const known =
+                  peer.peerHJoined && peer.peerHStdoutEof && peer.peerHStderrEof && !fault;
                 reply({
                   kind: known
                     ? "linux-oci-parent-h-exited@1"
@@ -476,30 +501,32 @@ async function fixture(
                 return;
               }
               if (familyIndex !== -1) {
-                if (Object.keys(command).length !== 1 || !(peerEffects & (1 << 8)))
+                if (Object.keys(command).length !== 1 || !(peer.peerEffects & (1 << 8)))
                   throw Error("nonfixed/early retirement command");
                 const kind = familyIndex + 11,
                   op = family[familyIndex]!;
-                if ([11, 13, 15].includes(kind) && peerEffects & (1 << kind))
+                if ([11, 13, 15].includes(kind) && peer.peerEffects & (1 << kind))
                   throw Error("retirement effect replay");
                 if (
-                  (kind === 12 && !(peerEffects & (1 << 11))) ||
-                  (kind === 14 && !(peerEffects & (1 << 13))) ||
-                  (kind === 16 && !(peerEffects & (1 << 15)))
+                  (kind === 12 && !(peer.peerEffects & (1 << 11))) ||
+                  (kind === 14 && !(peer.peerEffects & (1 << 13))) ||
+                  (kind === 16 && !(peer.peerEffects & (1 << 15)))
                 )
                   throw Error("retirement observation before original effect");
                 if (
                   (adversarial.parentPeerLocal || adversarial.parentPeerApplicationOwner) &&
                   kind === 15
                 ) {
-                  expect(peerKind).toBe(11);
-                  expect(peerReply).toMatchObject({ kind: "linux-oci-tracked-join-handoff@1" });
+                  expect(peer.peerKind).toBe(11);
+                  expect(peer.peerReply).toMatchObject({
+                    kind: "linux-oci-tracked-join-handoff@1",
+                  });
                   expect(nativeRequests.includes("linux-oci-read-tracked-join@1")).toBe(false);
                 }
                 nativeRequests.push(command.kind);
-                peerKind = kind;
-                peerBytes = frame.length;
-                if ([11, 13, 15].includes(kind)) peerEffects |= 1 << kind;
+                peer.peerKind = kind;
+                peer.peerBytes = frame.length;
+                if ([11, 13, 15].includes(kind)) peer.peerEffects |= 1 << kind;
                 const kinds = [
                   "linux-oci-tracked-join-handoff@1",
                   "linux-oci-tracked-owner-destruction@1",
@@ -513,7 +540,7 @@ async function fixture(
                   kind === 11 ? "begin" : kind === 13 ? "delete" : kind === 15 ? "dispose" : "none";
                 const retained = fault === `${selected}-retained`,
                   lost = fault === `${selected}-lost` || (fault === "missing" && kind === 11);
-                peerReply = retained
+                peer.peerReply = retained
                   ? {
                       kind: "linux-oci-refused@1",
                       stage: op,
@@ -523,16 +550,16 @@ async function fixture(
                     }
                   : { kind: kinds[familyIndex], barrier: "unproven" };
                 if (fault === "wrong-phase" && kind === 11)
-                  peerReply = { kind: kinds[2], barrier: "unproven" };
-                if (fault === "missing" && kind === 11) peerReply = undefined;
+                  peer.peerReply = { kind: kinds[2], barrier: "unproven" };
+                if (fault === "missing" && kind === 11) peer.peerReply = undefined;
                 if (!retained && (kind === 15 || kind === 16)) {
                   // Raw P/H boundary facts are independent from connector exit.
                   const h = adversarial.peerHResultFault;
-                  peerHJoined = h !== "unknown";
-                  peerHStdoutEof = h !== "stdout";
-                  peerHStderrEof = h !== "stderr";
+                  peer.peerHJoined = h !== "unknown";
+                  peer.peerHStdoutEof = h !== "stdout";
+                  peer.peerHStderrEof = h !== "stderr";
                 }
-                if (!lost) reply(peerReply);
+                if (!lost) reply(peer.peerReply);
                 done();
                 queueMicrotask(() => {
                   stdout.end();
@@ -548,23 +575,23 @@ async function fixture(
                   "linux-oci-continue-namespace-release@1",
                 ].includes(command.kind)
               ) {
-                if (Object.keys(command).length !== 1 || !(peerEffects & (1 << 6)))
+                if (Object.keys(command).length !== 1 || !(peer.peerEffects & (1 << 6)))
                   throw Error("namespace before original STOP/JOIN");
                 const release = command.kind === "linux-oci-release-namespace@1";
-                if (release ? peerEffects & (1 << 8) : !(peerEffects & (1 << 8)))
+                if (release ? peer.peerEffects & (1 << 8) : !(peer.peerEffects & (1 << 8)))
                   throw Error("namespace effect replay or missing RELEASE");
                 nativeRequests.push(command.kind);
-                peerKind = release ? 8 : 9;
-                peerEffects |= 1 << 8;
-                peerBytes = frame.length;
-                if (!originalCreate || typeof originalCreate.claimId !== "string")
+                peer.peerKind = release ? 8 : 9;
+                peer.peerEffects |= 1 << 8;
+                peer.peerBytes = frame.length;
+                if (!peer.originalCreate || typeof peer.originalCreate.claimId !== "string")
                   throw Error("original peer native absent");
                 const fault = adversarial.peerNamespaceFault;
-                peerReply = {
+                peer.peerReply = {
                   kind: release
                     ? "linux-oci-namespace-release-observation@1"
                     : "linux-oci-namespace-release-continuation@1",
-                  nativeId: fault === "foreign" ? "f".repeat(64) : originalCreate.claimId,
+                  nativeId: fault === "foreign" ? "f".repeat(64) : peer.originalCreate.claimId,
                   namespaceDevice: 4,
                   namespaceInode: 55,
                   netCookie: !release && fault === "cookie" ? "2" : "18446744073709551615",
@@ -580,7 +607,7 @@ async function fixture(
                   barrier: "unproven",
                 };
                 if (release && fault === "retained")
-                  peerReply = {
+                  peer.peerReply = {
                     kind: "linux-oci-refused@1",
                     stage: "release-namespace",
                     errno: 11,
@@ -588,8 +615,8 @@ async function fixture(
                     barrier: "unproven",
                   };
                 const lost = release && (fault === "lost" || fault === "unknown");
-                if (release && fault === "unknown") peerReply = undefined;
-                if (!lost) reply(peerReply);
+                if (release && fault === "unknown") peer.peerReply = undefined;
+                if (!lost) reply(peer.peerReply);
                 done();
                 queueMicrotask(() => {
                   stdout.end();
@@ -605,20 +632,20 @@ async function fixture(
               )
                 throw Error("nonfixed management command");
               const stop = command.kind === "linux-oci-stop-init@1";
-              if (stop && peerEffects & (1 << 6)) throw Error("replayed original STOP");
-              if (!stop && !(peerEffects & (1 << 6))) throw Error("JOIN before original STOP");
+              if (stop && peer.peerEffects & (1 << 6)) throw Error("replayed original STOP");
+              if (!stop && !(peer.peerEffects & (1 << 6))) throw Error("JOIN before original STOP");
               nativeRequests.push(command.kind);
-              peerKind = stop ? 6 : 7;
-              peerEffects |= stop ? 1 << 6 : 0;
-              peerBytes = frame.length;
-              if (!originalCreate || typeof originalCreate.claimId !== "string")
+              peer.peerKind = stop ? 6 : 7;
+              peer.peerEffects |= stop ? 1 << 6 : 0;
+              peer.peerBytes = frame.length;
+              if (!peer.originalCreate || typeof peer.originalCreate.claimId !== "string")
                 throw Error("original peer native absent");
-              peerReply = {
+              peer.peerReply = {
                 kind: stop ? "linux-oci-init-reaped@1" : "linux-oci-init-reaped-observation@1",
                 nativeId:
                   !stop && adversarial.peerJoinFault === "foreign"
                     ? "f".repeat(64)
-                    : originalCreate.claimId,
+                    : peer.originalCreate.claimId,
                 namespaceDevice: 4,
                 namespaceInode: 55,
                 pidNamespaceDevice: 6,
@@ -626,7 +653,7 @@ async function fixture(
                 barrier: "unproven",
               };
               if (!stop && adversarial.peerJoinFault === "refused")
-                peerReply = {
+                peer.peerReply = {
                   kind: "linux-oci-refused@1",
                   stage: "join-init",
                   errno: 11,
@@ -636,7 +663,7 @@ async function fixture(
               const lost =
                 (stop && adversarial.peerManagementFault === "lost-reply") ||
                 (!stop && adversarial.peerJoinFault === "unknown");
-              if (!lost) reply(peerReply);
+              if (!lost) reply(peer.peerReply);
               done();
               queueMicrotask(() => {
                 stdout.end();
@@ -654,7 +681,12 @@ async function fixture(
                     ? "linux-oci-parent-read-application-owner@1"
                     : "linux-oci-parent-read-result@2",
               );
-              const original = originalPeerBootstrap;
+              if (adversarial.alternateHostTopology !== undefined) {
+                const captured = originalPeers.get(frame.subarray(12, 76).toString("ascii"));
+                if (!captured) throw Error("NONSECRET original P capture absent");
+                peer = captured;
+              }
+              const original = peer.originalPeerBootstrap;
               const valid =
                 original &&
                 frame.length === 176 &&
@@ -663,11 +695,13 @@ async function fixture(
                 frame.subarray(92, 124).equals(original.subarray(84, 116)) &&
                 frame.readBigUInt64BE(84) === 0xfedcba9876543210n &&
                 frame.readBigUInt64BE(124) === 5n &&
-                frame.readBigUInt64BE(132) === 0x123456789abcdef0n &&
+                frame.readBigUInt64BE(132) === peer.inode &&
                 frame.subarray(140).equals(Buffer.from("11111111-2222-4333-8444-555555555555"));
               if (valid && managing) {
                 const body =
-                    peerReply === undefined ? undefined : Buffer.from(JSON.stringify(peerReply)),
+                    peer.peerReply === undefined
+                      ? undefined
+                      : Buffer.from(JSON.stringify(peer.peerReply)),
                   captured = body ? Buffer.alloc(body.length + 4) : Buffer.alloc(0);
                 if (body) {
                   captured.writeUInt32BE(body.length);
@@ -676,11 +710,11 @@ async function fixture(
                 const missing = adversarial.peerManagementFault === "missing-reply";
                 reply({
                   kind: "linux-oci-parent-outcome@1",
-                  requestKind: peerKind,
-                  effects: peerEffects,
-                  requestBytes: String(peerBytes),
+                  requestKind: peer.peerKind,
+                  effects: peer.peerEffects,
+                  requestBytes: String(peer.peerBytes),
                   issuedBytes: String(
-                    adversarial.peerManagementFault === "incomplete" ? 0 : peerBytes,
+                    adversarial.peerManagementFault === "incomplete" ? 0 : peer.peerBytes,
                   ),
                   deliveryUnknown: 1,
                   replyBytes: String(missing ? 0 : captured.length),
@@ -745,7 +779,12 @@ async function fixture(
                     ),
                   ),
               ).toBe(true);
-              originalPeerBootstrap = Buffer.from(frame);
+              peer.originalPeerBootstrap = Buffer.from(frame);
+              if (adversarial.alternateHostTopology !== undefined) {
+                const claim = frame.subarray(12, 76).toString("ascii");
+                if (originalPeers.has(claim)) throw Error("NONSECRET original P replacement");
+                originalPeers.set(claim, peer);
+              }
               nativeRequests.push(
                 adversarial.parentPeerApplicationOwner
                   ? "linux-oci-parent-bootstrap@5"
@@ -779,7 +818,7 @@ async function fixture(
               frame.copy(response, 12, 12, 84);
               response.writeBigUInt64BE(0xfedcba9876543210n, 84);
               response.writeBigUInt64BE(5n, 92);
-              response.writeBigUInt64BE(0x123456789abcdef0n, 100);
+              response.writeBigUInt64BE(peer.inode, 100);
               response.write("11111111-2222-4333-8444-555555555555", 108, "ascii");
               if (adversarial.parentPeerApplicationOwner) {
                 response.writeBigUInt64BE(5n, 144);
@@ -821,9 +860,10 @@ async function fixture(
                 "linux-oci-start@1": 4,
                 "linux-oci-observe-started@1": 5,
               };
-              peerKind = kinds[request.kind] ?? 0;
-              peerBytes = frame.length;
-              if (peerKind === 1 || peerKind === 4) peerEffects |= 1 << peerKind;
+              peer.peerKind = kinds[request.kind] ?? 0;
+              peer.peerBytes = frame.length;
+              if (peer.peerKind === 1 || peer.peerKind === 4)
+                peer.peerEffects |= 1 << peer.peerKind;
             }
             if (request.kind === "linux-oci-create-stopped@1") {
               if (adversarial.peerAllocationSchema) {
@@ -842,6 +882,7 @@ async function fixture(
                 );
               }
               if (nativeProcesses === 1) originalCreate = request;
+              peer.originalCreate = request;
               created = true;
               if (typeof request.claimId !== "string" || typeof request.allocationRoot !== "string")
                 throw new Error("raw original allocation absent");
@@ -851,11 +892,12 @@ async function fixture(
               if (!isJsonObject(receipt)) throw new Error("raw artifact receipt absent");
               expect(receipt.claimId).toBe(request.claimId);
               expect(request.sourceDigest).toBe(receipt.sourceDigest);
-              expect(request.env).toEqual([
-                "BASE=image",
-                "MODE=synthetic-public",
-                "SECRET=synthetic-loan",
-              ]);
+              if (adversarial.alternateHostTopology === undefined)
+                expect(request.env).toEqual([
+                  "BASE=image",
+                  "MODE=synthetic-public",
+                  "SECRET=synthetic-loan",
+                ]);
               if (adversarial.nativeMode === "closed-before-ack") {
                 nativeClosing = composition.close();
                 void nativeClosing.catch(() => undefined);

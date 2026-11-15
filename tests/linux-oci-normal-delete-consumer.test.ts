@@ -22,6 +22,9 @@ async function live(
     producerRevision?: "missing";
     producerDigest?: "missing" | "wrong";
     localCleanup?: boolean;
+    alternateHostTopology?: NonNullable<
+      Parameters<typeof originalPeerDeleteFixture>[0]
+    >["alternateHostTopology"];
   } = {},
 ) {
   const f = await originalPeerDeleteFixture({
@@ -609,3 +612,5 @@ test("normal-delete-consumer delayed original UPDATE prepare cannot recapture se
     await f.cleanup();
   }
 });
+
+export { live as qualifiedNormalDeleteFixture };

@@ -30,6 +30,9 @@ async function fixture(
     localCleanup?: boolean;
     applicationOwner?: boolean;
     configuredPeer?: boolean;
+    alternateHostTopology?: NonNullable<
+      Parameters<typeof originalOwnedOciFixture>[1]
+    >["hostTopology"];
     joinFault?: "foreign" | "refused" | "unknown" | "pidns";
     namespaceFault?:
       | "retained"
@@ -108,6 +111,9 @@ async function fixture(
       ...(options.configuredPeer
         ? acceptedHttpSelection()
         : { nativeMode: "retire-pending" as const }),
+      ...(options.alternateHostTopology === undefined
+        ? {}
+        : { alternateHostTopology: options.alternateHostTopology }),
       fixedKeys: { key, comparison },
     });
     return Object.assign(f, {

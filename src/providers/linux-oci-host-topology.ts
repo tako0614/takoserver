@@ -174,6 +174,42 @@ export function snapshotLinuxOciHostTopology(value: unknown): Readonly<LinuxOciH
   });
 }
 
+/** Private expected coordinates only. Both address families must have separate
+ * peer networks; no observation or permission follows from this comparison. */
+export function linuxOciPeerNetworksDisjoint(
+  a: LinuxOciHostTopology,
+  b: LinuxOciHostTopology,
+): boolean {
+  return (
+    ipv4(a.peerIpv4Host) >> 1n !== ipv4(b.peerIpv4Host) >> 1n &&
+    ipv6(a.peerIpv6Host) >> 1n !== ipv6(b.peerIpv6Host) >> 1n
+  );
+}
+export function snapshotLinuxOciTopologyPair(primary: unknown, alternate: unknown) {
+  if (primary === undefined) {
+    if (alternate !== undefined) return fail();
+    return undefined;
+  }
+  const first = snapshotLinuxOciHostTopology(primary);
+  if (alternate === undefined) return Object.freeze({ primary: first, alternate: undefined });
+  const second = snapshotLinuxOciHostTopology(alternate);
+  if (
+    !keys
+      .filter((key) => !key.startsWith("peer"))
+      .every((key) => Reflect.get(first, key) === Reflect.get(second, key)) ||
+    !linuxOciPeerNetworksDisjoint(first, second)
+  )
+    return fail();
+  return Object.freeze({ primary: first, alternate: second });
+}
+export function linuxOciGenerationTopology(
+  pair: NonNullable<ReturnType<typeof snapshotLinuxOciTopologyPair>>,
+  generation: number,
+) {
+  if (!Number.isSafeInteger(generation) || generation < 1) return fail();
+  return generation % 2 === 0 && pair.alternate !== undefined ? pair.alternate : pair.primary;
+}
+
 /** Private selection bytes from the ORIGINAL pending claim and artifact. The
  * native owner must verify real topology; this file can neither adopt a link
  * nor grant policy, admission, health, serving or terminal authority. */
