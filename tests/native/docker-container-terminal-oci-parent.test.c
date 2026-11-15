@@ -407,9 +407,13 @@ static void refusal_cases(void) {
 static void host_loss_and_delivery(void) {
   static const unsigned char reply[]={0,0,0,2,'{','}'};
   struct ocipp_owner o;prepare_parent(&o,0);CHECK(ocipp_spawn(&o)==0);
+  unsigned char *allocation=o.create,*expected=malloc(o.create_size);size_t size=o.create_size;
+  CHECK(expected);memcpy(expected,o.create,size); /* NONSECRET raw expected frame. */
   pm.chunk=7;CHECK(ocipp_flush_input(&o)==0 && o.incoming_sent==7);ocipp_host_lost(&o);
   while(o.pending)CHECK(ocipp_flush_input(&o)==0);
-  CHECK(pm.sent_size==o.create_size && !memcmp(pm.sent,o.create,o.create_size) && !pm.closes[71]);
+  CHECK(pm.sent_size==size && !memcmp(pm.sent,expected,size) && !pm.closes[71]);
+  CHECK(o.create==allocation && o.create_size==size);memset(expected,0,size);
+  CHECK(!memcmp(o.create,expected,size));free(expected);
   pm.stream[0]=reply;pm.stream_size[0]=sizeof(reply);CHECK(ocipp_drain(&o,0)==1 && ocipp_parse_reply(&o)==0);
   CHECK(ocipp_forward(&o,0)==0 && !pm.delivered_size && !memcmp(o.captured[0],reply,sizeof(reply)));
   pm.eof[0]=pm.eof[1]=1;pm.wait_kind=1;CHECK(ocipp_drain(&o,0)==0 && ocipp_drain(&o,1)==0 && ocipp_wait(&o)==0 && ocipp_fact(&o)==0);
@@ -423,9 +427,13 @@ static void host_loss_and_delivery(void) {
 }
 static void readiness_and_child(void) {
   struct ocipp_owner o;prepare_parent(&o,TNS_OCI_MAX_JSON);CHECK(ocipp_spawn(&o)==0);
+  unsigned char *allocation=o.create,*expected=malloc(o.create_size);size_t size=o.create_size;
+  CHECK(expected);memcpy(expected,o.create,size); /* NONSECRET raw expected frame. */
   pm.chunk=16384;pm.writes_again=1;
   while(o.pending){CHECK(ocipp_step(&o)<0);CHECK(pm.polls<200);}
-  CHECK(pm.sent_size==o.create_size && !memcmp(pm.sent,o.create,o.create_size));
+  CHECK(pm.sent_size==size && !memcmp(pm.sent,expected,size));
+  CHECK(o.create==allocation && o.create_size==size);memset(expected,0,size);
+  CHECK(!memcmp(o.create,expected,size));free(expected);
   CHECK(pm.writable_interest==pm.polls && pm.clock<4000 && !pm.host_read_interest);
   /* Cadence/readiness model only, not actual H scheduling or its 4s deadline. */
   pm.host_bytes=(const unsigned char*)"queued";pm.host_size=6;
@@ -586,6 +594,8 @@ static void partial_loss_and_readonly(void) {
 }
 static void actual_frontend_loop(void) {
   struct ocipp_owner o;prepare_parent(&o,0);CHECK(ocipp_spawn(&o)==0 && pm.clones==1);
+  unsigned char *allocation=o.create,*expected=malloc(o.create_size);size_t size=o.create_size;
+  CHECK(expected);memcpy(expected,o.create,size); /* NONSECRET raw expected frame. */
   ocipp_host_lost(&o);CHECK(o.input_paused && !o.incoming_sent && !pm.sent_size);
   unsigned char auth[124];auth_bytes(&o,auth);
   pm.frontend_bytes=auth;pm.frontend_size=sizeof(auth);pm.frontend_at=0;pm.frontend_chunk=7;pm.accept_ready=1;
@@ -609,7 +619,9 @@ static void actual_frontend_loop(void) {
   }
   if(o.pending)CHECK(ocipp_step(&o)<0);
   CHECK(!o.pending && o.awaiting && !o.input_paused && pm.clones==1);
-  CHECK(pm.sent_size==o.create_size && !memcmp(pm.sent,o.create,o.create_size));
+  CHECK(pm.sent_size==size && !memcmp(pm.sent,expected,size));
+  CHECK(o.create==allocation && o.create_size==size);memset(expected,0,size);
+  CHECK(!memcmp(o.create,expected,size));free(expected);
   CHECK(o.effects==(1u<<TNS_OCIP_CREATE) && !pm.closes[71]);dispose_fixture(&o);
 }
 static void authentication_bounds_only(void) {

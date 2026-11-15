@@ -666,6 +666,11 @@ static int ocipp_flush_input(struct ocipp_owner *o) {
   o->incoming_sent += (size_t)n;
   o->issued_size = o->incoming_sent;
   if (o->incoming_sent == o->incoming_size) {
+    /* The original CREATE bytes are never replayed after full delivery.
+     * Keep its allocation/size as the one-use birth sentinel, not env data.
+     * This is no H acknowledgement or process/I/O completion observation. */
+    if (o->request_kind == TNS_OCIP_CREATE && o->create)
+      explicit_bzero(o->create, o->create_size);
     explicit_bzero(o->incoming, o->incoming_size); o->incoming_size = o->incoming_sent = 0;
     o->incoming_need = 4; o->pending = 0; o->awaiting = 1;
   }
