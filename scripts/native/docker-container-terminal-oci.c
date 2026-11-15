@@ -39,7 +39,7 @@ struct oci_policy_owner;
 struct oci_admission_owner;
 /* Chosen only by a fixed private constructor before any original effect.
  * This profile changes runtime-delete ordering, never terminal permission. */
-enum oci_retirement_profile { OCI_RETIREMENT_TRACKED, OCI_RETIREMENT_RUNTIME_FIRST };
+enum oci_retirement_profile { OCI_RETIREMENT_TRACKED, OCI_RETIREMENT_RUNTIME_FIRST, OCI_RETIREMENT_RUNTIME_LOCAL };
 struct tns_oci_owner {
   enum oci_retirement_profile retirement_profile;
   struct oci_uplink_owner *uplink;
@@ -68,6 +68,7 @@ struct tns_oci_owner {
   /* Dedicated local born disposal; old execution/currentness proofs stay
    * unchanged until all local phases are known and this object is freed. */
   unsigned int born_dispose_phase, born_config_unlink_attempted;
+  int born_dispose_selected;
   int born_config_fd, born_dispose_unknown;
   pid_t start_pid, controller_pid, init_pid;
   int parent_pidns, init_pidns, init_custody, init_joined;
@@ -75,7 +76,7 @@ struct tns_oci_owner {
   unsigned int namespace_release_attempt;
   int namespace_release_dispatched;
   /* Set only by the successful actual release/readback path, not dispatch. */
-  int runtime_first_namespace_known;
+  int runtime_first_namespace_known, runtime_first_handoff_known;
   int namespace_loan_close_unknown;
   struct stat parent_pidns_identity, init_pidns_identity;
   int root, rootfs, receipt, runtime, bundle, state, network, command_pidfd;
@@ -844,6 +845,11 @@ int tns_oci_create_selected_runtime(const struct tns_oci_options *options,
   return oci_create_profile(options, slot, OCI_RETIREMENT_RUNTIME_FIRST);
 }
 
+int tns_oci_create_selected_local_cleanup(const struct tns_oci_options *options,
+                                            struct tns_oci_owner **slot) {
+  return oci_create_profile(options, slot, OCI_RETIREMENT_RUNTIME_LOCAL);
+}
+
 int tns_oci_cancel(struct tns_oci_owner *o) {
   if (!o) { errno = EINVAL; return -1; }
   o->invalid = 1;
@@ -965,7 +971,7 @@ static int oci_namespace_release_progress(struct tns_oci_owner *o,
   if (result < 0) return -1;
   if (o->namespace_loan_close_unknown) { errno = EUCLEAN; return -1; }
   int observed = tns_oci_observe_namespace_lifetime(o, lifetime);
-  if (!observed && o->retirement_profile == OCI_RETIREMENT_RUNTIME_FIRST &&
+  if (!observed && o->retirement_profile != OCI_RETIREMENT_TRACKED &&
       lifetime->lifetime.release_attempted == 1 &&
       lifetime->lifetime.reference_released == 1 && !lifetime->lifetime.poisoned)
     o->runtime_first_namespace_known = 1;
@@ -1002,7 +1008,10 @@ int tns_oci_begin_tracked_join(struct tns_oci_owner *o) {
   if (oci_tracked_join_current(o) < 0) return -1;
   if (tns_owner_begin_tracked_join(o->birth) < 0) return -1;
   /* BEGIN zero acknowledges only the original file-reference handoff. */
-  return oci_tracked_join_current(o);
+  int current = oci_tracked_join_current(o);
+  if (!current && o->retirement_profile == OCI_RETIREMENT_RUNTIME_LOCAL)
+    o->runtime_first_handoff_known = 1; /* Actual zero, never the attempt bit. */
+  return current;
 }
 
 int tns_oci_read_tracked_join(struct tns_oci_owner *o) {
@@ -1125,7 +1134,8 @@ int tns_oci_delete_born(struct tns_oci_owner *o) {
  * readback above. No tracked READ, counter, netGone or caller result is used.
  * Generic cancellation cannot erase cleanup custody; identity remains required. */
 static int oci_selected_runtime_delete_current(struct tns_oci_owner *o) {
-  if (!o || !o->birth || o->retirement_profile != OCI_RETIREMENT_RUNTIME_FIRST ||
+  if (!o || !o->birth || (o->retirement_profile != OCI_RETIREMENT_RUNTIME_FIRST &&
+                             o->retirement_profile != OCI_RETIREMENT_RUNTIME_LOCAL) ||
       !o->runtime_first_namespace_known || !o->namespace_release_attempt ||
       !o->namespace_release_dispatched || o->network >= 0 ||
       o->namespace_loan_close_unknown || o->egress_close_unknown ||
@@ -1195,10 +1205,15 @@ int tns_oci_delete_selected_runtime(struct tns_oci_owner *o) {
 /* Target-free local disposal only. Before config consumption the original
  * currentness/DELETE/READ remains mandatory. Afterwards only recorded original
  * phase history can continue; global held-input predicates are never relaxed. */
-int tns_oci_dispose_born(struct tns_oci_owner **slot) {
+static int oci_dispose_born_profile(struct tns_oci_owner **slot, int selected) {
   if (!slot || !*slot) { errno = EINVAL; return -1; }
   struct tns_oci_owner *o = *slot;
   if (o->controller_pid != getpid()) { errno = EPERM; return -1; }
+  if ((selected && (o->retirement_profile != OCI_RETIREMENT_RUNTIME_LOCAL ||
+                    !o->runtime_first_handoff_known)) ||
+      (o->born_dispose_phase && o->born_dispose_selected != selected)) {
+    errno = EUCLEAN; return -1;
+  }
   if (!o->born_dispose_phase) {
     if (o->admission || o->policy || o->uplink || o->egress_close_unknown ||
         o->namespace_loan_close_unknown || !o->delete_attempt ||
@@ -1207,7 +1222,8 @@ int tns_oci_dispose_born(struct tns_oci_owner **slot) {
     }
     for (size_t i = 0; i < 3; ++i)
       if (o->egress_pid[i] && !o->egress_joined[i]) { errno = EBUSY; return -1; }
-    if (oci_born_delete_observed(o) < 0) return -1;
+    if ((selected ? oci_selected_runtime_delete_observed(o) : oci_born_delete_observed(o)) < 0) return -1;
+    o->born_dispose_selected = selected; /* Fixed before config/FD effects. */
     o->born_dispose_phase = 1;
     o->born_config_fd = openat(o->bundle, "config.json",
                               O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
@@ -1217,7 +1233,7 @@ int tns_oci_dispose_born(struct tns_oci_owner **slot) {
   if (o->born_dispose_phase == 1) {
     if (o->born_config_unlink_attempted) { errno = EUCLEAN; return -1; }
     struct stat held, named;
-    if (o->born_config_fd < 0 || oci_born_delete_observed(o) < 0 ||
+    if (o->born_config_fd < 0 || (selected ? oci_selected_runtime_delete_observed(o) : oci_born_delete_observed(o)) < 0 ||
         oci_owned(o->born_config_fd, 0, 0600) < 0 ||
         fstat(o->born_config_fd, &held) < 0 || held.st_nlink != 1 ||
         !oci_same(&held, &o->config_identity) ||
@@ -1227,7 +1243,7 @@ int tns_oci_dispose_born(struct tns_oci_owner **slot) {
         held.st_ctim.tv_sec != o->config_identity.st_ctim.tv_sec ||
         held.st_ctim.tv_nsec != o->config_identity.st_ctim.tv_nsec ||
         fstatat(o->bundle, "config.json", &named, AT_SYMLINK_NOFOLLOW) < 0 ||
-        !oci_same(&held, &named) || oci_born_delete_observed(o) < 0) {
+        !oci_same(&held, &named) || (selected ? oci_selected_runtime_delete_observed(o) : oci_born_delete_observed(o)) < 0) {
       if (!errno) errno = ESTALE;
       return -1;
     }
@@ -1238,11 +1254,13 @@ int tns_oci_dispose_born(struct tns_oci_owner **slot) {
     }
     o->born_dispose_phase = 2;
   }
-  /* Config is now consumed: never old OCI currentness/READ again. C26 owns
-   * fresh namespace READ until its own first close, then only its saved phase.
-   * Use the real birth slot, so known success actually clears original custody. */
+  /* Config is consumed: no old OCI currentness is replayed. The legacy
+   * family requires its fresh READ; selected local cleanup uses the saved
+   * release handoff. Both share the same original four-FD close history.
+   * The real birth slot is cleared only after every known original close. */
   if (o->born_dispose_phase == 2) {
-    if (tns_owner_dispose_tracked(&o->birth) < 0) return -1;
+    if ((selected ? tns_owner_dispose_released(&o->birth) :
+                    tns_owner_dispose_tracked(&o->birth)) < 0) return -1;
     if (o->birth) { errno = EPROTO; return -1; }
     o->born_dispose_phase = 3;
   }
@@ -1280,4 +1298,11 @@ int tns_oci_dispose_born(struct tns_oci_owner **slot) {
   free(o);
   *slot = NULL;
   return 0;
+}
+
+int tns_oci_dispose_born(struct tns_oci_owner **slot) {
+  return oci_dispose_born_profile(slot, 0);
+}
+int tns_oci_dispose_selected_runtime(struct tns_oci_owner **slot) {
+  return oci_dispose_born_profile(slot, 1);
 }

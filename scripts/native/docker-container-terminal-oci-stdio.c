@@ -269,7 +269,7 @@ static int ocip_namespace_retained_error(struct ocip_namespace_state *state,
 struct ocip_retirement_state {
   int entered, unusable, begin_requested, read_known;
   int delete_requested, delete_known, dispose_requested, disposed;
-  int runtime_first; /* fixed original H mode, not a decoded request */
+  int runtime_first, begin_known; /* fixed H mode / actual handoff zero only */
 };
 
 static const char *ocip_retirement_stage(enum tns_ocip_kind kind) {
@@ -367,7 +367,8 @@ static int ocip_cleanup_routed(struct tns_oci_owner **owner,
   if (!*owner) return EPROTO;
   int result = 0;
   if (state->dispose_requested) {
-    result = tns_oci_dispose_born(owner);
+    result = state->runtime_first == 2 ? tns_oci_dispose_selected_runtime(owner) :
+                                    tns_oci_dispose_born(owner);
     if (!result && !*owner) state->disposed = 1;
   } else if (state->delete_requested && !state->delete_known) {
     result = state->runtime_first ? tns_oci_join_selected_runtime_delete(*owner) :
@@ -445,6 +446,7 @@ static int ocip_runtime_retirement_command(enum tns_ocip_kind kind,
       goto wrong_order;
     state->begin_requested = 1;
     result = tns_oci_begin_tracked_join(*owner);
+    if (!result) state->begin_known = 1;
   } else if (kind == TNS_OCIP_READ_TRACKED_JOIN) {
     if (!state->begin_requested || state->dispose_requested) goto wrong_order;
     result = tns_oci_read_tracked_join(*owner);
@@ -452,10 +454,11 @@ static int ocip_runtime_retirement_command(enum tns_ocip_kind kind,
   } else {
     if (kind == TNS_OCIP_DISPOSE_BORN) {
       if (state->dispose_requested) { errno = EALREADY; return -1; }
-      if (!state->delete_known || !state->read_known) goto wrong_order;
+      if (!state->delete_known || (state->runtime_first == 2 ? !state->begin_known : !state->read_known)) goto wrong_order;
       state->dispose_requested = 1;
     } else if (!state->dispose_requested) goto wrong_order;
-    result = tns_oci_dispose_born(owner);
+    result = state->runtime_first == 2 ? tns_oci_dispose_selected_runtime(owner) :
+                                       tns_oci_dispose_born(owner);
     if (!result && !*owner) state->disposed = 1;
   }
   if (interrupted) { state->unusable = 1; errno = ECANCELED; return -2; }
@@ -471,9 +474,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent")) return ocipp_main();
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer")) return ocipp_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer-runtime")) return ocipp_runtime_peer_main();
+  if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer-local-cleanup")) return ocipp_local_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-result")) return ocipp_connector_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-manage-init")) return ocipp_connector_management_main();
-  int runtime_first = argc == 2 && !strcmp(argv[1], "--selected-runtime-owner");
+  int runtime_first = argc == 2 && !strcmp(argv[1], "--selected-runtime-local-cleanup-owner") ? 2 :
+                      argc == 2 && !strcmp(argv[1], "--selected-runtime-owner") ? 1 : 0;
   if ((argc != 1 && !runtime_first) || geteuid() != 0 || fcntl(2, F_GETFD) < 0 ||
       ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
   int input_flags = fcntl(0, F_GETFL), output_flags = fcntl(1, F_GETFL);
@@ -519,7 +524,8 @@ int main(int argc, char **argv) {
     const char *stage = "request"; int failure = EPROTO;
     if (!result && !interrupted && request->kind == TNS_OCIP_CREATE && first && !sealed && !retirement_state.entered) {
       stage = "create";
-      result = runtime_first ? tns_oci_create_selected_runtime(&request->options, &owner) :
+      result = runtime_first == 2 ? tns_oci_create_selected_local_cleanup(&request->options, &owner) :
+               runtime_first ? tns_oci_create_selected_runtime(&request->options, &owner) :
                                tns_oci_create(&request->options, &owner);
       if (result < 0) failure = errno ? errno : EPROTO;
       else {

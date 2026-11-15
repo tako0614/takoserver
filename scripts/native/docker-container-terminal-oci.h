@@ -141,6 +141,13 @@ int tns_oci_join_selected_runtime_delete(struct tns_oci_owner *owner);
  * Earlier transient-FD history, helper exit, full traffic terminal and Core
  * removed/slot reuse are not qualified. Cancellation grants no positive fact. */
 int tns_oci_dispose_born(struct tns_oci_owner **slot);
+/* Fixed original runtime-first owner only: actual init/runtime consuming joins,
+ * known own release and acknowledged handoff precede local config/FD disposal.
+ * Retains every unknown/one-use phase; no tracked-zero/full-retirement grant. */
+int tns_oci_dispose_selected_runtime(struct tns_oci_owner **slot);
+/* Distinct fresh pre-effect profile; never upgrades a prior runtime-first H. */
+int tns_oci_create_selected_local_cleanup(const struct tns_oci_options *options,
+                                            struct tns_oci_owner **slot);
 
 /* Pure closed data primitives; none is an owner or physical result. */
 #define TNS_OCI_MAX_JSON 1048576u

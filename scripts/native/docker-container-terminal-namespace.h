@@ -87,6 +87,12 @@ int tns_owner_read_tracked_join(struct tns_owner *owner);
  * this local object after all four known closes; it does not qualify earlier
  * transient/status/control closes, OCI cleanup, slot reuse or terminal. */
 int tns_owner_dispose_tracked(struct tns_owner **slot);
+/* Selected OCI's released-reference local cleanup only. Original BEGIN's
+ * captured release/identity precedes handoff; this does NOT observe completion.
+ * Same four consume-before-close slots/UNKNOWN history, exclusive family once
+ * started: tracked/generic close cannot erase failure. Zero frees/nulls only
+ * local custody, never network/full-traffic/slot/OCI/Core authority. */
+int tns_owner_dispose_released(struct tns_owner **slot);
 
 /* Closed internal byte protocol, shared with portable decoder tests.
  * A decoded message is not authority: the constructor verifies its own held

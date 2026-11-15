@@ -1273,7 +1273,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   if (physicalBinary !== undefined && (!text(physicalBinary) || !isAbsolute(physicalBinary)))
     return fail("invalid_request");
   const parentMode = options.ociParentControl;
-  const peerMode = parentMode === "sealed-peer@1" || parentMode === "sealed-peer-runtime@1";
+  const peerMode =
+    parentMode === "sealed-peer@1" ||
+    parentMode === "sealed-peer-runtime@1" ||
+    parentMode === "sealed-peer-local-cleanup@1";
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
   const parents = new Map<
@@ -2483,9 +2486,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             ...(peerMode
               ? {
                   peerProfile:
-                    parentMode === "sealed-peer-runtime@1"
-                      ? ("pidfs64-runtime@1" as const)
-                      : ("pidfs64@1" as const),
+                    parentMode === "sealed-peer-local-cleanup@1"
+                      ? ("pidfs64-local-cleanup@1" as const)
+                      : parentMode === "sealed-peer-runtime@1"
+                        ? ("pidfs64-runtime@1" as const)
+                        : ("pidfs64@1" as const),
                 }
               : {}),
             claimId: receipt.claimId,

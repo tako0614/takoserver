@@ -138,7 +138,11 @@ export interface DockerContainerCoreOwnerOptions {
   readonly backendId: string;
   readonly targetKey: string;
   /** Explicit private mode, never selected by a request or old claim. */
-  readonly ociParentControl?: "sealed-original@1" | "sealed-peer@1" | "sealed-peer-runtime@1";
+  readonly ociParentControl?:
+    | "sealed-original@1"
+    | "sealed-peer@1"
+    | "sealed-peer-runtime@1"
+    | "sealed-peer-local-cleanup@1";
   readonly configuredInputs?: {
     readonly keyring: HostedContainerSecretKeyring;
     readonly maxSecretBytes: number;
@@ -568,14 +572,19 @@ export function createDockerContainerCoreOwner(
 ): DockerContainerCoreOwner {
   const { sql, clock, installationId, backendId, targetKey } = options;
   const parentMode = options.ociParentControl;
-  const peerMode = parentMode === "sealed-peer@1" || parentMode === "sealed-peer-runtime@1";
+  const peerMode =
+    parentMode === "sealed-peer@1" ||
+    parentMode === "sealed-peer-runtime@1" ||
+    parentMode === "sealed-peer-local-cleanup@1";
   // Keep the existing durable peer domain/shape. The authenticated inner
   // purpose below fixes the original pre-CREATE profile without DDL retrofit.
   const peerPurpose = "takoserver.linux-oci-parent-peer-control@1";
   const peerReconstructionPurpose =
-    parentMode === "sealed-peer-runtime@1"
-      ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
-      : "takoserver.linux-oci-peer-reconstruction@1";
+    parentMode === "sealed-peer-local-cleanup@1"
+      ? "takoserver.linux-oci-peer-local-cleanup-reconstruction@1"
+      : parentMode === "sealed-peer-runtime@1"
+        ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
+        : "takoserver.linux-oci-peer-reconstruction@1";
   if (parentMode !== undefined && parentMode !== "sealed-original@1" && !peerMode) return fail();
   const original = createV2ContainerHostAcceptance({
     sql,

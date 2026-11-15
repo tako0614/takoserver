@@ -431,3 +431,4 @@ int tns_owner_read_tracked_join(struct tns_owner *owner) {
 int tns_owner_dispose_tracked(struct tns_owner **slot) {
   (void)slot; abort();
 }
+int tns_owner_dispose_released(struct tns_owner **slot) { (void)slot; abort(); }

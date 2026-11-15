@@ -1,5 +1,5 @@
 /* Repository-only reproduction, from the product root; use existing scratch.
- * Extract exactly these four current bodies (no private packet is needed).
+ * Extract exactly these five current bodies (no private packet is needed).
  * These fixed bodies have no brace characters in string/comment text.
  * The selected public function gets static linkage only, as in this raw test.
 
@@ -10,7 +10,7 @@ out = []
 for file, names in [
     ("scripts/native/docker-container-terminal-oci.c", ["oci_owned"]),
     ("scripts/native/docker-container-terminal-oci-egress.h", ["oci_egress_close_fd", "oci_egress_close"]),
-    ("scripts/native/docker-container-terminal-oci.c", ["tns_oci_dispose_born"]),
+    ("scripts/native/docker-container-terminal-oci.c", ["oci_dispose_born_profile", "tns_oci_dispose_born"]),
 ]:
     source = Path(file).read_text()
     for name in names:
@@ -68,6 +68,7 @@ static int od_dispose(struct tns_oci_owner **slot);
 #define oci_owned od_owned
 #define oci_egress_close_fd od_egress_close_fd
 #define oci_egress_close od_egress_close
+#define oci_dispose_born_profile od_dispose_profile
 #define tns_oci_dispose_born od_dispose
 #ifndef OCI_DISPOSE_RAW_BODY
 #error "Compile using the exact actual-body extraction recorded by this unit"
@@ -83,6 +84,7 @@ static int od_dispose(struct tns_oci_owner **slot);
 #undef oci_owned
 #undef oci_egress_close_fd
 #undef oci_egress_close
+#undef oci_dispose_born_profile
 #undef tns_oci_dispose_born
 
 enum { OD_COMMAND=300,OD_CONFIG,OD_STOPPED,OD_LIMIT=400 };

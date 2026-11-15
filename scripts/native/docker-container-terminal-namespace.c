@@ -59,7 +59,7 @@ struct tns_owner {
   unsigned int tracked_join_attempted;
   struct tns_lifetime tracked_join_before;
   /* Local remaining-FD disposal history only, not whole lifetime coverage. */
-  unsigned int tracked_dispose_started;
+  unsigned int tracked_dispose_started; /* 1 tracked / 2 selected local. */
   int tracked_dispose_close_unknown;
   struct tns_identity creator;
   struct tns_identity identity;
@@ -501,6 +501,7 @@ int tns_owner_stop_custodian(struct tns_owner *owner) {
 int tns_owner_close(struct tns_owner **slot) {
   if (!slot || !*slot) { errno = EINVAL; return -1; }
   struct tns_owner *owner = *slot;
+  if ((owner->tracked_dispose_started == 2)) { errno = EUCLEAN; return -1; }
   if (tns_owner_stop_custodian(owner) < 0) return -1;
   tns_close_fd(&owner->netfd);
   tns_close_fd(&owner->kernel_fd);
@@ -753,23 +754,10 @@ int tns_owner_read_tracked_join(struct tns_owner *owner) {
 }
 
 
-/* This phase owns only the four remaining original private descriptors.
- * Existing transient/status/control close history is deliberately unqualified.
- * After it starts the caller must use only this function, never legacy close. */
-int tns_owner_dispose_tracked(struct tns_owner **slot) {
-  if (!slot || !*slot) { errno = EINVAL; return -1; }
+/* The SAME original close slots/UNKNOWN history serve both local families.
+ * No original observation or retired FD is replayed after either starts. */
+static int tns_dispose_remaining(struct tns_owner **slot) {
   struct tns_owner *owner = *slot;
-  if (tns_controller(owner) < 0) return -1;
-  if (!owner->tracked_dispose_started) {
-    if (owner->procfd < 0 || owner->procroot < 0 || owner->pidfd < 0) {
-      errno = EUCLEAN; return -1;
-    }
-    /* Fresh actual same-FD completion and its original currentness bookends
-     * precede the first close. Cache only this operation history before retiring
-     * that FD; after it closes no old READ/OBSERVE/LIFETIME is possible. */
-    if (tns_owner_read_tracked_join(owner) < 0) return -1;
-    owner->tracked_dispose_started = 1;
-  }
   int *remaining[] = {&owner->kernel_fd, &owner->procfd,
                      &owner->procroot, &owner->pidfd};
   for (size_t i = 0; i < sizeof(remaining) / sizeof(remaining[0]); ++i) {
@@ -789,4 +777,51 @@ int tns_owner_dispose_tracked(struct tns_owner **slot) {
   free(owner);
   *slot = NULL;
   return 0;
+}
+
+/* This phase owns only the four remaining original private descriptors.
+ * Existing transient/status/control close history is deliberately unqualified.
+ * After it starts the caller must use only this function, never legacy close. */
+int tns_owner_dispose_tracked(struct tns_owner **slot) {
+  if (!slot || !*slot) { errno = EINVAL; return -1; }
+  struct tns_owner *owner = *slot;
+  if (tns_controller(owner) < 0) return -1;
+  if ((owner->tracked_dispose_started == 2)) { errno = EUCLEAN; return -1; }
+  if (!owner->tracked_dispose_started) {
+    if (owner->procfd < 0 || owner->procroot < 0 || owner->pidfd < 0) {
+      errno = EUCLEAN; return -1;
+    }
+    /* Fresh actual same-FD completion and its original currentness bookends
+     * precede the first close. Cache only this operation history before retiring
+     * that FD; after it closes no old READ/OBSERVE/LIFETIME is possible. */
+    if (tns_owner_read_tracked_join(owner) < 0) return -1;
+    owner->tracked_dispose_started = 1;
+  }
+  return tns_dispose_remaining(slot);
+}
+
+/* Local released-reference disposal, not a tracked-completion observation.
+ * BEGIN saved this real release/cookie/identity BEFORE the handoff. Its attempt
+ * is not an ACK: the selected OCI caller independently requires its actual
+ * successful BEGIN return. No READ/count/netGone success is inferred here. */
+int tns_owner_dispose_released(struct tns_owner **slot) {
+  if (!slot || !*slot) { errno = EINVAL; return -1; }
+  struct tns_owner *owner = *slot;
+  if (tns_controller(owner) < 0) return -1;
+  if (owner->tracked_dispose_started == 1) { errno = EUCLEAN; return -1; }
+  if (!owner->tracked_dispose_started) {
+    const struct tns_lifetime *before = &owner->tracked_join_before;
+    if (!owner->tracked_join_attempted || owner->procfd < 0 ||
+        owner->procroot < 0 || owner->pidfd < 0 ||
+        before->born != 1 || before->release_attempted != 1 ||
+        before->reference_released != 1 || before->poisoned ||
+        !tns_identity_equal(&before->identity, &owner->identity) ||
+        before->net_cookie != owner->kernel_cookie ||
+        tns_tracked_join_inputs(owner) < 0) {
+      if (!errno) errno = EUCLEAN;
+      return -1;
+    }
+    owner->tracked_dispose_started = 2; /* Before first consume/close. */
+  }
+  return tns_dispose_remaining(slot);
 }

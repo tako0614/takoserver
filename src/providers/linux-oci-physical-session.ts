@@ -1212,7 +1212,8 @@ export interface LinuxOciParentBootstrapInfo {
   readonly kind:
     | "linux-oci-parent-bootstrap@1"
     | "linux-oci-parent-bootstrap@2"
-    | "linux-oci-parent-bootstrap@3";
+    | "linux-oci-parent-bootstrap@3"
+    | "linux-oci-parent-bootstrap@4";
   readonly peer?: LinuxOciParentPeerIdentity;
   readonly claimId: string;
   readonly generation: number;
@@ -1262,6 +1263,7 @@ export class LinuxOciParentBootstrap {
   readonly #lifetime: AbortSignal | undefined;
   readonly #peerProfile: boolean;
   readonly #runtimeFirst: boolean;
+  readonly #localCleanup: boolean;
   #peer: LinuxOciParentPeerIdentity | undefined;
   #peerConnector: ChildProcessWithoutNullStreams | undefined;
   #peerReadUnknown = false;
@@ -1282,7 +1284,7 @@ export class LinuxOciParentBootstrap {
 
   constructor(options: {
     readonly binary: string;
-    readonly peerProfile?: "pidfs64@1" | "pidfs64-runtime@1";
+    readonly peerProfile?: "pidfs64@1" | "pidfs64-runtime@1" | "pidfs64-local-cleanup@1";
     readonly claimId: string;
     readonly generation: number;
     readonly capability: Uint8Array;
@@ -1292,11 +1294,13 @@ export class LinuxOciParentBootstrap {
     if (
       options.peerProfile !== undefined &&
       options.peerProfile !== "pidfs64@1" &&
-      options.peerProfile !== "pidfs64-runtime@1"
+      options.peerProfile !== "pidfs64-runtime@1" &&
+      options.peerProfile !== "pidfs64-local-cleanup@1"
     )
       throw failure("parent_binding");
     this.#peerProfile = options.peerProfile !== undefined;
-    this.#runtimeFirst = options.peerProfile === "pidfs64-runtime@1";
+    this.#localCleanup = options.peerProfile === "pidfs64-local-cleanup@1";
+    this.#runtimeFirst = this.#localCleanup || options.peerProfile === "pidfs64-runtime@1";
     this.#claim = options.claimId;
     this.#generation = options.generation;
     this.#timeout = options.timeoutMs ?? 20_000;
@@ -1329,11 +1333,13 @@ export class LinuxOciParentBootstrap {
     this.#child = spawn(
       binary,
       [
-        this.#runtimeFirst
-          ? "--persistent-parent-peer-runtime"
-          : this.#peerProfile
-            ? "--persistent-parent-peer"
-            : "--persistent-parent",
+        this.#localCleanup
+          ? "--persistent-parent-peer-local-cleanup"
+          : this.#runtimeFirst
+            ? "--persistent-parent-peer-runtime"
+            : this.#peerProfile
+              ? "--persistent-parent-peer"
+              : "--persistent-parent",
       ],
       {
         env: Object.create(null),
@@ -1372,7 +1378,13 @@ export class LinuxOciParentBootstrap {
     this.#current(signal);
     const body = Buffer.alloc(112);
     body.write(
-      this.#runtimeFirst ? "TKOBIND3" : this.#peerProfile ? "TKOBIND2" : "TKOBIND1",
+      this.#localCleanup
+        ? "TKOBIND4"
+        : this.#runtimeFirst
+          ? "TKOBIND3"
+          : this.#peerProfile
+            ? "TKOBIND2"
+            : "TKOBIND1",
       0,
       "ascii",
     );
@@ -1511,9 +1523,11 @@ export class LinuxOciParentBootstrap {
         ...(originalAllocation === undefined
           ? {}
           : {
-              purpose: this.#runtimeFirst
-                ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
-                : "takoserver.linux-oci-peer-reconstruction@1",
+              purpose: this.#localCleanup
+                ? "takoserver.linux-oci-peer-local-cleanup-reconstruction@1"
+                : this.#runtimeFirst
+                  ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
+                  : "takoserver.linux-oci-peer-reconstruction@1",
               allocation: originalAllocation,
             }),
       }),
@@ -1556,6 +1570,7 @@ export class LinuxOciParentBootstrap {
     return readOriginalPeerResult(
       {
         runtimeFirst: this.#runtimeFirst,
+        localCleanup: this.#localCleanup,
         binary: this.#binary,
         claim: this.#claim,
         generation: this.#generation,
@@ -1717,7 +1732,13 @@ export class LinuxOciParentBootstrap {
           .subarray(0, 8)
           .equals(
             Buffer.from(
-              this.#runtimeFirst ? "TKOINFO3" : this.#peerProfile ? "TKOINFO2" : "TKOINFO1",
+              this.#localCleanup
+                ? "TKOINFO4"
+                : this.#runtimeFirst
+                  ? "TKOINFO3"
+                  : this.#peerProfile
+                    ? "TKOINFO2"
+                    : "TKOINFO1",
               "ascii",
             ),
           ) ||
@@ -1744,11 +1765,13 @@ export class LinuxOciParentBootstrap {
         });
       }
       this.#info = Object.freeze({
-        kind: this.#runtimeFirst
-          ? "linux-oci-parent-bootstrap@3"
-          : this.#peerProfile
-            ? "linux-oci-parent-bootstrap@2"
-            : "linux-oci-parent-bootstrap@1",
+        kind: this.#localCleanup
+          ? "linux-oci-parent-bootstrap@4"
+          : this.#runtimeFirst
+            ? "linux-oci-parent-bootstrap@3"
+            : this.#peerProfile
+              ? "linux-oci-parent-bootstrap@2"
+              : "linux-oci-parent-bootstrap@1",
         ...(this.#peer ? { peer: this.#peer } : {}),
         claimId: this.#claim,
         generation: this.#generation,
@@ -1788,6 +1811,7 @@ export function createLinuxOciParentBootstrap(
  * type nor the returned unproven result is an accepted/removed authority. */
 interface OriginalPeerReaderState {
   readonly runtimeFirst: boolean;
+  readonly localCleanup: boolean;
   readonly binary: string;
   readonly claim: string;
   readonly generation: number;
@@ -1982,7 +2006,8 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     !exact(value, keys) ||
     value.kind !== "linux-oci-original-peer-control@1" ||
     (value.purpose !== "takoserver.linux-oci-peer-reconstruction@1" &&
-      value.purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1") ||
+      value.purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1" &&
+      value.purpose !== "takoserver.linux-oci-peer-local-cleanup-reconstruction@1") ||
     typeof value.claimId !== "string" ||
     !CLAIM.test(value.claimId) ||
     !integer(value.generation, 1) ||
@@ -2024,7 +2049,8 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     bootId: value.peer.bootId,
   });
   const state: OriginalPeerReaderState = {
-    runtimeFirst: value.purpose === "takoserver.linux-oci-peer-runtime-reconstruction@1",
+    runtimeFirst: value.purpose !== "takoserver.linux-oci-peer-reconstruction@1",
+    localCleanup: value.purpose === "takoserver.linux-oci-peer-local-cleanup-reconstruction@1",
     binary,
     claim: value.claimId,
     generation: value.generation,
@@ -2404,9 +2430,11 @@ export function prepareAuthenticatedLinuxOciPeerInit(
             ? "read-helper-result"
             : "continue-born-disposal";
       } else if (outcome.effects & begin) {
-        if (outcome.requestKind === 11 && matched("begin-tracked-join"))
-          operation = "read-tracked-join";
-        else if (outcome.requestKind === 12 && matched("read-tracked-join"))
+        if (outcome.requestKind === 11 && matched("begin-tracked-join")) {
+          if (state.localCleanup && !known("begin-tracked-join"))
+            throw failure("parent_peer_phase");
+          operation = state.localCleanup ? "dispose-born" : "read-tracked-join";
+        } else if (outcome.requestKind === 12 && matched("read-tracked-join"))
           operation = known("read-tracked-join") ? "dispose-born" : "read-tracked-join";
         else throw failure("parent_peer_phase");
       } else if (outcome.effects & deletion) {

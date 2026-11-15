@@ -238,6 +238,18 @@ static int ocipp_runtime_peer_bootstrap(struct ocipp_owner *o,
   o->runtime_first = 1;
   return ocipp_self_current(o);
 }
+/* Separate fresh local-cleanup profile, preserving all older bootstrap bytes. */
+static int ocipp_local_peer_bootstrap(struct ocipp_owner *o,
+                                      const unsigned char *p, size_t size) {
+  if (!p || size != 112 || memcmp(p, "TKOBIND4", 8)) { errno = EPROTO; return -1; }
+  unsigned char original[112]; memcpy(original, p, sizeof(original));
+  memcpy(original, "TKOBIND2", 8);
+  int result = ocipp_peer_bootstrap(o, original, sizeof(original));
+  explicit_bzero(original, sizeof(original));
+  if (result < 0) return -1;
+  o->runtime_first = 2;
+  return ocipp_self_current(o);
+}
 /* TKOINFO2 is original info plus devBE64/inoBE64/canonical boot UUID36.
  * These are interval identity facts, no H/CREATE/SQL/retirement permission. */
 static int ocipp_peer_bootstrap_reply(struct ocipp_owner *o) {
@@ -251,9 +263,9 @@ static int ocipp_peer_bootstrap_reply(struct ocipp_owner *o) {
   return ocip_io(1, bytes, sizeof(bytes), 1, 0, now + 4000);
 }
 static int ocipp_runtime_peer_bootstrap_reply(struct ocipp_owner *o) {
-  if (!o->runtime_first || ocipp_self_current(o) < 0 || o->attempted || o->create) return -1;
+  if ((o->runtime_first != 1 && o->runtime_first != 2) || ocipp_self_current(o) < 0 || o->attempted || o->create) return -1;
   unsigned char bytes[144] = {0, 0, 0, 140};
-  memcpy(bytes + 4, "TKOINFO3", 8); memcpy(bytes + 12, o->claim, 64);
+  memcpy(bytes + 4, o->runtime_first == 2 ? "TKOINFO4" : "TKOINFO3", 8); memcpy(bytes + 12, o->claim, 64);
   ocipp_put64(bytes + 76, o->generation); ocipp_put64(bytes + 84, o->listener_cookie);
   ocipp_put64(bytes + 92, o->self_device); ocipp_put64(bytes + 100, o->self_inode);
   memcpy(bytes + 108, o->boot_id, 36);
@@ -299,8 +311,10 @@ static _Noreturn void ocipp_child(struct ocipp_owner *o) {
   char *const argv[] = {(char *)"docker-container-terminal-oci", NULL};
   char *const selected_argv[] = {(char *)"docker-container-terminal-oci",
                                 (char *)"--selected-runtime-owner", NULL};
+  char *const local_argv[] = {(char *)"docker-container-terminal-oci",
+                             (char *)"--selected-runtime-local-cleanup-owner", NULL};
   char *const environment[] = {NULL};
-  (void)syscall(SYS_execveat, 3, "", o->runtime_first ? selected_argv : argv,
+  (void)syscall(SYS_execveat, 3, "", o->runtime_first == 2 ? local_argv : o->runtime_first ? selected_argv : argv,
                 environment, AT_EMPTY_PATH);
   _exit(126);
 }
@@ -678,12 +692,13 @@ static int ocipp_main(void) {
   unsigned char *body = NULL; uint32_t size = 0;
   if (ocip_read(&body, &size)) { if (body) { explicit_bzero(body, size); free(body); } return 77; }
   struct ocipp_owner *o = calloc(1, sizeof(*o));
-  int prepared = !o ? -1 : ocipp_peer_mode == 2 ?
+  int prepared = !o ? -1 : ocipp_peer_mode == 3 ?
+    ocipp_local_peer_bootstrap(o, body, size) : ocipp_peer_mode == 2 ?
     ocipp_runtime_peer_bootstrap(o, body, size) : ocipp_peer_mode ?
     ocipp_peer_bootstrap(o, body, size) : ocipp_bootstrap(o, body, size);
   explicit_bzero(body, size); free(body);
   if (prepared < 0) return 77; /* No H has been created or sent any bytes. */
-  if ((ocipp_peer_mode == 2 ? ocipp_runtime_peer_bootstrap_reply(o) :
+  if ((ocipp_peer_mode >= 2 ? ocipp_runtime_peer_bootstrap_reply(o) :
        ocipp_peer_mode ? ocipp_peer_bootstrap_reply(o) : ocipp_bootstrap_reply(o)) < 0) return 77;
   /* This SAME P stays alive after Host loss AND after a known H exit. Facts and
    * all original output remain in this record. Authenticated reads/control are
@@ -927,4 +942,5 @@ static int ocipp_connector_management_main(void) {
 }
 static int ocipp_peer_main(void) { ocipp_peer_mode = 1; return ocipp_main(); }
 static int ocipp_runtime_peer_main(void) { ocipp_peer_mode = 2; return ocipp_main(); }
+static int ocipp_local_peer_main(void) { ocipp_peer_mode = 3; return ocipp_main(); }
 #endif

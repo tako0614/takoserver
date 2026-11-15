@@ -77,6 +77,7 @@ async function fixture(
     readonly parentControl?: boolean;
     readonly parentPeer?: boolean;
     readonly parentPeerRuntime?: boolean;
+    readonly parentPeerLocal?: boolean;
     readonly peerPending?: boolean;
     readonly peerManagementFault?: "incomplete" | "missing-reply" | "lost-reply";
     readonly peerJoinFault?: "foreign" | "refused" | "unknown" | "pidns";
@@ -292,9 +293,11 @@ async function fixture(
       configuredInputs,
       ...(adversarial.parentPeer
         ? {
-            ociParentControl: adversarial.parentPeerRuntime
-              ? ("sealed-peer-runtime@1" as const)
-              : ("sealed-peer@1" as const),
+            ociParentControl: adversarial.parentPeerLocal
+              ? ("sealed-peer-local-cleanup@1" as const)
+              : adversarial.parentPeerRuntime
+                ? ("sealed-peer-runtime@1" as const)
+                : ("sealed-peer@1" as const),
           }
         : adversarial.parentControl
           ? { ociParentControl: "sealed-original@1" as const }
@@ -375,9 +378,11 @@ async function fixture(
           ? [managing ? "--parent-peer-manage-init" : "--parent-peer-read-result"]
           : adversarial.parentPeer
             ? [
-                adversarial.parentPeerRuntime
-                  ? "--persistent-parent-peer-runtime"
-                  : "--persistent-parent-peer",
+                adversarial.parentPeerLocal
+                  ? "--persistent-parent-peer-local-cleanup"
+                  : adversarial.parentPeerRuntime
+                    ? "--persistent-parent-peer-runtime"
+                    : "--persistent-parent-peer",
               ]
             : adversarial.parentControl
               ? ["--persistent-parent"]
@@ -455,6 +460,11 @@ async function fixture(
                   (kind === 16 && !(peerEffects & (1 << 15)))
                 )
                   throw Error("retirement observation before original effect");
+                if (adversarial.parentPeerLocal && kind === 15) {
+                  expect(peerKind).toBe(11);
+                  expect(peerReply).toMatchObject({ kind: "linux-oci-tracked-join-handoff@1" });
+                  expect(nativeRequests.includes("linux-oci-read-tracked-join@1")).toBe(false);
+                }
                 nativeRequests.push(command.kind);
                 peerKind = kind;
                 peerBytes = frame.length;
@@ -669,17 +679,35 @@ async function fixture(
               expect(
                 frame
                   .subarray(4, 12)
-                  .equals(Buffer.from(adversarial.parentPeerRuntime ? "TKOBIND3" : "TKOBIND2")),
+                  .equals(
+                    Buffer.from(
+                      adversarial.parentPeerLocal
+                        ? "TKOBIND4"
+                        : adversarial.parentPeerRuntime
+                          ? "TKOBIND3"
+                          : "TKOBIND2",
+                    ),
+                  ),
               ).toBe(true);
               originalPeerBootstrap = Buffer.from(frame);
               nativeRequests.push(
-                adversarial.parentPeerRuntime
-                  ? "linux-oci-parent-bootstrap@3"
-                  : "linux-oci-parent-bootstrap@2",
+                adversarial.parentPeerLocal
+                  ? "linux-oci-parent-bootstrap@4"
+                  : adversarial.parentPeerRuntime
+                    ? "linux-oci-parent-bootstrap@3"
+                    : "linux-oci-parent-bootstrap@2",
               );
               const response = Buffer.alloc(144);
               response.writeUInt32BE(140);
-              response.write(adversarial.parentPeerRuntime ? "TKOINFO3" : "TKOINFO2", 4, "ascii");
+              response.write(
+                adversarial.parentPeerLocal
+                  ? "TKOINFO4"
+                  : adversarial.parentPeerRuntime
+                    ? "TKOINFO3"
+                    : "TKOINFO2",
+                4,
+                "ascii",
+              );
               frame.copy(response, 12, 12, 84);
               response.writeBigUInt64BE(0xfedcba9876543210n, 84);
               response.writeBigUInt64BE(5n, 92);
