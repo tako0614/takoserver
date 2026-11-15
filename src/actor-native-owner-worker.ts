@@ -1497,6 +1497,7 @@ export function createActorNativeOwner(
           return new Response(null, { status: 503 });
         }
         if (
+          (SafeReflectApply(SafeNow, Date, []) as number) >= row.expiresAt ||
           record.reservationGenerationKey !== graph.generationKey ||
           record.reservationEpoch !== graph.epoch ||
           SafeReflectApply(SafeArrayIndexOf, graph.variantKeys, [record.reservationVariantKey]) < 0

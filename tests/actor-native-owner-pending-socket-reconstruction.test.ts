@@ -16,6 +16,7 @@ function pendingFixture(
   frames: readonly Frame[],
   fault?: "partial-write" | "descriptor-write" | "ambiguous-send",
   selectedKind: "v2" | "legacy" = "v2",
+  clock?: () => number,
 ) {
   class Socket {
     attachment: unknown;
@@ -95,6 +96,15 @@ function pendingFixture(
       clearTimeout,
       atob,
       btoa,
+      ...(clock
+        ? {
+            Date: class extends Date {
+              static override now() {
+                return clock();
+              }
+            },
+          }
+        : {}),
     },
     { timeout: 1_000 },
   ) as {
@@ -255,6 +265,30 @@ function pendingFixture(
       const before = owner;
       construct(epoch);
       expect(owner).not.toBe(before);
+    },
+    holdNextGraphRead() {
+      const heldOwner = owner;
+      const read = Reflect.get(heldOwner, "currentGraph");
+      if (typeof read !== "function" || Object.hasOwn(heldOwner, "currentGraph"))
+        throw new Error("original graph reader unavailable");
+      let enter!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        enter = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      // Delay only the actual reader's result. Its graph and receiver stay
+      // unchanged; the original signed reservation and queued socket are real.
+      Reflect.set(heldOwner, "currentGraph", async (...args: unknown[]) => {
+        Reflect.deleteProperty(heldOwner, "currentGraph");
+        const graph = await Reflect.apply(read, heldOwner, args);
+        enter();
+        await gate;
+        return graph;
+      });
+      return { entered, release };
     },
     async settle(action: "commit" | "abandon", bearer = offer) {
       return owner.fetch(
@@ -520,3 +554,36 @@ test("pending boundary orphan chunks stay within existing paged attachment retir
     await f.close();
   }
 });
+
+for (const remaining of [0, 1] as const)
+  test(`pending graph-read expiry boundary with ${remaining}ms remaining`, async () => {
+    let now = Date.now();
+    const f = pendingFixture(["original-greeting"], undefined, "v2", () => now);
+    let release: (() => void) | undefined;
+    try {
+      await f.open();
+      const row = f.sql.exec("SELECT expires_at AS expiresAt FROM actor_socket_reservations")[0];
+      if (typeof row?.expiresAt !== "number") throw new Error("original reservation unavailable");
+      expect(row.expiresAt - now).toBe(30_000);
+      f.reconstruct();
+      const held = f.holdNextGraphRead();
+      release = held.release;
+      const commit = f.settle("commit");
+      await held.entered;
+      expect(f.pairs[0]?.[0].received).toEqual([]);
+      now = row.expiresAt - remaining;
+      held.release();
+      expect((await commit).status).toBe(remaining === 0 ? 404 : 204);
+      expect(f.pairs[0]?.[0].received).toEqual(remaining === 0 ? [] : ["original-greeting"]);
+      expect(f.pairs[0]?.[0].closed).toBe(remaining === 0);
+      expect(f.values.size).toBe(remaining === 0 ? 0 : 1);
+      expect(f.sql.exec("SELECT COUNT(*) AS n FROM actor_socket_reservations")).toEqual([{ n: 0 }]);
+      f.reconstruct();
+      expect((await f.settle("commit")).status).toBe(404);
+      expect(f.pairs[0]?.[0].received).toEqual(remaining === 0 ? [] : ["original-greeting"]);
+      expect(f.facetCalls).toBe(1);
+    } finally {
+      release?.();
+      await f.close();
+    }
+  });
