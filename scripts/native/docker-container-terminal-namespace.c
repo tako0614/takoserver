@@ -50,6 +50,7 @@ struct tns_owner {
   struct stat device_identity;
   int control;
   int status;
+  int custodian_close_unknown;
   int kill_attempted;
   int namespace_loaned;
   int namespace_release_attempted;
@@ -112,6 +113,18 @@ static int tns_private_device(const struct stat *st) {
 
 static int tns_controller(const struct tns_owner *owner) {
   if (!owner || owner->controller_pid != getpid()) { errno = EPERM; return -1; }
+  return 0;
+}
+
+/* Original custodian transports are consumed before close, including error.
+ * Their UNKNOWN survives every later release/disposal family; an empty slot
+ * alone is not a successful close and a reused numeric FD is never retried. */
+static int tns_close_custodian_fd(struct tns_owner *owner, int *slot) {
+  if (tns_controller(owner) < 0) return -1;
+  if (*slot < 0) return 0;
+  int fd = *slot;
+  *slot = -1;
+  if (close(fd) < 0) { owner->custodian_close_unknown = 1; return -1; }
   return 0;
 }
 
@@ -411,12 +424,12 @@ int tns_owner_create(struct tns_owner **slot) {
       tns_remaining(deadline) < 0) goto fail;
   if (!tns_birth_matches(&owner->creator, &message, &owner->identity) ||
       tns_phase_hold(&owner->phase) < 0) { errno = EPROTO; goto fail; }
-  tns_close_fd(&owner->status);
+  if (tns_close_custodian_fd(owner, &owner->status) < 0) goto fail;
   return 0;
 fail:
   saved = errno ? errno : EPROTO;
   (void)tns_phase_close(&owner->phase);
-  tns_close_fd(&owner->status);
+  (void)tns_close_custodian_fd(owner, &owner->status);
   if (tns_join(owner) < 0) return -1; /* Held for close/join, never restart. */
   errno = saved;
   return -1;
@@ -491,8 +504,11 @@ int tns_owner_stop_custodian(struct tns_owner *owner) {
   if (tns_controller(owner) < 0) return -1;
   if (tns_phase_close(&owner->phase) < 0) { errno = EPROTO; return -1; }
   if (tns_join(owner) < 0) return -1;
-  tns_close_fd(&owner->status);
-  tns_close_fd(&owner->control);
+  int saved = 0;
+  if (tns_close_custodian_fd(owner, &owner->status) < 0) saved = errno;
+  if (tns_close_custodian_fd(owner, &owner->control) < 0 && !saved) saved = errno;
+  if (saved) { errno = saved; return -1; }
+  if (owner->custodian_close_unknown) { errno = EUCLEAN; return -1; }
   /* Keep original kernel/NSFS FDs and private owner, including after a born
    * runtime loses transport. This does not issue RELEASE_NAMESPACE or free. */
   return 0;
@@ -705,7 +721,8 @@ static int tns_tracked_join_inputs(struct tns_owner *owner) {
       owner->child != 0 || owner->netfd >= 0 || owner->control >= 0 ||
       owner->status >= 0 || !owner->cut_attempted || !owner->cut_confirmed ||
       !owner->kernel_attempted || owner->kernel_fd < 0 ||
-      !owner->kernel_cookie || owner->namespace_close_unknown) {
+      !owner->kernel_cookie || owner->namespace_close_unknown ||
+      owner->custodian_close_unknown) {
     errno = EUCLEAN; return -1;
   }
   return tns_device_current(owner);
@@ -771,7 +788,9 @@ static int tns_dispose_remaining(struct tns_owner **slot) {
     }
   }
   if (tns_controller(owner) < 0) return -1;
-  if (owner->tracked_dispose_close_unknown) { errno = EUCLEAN; return -1; }
+  if (owner->tracked_dispose_close_unknown || owner->custodian_close_unknown) {
+    errno = EUCLEAN; return -1;
+  }
   /* All four recorded remaining closes succeeded. This frees only their
    * private userspace object; it grants no OCI/Core/traffic terminal fact. */
   free(owner);
@@ -780,7 +799,8 @@ static int tns_dispose_remaining(struct tns_owner **slot) {
 }
 
 /* This phase owns only the four remaining original private descriptors.
- * Existing transient/status/control close history is deliberately unqualified.
+ * Original custodian transport UNKNOWN remains a refusal. Other historical
+ * transient closes are not qualified by these four remaining descriptors.
  * After it starts the caller must use only this function, never legacy close. */
 int tns_owner_dispose_tracked(struct tns_owner **slot) {
   if (!slot || !*slot) { errno = EINVAL; return -1; }
