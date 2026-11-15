@@ -91,18 +91,32 @@ export async function openSelfhostContainerBindingSocket(
   });
   await chmod(path, 0o600);
   const pin = await lstat(path);
-  let closed = false;
+  let closing: Promise<void> | undefined;
   return {
     path,
     identity: { dev: pin.dev, ino: pin.ino, uid: pin.uid },
-    async close() {
-      if (closed) return;
-      closed = true;
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      const current = await lstat(path).catch(() => null);
-      if (current && current.dev === pin.dev && current.ino === pin.ino && current.uid === pin.uid)
-        await unlink(path);
+    close(): Promise<void> {
+      if (closing) return closing;
+      let resolveClose!: () => void;
+      let rejectClose!: (error: unknown) => void;
+      // Publish the join before the original close side effects can reenter.
+      closing = new Promise<void>((resolve, reject) => {
+        resolveClose = resolve;
+        rejectClose = reject;
+      });
+      void (async () => {
+        server.closeAllConnections();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        const current = await lstat(path).catch(() => null);
+        if (
+          current &&
+          current.dev === pin.dev &&
+          current.ino === pin.ino &&
+          current.uid === pin.uid
+        )
+          await unlink(path);
+      })().then(resolveClose, rejectClose);
+      return closing;
     },
     support: C.supported,
   };
