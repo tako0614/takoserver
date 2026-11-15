@@ -12,7 +12,9 @@
 #undef main
 #undef CHECK
 #define main prior_codec_main_never_called
+#define valid parent_codec_valid
 #include "docker-container-terminal-oci-stdio.test.c"
+#undef valid
 #undef main
 #undef CHECK
 #define CHECK(c) do { ++checks; assert(c); } while (0)
@@ -45,6 +47,12 @@ static struct {
   uint64_t self_inode, peer_inode; size_t boot_at;
   unsigned char connector_reply[2048], expected_auth[124]; size_t connector_size, connector_at;
   size_t connector_auth_at, connector_request_at;
+  /* New profile-only syscall data. Old scenarios leave this branch disabled. */
+  int application_profile, application_dead, application_hup, application_unsupported;
+  int application_short, application_parent_changed, application_foreign_peer;
+  int application_cookie_changed, application_poll_error, application_stat_changed;
+  unsigned int application_gets, application_polls;
+  uint64_t application_inode;
 
 } pm;
 static jmp_buf parent_jump;
@@ -142,6 +150,7 @@ static _Noreturn void parent_exit(int status);
 #undef open
 #undef syscall
 #undef main
+#define valid parent_codec_valid
 
 static struct ocipp_owner cloned_image;
 static int parent_open(const char *name, int flags, ...) {
@@ -149,6 +158,7 @@ static int parent_open(const char *name, int flags, ...) {
   CHECK(!strcmp(name, "/proc/self/exe") && flags == (O_PATH | O_CLOEXEC)); return 60;
 }
 static int parent_fstat(int fd, struct stat *out) {
+  if(fd==93){CHECK(pm.application_profile);*out=(struct stat){.st_dev=42,.st_ino=pm.application_inode+(pm.application_stat_changed?1u:0u)};return 0;}
   if(fd==61 || fd==92){*out=(struct stat){.st_dev=42,.st_ino=fd==61?pm.self_inode:pm.peer_inode,.st_mode=0700};return 0;}
   CHECK(fd == 60 || (pm.child && fd == 3));
   if(fd==60)pm.executable_stats++;
@@ -156,14 +166,14 @@ static int parent_fstat(int fd, struct stat *out) {
     .st_uid=0,.st_gid=0,.st_nlink=1,.st_size=12345}; return 0;
 }
 static int parent_fstatfs(int fd,struct statfs *out){
-  CHECK(fd==61 || fd==62 || fd==92);memset(out,0,sizeof(*out));
+  CHECK(fd==61 || fd==62 || fd==92 || (fd==93 && pm.application_profile));memset(out,0,sizeof(*out));
   out->f_type=fd==62?PROC_SUPER_MAGIC:pm.old_pidfs?ANON_INODE_FS_MAGIC:PID_FS_MAGIC;return 0;
 }
 static int parent_connect(int fd,const struct sockaddr *address,socklen_t size){
   CHECK(pm.connector && fd==90 && size==pm.address_size && !memcmp(address,pm.address,size));pm.connects++;return 0;
 }
 static pid_t parent_getpid(void) { return pm.wrong_controller ? 9 : pm.child ? 5001 : pm.connector ? 5002 : 5000; }
-static pid_t parent_getppid(void) { return pm.wrong_parent ? 9 : 5000; }
+static pid_t parent_getppid(void) { return pm.wrong_parent ? 9 : pm.application_profile && !pm.child ? pm.application_parent_changed && pm.application_gets ? 6001 : 6000 : 5000; }
 static uid_t parent_geteuid(void) { return pm.not_root ? 1 : 0; }
 static int parent_close(int fd) {
   CHECK(fd >= 0 && fd < 256); pm.closes[fd]++;
@@ -175,7 +185,7 @@ static int parent_pipe2(int ends[2], int flags) {
 }
 static int parent_fcntl(int fd, int command, ...) {
   va_list ap; va_start(ap,command); int minimum=va_arg(ap,int); va_end(ap);
-  if(command==F_SETFD){CHECK((fd==61 || fd==92) && minimum==FD_CLOEXEC);return 0;}
+  if(command==F_SETFD){CHECK((fd==61 || fd==92 || (fd==93 && pm.application_profile)) && minimum==FD_CLOEXEC);return 0;}
   CHECK(pm.child && command==F_DUPFD_CLOEXEC && minimum==10);
   CHECK(fd==70 || fd==73 || fd==75 || fd==60); return 100+(int)pm.duplicates++;
 }
@@ -222,6 +232,14 @@ static int parent_clock(clockid_t kind,struct timespec *out) {
 }
 static int parent_getsockopt(int fd,int level,int option,void *out,socklen_t *size) {
   CHECK(level==SOL_SOCKET);
+  if(fd==0){
+    CHECK(pm.application_profile);
+    if(pm.application_unsupported){errno=ENOTSOCK;return -1;}
+    if(option==SO_DOMAIN || option==SO_TYPE){CHECK(*size==sizeof(int));*(int*)out=option==SO_DOMAIN?AF_UNIX:SOCK_STREAM;return 0;}
+    if(option==SO_COOKIE){CHECK(*size==sizeof(uint64_t));*(uint64_t*)out=77u+(pm.application_cookie_changed && pm.application_gets?1u:0u);return 0;}
+    if(option==SO_PEERCRED){CHECK(*size==sizeof(struct ucred));*(struct ucred*)out=(struct ucred){.pid=pm.application_foreign_peer?6001:6000,.uid=0,.gid=0};return 0;}
+    CHECK(option==SO_PEERPIDFD && *size==sizeof(int));pm.application_gets++;*(int*)out=93;*size=pm.application_short?3:sizeof(int);return 0;
+  }
   if(fd==90){
     if(option==SO_PEERPIDFD){CHECK(pm.connector && *size==sizeof(int));pm.peer_gets++;
       if(pm.pidfd_unsupported){errno=ENOPROTOOPT;return -1;}*(int*)out=92;*size=pm.pidfd_short?3:sizeof(int);return 0;}
@@ -283,6 +301,9 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
     if(pm.connector_auth_at<sizeof(pm.expected_auth)){CHECK(size<=sizeof(pm.expected_auth)-pm.connector_auth_at);
       CHECK(!memcmp(bytes,pm.expected_auth+pm.connector_auth_at,size));pm.connector_auth_at+=size;pm.cap_writes++;}
     else if(pm.manage_mode) return model_management_send(bytes,size);
+    else if(pm.application_profile){static const char request[]="{\"kind\":\"linux-oci-parent-read-application-owner@1\"}";
+      unsigned char frame[4+sizeof(request)-1];size_t n=sizeof(request)-1;frame[0]=frame[1]=frame[2]=0;frame[3]=(unsigned char)n;memcpy(frame+4,request,n);
+      CHECK(size<=sizeof(frame)-pm.connector_request_at && !memcmp(bytes,frame+pm.connector_request_at,size));pm.connector_request_at+=size;pm.readonly_writes++;}
     else {static const char request[]="{\"kind\":\"linux-oci-parent-read-result@1\"}";
       unsigned char frame[4+sizeof(request)-1];size_t n=sizeof(request)-1;frame[0]=frame[1]=frame[2]=0;frame[3]=(unsigned char)n;memcpy(frame+4,request,n);
       CHECK(size<=sizeof(frame)-pm.connector_request_at && !memcmp(bytes,frame+pm.connector_request_at,size));pm.connector_request_at+=size;pm.readonly_writes++;}
@@ -302,6 +323,9 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
 }
 static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
   if(count==1){
+    if(fds[0].fd==93){CHECK(pm.application_profile && timeout==0 && fds[0].events==POLLIN);pm.application_polls++;fds[0].revents=0;
+      if(pm.application_poll_error){errno=EIO;return -1;}
+      if(pm.application_dead){fds[0].revents=(short)(POLLIN|(pm.application_hup?POLLHUP:0));return 1;}return 0;}
     if(timeout==0 && (fds[0].fd==61 || fds[0].fd==92)){CHECK(fds[0].events==POLLIN);fds[0].revents=0;
       if(fds[0].fd==92){pm.peer_checks++;if(pm.peer_dead){fds[0].revents=POLLIN;return 1;}}return 0;}
     if(fds[0].fd==90 && pm.connector){fds[0].revents=0;if(fds[0].events==POLLIN && pm.connector_at<pm.connector_size){fds[0].revents=POLLIN;return 1;}

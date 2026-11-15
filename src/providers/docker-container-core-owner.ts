@@ -55,6 +55,7 @@ import {
   originalLinuxOciHttpRetirementSource,
   originalLinuxOciParentControlSource,
   prepareOriginalLinuxOciAllocationDisposal,
+  prepareOriginalLinuxOciApplicationOwnerRead,
   prepareOriginalLinuxOciPeerInit,
   prepareOriginalLinuxOciPeerRead,
   readOriginalLinuxOciControlArtifact,
@@ -64,6 +65,7 @@ import {
   verifyOriginalLinuxOciParentControl,
 } from "./linux-oci-owned-bundle.ts";
 import type {
+  LinuxOciApplicationOwnerExit,
   LinuxOciDisposedHelperObservation,
   LinuxOciInitReapedObservation,
   LinuxOciNamespaceLifetimeObservation,
@@ -142,7 +144,8 @@ export interface DockerContainerCoreOwnerOptions {
     | "sealed-original@1"
     | "sealed-peer@1"
     | "sealed-peer-runtime@1"
-    | "sealed-peer-local-cleanup@1";
+    | "sealed-peer-local-cleanup@1"
+    | "sealed-peer-application-owner@1";
   readonly configuredInputs?: {
     readonly keyring: HostedContainerSecretKeyring;
     readonly maxSecretBytes: number;
@@ -164,6 +167,12 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<undefined | LinuxOciParentHResult>;
+  readAcceptedApplicationOwnerExit(
+    execution: V2Execution,
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciApplicationOwnerExit>;
   manageAcceptedPeerInit(
     execution: V2Execution,
     record: DockerContainerCreateRecord,
@@ -575,16 +584,19 @@ export function createDockerContainerCoreOwner(
   const peerMode =
     parentMode === "sealed-peer@1" ||
     parentMode === "sealed-peer-runtime@1" ||
-    parentMode === "sealed-peer-local-cleanup@1";
+    parentMode === "sealed-peer-local-cleanup@1" ||
+    parentMode === "sealed-peer-application-owner@1";
   // Keep the existing durable peer domain/shape. The authenticated inner
   // purpose below fixes the original pre-CREATE profile without DDL retrofit.
   const peerPurpose = "takoserver.linux-oci-parent-peer-control@1";
   const peerReconstructionPurpose =
-    parentMode === "sealed-peer-local-cleanup@1"
-      ? "takoserver.linux-oci-peer-local-cleanup-reconstruction@1"
-      : parentMode === "sealed-peer-runtime@1"
-        ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
-        : "takoserver.linux-oci-peer-reconstruction@1";
+    parentMode === "sealed-peer-application-owner@1"
+      ? "takoserver.linux-oci-peer-application-owner-reconstruction@1"
+      : parentMode === "sealed-peer-local-cleanup@1"
+        ? "takoserver.linux-oci-peer-local-cleanup-reconstruction@1"
+        : parentMode === "sealed-peer-runtime@1"
+          ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
+          : "takoserver.linux-oci-peer-reconstruction@1";
   if (parentMode !== undefined && parentMode !== "sealed-original@1" && !peerMode) return fail();
   const original = createV2ContainerHostAcceptance({
     sql,
@@ -2505,7 +2517,7 @@ export function createDockerContainerCoreOwner(
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-    management = false,
+    management: boolean | "application-owner" = false,
   ) {
     if (parentMode === undefined || !controlDecryptionKey || signal.aborted) return fail();
     await assertExecution(execution);
@@ -2584,7 +2596,8 @@ export function createDockerContainerCoreOwner(
       signal.aborted
     )
       return fail();
-    const key = controlDecryptionKey(envelope.keyId),
+    const originalControlKeyId = envelope.keyId,
+      key = controlDecryptionKey(originalControlKeyId),
       nonce = decodeContainerSecretBytes(envelope.nonce),
       ciphertext = decodeContainerSecretBytes(envelope.ciphertext);
     if (
@@ -2615,8 +2628,63 @@ export function createDockerContainerCoreOwner(
         [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
       );
       if (fresh.length !== 1 || fresh[0]?.native_control !== raw || signal.aborted) return fail();
+      if (management === "application-owner") {
+        if (
+          parentMode !== "sealed-peer-application-owner@1" ||
+          phase !== "remove" ||
+          !(await inspectV2ContainerOwnerAllocationSchema(sql))
+        )
+          return fail();
+        // No application_io_closed is inferred or written. This is the fresh
+        // owner's missing-before-save input; all original files must still match.
+        const currentOwner = async () => {
+          await assertSnapshot(loaded.proof);
+          await assertExecution(execution);
+          const row = await sql.query(
+            "SELECT native_control,allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=?",
+            [
+              input.intent.resourceUid,
+              input.intent.policy.generation,
+              input.claimId,
+              input.nativeId,
+            ],
+          );
+          if (
+            row.length !== 1 ||
+            row[0]?.native_control !== raw ||
+            row[0]?.allocation_cleanup !== "untouched" ||
+            !(await current(lease))
+          )
+            return fail();
+          await assertExecution(execution);
+          if (
+            !controlDecryptionKey ||
+            controlDecryptionKey(originalControlKeyId) !== key ||
+            signal.aborted ||
+            !lease.active ||
+            lease.controller.signal.aborted ||
+            !leases.has(lease)
+          )
+            return fail();
+          executionScope(execution);
+        };
+        await currentOwner();
+        const read = await prepareOriginalLinuxOciApplicationOwnerRead(
+          originalCustody,
+          result,
+          input,
+          artifact,
+          binding,
+          signal,
+        );
+        await currentOwner();
+        const observation = await read(signal);
+        await currentOwner();
+        return observation; // nonconsuming original process exit; no H/I/O/removed grant
+      }
       if (
-        parentMode === "sealed-peer-local-cleanup@1" &&
+        (parentMode === "sealed-peer-local-cleanup@1" ||
+          parentMode === "sealed-peer-application-owner@1") &&
         phase === "remove" &&
         (await inspectV2ContainerOwnerApplicationIoSchema(sql))
       ) {
@@ -3141,7 +3209,23 @@ export function createDockerContainerCoreOwner(
     },
     async readAcceptedParentControl(execution, input, originalCustody, signal) {
       const observation = await acceptedParentControl(execution, input, originalCustody, signal);
-      if (observation?.kind === "linux-oci-peer-init-progress@1") return fail();
+      if (
+        observation &&
+        observation.kind !== "linux-oci-parent-h-exited@1" &&
+        observation.kind !== "linux-oci-parent-h-result-refused@1"
+      )
+        return fail();
+      return observation;
+    },
+    async readAcceptedApplicationOwnerExit(execution, input, originalCustody, signal) {
+      const observation = await acceptedParentControl(
+        execution,
+        input,
+        originalCustody,
+        signal,
+        "application-owner",
+      );
+      if (observation?.kind !== "linux-oci-parent-application-owner-exited@1") return fail();
       return observation;
     },
     async manageAcceptedPeerInit(execution, input, originalCustody, signal) {

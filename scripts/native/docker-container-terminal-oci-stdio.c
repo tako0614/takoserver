@@ -475,7 +475,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer")) return ocipp_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer-runtime")) return ocipp_runtime_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer-local-cleanup")) return ocipp_local_peer_main();
+  if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer-application-owner")) return ocipp_application_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-result")) return ocipp_connector_main();
+  if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-application-owner")) return ocipp_application_connector_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-manage-init")) return ocipp_connector_management_main();
   int runtime_first = argc == 2 && !strcmp(argv[1], "--selected-runtime-local-cleanup-owner") ? 2 :
                       argc == 2 && !strcmp(argv[1], "--selected-runtime-owner") ? 1 : 0;

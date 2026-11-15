@@ -46,6 +46,7 @@ import { createLinuxOciHttpHealthProbe } from "./linux-oci-http-health.ts";
 import {
   createLinuxOciParentBootstrap,
   createLinuxOciPhysicalSession,
+  type LinuxOciApplicationOwnerExit,
   type LinuxOciCreateStoppedRequest,
   type LinuxOciDisposedHelperObservation,
   type LinuxOciInitReapedObservation,
@@ -56,6 +57,7 @@ import {
   LinuxOciPhysicalSession,
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
+  prepareAuthenticatedLinuxOciApplicationOwnerReader,
   prepareAuthenticatedLinuxOciPeerInit,
   prepareAuthenticatedLinuxOciPeerReader,
 } from "./linux-oci-physical-session.ts";
@@ -506,7 +508,7 @@ async function authenticatedOriginalPeerSource(
     return fail("parent_custody");
   return { custody, binary: custody.physicalBinary, allocation: captured };
 }
-export async function prepareOriginalLinuxOciPeerRead(
+export function prepareOriginalLinuxOciPeerRead(
   original: object,
   core: DockerContainerCoreOwner,
   record: DockerContainerCreateRecord,
@@ -514,6 +516,50 @@ export async function prepareOriginalLinuxOciPeerRead(
   binding: unknown,
   signal: AbortSignal,
   allocationState: "present" | "closed" = "present",
+) {
+  return prepareOriginalReadonlyPeer(
+    original,
+    core,
+    record,
+    artifact,
+    binding,
+    signal,
+    allocationState,
+    prepareAuthenticatedLinuxOciPeerReader,
+  );
+}
+export function prepareOriginalLinuxOciApplicationOwnerRead(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+) {
+  return prepareOriginalReadonlyPeer(
+    original,
+    core,
+    record,
+    artifact,
+    binding,
+    signal,
+    "present",
+    prepareAuthenticatedLinuxOciApplicationOwnerReader,
+  );
+}
+async function prepareOriginalReadonlyPeer<T>(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+  allocationState: "present" | "closed",
+  prepare: (
+    binary: string,
+    value: unknown,
+    lifetime: AbortSignal,
+  ) => (signal: AbortSignal) => Promise<T>,
 ) {
   const { custody, binary } = await authenticatedOriginalPeerSource(
     original,
@@ -525,14 +571,12 @@ export async function prepareOriginalLinuxOciPeerRead(
     undefined,
     allocationState,
   );
-  // Only original, not-yet-used reader state; no persistent adopted allocation.
   return async (actualSignal: AbortSignal) => {
     if (custody.signal.aborted || actualSignal.aborted || custody.peerReads.has(record.claimId))
       return fail("parent_custody");
-    const read = prepareAuthenticatedLinuxOciPeerReader(binary, binding, custody.signal);
-    // Retain the actual closure/child even on UNKNOWN, never a replaceable flag.
+    const read = prepare(binary, binding, custody.signal);
     const settlement = Promise.resolve().then(() => read(actualSignal));
-    custody.peerReads.set(record.claimId, Object.freeze({ custody: read, settlement })); // before sole connector spawn
+    custody.peerReads.set(record.claimId, Object.freeze({ custody: read, settlement }));
     return settlement;
   };
 }
@@ -1287,7 +1331,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const peerMode =
     parentMode === "sealed-peer@1" ||
     parentMode === "sealed-peer-runtime@1" ||
-    parentMode === "sealed-peer-local-cleanup@1";
+    parentMode === "sealed-peer-local-cleanup@1" ||
+    parentMode === "sealed-peer-application-owner@1";
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
   const parents = new Map<
@@ -2156,7 +2201,9 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   function manageRetainedPeerInit(
     execution: V2Execution,
     externalSignal?: AbortSignal,
-  ): Promise<readonly (LinuxOciPeerInitProgress | LinuxOciParentHResult)[]> {
+  ): Promise<
+    readonly (LinuxOciPeerInitProgress | LinuxOciParentHResult | LinuxOciApplicationOwnerExit)[]
+  > {
     if (closed || !peerMode)
       return Promise.reject(new Error("linux_oci_owned_bundle_parent_unavailable"));
     if (externalSignal !== undefined && !(externalSignal instanceof AbortSignal))
@@ -2176,7 +2223,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           !accepted.retained.length
         )
           return fail("parent_unavailable");
-        const observations: (LinuxOciPeerInitProgress | LinuxOciParentHResult)[] = [];
+        const observations: (
+          | LinuxOciPeerInitProgress
+          | LinuxOciParentHResult
+          | LinuxOciApplicationOwnerExit
+        )[] = [];
         for (const item of accepted.retained) {
           const { record } = item;
           if (
@@ -2208,12 +2259,22 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               void applicationClose?.catch(() => undefined);
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
-              const result = await core.manageAcceptedPeerInit(
-                execution,
-                record,
-                originalNativeCustody,
-                loan.signal,
-              );
+              // Missing local runtime is only a recovery selector. It supplies
+              // no closed-I/O fact: original P must attest its captured process.
+              const result = await (parentMode === "sealed-peer-application-owner@1" &&
+              !httpRuntimes.has(record.claimId)
+                ? core.readAcceptedApplicationOwnerExit(
+                    execution,
+                    record,
+                    originalNativeCustody,
+                    loan.signal,
+                  )
+                : core.manageAcceptedPeerInit(
+                    execution,
+                    record,
+                    originalNativeCustody,
+                    loan.signal,
+                  ));
               if (!result || closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
               observations.push(result);
@@ -2497,11 +2558,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             ...(peerMode
               ? {
                   peerProfile:
-                    parentMode === "sealed-peer-local-cleanup@1"
-                      ? ("pidfs64-local-cleanup@1" as const)
-                      : parentMode === "sealed-peer-runtime@1"
-                        ? ("pidfs64-runtime@1" as const)
-                        : ("pidfs64@1" as const),
+                    parentMode === "sealed-peer-application-owner@1"
+                      ? ("pidfs64-application-owner@1" as const)
+                      : parentMode === "sealed-peer-local-cleanup@1"
+                        ? ("pidfs64-local-cleanup@1" as const)
+                        : parentMode === "sealed-peer-runtime@1"
+                          ? ("pidfs64-runtime@1" as const)
+                          : ("pidfs64@1" as const),
                 }
               : {}),
             claimId: receipt.claimId,

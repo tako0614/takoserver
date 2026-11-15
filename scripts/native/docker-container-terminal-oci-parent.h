@@ -46,6 +46,12 @@ struct ocipp_owner {
   /* Fixed bootstrap3/held-executable H selection before first CREATE. */
   unsigned int runtime_first;
   uint64_t self_device, self_inode; char boot_id[37];
+  /* Fresh profile5 only: actual original stdin peer AND birth-parent relation.
+   * This held pidfd is not our child and is never passed to consuming wait. */
+  int application_pidfd;
+  pid_t application_parent;
+  unsigned int application_attempt, application_unknown;
+  uint64_t application_device, application_inode;
   enum tns_ocip_kind request_kind;
   size_t request_size, issued_size, last_reply_start, last_reply_end;
   unsigned char *frontend_input, *management_output;
@@ -101,6 +107,7 @@ static int ocipp_initialize(struct ocipp_owner *o) {
   if (o->controller || o->attempted) { errno = EALREADY; return -1; }
   memset(o, 0, sizeof(*o)); o->controller = getpid(); o->executable = o->pidfd = -1;
   o->listener = o->candidate = o->frontend = -1;
+  o->application_pidfd = -1;
   for (unsigned int i = 0; i < 2; ++i) o->input[i] = o->output[i] = o->errors[i] = -1;
   if (geteuid()) return -1;
   o->executable = open("/proc/self/exe", O_PATH | O_CLOEXEC);
@@ -250,6 +257,75 @@ static int ocipp_local_peer_bootstrap(struct ocipp_owner *o,
   o->runtime_first = 2;
   return ocipp_self_current(o);
 }
+/* SO_PEERPIDFD pins the original private stdin peer even if that process died
+ * before P ran. getppid alone could instead observe its adopting ancestor.
+ * Unsupported pipe transports have no numeric-PID fallback in this profile. */
+static int ocipp_application_state(struct ocipp_owner *o) {
+  struct statfs fs; struct stat st;
+  if (!o) { errno=EINVAL; return -1; }
+  if (ocipp_self_current(o) < 0 || !o->application_attempt || o->application_unknown ||
+      o->application_pidfd < 0 || !o->application_parent ||
+      fstatfs(o->application_pidfd, &fs) < 0 || fs.f_type != PID_FS_MAGIC ||
+      fstat(o->application_pidfd, &st) < 0 ||
+      (uint64_t)st.st_dev != o->application_device || (uint64_t)st.st_ino != o->application_inode) {
+    o->application_unknown = 1; errno = ESTALE; return -1;
+  }
+  struct pollfd p = {.fd=o->application_pidfd,.events=POLLIN};
+  int ready = poll(&p,1,0);
+  if (ready < 0 || ready > 1 || (!ready && p.revents) ||
+      (ready && (!(p.revents & POLLIN) || (p.revents & ~(POLLIN | POLLHUP))))) {
+    o->application_unknown = 1; errno = EUCLEAN; return -1;
+  }
+  if (ocipp_self_current(o) < 0 || fstat(o->application_pidfd,&st) < 0 ||
+      (uint64_t)st.st_dev != o->application_device || (uint64_t)st.st_ino != o->application_inode) {
+    o->application_unknown = 1; errno = ESTALE; return -1;
+  }
+  return ready; /* pidfs readiness: whole process exit, never consuming wait */
+}
+static int ocipp_application_peer_bootstrap(struct ocipp_owner *o,
+                                           const unsigned char *p,size_t size) {
+  if (!p || size != 112 || memcmp(p,"TKOBIND5",8)) { errno=EPROTO; return -1; }
+  pid_t parent = getppid();
+  unsigned char original[112]; memcpy(original,p,sizeof(original));memcpy(original,"TKOBIND4",8);
+  int result = ocipp_local_peer_bootstrap(o,original,sizeof(original));
+  explicit_bzero(original,sizeof(original));
+  if (result < 0 || o->application_attempt) return -1;
+  o->application_attempt=1; /* before the sole original-peer pidfd acquisition */
+  int domain=0,type=0; struct ucred peer; uint64_t before=0,after=0;
+  socklen_t n=sizeof(domain);
+  if (parent <= 0 || parent == getpid() || getsockopt(0,SOL_SOCKET,SO_DOMAIN,&domain,&n)<0 ||
+      n!=sizeof(domain) || domain!=AF_UNIX) goto unknown;
+  n=sizeof(type);
+  if (getsockopt(0,SOL_SOCKET,SO_TYPE,&type,&n)<0 || n!=sizeof(type) || type!=SOCK_STREAM) goto unknown;
+  n=sizeof(before);
+  if (getsockopt(0,SOL_SOCKET,SO_COOKIE,&before,&n)<0 || n!=sizeof(before) || !before) goto unknown;
+  n=sizeof(peer);
+  if (getsockopt(0,SOL_SOCKET,SO_PEERCRED,&peer,&n)<0 || n!=sizeof(peer) ||
+      peer.pid!=parent || peer.uid!=geteuid() || getppid()!=parent) goto unknown;
+  n=sizeof(o->application_pidfd);
+  if (getsockopt(0,SOL_SOCKET,SO_PEERPIDFD,&o->application_pidfd,&n)<0 ||
+      n!=sizeof(o->application_pidfd) || o->application_pidfd<0 ||
+      fcntl(o->application_pidfd,F_SETFD,FD_CLOEXEC)<0 ||
+      ocipp_pidfs(o->application_pidfd,&o->application_device,&o->application_inode)<0) goto unknown;
+  o->application_parent=parent;
+  n=sizeof(after);
+  if (getsockopt(0,SOL_SOCKET,SO_COOKIE,&after,&n)<0 || n!=sizeof(after) ||
+      after!=before || getppid()!=parent || ocipp_application_state(o)!=0) goto unknown;
+  return 0;
+unknown:
+  o->application_unknown=1; errno=ESTALE; return -1;
+}
+static int ocipp_application_peer_bootstrap_reply(struct ocipp_owner *o) {
+  if (ocipp_application_state(o)!=0 || o->attempted || o->create) return -1;
+  unsigned char bytes[160]={0,0,0,156};
+  memcpy(bytes+4,"TKOINFO5",8);memcpy(bytes+12,o->claim,64);
+  ocipp_put64(bytes+76,o->generation);ocipp_put64(bytes+84,o->listener_cookie);
+  ocipp_put64(bytes+92,o->self_device);ocipp_put64(bytes+100,o->self_inode);
+  memcpy(bytes+108,o->boot_id,36);
+  ocipp_put64(bytes+144,o->application_device);ocipp_put64(bytes+152,o->application_inode);
+  int64_t now=ocip_now();if(now<0)return -1;
+  return ocip_io(1,bytes,sizeof(bytes),1,0,now+4000);
+}
 /* TKOINFO2 is original info plus devBE64/inoBE64/canonical boot UUID36.
  * These are interval identity facts, no H/CREATE/SQL/retirement permission. */
 static int ocipp_peer_bootstrap_reply(struct ocipp_owner *o) {
@@ -321,6 +397,7 @@ static _Noreturn void ocipp_child(struct ocipp_owner *o) {
 static int ocipp_spawn(struct ocipp_owner *o) {
   if (!o || o->attempted) { errno = EALREADY; return -1; }
   if (ocipp_binding_current(o) < 0 || !o->create || !o->pending) return -1;
+  if (o->application_attempt && ocipp_application_state(o)!=0) return -1;
   o->attempted = 1; /* Permanently consumed before any possible child birth. */
   if (pipe2(o->input, O_CLOEXEC | O_NONBLOCK) < 0 ||
       pipe2(o->output, O_CLOEXEC | O_NONBLOCK) < 0 ||
@@ -492,8 +569,17 @@ static int ocipp_management(struct ocipp_owner *o, const unsigned char *body, si
   static const char result[] = "{\"kind\":\"linux-oci-parent-read-result@1\"}";
   static const char outcome[] = "{\"kind\":\"linux-oci-parent-read-outcome@1\"}";
   static const char resume[] = "{\"kind\":\"linux-oci-parent-continue-frame@1\"}";
+  static const char application[] = "{\"kind\":\"linux-oci-parent-read-application-owner@1\"}";
   if (ocipp_binding_current(o) < 0 || o->frontend < 0) return -1;
   char text[900]; int n;
+  if (size == sizeof(application)-1 && !memcmp(body,application,size)) {
+    int state=ocipp_application_state(o);
+    if (state!=1) return ocipp_management_text(o,"{\"kind\":\"linux-oci-parent-application-owner-refused@1\",\"barrier\":\"unproven\"}");
+    n=snprintf(text,sizeof(text),"{\"kind\":\"linux-oci-parent-application-owner-exited@1\",\"device\":\"%llu\",\"inode\":\"%llu\",\"bootId\":\"%s\",\"barrier\":\"unproven\"}",
+      (unsigned long long)o->application_device,(unsigned long long)o->application_inode,o->boot_id);
+    if(n<0 || (size_t)n>=sizeof(text))return -1;
+    return ocipp_management_text(o,text);
+  }
   if (size == sizeof(resume) - 1 && !memcmp(body, resume, size)) {
     /* Authentication and reading past facts cannot issue held unsent effects.
      * Only this explicit operation continues the SAME previously saved frame. */
@@ -692,13 +778,15 @@ static int ocipp_main(void) {
   unsigned char *body = NULL; uint32_t size = 0;
   if (ocip_read(&body, &size)) { if (body) { explicit_bzero(body, size); free(body); } return 77; }
   struct ocipp_owner *o = calloc(1, sizeof(*o));
-  int prepared = !o ? -1 : ocipp_peer_mode == 3 ?
+  int prepared = !o ? -1 : ocipp_peer_mode == 4 ?
+    ocipp_application_peer_bootstrap(o, body, size) : ocipp_peer_mode == 3 ?
     ocipp_local_peer_bootstrap(o, body, size) : ocipp_peer_mode == 2 ?
     ocipp_runtime_peer_bootstrap(o, body, size) : ocipp_peer_mode ?
     ocipp_peer_bootstrap(o, body, size) : ocipp_bootstrap(o, body, size);
   explicit_bzero(body, size); free(body);
   if (prepared < 0) return 77; /* No H has been created or sent any bytes. */
-  if ((ocipp_peer_mode >= 2 ? ocipp_runtime_peer_bootstrap_reply(o) :
+  if ((ocipp_peer_mode == 4 ? ocipp_application_peer_bootstrap_reply(o) :
+       ocipp_peer_mode >= 2 ? ocipp_runtime_peer_bootstrap_reply(o) :
        ocipp_peer_mode ? ocipp_peer_bootstrap_reply(o) : ocipp_bootstrap_reply(o)) < 0) return 77;
   /* This SAME P stays alive after Host loss AND after a known H exit. Facts and
    * all original output remain in this record. Authenticated reads/control are
@@ -831,6 +919,24 @@ static int ocipp_outcome_decimal(const unsigned char **at, const unsigned char *
   if (*at == start || (*at - start > 1 && *start == '0')) return -1;
   *value = n; return 0;
 }
+static int ocipp_application_connector_read(struct ocipp_connector *c,const unsigned char *p,size_t size,
+                                           unsigned char reply[512],size_t *reply_size) {
+  if (ocipp_connector_open(c,p,size)<0 ||
+      ocipp_connector_command(c,"{\"kind\":\"linux-oci-parent-read-application-owner@1\"}",c->deadline)<0 ||
+      ocipp_connector_frame(c->socket,reply,reply_size,c->deadline)<0 ||
+      ocipp_connector_current(c)<0) return -1;
+  const unsigned char *at=reply,*end=reply+*reply_size;uint64_t device=0,inode=0;
+  if (ocipp_outcome_literal(&at,end,"{\"kind\":\"linux-oci-parent-application-owner-exited@1\",\"device\":\"")<0 ||
+      ocipp_outcome_decimal(&at,end,UINT64_MAX,&device)<0 || !device ||
+      ocipp_outcome_literal(&at,end,"\",\"inode\":\"")<0 ||
+      ocipp_outcome_decimal(&at,end,UINT64_MAX,&inode)<0 || !inode ||
+      ocipp_outcome_literal(&at,end,"\",\"bootId\":\"")<0 ||
+      (size_t)(end-at)<36 || memcmp(at,c->boot,36)) return -1;
+  at+=36;
+  if(ocipp_outcome_literal(&at,end,"\",\"barrier\":\"unproven\"}")<0 || at!=end)return -1;
+  struct pollfd trailing={.fd=c->socket,.events=POLLIN};
+  return poll(&trailing,1,0) || trailing.revents ? -1 : 0;
+}
 static int ocipp_connector_outcome_size(const unsigned char *body, size_t size, size_t *reply_size) {
   const unsigned char *at = body, *end = body + size; uint64_t kind, effects, request, issued, unknown, reply;
   if (ocipp_outcome_literal(&at,end,"{\"kind\":\"linux-oci-parent-outcome@1\",\"requestKind\":") < 0 ||
@@ -908,21 +1014,24 @@ static void ocipp_connector_free(struct ocipp_connector *c) {
   free(c->custody.incoming); free(c->custody.frontend_input); free(c->custody.management_output);
   free(c->custody.captured[0]); free(c->custody.captured[1]);
 }
-static int ocipp_connector_main(void) {
+static int ocipp_connector_mode_main(int application) {
   if (geteuid() || ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
   unsigned char *body = NULL; uint32_t size = 0;
   if (ocip_read(&body, &size)) { if (body) { explicit_bzero(body, size); free(body); } return 77; }
   struct ocipp_connector c; memset(&c, 0, sizeof(c)); c.socket = c.peer_pidfd = -1;
   c.custody.executable = -1;
   unsigned char reply[512]; size_t reply_size = 0;
-  int result = ocipp_connector_read(&c, body, size, reply, &reply_size);
+  int result = application ? ocipp_application_connector_read(&c,body,size,reply,&reply_size) :
+    ocipp_connector_read(&c, body, size, reply, &reply_size);
   explicit_bzero(body, size); free(body);
   if (ocipp_connector_close(&c) < 0) result = -1;
   ocipp_connector_free(&c);
   if (result < 0) return 77;
-  /* This relays original P's factual H reply, never connector-exit=>H-exit. */
+  /* Relay the original P result; connector exit is only transport closure. */
   return ocip_reply((const char *)reply) < 0 ? 77 : 0;
 }
+static int ocipp_connector_main(void) { return ocipp_connector_mode_main(0); }
+static int ocipp_application_connector_main(void) { return ocipp_connector_mode_main(1); }
 static int ocipp_connector_management_main(void) {
   if (geteuid() || ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
   unsigned char *body = NULL; uint32_t size = 0;
@@ -943,4 +1052,5 @@ static int ocipp_connector_management_main(void) {
 static int ocipp_peer_main(void) { ocipp_peer_mode = 1; return ocipp_main(); }
 static int ocipp_runtime_peer_main(void) { ocipp_peer_mode = 2; return ocipp_main(); }
 static int ocipp_local_peer_main(void) { ocipp_peer_mode = 3; return ocipp_main(); }
+static int ocipp_application_peer_main(void) { ocipp_peer_mode = 4; return ocipp_main(); }
 #endif

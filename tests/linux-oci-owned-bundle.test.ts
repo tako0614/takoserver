@@ -78,6 +78,7 @@ async function fixture(
     readonly parentPeer?: boolean;
     readonly parentPeerRuntime?: boolean;
     readonly parentPeerLocal?: boolean;
+    readonly parentPeerApplicationOwner?: boolean;
     readonly peerPending?: boolean;
     readonly peerManagementFault?: "incomplete" | "missing-reply" | "lost-reply";
     readonly peerJoinFault?: "foreign" | "refused" | "unknown" | "pidns";
@@ -293,11 +294,13 @@ async function fixture(
       configuredInputs,
       ...(adversarial.parentPeer
         ? {
-            ociParentControl: adversarial.parentPeerLocal
-              ? ("sealed-peer-local-cleanup@1" as const)
-              : adversarial.parentPeerRuntime
-                ? ("sealed-peer-runtime@1" as const)
-                : ("sealed-peer@1" as const),
+            ociParentControl: adversarial.parentPeerApplicationOwner
+              ? ("sealed-peer-application-owner@1" as const)
+              : adversarial.parentPeerLocal
+                ? ("sealed-peer-local-cleanup@1" as const)
+                : adversarial.parentPeerRuntime
+                  ? ("sealed-peer-runtime@1" as const)
+                  : ("sealed-peer@1" as const),
           }
         : adversarial.parentControl
           ? { ociParentControl: "sealed-original@1" as const }
@@ -361,6 +364,8 @@ async function fixture(
     peerKind = 0,
     peerEffects = 0,
     peerBytes = 0;
+  let applicationOwnerExited = false;
+  let applicationOwnerFault: "foreign" | "boot" | "lost" | "exit" | undefined;
   let peerHJoined = false,
     peerHStdoutEof = false,
     peerHStderrEof = false;
@@ -371,18 +376,30 @@ async function fixture(
   ) => {
     if (file === physicalBinary) {
       const managing = adversarial.parentPeer && args[0] === "--parent-peer-manage-init";
+      const applicationReader =
+        adversarial.parentPeerApplicationOwner &&
+        args[0] === "--parent-peer-read-application-owner";
       const connector =
-        adversarial.parentPeer && (args[0] === "--parent-peer-read-result" || managing);
+        adversarial.parentPeer &&
+        (args[0] === "--parent-peer-read-result" || managing || applicationReader);
       expect(args).toEqual(
         connector
-          ? [managing ? "--parent-peer-manage-init" : "--parent-peer-read-result"]
+          ? [
+              managing
+                ? "--parent-peer-manage-init"
+                : applicationReader
+                  ? "--parent-peer-read-application-owner"
+                  : "--parent-peer-read-result",
+            ]
           : adversarial.parentPeer
             ? [
-                adversarial.parentPeerLocal
-                  ? "--persistent-parent-peer-local-cleanup"
-                  : adversarial.parentPeerRuntime
-                    ? "--persistent-parent-peer-runtime"
-                    : "--persistent-parent-peer",
+                adversarial.parentPeerApplicationOwner
+                  ? "--persistent-parent-peer-application-owner"
+                  : adversarial.parentPeerLocal
+                    ? "--persistent-parent-peer-local-cleanup"
+                    : adversarial.parentPeerRuntime
+                      ? "--persistent-parent-peer-runtime"
+                      : "--persistent-parent-peer",
               ]
             : adversarial.parentControl
               ? ["--persistent-parent"]
@@ -460,7 +477,10 @@ async function fixture(
                   (kind === 16 && !(peerEffects & (1 << 15)))
                 )
                   throw Error("retirement observation before original effect");
-                if (adversarial.parentPeerLocal && kind === 15) {
+                if (
+                  (adversarial.parentPeerLocal || adversarial.parentPeerApplicationOwner) &&
+                  kind === 15
+                ) {
                   expect(peerKind).toBe(11);
                   expect(peerReply).toMatchObject({ kind: "linux-oci-tracked-join-handoff@1" });
                   expect(nativeRequests.includes("linux-oci-read-tracked-join@1")).toBe(false);
@@ -617,7 +637,11 @@ async function fixture(
             }
             if (connector) {
               nativeRequests.push(
-                managing ? "linux-oci-parent-read-outcome@2" : "linux-oci-parent-read-result@2",
+                managing
+                  ? "linux-oci-parent-read-outcome@2"
+                  : applicationReader
+                    ? "linux-oci-parent-read-application-owner@1"
+                    : "linux-oci-parent-read-result@2",
               );
               const original = originalPeerBootstrap;
               const valid =
@@ -656,7 +680,26 @@ async function fixture(
                 done();
                 return;
               }
-              if (valid)
+              if (valid && applicationReader) {
+                if (applicationOwnerFault !== "lost")
+                  reply(
+                    applicationOwnerExited
+                      ? {
+                          kind: "linux-oci-parent-application-owner-exited@1",
+                          device: "5",
+                          inode: applicationOwnerFault === "foreign" ? "99" : "1311768467463790321",
+                          bootId:
+                            applicationOwnerFault === "boot"
+                              ? "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+                              : "11111111-2222-4333-8444-555555555555",
+                          barrier: "unproven",
+                        }
+                      : {
+                          kind: "linux-oci-parent-application-owner-refused@1",
+                          barrier: "unproven",
+                        },
+                  );
+              } else if (valid)
                 reply(
                   adversarial.peerPending
                     ? {
@@ -670,8 +713,8 @@ async function fixture(
               queueMicrotask(() => {
                 stdout.end();
                 stderr.end();
-                child.emit("exit", valid ? 0 : 1, null);
-                child.emit("close", valid ? 0 : 1, null);
+                child.emit("exit", valid && applicationOwnerFault !== "exit" ? 0 : 1, null);
+                child.emit("close", valid && applicationOwnerFault !== "exit" ? 0 : 1, null);
               });
               return;
             }
@@ -681,30 +724,36 @@ async function fixture(
                   .subarray(4, 12)
                   .equals(
                     Buffer.from(
-                      adversarial.parentPeerLocal
-                        ? "TKOBIND4"
-                        : adversarial.parentPeerRuntime
-                          ? "TKOBIND3"
-                          : "TKOBIND2",
+                      adversarial.parentPeerApplicationOwner
+                        ? "TKOBIND5"
+                        : adversarial.parentPeerLocal
+                          ? "TKOBIND4"
+                          : adversarial.parentPeerRuntime
+                            ? "TKOBIND3"
+                            : "TKOBIND2",
                     ),
                   ),
               ).toBe(true);
               originalPeerBootstrap = Buffer.from(frame);
               nativeRequests.push(
-                adversarial.parentPeerLocal
-                  ? "linux-oci-parent-bootstrap@4"
-                  : adversarial.parentPeerRuntime
-                    ? "linux-oci-parent-bootstrap@3"
-                    : "linux-oci-parent-bootstrap@2",
+                adversarial.parentPeerApplicationOwner
+                  ? "linux-oci-parent-bootstrap@5"
+                  : adversarial.parentPeerLocal
+                    ? "linux-oci-parent-bootstrap@4"
+                    : adversarial.parentPeerRuntime
+                      ? "linux-oci-parent-bootstrap@3"
+                      : "linux-oci-parent-bootstrap@2",
               );
-              const response = Buffer.alloc(144);
-              response.writeUInt32BE(140);
+              const response = Buffer.alloc(adversarial.parentPeerApplicationOwner ? 160 : 144);
+              response.writeUInt32BE(response.length - 4);
               response.write(
-                adversarial.parentPeerLocal
-                  ? "TKOINFO4"
-                  : adversarial.parentPeerRuntime
-                    ? "TKOINFO3"
-                    : "TKOINFO2",
+                adversarial.parentPeerApplicationOwner
+                  ? "TKOINFO5"
+                  : adversarial.parentPeerLocal
+                    ? "TKOINFO4"
+                    : adversarial.parentPeerRuntime
+                      ? "TKOINFO3"
+                      : "TKOINFO2",
                 4,
                 "ascii",
               );
@@ -713,6 +762,10 @@ async function fixture(
               response.writeBigUInt64BE(5n, 92);
               response.writeBigUInt64BE(0x123456789abcdef0n, 100);
               response.write("11111111-2222-4333-8444-555555555555", 108, "ascii");
+              if (adversarial.parentPeerApplicationOwner) {
+                response.writeBigUInt64BE(5n, 144);
+                response.writeBigUInt64BE(0x123456789abcdef1n, 152);
+              }
               stdout.write(response);
               done();
               return;
@@ -1333,6 +1386,10 @@ async function fixture(
     },
     afterStart(callback: typeof afterStart) {
       afterStart = callback;
+    },
+    applicationOwnerState(exited: boolean, fault?: typeof applicationOwnerFault) {
+      applicationOwnerExited = exited;
+      applicationOwnerFault = fault;
     },
     nativeCounts: () => ({ processes: nativeProcesses, requests: [...nativeRequests] }),
     nativeExits: () => nativeExits,

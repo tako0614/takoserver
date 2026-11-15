@@ -25,6 +25,7 @@ async function fixture(
     normal?: boolean;
     runtimeFirst?: boolean;
     localCleanup?: boolean;
+    applicationOwner?: boolean;
     configuredPeer?: boolean;
     joinFault?: "foreign" | "refused" | "unknown" | "pidns";
     namespaceFault?:
@@ -79,6 +80,7 @@ async function fixture(
       ...(options.v1 ? { parentControl: true } : { parentPeer: true }),
       ...(options.runtimeFirst ? { parentPeerRuntime: true } : {}),
       ...(options.localCleanup ? { parentPeerLocal: true } : {}),
+      ...(options.applicationOwner ? { parentPeerApplicationOwner: true } : {}),
       ...(options.pending === undefined ? {} : { peerPending: options.pending }),
       ...(options.normal === undefined ? {} : { normalBackend: options.normal }),
       ...(options.managementFault === undefined
@@ -1478,4 +1480,4 @@ test("peer allocation historical sealed NULL never becomes fresh untouched after
 });
 
 // Original closed raw sources reused by the same-creator DELETE regression.
-export { fixture as originalPeerDeleteFixture, normalCreate, acceptNormalDelete };
+export { acceptNormalDelete, fixture as originalPeerDeleteFixture, normalCreate };
