@@ -2628,11 +2628,24 @@ export function createDockerContainerCoreOwner(
         snapshot: { sql: "1", params: [] } satisfies SqlStatement,
       };
     }
-    // Untrusted envelope selects a historical row only. Today's DELETE stays
-    // separately current; no old lease/currentness or failure fallback is used.
+    // Untrusted envelope selects a historical row only. A pending accepted
+    // UPDATE may reuse a genuinely removed old slot; its own authority stays
+    // current independently of that historical close and its old lease.
+    const currentUpdate =
+      execution.action === "update" &&
+      proof.la_operation_id === execution.operationId &&
+      proof.la_action === "update" &&
+      proof.la_generation === execution.generation &&
+      proof.r_last_operation === execution.operationId &&
+      proof.r_phase === "pending" &&
+      proof.i_desired_generation === execution.generation &&
+      proof.i_retire_operation_id === null &&
+      proof.i_retired_at_ms === null &&
+      proof.q_state === "removed" &&
+      usable(proof, "remove");
     if (
       !text(id) ||
-      execution.action !== "delete" ||
+      (execution.action !== "delete" && !currentUpdate) ||
       !(await inspectV2ContainerOwnerHistoricalDeleteSchema(sql))
     )
       return fail();
