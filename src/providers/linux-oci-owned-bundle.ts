@@ -2231,6 +2231,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         for (const item of accepted.retained) {
           const { record } = item;
           if (
+            parentMode === "sealed-peer-runtime@1" &&
+            accepted.action === "delete" &&
+            record.state === "removed" &&
+            item.removedAtMs !== null
+          )
+            continue;
+          if (
             item.removedAtMs !== null ||
             record.state !== "bound" ||
             record.nativeId === null ||
@@ -2333,6 +2340,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       ) {
         await creator.manageRetainedPeerInit(execution, cancel.signal);
         local();
+        if (parentMode === "sealed-peer-runtime@1" && accepted.action === "delete") {
+          await core.withExecution(execution, () =>
+            core.finalizeAcceptedDelete(execution, originalNativeCustody, cancel.signal),
+          );
+          local();
+          return { kind: "complete", observed: {}, output: {} };
+        }
         return unknown();
       }
       if (accepted.action === "delete") {

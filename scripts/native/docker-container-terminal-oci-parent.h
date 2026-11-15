@@ -340,13 +340,20 @@ static int ocipp_peer_bootstrap_reply(struct ocipp_owner *o) {
 }
 static int ocipp_runtime_peer_bootstrap_reply(struct ocipp_owner *o) {
   if ((o->runtime_first != 1 && o->runtime_first != 2) || ocipp_self_current(o) < 0 || o->attempted || o->create) return -1;
-  unsigned char bytes[144] = {0, 0, 0, 140};
+  /* Runtime3's closed revision is supplied by this actual P before H/CREATE.
+   * The same held executable starts H. It is a producer selector only; the
+   * real consuming H result/READ/owned cleanup remain mandatory. Local4 and
+   * historical runtime3 responses retain their separate legacy semantics. */
+  unsigned char bytes[152] = {0};
+  size_t size = o->runtime_first == 1 ? sizeof(bytes) : 144;
+  bytes[3] = (unsigned char)(size - 4);
   memcpy(bytes + 4, o->runtime_first == 2 ? "TKOINFO4" : "TKOINFO3", 8); memcpy(bytes + 12, o->claim, 64);
   ocipp_put64(bytes + 76, o->generation); ocipp_put64(bytes + 84, o->listener_cookie);
   ocipp_put64(bytes + 92, o->self_device); ocipp_put64(bytes + 100, o->self_inode);
   memcpy(bytes + 108, o->boot_id, 36);
+  if (o->runtime_first == 1) memcpy(bytes + 144, "NCLOSE01", 8);
   int64_t now = ocip_now(); if (now < 0) return -1;
-  return ocip_io(1, bytes, sizeof(bytes), 1, 0, now + 4000);
+  return ocip_io(1, bytes, size, 1, 0, now + 4000);
 }
 static int ocipp_first_create(struct ocipp_owner *o, const unsigned char *body, uint32_t size) {
   if (ocipp_binding_current(o) < 0 || o->create_attempt || o->attempted || o->create ||

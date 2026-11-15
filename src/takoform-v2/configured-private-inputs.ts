@@ -1,4 +1,4 @@
-import type { Sql } from "../ports.ts";
+import type { Sql, SqlStatement } from "../ports.ts";
 import {
   v2ConfiguredUpdateDiscardObjects,
   v2ConfiguredUpdateDiscardSchema,
@@ -199,6 +199,18 @@ const FINAL_DISCARD_SCHEMA: DiscardSchema = DISCARD_SCHEMA.map(([name, type, tab
       : ddl,
 ]);
 
+/** Negative storage fence for an owning atomic finalization, including when
+ * no UPDATE map remains. This fixed shape carries no Native retirement grant. */
+export function v2FinalDeleteConfiguredUpdateSchemaFence(): SqlStatement {
+  return {
+    sql:
+      "(SELECT count(*) FROM sqlite_schema WHERE " +
+      FINAL_DISCARD_SCHEMA.map(() => "(name=? AND type=? AND tbl_name=? AND sql=?)").join(" OR ") +
+      ")=5",
+    params: FINAL_DISCARD_SCHEMA.flatMap((row) => [...row]),
+  };
+}
+
 function schemaReady(
   rows: readonly Record<string, unknown>[],
   schema: DiscardSchema = DISCARD_SCHEMA,
@@ -323,6 +335,8 @@ export interface V2FinalDeleteConfiguredUpdateInput extends V2RetiredConfiguredU
 
 export function createV2FinalDeleteConfiguredUpdateDiscard(options: {
   readonly sql: Sql;
+  /** Optional owning synchronous revocation fence, immediately before batch. */
+  readonly assertCurrent?: () => void;
   readonly assertRetired: (
     input: V2FinalDeleteConfiguredUpdateInput,
     signal: AbortSignal,
@@ -342,7 +356,8 @@ export function createV2FinalDeleteConfiguredUpdateDiscard(options: {
     discardUnavailable();
   const query = options.sql.query.bind(options.sql),
     batch = options.sql.batch.bind(options.sql),
-    assertRetired = options.assertRetired.bind(options);
+    assertRetired = options.assertRetired.bind(options),
+    assertCurrent = options.assertCurrent?.bind(options);
   return Object.freeze({
     async discard(value: V2FinalDeleteConfiguredUpdateInput, signal: AbortSignal): Promise<void> {
       if (!value || typeof value !== "object" || !(signal instanceof AbortSignal) || signal.aborted)
@@ -392,6 +407,7 @@ export function createV2FinalDeleteConfiguredUpdateDiscard(options: {
       ] as const;
       let writes: Awaited<ReturnType<Sql["batch"]>>;
       try {
+        assertCurrent?.();
         if (signal.aborted) discardUnavailable();
         writes = await batch([
           {

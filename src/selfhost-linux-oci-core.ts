@@ -15,6 +15,7 @@ export type SelfhostLinuxOciCoreSelection = Pick<
   | "artifactRoot"
   | "umociBinary"
   | "physicalBinary"
+  | "qualifiedPhysicalDigest"
   | "images"
   | "memoryBytes"
   | "nanoCpus"
@@ -78,7 +79,14 @@ export function createSelfhostLinuxOciCore(input: {
   ];
   dataKeys(
     selection,
-    [...required, "physicalBinary", "egressLimits", "hostTopology", "ociParentControl"],
+    [
+      ...required,
+      "physicalBinary",
+      "qualifiedPhysicalDigest",
+      "egressLimits",
+      "hostTopology",
+      "ociParentControl",
+    ],
     required,
   );
   dataKeys(selection.configuredInputs, ["keyring", "maxSecretBytes"]);
@@ -115,6 +123,10 @@ export function createSelfhostLinuxOciCore(input: {
     umociBinary: selection.umociBinary,
     ...(Object.hasOwn(selection, "physicalBinary") && selection.physicalBinary !== undefined
       ? { physicalBinary: selection.physicalBinary }
+      : {}),
+    ...(Object.hasOwn(selection, "qualifiedPhysicalDigest") &&
+    selection.qualifiedPhysicalDigest !== undefined
+      ? { qualifiedPhysicalDigest: selection.qualifiedPhysicalDigest }
       : {}),
     images: {
       source: images.source,

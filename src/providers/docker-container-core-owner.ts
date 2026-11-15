@@ -2,12 +2,17 @@ import { CONTAINER_CONTRACT as C } from "../container-contract.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
 import type { Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import { parseStrictJson } from "../strict-json.ts";
-import { readV2ConfiguredPrivateInputs } from "../takoform-v2/configured-private-inputs.ts";
+import {
+  createV2FinalDeleteConfiguredUpdateDiscard,
+  readV2ConfiguredPrivateInputs,
+  v2FinalDeleteConfiguredUpdateSchemaFence,
+} from "../takoform-v2/configured-private-inputs.ts";
 import {
   createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerAllocationSchema,
   inspectV2ContainerOwnerApplicationIoSchema,
   inspectV2ContainerOwnerControlSchema,
+  inspectV2ContainerOwnerFinalDeleteSchema,
   serializeV2ContainerConfiguredPrivateInputs,
   V2_CONTAINER_APPLICATION_IO_RESERVED,
   V2_CONTAINER_CONTROL_RESERVED,
@@ -139,6 +144,9 @@ export interface DockerContainerCoreOwnerOptions {
   readonly installationId: string;
   readonly backendId: string;
   readonly targetKey: string;
+  /** Explicit qualified Native build output, independent of OCI image digests.
+   * Selects a producer; it never supplies a termination observation. */
+  readonly qualifiedPhysicalDigest?: string;
   /** Explicit private mode, never selected by a request or old claim. */
   readonly ociParentControl?:
     | "sealed-original@1"
@@ -159,8 +167,14 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<void>;
-  /** Data readback against the SAME original P, not an authenticated restart
-   * session or H-exit/removed grant. Missing original custody refuses. */
+  /** Final storage consumer after this owning Core's genuine Native removal.
+   * It authenticates original control and same-operation close; no DTO grants retirement. */
+  finalizeAcceptedDelete(
+    execution: V2Execution,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<void>;
+  /** Data readback against the SAME original P. Missing original custody refuses. */
   readAcceptedParentControl(
     execution: V2Execution,
     record: DockerContainerCreateRecord,
@@ -581,6 +595,12 @@ export function createDockerContainerCoreOwner(
 ): DockerContainerCoreOwner {
   const { sql, clock, installationId, backendId, targetKey } = options;
   const parentMode = options.ociParentControl;
+  const qualifiedPhysicalDigest = options.qualifiedPhysicalDigest;
+  if (
+    qualifiedPhysicalDigest !== undefined &&
+    !/^sha256:[a-f0-9]{64}$/u.test(qualifiedPhysicalDigest)
+  )
+    return fail();
   const peerMode =
     parentMode === "sealed-peer@1" ||
     parentMode === "sealed-peer-runtime@1" ||
@@ -613,6 +633,7 @@ export function createDockerContainerCoreOwner(
   const deleteExecutions = new Set<ExecutionScope>();
   let configuredInputs: DockerContainerConfiguredInputs | undefined;
   const contexts = new Map<string, Context>();
+  const closedContextAdmission = new Set<string>();
   const leases = new Set<Lease>();
   const now = () => {
     const value = clock();
@@ -629,6 +650,10 @@ export function createDockerContainerCoreOwner(
       })
     )
       return fail();
+    // An already-retired Resource may still have an earlier prepare in flight.
+    // Keep its original SQL admission result without retaining its payload or
+    // letting that late capture cancel the current DELETE lease.
+    if (closedContextAdmission.has(context.resourceUid)) return;
     for (const lease of leases)
       if (
         lease.record.intent.resourceUid === context.resourceUid &&
@@ -790,6 +815,22 @@ export function createDockerContainerCoreOwner(
         fail();
     }
   }
+  // Removed is the existing owning Native CAS, never inferred from absent
+  // material. This permits only historical reads while the SAME DELETE still
+  // owns the Resource; active/bound snapshots retain their original checks.
+  function retiredDeleteProof(proof: Proof, alias: "a" | "la"): boolean {
+    return (
+      alias === "a" &&
+      parentMode === "sealed-peer-runtime@1" &&
+      proof.q_state === "removed" &&
+      proof.la_action === "delete" &&
+      proof.i_retire_operation_id === proof.la_operation_id &&
+      proof.r_last_operation === proof.la_operation_id &&
+      proof.r_phase === "deleting" &&
+      proof.r_deleted_at === null &&
+      Number(proof.a_generation) < Number(proof.la_generation)
+    );
+  }
   function acceptedF2(proof: Proof, acceptanceAlias: "a" | "la", operationAlias: "o" | "lo"): void {
     const a = (key: string) => proof[acceptanceAlias + "_" + key];
     const o = (key: string) => proof[operationAlias + "_" + key];
@@ -904,14 +945,16 @@ export function createDockerContainerCoreOwner(
       (a("action") === "delete" && (configured !== null || o("private_inputs_present") !== 0)) ||
       (a("action") === "create" &&
         names.length > 0 &&
-        (configured === null || o("private_inputs_present") !== 1)) ||
+        ((configured === null && !retiredDeleteProof(proof, acceptanceAlias)) ||
+          o("private_inputs_present") !== 1)) ||
       // An explicit map that declares names must carry its own sealed envelope. An UPDATE
       // without a map keeps what Core captured at admission, which is null when the CREATE
       // had no envelope; its retained source is proved separately at admission.
       (a("action") === "update" &&
         configured === null &&
         names.length > 0 &&
-        o("private_inputs_present") === 1)
+        o("private_inputs_present") === 1 &&
+        !retiredDeleteProof(proof, acceptanceAlias))
     )
       fail();
     // A live preparation keeps its exact original identity; durable recovery
@@ -941,7 +984,9 @@ export function createDockerContainerCoreOwner(
       if (
         !originalPairs.every(([key, value]) => a(key) === value) ||
         (context.privateInputs === undefined ? 0 : 1) !== o("private_inputs_present") ||
-        serializeV2ContainerConfiguredPrivateInputs(context.configuredPrivateInputs) !== configured
+        (serializeV2ContainerConfiguredPrivateInputs(context.configuredPrivateInputs) !==
+          configured &&
+          !(configured === null && retiredDeleteProof(proof, acceptanceAlias)))
       )
         fail();
     }
@@ -980,6 +1025,7 @@ export function createDockerContainerCoreOwner(
   async function configuredSnapshot(proof: Proof, alias: "a" | "la"): Promise<void> {
     const a = (key: string) => proof[alias + "_" + key];
     if (proof.i_form_url !== V2_CONTAINER_F2_FORM || a("action") === "delete") return;
+    if (retiredDeleteProof(proof, alias)) return; // Native receipt precedes final map purge.
     const value = await readV2ConfiguredPrivateInputs(
       sql,
       {
@@ -2285,33 +2331,53 @@ export function createDockerContainerCoreOwner(
       await confirmBoundStopped({ intent, proof, record: saved }, lease);
     },
     async confirmRemoved(input, nativeId) {
-      if (!hex(nativeId)) return fail();
-      const lease = await activeRecord(input, "remove");
-      const { intent, proof } = await load(input.intent);
-      const saved = sameRecord(input, record(intent, proof));
-      if (saved.nativeId !== nativeId || !usable(proof, "remove")) return fail();
-      if (saved.state === "removed") return;
-      if (saved.state !== "bound") return fail();
-      const guard = fence(proof);
-      if (!lease.active || lease.controller.signal.aborted) return fail();
-      const write = await sql.run(
-        "UPDATE tf_v2_container_create_claims SET state='removed',removed_at_ms=? WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND " +
-          guard.sql,
-        [
-          now(),
-          intent.resourceUid,
-          intent.policy.generation,
-          saved.claimId,
-          nativeId,
-          ...guard.params,
-        ],
-      );
-      if (write.changes !== 1) return fail();
-      const after = await load(intent);
-      const removed = sameRecord(input, record(after.intent, after.proof));
-      if (removed.nativeId !== nativeId || removed.state !== "removed") return fail();
+      return confirmRemoved(input, nativeId);
     },
   });
+  async function confirmRemoved(
+    input: DockerContainerCreateRecord,
+    nativeId: string,
+    local?: () => void,
+    execution?: V2Execution,
+  ) {
+    if (!hex(nativeId)) return fail();
+    const lease = await activeRecord(input, "remove");
+    const { intent, proof } = await load(input.intent);
+    const saved = sameRecord(input, record(intent, proof));
+    if (saved.nativeId !== nativeId || !usable(proof, "remove")) return fail();
+    if (saved.state === "removed") return;
+    if (saved.state !== "bound") return fail();
+    const guard = fence(proof);
+    if (execution) await assertExecution(execution);
+    if (!lease.active || lease.controller.signal.aborted) return fail();
+    local?.();
+    if (execution) executionScope(execution);
+    const write = await sql.run(
+      "UPDATE tf_v2_container_create_claims SET state='removed',removed_at_ms=? WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND " +
+        guard.sql +
+        (execution
+          ? " AND EXISTS (SELECT 1 FROM tf_v2_operations op WHERE op.id=? AND op.resource_uid=? AND op.lease_token=? AND op.lease_until_ms>(CAST(strftime('%s','now') AS INTEGER)+1)*1000 AND op.status='reconciling' AND op.effect='unknown' AND op.dispatch_possible=1)"
+          : ""),
+      [
+        now(),
+        intent.resourceUid,
+        intent.policy.generation,
+        saved.claimId,
+        nativeId,
+        ...guard.params,
+        ...(execution ? [execution.operationId, execution.resourceUid, execution.leaseToken] : []),
+      ],
+    );
+    if (write.changes !== 1) return fail();
+    const after = await load(intent);
+    const removed = sameRecord(input, record(after.intent, after.proof));
+    if (removed.nativeId !== nativeId || removed.state !== "removed") return fail();
+    if (execution) {
+      await assertExecution(execution);
+      executionScope(execution);
+    }
+    local?.();
+  }
   function retainedNamespace(
     execution: V2Execution,
     input: DockerContainerCreateRecord,
@@ -2517,18 +2583,47 @@ export function createDockerContainerCoreOwner(
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-    management: boolean | "application-recovery" = false,
-  ) {
+    management: "retired",
+  ): Promise<() => Promise<() => void>>;
+  async function acceptedParentControl(
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    management?: boolean | "application-recovery",
+  ): Promise<
+    LinuxOciParentHResult | LinuxOciPeerInitProgress | LinuxOciApplicationOwnerExit | undefined
+  >;
+  async function acceptedParentControl(
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    management: boolean | "application-recovery" | "retired" = false,
+  ): Promise<
+    | LinuxOciParentHResult
+    | LinuxOciPeerInitProgress
+    | LinuxOciApplicationOwnerExit
+    | (() => Promise<() => void>)
+    | undefined
+  > {
     if (parentMode === undefined || !controlDecryptionKey || signal.aborted) return fail();
     await assertExecution(execution);
     if (management) {
-      if (!peerMode || input.state !== "bound" || !hex(input.nativeId)) return fail();
+      if (
+        !peerMode ||
+        input.state !== (management === "retired" ? "removed" : "bound") ||
+        !hex(input.nativeId)
+      )
+        return fail();
       const accepted = await result.readAcceptedExecution(execution);
       const retained = accepted.retained.find((item) => item.record.claimId === input.claimId);
       if (
         (accepted.action !== "delete" && accepted.action !== "update") ||
         !retained ||
-        retained.removedAtMs !== null ||
+        (management === "retired"
+          ? retained.removedAtMs === null
+          : retained.removedAtMs !== null) ||
         input.intent.policy.generation >= accepted.generation ||
         canonicalJson(retained.record) !== canonicalJson(input)
       )
@@ -2618,6 +2713,13 @@ export function createDockerContainerCoreOwner(
       const binding = parseStrictJson(plaintext, 65536);
       if (peerMode && (!isJsonObject(binding) || binding.purpose !== peerReconstructionPurpose))
         return fail();
+      const finalProducer =
+        parentMode === "sealed-peer-runtime@1" &&
+        qualifiedPhysicalDigest !== undefined &&
+        isJsonObject(binding) &&
+        own(binding.retirementProducer, ["revision", "digest"]) &&
+        binding.retirementProducer.revision === "NCLOSE01" &&
+        binding.retirementProducer.digest === qualifiedPhysicalDigest;
       if (JSON.stringify(binding) !== new TextDecoder("utf-8", { fatal: true }).decode(plaintext))
         return fail();
       await assertSnapshot(loaded.proof);
@@ -2628,6 +2730,83 @@ export function createDockerContainerCoreOwner(
         [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
       );
       if (fresh.length !== 1 || fresh[0]?.native_control !== raw || signal.aborted) return fail();
+      if (management === "retired") {
+        if (
+          !finalProducer ||
+          execution.action !== "delete" ||
+          !retiredDeleteProof(loaded.proof, "a") ||
+          !(await inspectV2ContainerOwnerFinalDeleteSchema(sql))
+        )
+          return fail();
+        const rows = await sql.query(
+          "SELECT allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='removed' AND native_id=? AND native_control=?",
+          [
+            input.intent.resourceUid,
+            input.intent.policy.generation,
+            input.claimId,
+            input.nativeId,
+            raw,
+          ],
+        );
+        if (rows.length !== 1 || rows[0]?.allocation_cleanup !== "closed") return fail();
+        const document = rows[0]?.application_io_cleanup;
+        const ioScope = await applicationCloseScope(scope, loaded.proof, execution, input, raw);
+        const factCurrent = await readApplicationCloseFact(document, ioScope);
+        // Cipherpayload alone may move monotonically to NULL in this explicit
+        // successor. Pin all nonsecret original fields and actual control/close.
+        const nonsecret = fields.filter(
+          (field) => field.key !== "a_configured_private_inputs_json",
+        );
+        const snapshotSql =
+          "EXISTS (SELECT 1" +
+          from +
+          " WHERE " +
+          nonsecret.map((field) => field.column + " IS ?").join(" AND ") +
+          ")";
+        const snapshotParams = nonsecret.map((field) => loaded.proof[field.key]!);
+        const localRetired = () => {
+          if (
+            !controlDecryptionKey ||
+            controlDecryptionKey(originalControlKeyId) !== key ||
+            signal.aborted ||
+            !lease.active ||
+            lease.controller.signal.aborted ||
+            !leases.has(lease)
+          )
+            return fail();
+          factCurrent();
+          executionScope(execution);
+        };
+        const currentRetired = async () => {
+          const exact = await sql.query(
+            "SELECT 1 AS owner_current WHERE " + snapshotSql,
+            snapshotParams,
+          );
+          if (exact.length !== 1 || exact[0]?.owner_current !== 1) return fail();
+          const row = await sql.query(
+            "SELECT native_control,allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='removed' AND native_id=?",
+            [
+              input.intent.resourceUid,
+              input.intent.policy.generation,
+              input.claimId,
+              input.nativeId,
+            ],
+          );
+          if (
+            row.length !== 1 ||
+            row[0]?.native_control !== raw ||
+            row[0]?.allocation_cleanup !== "closed" ||
+            row[0]?.application_io_cleanup !== document ||
+            !(await current(lease))
+          )
+            return fail();
+          await assertExecution(execution);
+          localRetired();
+          return localRetired;
+        };
+        await currentRetired();
+        return currentRetired; // negative currentness, not a new Native observation/effect
+      }
       let missingApplicationDocument: string | null | undefined;
       if (
         (parentMode === "sealed-peer-runtime@1" ||
@@ -2708,7 +2887,33 @@ export function createDockerContainerCoreOwner(
           if (observation.kind !== "linux-oci-parent-h-exited@1" || observation.error !== 0)
             return fail();
           await guard();
-          return observation; // original P's result only; no allocation/removed CAS
+          if (
+            management &&
+            finalProducer &&
+            execution.action === "delete" &&
+            (await inspectV2ContainerOwnerFinalDeleteSchema(sql))
+          ) {
+            await guard();
+            await confirmRemoved(
+              input,
+              input.nativeId ?? fail(),
+              () => {
+                if (
+                  signal.aborted ||
+                  !lease.active ||
+                  lease.controller.signal.aborted ||
+                  !leases.has(lease) ||
+                  !controlDecryptionKey ||
+                  controlDecryptionKey(controlKeyId) !== key
+                )
+                  return fail();
+                executionScope(execution);
+                factCurrent();
+              },
+              execution,
+            );
+          }
+          return observation; // same original readonly P/H result; optional owning CAS above
         }
       }
       if (management === "application-recovery") {
@@ -3060,6 +3265,38 @@ export function createDockerContainerCoreOwner(
                   // Historical NULL and consumed UNKNOWN never acquire untouched
                   // from this fresh creator or from a path/absence observation.
                 }
+                if (
+                  finalProducer &&
+                  execution.action === "delete" &&
+                  applicationFactCurrent &&
+                  (await inspectV2ContainerOwnerFinalDeleteSchema(sql))
+                ) {
+                  const factCurrent = applicationFactCurrent;
+                  await currentApplication();
+                  const terminal = await sql.query(
+                    "SELECT allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=?",
+                    [
+                      input.intent.resourceUid,
+                      input.intent.policy.generation,
+                      input.claimId,
+                      input.nativeId,
+                      raw,
+                    ],
+                  );
+                  if (terminal.length !== 1 || terminal[0]?.allocation_cleanup !== "closed")
+                    return fail();
+                  await assertExecution(execution);
+                  const local = () => {
+                    localApplication();
+                    factCurrent();
+                    if (!controlDecryptionKey || controlDecryptionKey(originalControlKeyId) !== key)
+                      return fail();
+                  };
+                  local();
+                  await confirmRemoved(input, input.nativeId, local, execution);
+                  complete = true;
+                  return observation; // no stale bound-snapshot check after the real owning CAS
+                }
               }
               if (observation.operation === "join-init") {
                 // Only the same actual private connector can supply this original
@@ -3263,6 +3500,178 @@ export function createDockerContainerCoreOwner(
       )
         return fail();
       return observation;
+    },
+    async finalizeAcceptedDelete(execution, originalCustody, signal) {
+      if (
+        parentMode !== "sealed-peer-runtime@1" ||
+        execution.action !== "delete" ||
+        signal.aborted ||
+        !(await inspectV2ContainerOwnerFinalDeleteSchema(sql))
+      )
+        return fail();
+      const accepted = await result.readAcceptedExecution(execution);
+      if (
+        !accepted.retained.length ||
+        accepted.retained.some(
+          (item) =>
+            item.record.state !== "removed" ||
+            item.record.nativeId === null ||
+            item.removedAtMs === null,
+        )
+      )
+        return fail();
+      // Keep the actual original remove leases and decrypted same-operation
+      // control/close facts alive through final material disposal. A removed
+      // string or missing map alone cannot enter this owning closure.
+      const sources: { refresh: () => Promise<() => void>; proof: Proof }[] = [];
+      let localFences: (() => void)[] = [];
+      const local = () => {
+        if (signal.aborted || localFences.length !== sources.length) return fail();
+        executionScope(execution);
+        for (const fence of localFences) fence();
+      };
+      const refresh = async () => {
+        const fences: (() => void)[] = [];
+        for (const source of sources) fences.push(await source.refresh());
+        localFences = fences;
+        local();
+      };
+      const finish = async (index: number): Promise<void> => {
+        const item = accepted.retained[index];
+        if (item) {
+          return owner.withAuthority(item.record, "remove", async () => {
+            const current = await acceptedParentControl(
+              execution,
+              item.record,
+              originalCustody,
+              signal,
+              "retired",
+            );
+            const loaded = await load(item.record.intent);
+            sameRecord(item.record, record(loaded.intent, loaded.proof));
+            if (!retiredDeleteProof(loaded.proof, "a")) return fail();
+            sources.push({ refresh: current, proof: loaded.proof });
+            await finish(index + 1);
+          });
+        }
+        await refresh();
+        const materials = await sql.query(
+          "SELECT operation_id,generation FROM tf_v2_operation_configured_private_inputs WHERE resource_uid=? LIMIT 4097",
+          [accepted.resourceUid],
+        );
+        if (materials.length > 4096) return fail();
+        for (const material of materials) {
+          const source = sources.find(
+            (source) =>
+              source.proof.a_operation_id === material.operation_id &&
+              source.proof.a_generation === material.generation,
+          );
+          if (
+            !source ||
+            typeof material.operation_id !== "string" ||
+            typeof material.generation !== "number" ||
+            material.generation < 2
+          )
+            return fail();
+          const input = Object.freeze({
+            principal: accepted.principal,
+            space: accepted.space,
+            name: accepted.name,
+            form: accepted.form,
+            resourceUid: accepted.resourceUid,
+            backendId,
+            targetKey,
+            operationId: material.operation_id,
+            generation: material.generation,
+            deleteOperationId: execution.operationId,
+            deleteGeneration: execution.generation,
+            leaseToken: execution.leaseToken,
+          });
+          const discard = createV2FinalDeleteConfiguredUpdateDiscard({
+            sql,
+            assertCurrent: local,
+            async assertRetired(candidate, candidateSignal) {
+              if (candidateSignal !== signal || canonicalJson(candidate) !== canonicalJson(input))
+                return fail();
+              await refresh();
+            },
+          });
+          await discard.discard(input, signal);
+        }
+        await refresh();
+        const snapshots = sources.map(({ proof }) => {
+          const nonsecret = fields.filter(
+            (field) => field.key !== "a_configured_private_inputs_json",
+          );
+          return {
+            sql:
+              "EXISTS (SELECT 1" +
+              from +
+              " WHERE " +
+              nonsecret.map((field) => field.column + " IS ?").join(" AND ") +
+              ")",
+            params: nonsecret.map((field) => proof[field.key]!),
+          };
+        });
+        const shape = v2FinalDeleteConfiguredUpdateSchemaFence();
+        const guard = {
+          sql:
+            snapshots.map((value) => value.sql).join(" AND ") +
+            " AND EXISTS (SELECT 1 FROM tf_v2_operations op JOIN tf_v2_resources resource ON resource.uid=op.resource_uid WHERE op.id=? AND op.resource_uid=? AND op.lease_token=? AND op.lease_until_ms>(CAST(strftime('%s','now') AS INTEGER)+1)*1000 AND op.action='delete' AND op.generation=? AND op.status='reconciling' AND op.effect='unknown' AND op.dispatch_possible=1 AND resource.last_operation=op.id AND resource.busy_operation=op.id AND resource.generation=op.generation AND resource.phase='deleting' AND resource.deleted_at IS NULL AND resource.spec_json=op.accepted_spec_json)" +
+            " AND (SELECT count(*) FROM tf_v2_container_create_claims WHERE resource_uid=?)=?" +
+            " AND NOT EXISTS (SELECT 1 FROM tf_v2_operation_configured_private_inputs WHERE resource_uid=?) AND " +
+            shape.sql,
+          params: [
+            ...snapshots.flatMap((value) => value.params),
+            execution.operationId,
+            execution.resourceUid,
+            execution.leaseToken,
+            execution.generation,
+            accepted.resourceUid,
+            sources.length,
+            accepted.resourceUid,
+            ...(shape.params ?? []),
+          ],
+        };
+        const assertion = {
+          sql:
+            "INSERT INTO tf_v2_configured_update_discard_gate(operation_id) SELECT NULL WHERE NOT (" +
+            guard.sql +
+            ")",
+          params: guard.params,
+        };
+        // Native retirement and all original facts are already authenticated.
+        // Release this owner's redundant cipherpayload cache before the final
+        // batch, including a lost-ACK exit. This never grants SQL completion:
+        // durable payload erasure/currentness below must still succeed.
+        local();
+        closedContextAdmission.add(accepted.resourceUid);
+        for (const [operationId, context] of contexts)
+          if (context.resourceUid === accepted.resourceUid) contexts.delete(operationId);
+        local(); // no await before the actual atomic batch dispatch
+        const writes = await sql.batch([
+          assertion,
+          {
+            sql:
+              "UPDATE tf_v2_container_acceptances SET configured_private_inputs_json=NULL WHERE resource_uid=? AND configured_private_inputs_json IS NOT NULL AND " +
+              guard.sql,
+            params: [accepted.resourceUid, ...guard.params],
+          },
+          {
+            sql:
+              assertion.sql +
+              " OR EXISTS (SELECT 1 FROM tf_v2_container_acceptances WHERE resource_uid=? AND configured_private_inputs_json IS NOT NULL)",
+            params: [...guard.params, accepted.resourceUid],
+          },
+        ]);
+        if (writes.length !== 3 || writes[0]?.changes !== 0 || writes[2]?.changes !== 0)
+          return fail();
+        await refresh();
+        local();
+        // Engine's existing deleted_at settlement/0081 trigger destroys the
+        // Resource-owned CREATE map; this consumer does not duplicate it.
+      };
+      await finish(0);
     },
     async claimAcceptedTopology(execution, input) {
       const intent = intentSnapshot(input);

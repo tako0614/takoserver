@@ -1,5 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { accessSync, constants, lstatSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { accessSync, constants, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, join, parse } from "node:path";
 import { canonicalDigest } from "../json.ts";
 import { parseStrictJson } from "../strict-json.ts";
@@ -16,6 +17,12 @@ const STDERR_LIMIT = 65_536;
 const INT_MAX = 2_147_483_647;
 const CLAIM = /^[a-f0-9]{64}$/u;
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
+const RETIREMENT_PRODUCER_REVISION = "NCLOSE01";
+function executableDigest(binary: string): string {
+  const size = lstatSync(binary).size;
+  if (!Number.isSafeInteger(size) || size < 1 || size > 64 * 1024 * 1024) throw failure("binary");
+  return "sha256:" + createHash("sha256").update(readFileSync(binary)).digest("hex");
+}
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const failure = (code = "unavailable") => new Error(`linux_oci_physical_session_${code}`);
@@ -1268,6 +1275,7 @@ export class LinuxOciParentBootstrap {
   readonly #generation: number;
   readonly #capability: Buffer;
   readonly #binary: string;
+  readonly #runtimeBinaryDigest: string | undefined;
   readonly #binaryIdentity: Readonly<{
     path: string;
     dev: number;
@@ -1280,6 +1288,7 @@ export class LinuxOciParentBootstrap {
   readonly #runtimeFirst: boolean;
   readonly #localCleanup: boolean;
   readonly #applicationProfile: boolean;
+  #retirementProducer: Readonly<{ revision: string; digest: string }> | undefined;
   #applicationOwner: LinuxOciApplicationOwnerIdentity | undefined;
   #peer: LinuxOciParentPeerIdentity | undefined;
   #peerConnector: ChildProcessWithoutNullStreams | undefined;
@@ -1353,6 +1362,8 @@ export class LinuxOciParentBootstrap {
       uid: stat.uid,
       mode: stat.mode,
     });
+    this.#runtimeBinaryDigest =
+      this.#runtimeFirst && !this.#localCleanup ? executableDigest(binary) : undefined;
     this.#assertBinary();
     this.#child = spawn(
       binary,
@@ -1548,6 +1559,7 @@ export class LinuxOciParentBootstrap {
         capability: encodeContainerSecretBytes(this.#capability),
         executable: this.#binaryIdentity,
         peer: this.#peer,
+        ...(this.#retirementProducer ? { retirementProducer: this.#retirementProducer } : {}),
         ...(this.#applicationProfile ? { applicationOwner: this.#applicationOwner } : {}),
         createDigest: await canonicalDigest(actual),
         ...(originalAllocation === undefined
@@ -1727,6 +1739,11 @@ export class LinuxOciParentBootstrap {
       throw failure("parent_retained");
     try {
       this.#assertBinary();
+      if (
+        this.#retirementProducer &&
+        executableDigest(this.#binary) !== this.#retirementProducer.digest
+      )
+        throw failure("parent_binary");
     } catch {
       this.#break();
       throw failure("parent_binary");
@@ -1746,18 +1763,42 @@ export class LinuxOciParentBootstrap {
   #data(chunk: Buffer): void {
     if (!this.#usable || this.#handoff) return;
     try {
-      const length = this.#applicationProfile ? 156 : this.#peerProfile ? 140 : 88;
+      const extendedRuntime = this.#runtimeFirst && !this.#localCleanup;
+      const maximum = extendedRuntime
+        ? 148
+        : this.#applicationProfile
+          ? 156
+          : this.#peerProfile
+            ? 140
+            : 88;
       if (
         !this.#pending ||
         !Buffer.isBuffer(chunk) ||
-        chunk.length > length + 4 - this.#buffer.length
+        chunk.length > maximum + 4 - this.#buffer.length
       )
         throw failure();
       this.#buffer = Buffer.concat([this.#buffer, chunk]);
       if (this.#buffer.length < 4) return;
-      if (this.#buffer.readUInt32BE(0) !== length) throw failure();
+      const length = this.#buffer.readUInt32BE(0);
+      if (
+        length !== (this.#applicationProfile ? 156 : this.#peerProfile ? 140 : 88) &&
+        !(extendedRuntime && length === 148)
+      )
+        throw failure();
       if (this.#buffer.length !== length + 4) return;
       const body = this.#buffer.subarray(4);
+      if (extendedRuntime && length === 148) {
+        if (!body.subarray(140, 148).equals(Buffer.from(RETIREMENT_PRODUCER_REVISION, "ascii")))
+          throw failure();
+        this.#assertBinary();
+        const digest = this.#runtimeBinaryDigest;
+        if (digest === undefined || executableDigest(this.#binary) !== digest) throw failure();
+        this.#retirementProducer = Object.freeze({
+          revision: RETIREMENT_PRODUCER_REVISION,
+          digest,
+        });
+        this.#assertBinary();
+      }
       const cookie = body.readBigUInt64BE(80);
       if (
         !body
@@ -2047,6 +2088,7 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     value.purpose === "takoserver.linux-oci-peer-application-owner-reconstruction@1";
   const keys = [
     ...(applicationProfile ? ["applicationOwner"] : []),
+    ...(record(value) && Object.hasOwn(value, "retirementProducer") ? ["retirementProducer"] : []),
     "kind",
     "claimId",
     "generation",
@@ -2089,9 +2131,26 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     lifetime.aborted
   )
     throw failure("parent_binding");
-  const assertBinary = ownedExecutable(binary),
+  const originalBinary = ownedExecutable(binary),
     stat = lstatSync(binary),
     executable = value.executable;
+  const producer = value.retirementProducer;
+  if (
+    producer !== undefined &&
+    (value.purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1" ||
+      !exact(producer, ["revision", "digest"]) ||
+      producer.revision !== RETIREMENT_PRODUCER_REVISION ||
+      typeof producer.digest !== "string" ||
+      !DIGEST.test(producer.digest))
+  )
+    throw failure("parent_binding");
+  const assertBinary = () => {
+    originalBinary();
+    if (producer !== undefined && executableDigest(binary) !== producer.digest)
+      throw failure("parent_binary");
+    originalBinary();
+  };
+  assertBinary();
   if (
     executable.path !== binary ||
     executable.dev !== stat.dev ||

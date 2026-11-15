@@ -24,6 +24,9 @@ async function fixture(
     v1?: boolean;
     normal?: boolean;
     runtimeFirst?: boolean;
+    qualifiedProducer?: boolean;
+    producerRevision?: "missing" | "wrong";
+    producerDigest?: "missing" | "wrong";
     localCleanup?: boolean;
     applicationOwner?: boolean;
     configuredPeer?: boolean;
@@ -79,6 +82,11 @@ async function fixture(
     const f = await originalOwnedOciFixture(false, {
       ...(options.v1 ? { parentControl: true } : { parentPeer: true }),
       ...(options.runtimeFirst ? { parentPeerRuntime: true } : {}),
+      ...(options.qualifiedProducer ? { qualifiedProducer: true } : {}),
+      ...(options.producerRevision === undefined
+        ? {}
+        : { producerRevision: options.producerRevision }),
+      ...(options.producerDigest === undefined ? {} : { producerDigest: options.producerDigest }),
       ...(options.localCleanup ? { parentPeerLocal: true } : {}),
       ...(options.applicationOwner ? { parentPeerApplicationOwner: true } : {}),
       ...(options.pending === undefined ? {} : { peerPending: options.pending }),

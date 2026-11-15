@@ -77,6 +77,9 @@ async function fixture(
     readonly parentControl?: boolean;
     readonly parentPeer?: boolean;
     readonly parentPeerRuntime?: boolean;
+    readonly qualifiedProducer?: boolean;
+    readonly producerRevision?: "missing" | "wrong";
+    readonly producerDigest?: "missing" | "wrong";
     readonly parentPeerLocal?: boolean;
     readonly parentPeerApplicationOwner?: boolean;
     readonly peerPending?: boolean;
@@ -309,6 +312,14 @@ async function fixture(
       umociBinary: unpacker,
       ...(adversarial.nativeMode !== undefined && !adversarial.noPhysicalBinary
         ? { physicalBinary }
+        : {}),
+      ...(adversarial.qualifiedProducer && adversarial.producerDigest !== "missing"
+        ? {
+            qualifiedPhysicalDigest:
+              adversarial.producerDigest === "wrong"
+                ? `sha256:${"0".repeat(64)}`
+                : digest(await readFile(physicalBinary)),
+          }
         : {}),
       memoryBytes: 268435456,
       nanoCpus: 500000000,
@@ -744,7 +755,15 @@ async function fixture(
                       ? "linux-oci-parent-bootstrap@3"
                       : "linux-oci-parent-bootstrap@2",
               );
-              const response = Buffer.alloc(adversarial.parentPeerApplicationOwner ? 160 : 144);
+              const producer =
+                adversarial.qualifiedProducer &&
+                adversarial.parentPeerRuntime &&
+                !adversarial.parentPeerLocal &&
+                !adversarial.parentPeerApplicationOwner &&
+                adversarial.producerRevision !== "missing";
+              const response = Buffer.alloc(
+                producer ? 152 : adversarial.parentPeerApplicationOwner ? 160 : 144,
+              );
               response.writeUInt32BE(response.length - 4);
               response.write(
                 adversarial.parentPeerApplicationOwner
@@ -766,6 +785,12 @@ async function fixture(
                 response.writeBigUInt64BE(5n, 144);
                 response.writeBigUInt64BE(0x123456789abcdef1n, 152);
               }
+              if (producer)
+                response.write(
+                  adversarial.producerRevision === "wrong" ? "NCLOSE00" : "NCLOSE01",
+                  144,
+                  "ascii",
+                );
               stdout.write(response);
               done();
               return;

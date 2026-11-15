@@ -781,18 +781,103 @@ const applicationIoReady =
     applicationIoNames,
   ) +
   ")";
-export async function inspectV2ContainerOwnerApplicationIoSchema(sql: Sql): Promise<boolean> {
+/** Explicit successor only. Native removal is established by its owning
+ * consumer; this guard permits only final DELETE cipherpayload erasure and
+ * retains every accepted identity/fingerprint/audit field. No active rewrite. */
+const finalDeleteAcceptance = trigger(
+  "acceptance_immutable",
+  A,
+  "BEFORE UPDATE",
+  refuse(`OLD.configured_private_inputs_json IS NOT NULL
+    AND NEW.configured_private_inputs_json IS NULL
+    AND ${same(["operation_id", "resource_uid", "installation_id", "incarnation_id", "principal", "space", "name", "form_url", "backend_id", "target_key", "action", "generation", "backend_key", "replay_key", "fingerprint", "accepted_spec_json", "accepted_output_json", "references_json", "accepted_at", "retain_until", "revision"])}
+    AND EXISTS (SELECT 1 FROM tf_v2_resources resource
+      JOIN tf_v2_operations op ON op.id=resource.last_operation
+      JOIN ${I} instance ON instance.resource_uid=resource.uid
+      WHERE resource.uid=OLD.resource_uid AND resource.principal=OLD.principal
+        AND resource.space=OLD.space AND resource.name=OLD.name AND resource.form_url=OLD.form_url
+        AND resource.backend_id=OLD.backend_id AND resource.target_key=OLD.target_key
+        AND resource.phase='deleting' AND resource.deleted_at IS NULL
+        AND resource.generation=op.generation AND resource.busy_operation=op.id
+        AND resource.spec_json=op.accepted_spec_json AND op.resource_uid=resource.uid
+        AND op.principal=resource.principal AND op.backend_id=resource.backend_id AND op.target_key=resource.target_key
+        AND op.action='delete' AND op.generation>OLD.generation
+        AND op.status='reconciling' AND op.effect='unknown' AND op.dispatch_possible=1
+        AND op.lease_token IS NOT NULL AND op.lease_until_ms>(CAST(strftime('%s','now') AS INTEGER)+1)*1000
+        AND instance.installation_id=OLD.installation_id AND instance.incarnation_id=OLD.incarnation_id
+        AND instance.retire_operation_id=op.id AND instance.desired_generation=op.generation
+        AND EXISTS (SELECT 1 FROM ${Q} claim WHERE claim.resource_uid=resource.uid)
+        AND NOT EXISTS (SELECT 1 FROM ${Q} claim WHERE claim.resource_uid=resource.uid
+          AND (claim.state<>'removed' OR claim.allocation_cleanup IS NOT 'closed'
+            OR json_extract(claim.application_io_cleanup,'$.scope.operation.operationId') IS NOT op.id)))
+    AND NOT EXISTS (SELECT 1 FROM tf_v2_operation_configured_private_inputs material
+      WHERE material.resource_uid=OLD.resource_uid)`),
+);
+const finalDeleteObjects = Object.freeze(
+  applicationIoObjects.map((item) =>
+    item.name === finalDeleteAcceptance.name ? finalDeleteAcceptance : item,
+  ),
+);
+const finalDeleteRows = Object.freeze(
+  finalDeleteObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const finalDeleteNames = finalDeleteObjects.map((item) => literal(item.name)).join(", ");
+const finalDeleteReadyParams = Object.freeze([JSON.stringify(finalDeleteRows)]);
+const finalDeleteReady =
+  "(WITH container_owner_final_delete_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, row, column) =>
+      `json_extract((SELECT document FROM container_owner_final_delete_values), '$[${row}][${column}]')`,
+    finalDeleteRows,
+    finalDeleteNames,
+  ) +
+  ")";
+export const V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  objects: finalDeleteObjects,
+  statements: Object.freeze([
+    {
+      sql: "CREATE TABLE __tako_container_final_delete_transition (ok INTEGER NOT NULL CHECK(ok=1))",
+    },
+    {
+      sql: `INSERT INTO __tako_container_final_delete_transition VALUES (${applicationIoReady})`,
+      params: applicationIoReadyParams,
+    },
+    { sql: `DROP TRIGGER ${finalDeleteAcceptance.name}` },
+    { sql: finalDeleteAcceptance.sql },
+    { sql: "DROP TABLE __tako_container_final_delete_transition" },
+  ]),
+});
+export async function inspectV2ContainerOwnerFinalDeleteSchema(sql: Sql): Promise<boolean> {
   try {
-    const rows = await sql.query(`SELECT ${applicationIoReady} AS ready`, applicationIoReadyParams);
+    const rows = await sql.query(`SELECT ${finalDeleteReady} AS ready`, finalDeleteReadyParams);
     return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
   } catch {
     return false;
   }
 }
-const selectedAllocationReady = "(" + allocationReady + " OR " + applicationIoReady + ")";
+const selectedApplicationIoReady = "(" + applicationIoReady + " OR " + finalDeleteReady + ")";
+const selectedApplicationIoReadyParams = Object.freeze([
+  ...applicationIoReadyParams,
+  ...finalDeleteReadyParams,
+]);
+export async function inspectV2ContainerOwnerApplicationIoSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(
+      `SELECT ${selectedApplicationIoReady} AS ready`,
+      selectedApplicationIoReadyParams,
+    );
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+const selectedAllocationReady = "(" + allocationReady + " OR " + selectedApplicationIoReady + ")";
 const selectedAllocationReadyParams = Object.freeze([
   ...allocationReadyParams,
-  ...applicationIoReadyParams,
+  ...selectedApplicationIoReadyParams,
 ]);
 const selectedControlReady = "(" + controlReady + " OR " + selectedAllocationReady + ")";
 const selectedControlReadyParams = Object.freeze([
