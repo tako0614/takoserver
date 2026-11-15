@@ -38,7 +38,9 @@ async function microtasks() {
 
 // Actual factory, wire framing and Web Streams; only Node HTTP/fs/toWeb and
 // the optional negative outer-reader cancel boundary are replaced. No OS I/O.
-async function boundary(options: { frame?: boolean; cancelError?: Error } = {}) {
+async function boundary(
+  options: { frame?: boolean; cancelError?: Error; innerCancelError?: Error } = {},
+) {
   const directory = "/NONSECRET-broker-handler";
   const socketName = `${"b".repeat(64)}.sock`;
   const path = `${directory}/${socketName}`;
@@ -72,6 +74,12 @@ async function boundary(options: { frame?: boolean; cancelError?: Error } = {}) 
         cancel() {
           cancelCalls++;
           events.push("reader.cancel");
+          if (options.innerCancelError) {
+            const error = options.innerCancelError;
+            return cancel.promise.then(() => {
+              throw error;
+            });
+          }
           return cancel.promise;
         },
       },
@@ -374,6 +382,35 @@ test("close releases original outgoing backpressure and joins its reader finally
     io.cancel.resolve();
     expect(await closing.result).toEqual({ status: "fulfilled" });
     expect(active.task?.state()).toBe("fulfilled");
+  } finally {
+    await io.dispose(closing);
+  }
+});
+
+test("actual inner reader rejection reaches shared socket close before unlink", async () => {
+  const error = Error("NONSECRET actual inner cancellation failure");
+  const io = await boundary({ innerCancelError: error });
+  io.accept();
+  io.responseReady.resolve();
+  await microtasks();
+  const original = io.socket.close();
+  const closing = observed(original);
+  try {
+    expect(io.socket.close()).toBe(original);
+    io.finishServerClose();
+    await microtasks();
+    expect(io.counts().cancelCalls).toBe(1);
+    expect(closing.state()).toBe("pending");
+    io.cancel.resolve();
+    const result = await closing.result;
+    expect(result.status).toBe("rejected");
+    if (result.status === "rejected") expect(result.reason).toBe(error);
+    expect(io.events).not.toContain("unlink");
+    const before = [...io.events];
+    expect(io.socket.close()).toBe(original);
+    expect(await observed(io.socket.close()).result).toEqual(result);
+    expect(io.counts().cancelCalls).toBe(1);
+    expect(io.events).toEqual(before);
   } finally {
     await io.dispose(closing);
   }

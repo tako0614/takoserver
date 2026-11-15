@@ -121,7 +121,7 @@ export function createContainerBindingWire(
                 }
               },
               async cancel() {
-                await input.cancel().catch(() => {});
+                await input.cancel();
               },
             },
             { highWaterMark: 0 },
