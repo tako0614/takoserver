@@ -281,6 +281,10 @@ export {
   sharedAppStagingNameFromHost,
 } from "./shared-app-name.ts";
 export { createD1Sql } from "./sql-d1.ts";
+export type {
+  V2SqliteBindingGrant,
+  V2SqliteSelectedVersionObserver,
+} from "./sqlite-binding-authority-types.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { currentTakoformCandidates } from "./takoform/current-candidates.ts";
 export {
