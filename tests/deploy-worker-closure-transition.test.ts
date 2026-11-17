@@ -508,6 +508,253 @@ function withRoot<T>(name: string, body: (root: string) => Promise<T>): Promise<
 }
 
 describe("reviewed Worker closure transition", () => {
+  test("fresh100 Console origin successor preserves its exact NORMAL closure and scoped gate", async () => {
+    await withRoot("takoserver-fresh100-console-origin-", async (root) => {
+      const { edgeSupplies: _edge, ...base } = storageRebindTarget;
+      const selected = {
+        ...base,
+        consoleOrigin: "https://console.integration.example.test",
+        takoformV2: { config: V2_PUBLIC_CONFIG, storageLineage: "v2-0100" },
+      } satisfies DeployTarget;
+      const parts = fixture(root, {
+        selected,
+        predecessor: { selected, v2Startup: true, dropVar: "TAKOSERVER_CONSOLE_ORIGIN" },
+        storeSecrets: expectedWorkerSecrets(selected),
+        local: schemaMigrations,
+        applied: schemaMigrations,
+        auditedShape: canonicalMoneyShape,
+      });
+      const delta: WorkerClosureDelta = {
+        retiredVars: [],
+        addedVars: ["TAKOSERVER_CONSOLE_ORIGIN"],
+        refreshedVars: [],
+        addedBindings: [],
+        addedSecrets: [],
+        rotatedSecrets: [],
+      };
+      const invocation = {
+        surface: "takoserver-worker-authority-cutover",
+        environment: "integration",
+        commit: COMMIT,
+        closurePredecessorVersionId: PREDECESSOR,
+        delta,
+      } as const;
+      const options = {
+        ...parts,
+        outputDirectory: root,
+        review: "reviewer@example.test",
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        integrationStorageVerification: baseIntegrationStorageVerificationOptions(selected, {
+          readState: async () => ({
+            applied: schemaMigrations,
+            shape: canonicalMoneyShape,
+            shapeDigest: `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`,
+          }),
+        }),
+        fetcher: publishedProductFetcher(),
+      };
+      const result = await runWorkerClosureTransition(
+        { ...invocation, action: "apply" },
+        selected,
+        options,
+      );
+      expect(result).toMatchObject({
+        state: "closure-transition-applied",
+        mutationApplied: true,
+        previousVersionId: PREDECESSOR,
+        versionId: SUCCESSOR,
+        pendingMigrations: [],
+        carriedSecrets: expectedWorkerSecrets(selected),
+      });
+      const uploads = parts.calls.filter((call) => call.includes("--no-bundle"));
+      expect(uploads).toHaveLength(1);
+      expect(uploads[0]).not.toContain("--secrets-file");
+      expect(parts.calls).not.toContainEqual(["bun", "run", "check"]);
+      expect(parts.calls).toContainEqual(["bun", "run", "typecheck:worker"]);
+      expect(
+        parts.calls.some((call) => call.includes("tests/deploy-worker-closure-transition.test.ts")),
+      ).toBe(true);
+      const status = await runWorkerClosureTransition(
+        { ...invocation, action: "status" },
+        selected,
+        options,
+      );
+      expect(status).toMatchObject({
+        state: "closure-transition-applied",
+        ready: true,
+        pendingMigrations: [],
+      });
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    });
+  });
+
+  test.each([
+    "foreign local ledger",
+    "foreign schema shape",
+    "missing storage proof",
+    "storage proof withdrawn after gate",
+    "wrong predecessor binding type",
+    "additional closure delta",
+    "wrong selected source",
+    "wrong Money policy",
+    "scoped gate failure",
+    "lost upload acknowledgement",
+  ] as const)(
+    "fresh100 Console origin successor refuses %s without a blind resend",
+    async (mode) => {
+      await withRoot("takoserver-fresh100-console-refusal-", async (root) => {
+        const { edgeSupplies: _edge, ...base } = storageRebindTarget;
+        const selected = {
+          ...base,
+          consoleOrigin: "https://console.integration.example.test",
+          takoformV2: { config: V2_PUBLIC_CONFIG, storageLineage: "v2-0100" },
+        } satisfies DeployTarget;
+        const parts = fixture(root, {
+          selected,
+          predecessor: {
+            selected,
+            v2Startup: true,
+            dropVar: "TAKOSERVER_CONSOLE_ORIGIN",
+            ...(mode === "additional closure delta"
+              ? { extraVar: "TAKOSERVER_OLD_CONSOLE_SETTING" }
+              : {}),
+          },
+          storeSecrets: expectedWorkerSecrets(selected),
+          local:
+            mode === "foreign local ledger"
+              ? [...schemaMigrations.slice(0, -1), "0100_foreign.sql"]
+              : schemaMigrations,
+          applied: schemaMigrations,
+          auditedShape: mode === "foreign schema shape" ? "[]" : canonicalMoneyShape,
+          ...(mode === "wrong Money policy" ? { moneyUnitPolicy: [] } : {}),
+        });
+        let storageReads = 0;
+        const verification = baseIntegrationStorageVerificationOptions(selected, {
+          readState: async () => ({
+            applied: schemaMigrations,
+            shape: canonicalMoneyShape,
+            shapeDigest: `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`,
+          }),
+        });
+        const storageProvider = verification.provider;
+        if (storageProvider === undefined) throw new Error("original fixture provider is required");
+        const invocation = {
+          surface: "takoserver-worker-authority-cutover",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: {
+            retiredVars:
+              mode === "additional closure delta" ? ["TAKOSERVER_OLD_CONSOLE_SETTING"] : [],
+            addedVars: ["TAKOSERVER_CONSOLE_ORIGIN"],
+            refreshedVars: [],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+          },
+        } as const;
+        const options = {
+          ...parts,
+          state: {
+            ...parts.state,
+            async workerVersion(workerName: string, versionId: string) {
+              if (mode !== "wrong predecessor binding type" || versionId !== PREDECESSOR) {
+                return await parts.state.workerVersion(workerName, versionId);
+              }
+              const version = predecessorVersion({
+                selected,
+                v2Startup: true,
+                dropVar: "TAKOSERVER_CONSOLE_ORIGIN",
+              });
+              return {
+                ...version,
+                resources: {
+                  bindings: version.resources.bindings.map((binding) =>
+                    binding.name === V2_CONFIG_VAR ? { ...binding, type: "secret_text" } : binding,
+                  ),
+                },
+              };
+            },
+          },
+          run: async (...args: Parameters<typeof parts.run>) => {
+            const result = await parts.run(...args);
+            const command = args[0];
+            if (mode === "wrong selected source" && command.join(" ") === "git rev-parse HEAD") {
+              return ok(`${LIVE_COMMIT}\n`);
+            }
+            if (
+              mode === "scoped gate failure" &&
+              command.join(" ") === "bun run typecheck:worker"
+            ) {
+              return { exitCode: 7, stdout: "controlled failure", stderr: "" };
+            }
+            if (mode === "lost upload acknowledgement" && command.includes("--no-bundle")) {
+              return { exitCode: 9, stdout: "", stderr: "controlled lost acknowledgement" };
+            }
+            return result;
+          },
+          outputDirectory: root,
+          review: "reviewer@example.test",
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          integrationStorageVerification: {
+            ...verification,
+            ...(mode === "missing storage proof" || mode === "storage proof withdrawn after gate"
+              ? {
+                  provider: {
+                    getD1: (id: string) => storageProvider.getD1(id),
+                    async getR2(name: string) {
+                      storageReads += 1;
+                      if (mode === "missing storage proof" || storageReads > 1) {
+                        throw new Error("controlled R2 identity read unavailable");
+                      }
+                      return await storageProvider.getR2(name);
+                    },
+                  },
+                }
+              : {}),
+          },
+          fetcher: publishedProductFetcher(),
+        };
+        const failure = await runWorkerClosureTransition(
+          { ...invocation, action: "apply" },
+          selected,
+          options,
+        ).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(DeployError);
+        if (!(failure instanceof DeployError)) throw new Error("expected original owner refusal");
+        expect(failure.phase).toBe(
+          mode === "lost upload acknowledgement" ? "mutation" : "preflight",
+        );
+        const uploads = parts.calls.filter((call) => call.includes("--no-bundle"));
+        expect(uploads).toHaveLength(mode === "lost upload acknowledgement" ? 1 : 0);
+        expect(uploads.some((call) => call.includes("--secrets-file"))).toBe(false);
+        if (mode === "lost upload acknowledgement") {
+          expect(failure.message).toContain(
+            "acknowledgement is indeterminate; do not retry before --status",
+          );
+          const status = await runWorkerClosureTransition(
+            { ...invocation, action: "status" },
+            selected,
+            options,
+          );
+          expect(status).toMatchObject({ ready: true, state: "closure-transition-applied" });
+          expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+        }
+        if (mode === "scoped gate failure") {
+          expect(failure.message).toContain(
+            "fresh100 Console origin Worker typecheck failed (exit 7)",
+          );
+          expect(parts.calls).toContainEqual(["bun", "run", "typecheck:worker"]);
+          expect(parts.calls).not.toContainEqual(["bun", "run", "check"]);
+        }
+        if (mode === "storage proof withdrawn after gate") {
+          expect(storageReads).toBe(2);
+          expect(parts.calls).toContainEqual(["bun", "run", "typecheck:worker"]);
+        }
+      });
+    },
+  );
+
   test("atomically adds v2 startup JSON and cursor secret in one qualified integration upload", async () => {
     await withRoot("takoserver-v2-startup-transition-", async (root) => {
       const auth103 = currentAuth103State;

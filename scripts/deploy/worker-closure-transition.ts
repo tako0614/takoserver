@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
@@ -15,6 +16,7 @@ import {
   verifyIntegrationStorageGenerationTarget,
 } from "./integration-storage-generation.ts";
 import {
+  moneyUnitPolicyReady,
   moneyUnitSchemaReady,
   readD1SchemaState,
   readMigrationArtifact,
@@ -173,6 +175,7 @@ export async function runWorkerClosureTransition(
     throw preflightError("closure predecessor Version ID must be one exact UUID");
   }
   const delta = normalizedWorkerClosureDelta(invocation.delta);
+  const freshConsoleOrigin = isFreshConsoleOriginTransition(target, delta);
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced") {
     if (
       JSON.stringify(delta.addedVars) !== JSON.stringify(["TAKOSERVER_SCHEMA_MAINTENANCE_MODE"]) ||
@@ -231,7 +234,8 @@ export async function runWorkerClosureTransition(
       ? null
       : await selectedStorageVerifier(target)(target, invocation.environment, {
           ...options.integrationStorageVerification,
-          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowCurrentAuditedSuccessor:
+            !freshConsoleOrigin && closureRequiresMoneyUnitSchema(target),
           allowMoneyUnitMaintenance:
             target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
@@ -314,6 +318,7 @@ export async function runWorkerClosureTransition(
           migrations,
           history,
           sourceRepositoryRoot,
+          initialStorageProof,
         ),
         providerExecutorBefore,
       );
@@ -367,8 +372,15 @@ export async function runWorkerClosureTransition(
           mutationApplied: false,
           ready:
             target.schemaMaintenanceMode === undefined &&
-            workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot) &&
-            (!closureRequiresMoneyUnitSchema(target) ||
+            closureSchemaAllowsPending(
+              target,
+              delta,
+              migrationState,
+              sourceRepositoryRoot,
+              initialStorageProof,
+            ) &&
+            (freshConsoleOrigin ||
+              !closureRequiresMoneyUnitSchema(target) ||
               workerMoneyUnitSchemaReady(migrationState, sourceRepositoryRoot)) &&
             (providerExecutorBefore === null || providerExecutorBefore.ready),
         },
@@ -376,13 +388,21 @@ export async function runWorkerClosureTransition(
       );
     }
 
-    if (!workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)) {
+    if (
+      !closureSchemaAllowsPending(
+        target,
+        delta,
+        migrationState,
+        sourceRepositoryRoot,
+        initialStorageProof,
+      )
+    ) {
       throw preflightError(
         "closure transition refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(pending),
       );
     }
-    if (closureRequiresMoneyUnitSchema(target)) {
+    if (!freshConsoleOrigin && closureRequiresMoneyUnitSchema(target)) {
       assertWorkerMoneyUnitSchema(migrationState, sourceRepositoryRoot, "preflight");
     }
     const reviewer = exactReviewer(
@@ -416,8 +436,40 @@ export async function runWorkerClosureTransition(
       commit: invocation.commit,
       run,
     });
-    const gates =
-      delta.storageRebind === undefined
+    const gates = freshConsoleOrigin
+      ? [
+          {
+            label: "fresh100 Console origin Worker typecheck",
+            command: ["bun", "run", "typecheck:worker"],
+          },
+          {
+            label: "focused fresh100 Console origin closure and Host tests",
+            command: [
+              "bun",
+              "test",
+              "--timeout",
+              "60000",
+              "--bail=1",
+              "tests/deploy-worker-closure-transition.test.ts",
+              "tests/deploy-worker-state.test.ts",
+              "tests/deploy-integration-worker-bootstrap.test.ts",
+              "tests/deploy-integration-storage-generation.test.ts",
+              "tests/deploy-signing.test.ts",
+              "tests/deploy-realized-config-v2.test.ts",
+              "tests/deploy-worker-artifact.test.ts",
+              "tests/deploy-worker-composition.test.ts",
+              "tests/deploy-wrangler-state.test.ts",
+              "tests/deploy-cloudflare-state.test.ts",
+              "tests/deploy-worker.test.ts",
+              "tests/entry-worker-origin.test.ts",
+              "tests/entry-worker-operator-authority.test.ts",
+              "tests/entry-worker-startup.test.ts",
+              "tests/runtime-input-seal-keyring.test.ts",
+              "tests/worker-production-composition.test.ts",
+            ],
+          },
+        ]
+      : delta.storageRebind === undefined
         ? [
             {
               label: "scoped owner gate `bun run check`",
@@ -545,13 +597,21 @@ export async function runWorkerClosureTransition(
       finalMigrationState,
       sourceRepositoryRoot,
     );
-    if (!workerSchemaAllowsPending(target, finalMigrationState, sourceRepositoryRoot)) {
+    if (
+      !closureSchemaAllowsPending(
+        target,
+        delta,
+        finalMigrationState,
+        sourceRepositoryRoot,
+        initialStorageProof,
+      )
+    ) {
       throw preflightError(
         "closure transition refuses changed pending D1 migrations before upload; apply takoserver-d1-schema first",
         JSON.stringify(finalPending),
       );
     }
-    if (closureRequiresMoneyUnitSchema(target)) {
+    if (!freshConsoleOrigin && closureRequiresMoneyUnitSchema(target)) {
       assertWorkerMoneyUnitSchema(finalMigrationState, sourceRepositoryRoot, "preflight");
     }
     if (
@@ -567,7 +627,8 @@ export async function runWorkerClosureTransition(
         invocation.environment,
         {
           ...options.integrationStorageVerification,
-          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowCurrentAuditedSuccessor:
+            !freshConsoleOrigin && closureRequiresMoneyUnitSchema(target),
           allowMoneyUnitMaintenance:
             target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
@@ -633,10 +694,18 @@ export async function runWorkerClosureTransition(
       afterMigrations,
       sourceRepositoryRoot,
     );
-    if (!workerSchemaAllowsPending(target, afterMigrations, sourceRepositoryRoot)) {
+    if (
+      !closureSchemaAllowsPending(
+        target,
+        delta,
+        afterMigrations,
+        sourceRepositoryRoot,
+        initialStorageProof,
+      )
+    ) {
       throw verificationError("closure transition left pending D1 migrations");
     }
-    if (closureRequiresMoneyUnitSchema(target)) {
+    if (!freshConsoleOrigin && closureRequiresMoneyUnitSchema(target)) {
       assertWorkerMoneyUnitSchema(afterMigrations, sourceRepositoryRoot, "verification");
     }
     const providerExecutorAfter =
@@ -657,7 +726,8 @@ export async function runWorkerClosureTransition(
         invocation.environment,
         {
           ...options.integrationStorageVerification,
-          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowCurrentAuditedSuccessor:
+            !freshConsoleOrigin && closureRequiresMoneyUnitSchema(target),
           allowMoneyUnitMaintenance:
             target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
@@ -765,6 +835,7 @@ async function appliedClosureTransitionStatus(
   migrations: WorkerMigrationReader,
   history: WorkerDeploymentHistory,
   sourceRepositoryRoot: string,
+  storageProof: IntegrationStorageGenerationTargetProof | null,
 ): Promise<Record<string, unknown>> {
   const selector = invocation.closurePredecessorVersionId;
   if (history.previousVersionId !== selector) {
@@ -824,8 +895,17 @@ async function appliedClosureTransitionStatus(
     mutationApplied: false,
     ready:
       target.schemaMaintenanceMode === undefined &&
-      workerSchemaAllowsPending(target, migrationState) &&
-      (!closureRequiresMoneyUnitSchema(target) ||
+      (isFreshConsoleOriginTransition(target, normalizedWorkerClosureDelta(invocation.delta))
+        ? closureSchemaAllowsPending(
+            target,
+            normalizedWorkerClosureDelta(invocation.delta),
+            migrationState,
+            sourceRepositoryRoot,
+            storageProof,
+          )
+        : workerSchemaAllowsPending(target, migrationState)) &&
+      (isFreshConsoleOriginTransition(target, normalizedWorkerClosureDelta(invocation.delta)) ||
+        !closureRequiresMoneyUnitSchema(target) ||
         workerMoneyUnitSchemaReady(migrationState, sourceRepositoryRoot)) &&
       successor.commit === invocation.commit,
   };
@@ -930,6 +1010,53 @@ function assertIntegrationStorageProofUnchanged(
       "generated integration storage target or schema changed before publication",
     );
   }
+}
+
+/** One same-storage NORMAL successor, never an admission for other closure changes. */
+function isFreshConsoleOriginTransition(target: DeployTarget, delta: WorkerClosureDelta): boolean {
+  return (
+    target.environment === "integration" &&
+    target.takoformV2?.storageLineage === "v2-0100" &&
+    typeof target.consoleOrigin === "string" &&
+    target.schemaMaintenanceMode === undefined &&
+    target.artifactBlobIoMode === undefined &&
+    target.moneyCutoverWriterPolicy === undefined &&
+    target.auth103NativeProfile === undefined &&
+    JSON.stringify(delta.addedVars) === JSON.stringify(["TAKOSERVER_CONSOLE_ORIGIN"]) &&
+    delta.retiredVars.length === 0 &&
+    delta.refreshedVars.length === 0 &&
+    (delta.refreshedServiceBindings?.length ?? 0) === 0 &&
+    delta.addedBindings.length === 0 &&
+    delta.addedSecrets.length === 0 &&
+    delta.rotatedSecrets.length === 0 &&
+    delta.storageRebind === undefined
+  );
+}
+
+function closureSchemaAllowsPending(
+  target: DeployTarget,
+  delta: WorkerClosureDelta,
+  migrations: Awaited<ReturnType<WorkerMigrationReader["read"]>>,
+  sourceRepositoryRoot: string,
+  storageProof: IntegrationStorageGenerationTargetProof | null,
+): boolean {
+  if (!isFreshConsoleOriginTransition(target, delta)) {
+    return workerSchemaAllowsPending(target, migrations, sourceRepositoryRoot);
+  }
+  // This proof comes only from the original generated-storage verifier above:
+  // exact D1/R2 identity, audited100 ledger and canonical schema, not a flag.
+  return (
+    storageProof !== null &&
+    storageProof.appliedMigrations.length === 100 &&
+    canonicalJson(migrations.local) === canonicalJson(storageProof.appliedMigrations) &&
+    canonicalJson(migrations.applied) === canonicalJson(storageProof.appliedMigrations) &&
+    typeof migrations.shape === "string" &&
+    migrations.shapeDigest === storageProof.schemaShapeDigest &&
+    `sha256:${createHash("sha256").update(migrations.shape).digest("hex")}` ===
+      storageProof.schemaShapeDigest &&
+    moneyUnitSchemaReady(migrations.applied) &&
+    moneyUnitPolicyReady(migrations.moneyUnitPolicy)
+  );
 }
 
 /** Both explicit modes return before app composition and never serve traffic. */
