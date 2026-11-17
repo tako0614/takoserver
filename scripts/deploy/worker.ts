@@ -691,6 +691,15 @@ export async function runWorker(
   if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
     throw preflightError("Worker maintenance selectors conflict");
   }
+  const ordinaryFresh100 =
+    invocation.surface === "takoserver-worker" &&
+    target.environment === "integration" &&
+    target.takoformV2?.storageLineage === "v2-0100" &&
+    target.takoformV2.appliedSchemaLineage === undefined &&
+    target.schemaMaintenanceMode === undefined &&
+    target.artifactBlobIoMode === undefined &&
+    target.moneyCutoverWriterPolicy === undefined &&
+    target.auth103NativeProfile === undefined;
   const freshAuth103Source =
     target.auth103NativeProfile === "root-shared-auth-staging-v1" &&
     target.schemaMaintenanceMode === "pre-auth103-quiesced" &&
@@ -755,7 +764,14 @@ export async function runWorker(
           options,
           run,
           sourceRepositoryRoot,
+          ordinaryFresh100,
         );
+  // Only this ordinary entry can use the original fresh100 verifier's proof.
+  // The shared financial/maintenance profile predicate keeps its own contract.
+  const schemaAllowsPending = (migrations: Awaited<ReturnType<WorkerMigrationReader["read"]>>) =>
+    ordinaryFresh100
+      ? fresh100NormalSchemaReady(migrations, v2StorageBefore, sourceRepositoryRoot)
+      : workerSchemaAllowsPending(target, migrations, sourceRepositoryRoot);
   const createCloudflareState = (token: string | undefined): CloudflareState =>
     new CloudflareState({
       accountId: target.accountId,
@@ -969,7 +985,7 @@ export async function runWorker(
         ready:
           target.schemaMaintenanceMode === undefined &&
           moneyServingReady &&
-          workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot) &&
+          schemaAllowsPending(before.migrations) &&
           (target.artifactBlobIoMode !== undefined || moneySchemaReady) &&
           stripeWebhookSchemaReady(target, before.migrations.applied) &&
           orgBillingSchemaReady(target, before.migrations.applied) &&
@@ -1010,7 +1026,7 @@ export async function runWorker(
     if (target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined) {
       assertWorkerMoneyUnitSchema(before.migrations, sourceRepositoryRoot, "preflight");
     }
-    if (!workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot)) {
+    if (!schemaAllowsPending(before.migrations)) {
       throw preflightError(
         "routine Worker publication refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(before.pending),
@@ -1049,16 +1065,52 @@ export async function runWorker(
     if (selectedTestWorkers !== undefined && !/^[1-9][0-9]?$/u.test(selectedTestWorkers)) {
       throw preflightError("TAKOSERVER_TEST_WORKERS must be a worker count from 1 to 99");
     }
-    const ownerGate = () =>
-      checked(
-        run,
-        "preflight",
-        "scoped owner gate `bun run check`",
-        ["bun", "run", "check"],
-        selectedTestWorkers === undefined
-          ? undefined
-          : { env: { TAKOSERVER_TEST_WORKERS: selectedTestWorkers } },
-      );
+    const ownerGate = async () => {
+      const gates = ordinaryFresh100
+        ? [
+            {
+              label: "ordinary fresh100 Worker typecheck",
+              command: ["bun", "run", "typecheck:worker"],
+            },
+            {
+              label: "focused ordinary fresh100 Host tests",
+              command: [
+                "bun",
+                "test",
+                "--timeout",
+                "60000",
+                "--bail=1",
+                "tests/deploy-integration-worker-bootstrap.test.ts",
+                "tests/deploy-integration-storage-generation.test.ts",
+                "tests/deploy-signing.test.ts",
+                "tests/deploy-realized-config-v2.test.ts",
+                "tests/deploy-worker-artifact.test.ts",
+                "tests/deploy-worker-composition.test.ts",
+                "tests/deploy-worker-state.test.ts",
+                "tests/deploy-wrangler-state.test.ts",
+                "tests/deploy-cloudflare-state.test.ts",
+                "tests/deploy-worker.test.ts",
+                "tests/entry-worker-origin.test.ts",
+                "tests/entry-worker-operator-authority.test.ts",
+                "tests/entry-worker-startup.test.ts",
+                "tests/runtime-input-seal-keyring.test.ts",
+                "tests/worker-production-composition.test.ts",
+              ],
+            },
+          ]
+        : [{ label: "scoped owner gate `bun run check`", command: ["bun", "run", "check"] }];
+      for (const gate of gates) {
+        await checked(
+          run,
+          "preflight",
+          gate.label,
+          gate.command,
+          selectedTestWorkers === undefined
+            ? undefined
+            : { env: { TAKOSERVER_TEST_WORKERS: selectedTestWorkers } },
+        );
+      }
+    };
     if (freshAuth103Source && run === runCommand) {
       // Only this original process can enter the registered native build.
       // Its full check must not leave generated bytes in that build's source.
@@ -1200,6 +1252,7 @@ export async function runWorker(
         options,
         run,
         sourceRepositoryRoot,
+        ordinaryFresh100,
       );
       assertFreshV2StorageProofUnchanged("preflight", v2StorageBefore, finalStorage);
     }
@@ -1318,7 +1371,7 @@ export async function runWorker(
     if (freshAuth103Source) {
       await inspectSelectedAuth103WorkerModules("verification", target, state, after);
     }
-    if (!workerSchemaAllowsPending(target, after.migrations, sourceRepositoryRoot)) {
+    if (!schemaAllowsPending(after.migrations)) {
       throw verificationError("Worker publication left pending D1 migrations");
     }
     if (target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined) {
@@ -1332,6 +1385,7 @@ export async function runWorker(
         options,
         run,
         sourceRepositoryRoot,
+        ordinaryFresh100,
       );
       assertFreshV2StorageProofUnchanged("verification", v2StorageBefore, servedStorage);
     }
@@ -1429,6 +1483,22 @@ export async function runWorker(
   }
 }
 
+/** The original verifier's100 ledger and shape, plus the existing Money-policy check. */
+function fresh100NormalSchemaReady(
+  migrations: Awaited<ReturnType<WorkerMigrationReader["read"]>>,
+  proof: FreshV2IntegrationStorageTargetProof | null,
+  sourceRepositoryRoot: string,
+): boolean {
+  return (
+    proof !== null &&
+    proof.appliedMigrations.length === 100 &&
+    canonicalJson(migrations.local) === canonicalJson(proof.appliedMigrations) &&
+    canonicalJson(migrations.applied) === canonicalJson(proof.appliedMigrations) &&
+    migrations.shapeDigest === proof.schemaShapeDigest &&
+    workerMoneyUnitSchemaReady(migrations, sourceRepositoryRoot)
+  );
+}
+
 async function readFreshV2StorageProof(
   phase: "preflight" | "verification",
   target: DeployTarget,
@@ -1436,6 +1506,7 @@ async function readFreshV2StorageProof(
   options: WorkerOptions,
   run: WorkerProcess,
   sourceRepositoryRoot: string,
+  requireFresh100 = false,
 ): Promise<FreshV2IntegrationStorageTargetProof> {
   try {
     return await verifyFreshV2IntegrationStorageTarget(
@@ -1445,6 +1516,7 @@ async function readFreshV2StorageProof(
       {
         ...options.integrationStorageVerification,
         allowCurrentAuditedSuccessor:
+          !requireFresh100 &&
           (target.schemaMaintenanceMode === undefined ||
             target.schemaMaintenanceMode === "pre-auth103-quiesced") &&
           target.artifactBlobIoMode === undefined,
