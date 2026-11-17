@@ -691,8 +691,12 @@ export async function runWorker(
   if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
     throw preflightError("Worker maintenance selectors conflict");
   }
-  const ordinaryFresh100 =
-    invocation.surface === "takoserver-worker" &&
+  const fresh100NormalCode =
+    (invocation.surface === "takoserver-worker" ||
+      (invocation.surface === "takoserver-worker-authority-cutover" &&
+        invocation.legacyPredecessorVersionId === undefined &&
+        invocation.legacyHostRuntimePredecessorVersionId === undefined &&
+        invocation.reverse !== true)) &&
     target.environment === "integration" &&
     target.takoformV2?.storageLineage === "v2-0100" &&
     target.takoformV2.appliedSchemaLineage === undefined &&
@@ -764,12 +768,12 @@ export async function runWorker(
           options,
           run,
           sourceRepositoryRoot,
-          ordinaryFresh100,
+          fresh100NormalCode,
         );
-  // Only this ordinary entry can use the original fresh100 verifier's proof.
+  // Only normal code publication can use the original fresh100 verifier's proof.
   // The shared financial/maintenance profile predicate keeps its own contract.
   const schemaAllowsPending = (migrations: Awaited<ReturnType<WorkerMigrationReader["read"]>>) =>
-    ordinaryFresh100
+    fresh100NormalCode
       ? fresh100NormalSchemaReady(migrations, v2StorageBefore, sourceRepositoryRoot)
       : workerSchemaAllowsPending(target, migrations, sourceRepositoryRoot);
   const createCloudflareState = (token: string | undefined): CloudflareState =>
@@ -902,7 +906,8 @@ export async function runWorker(
       ...(beforeAuthorityProfile === undefined ? {} : { authorityProfile: beforeAuthorityProfile }),
     });
     const versionPublication =
-      invocation.surface === "takoserver-worker" && invocation.environment !== "production";
+      (invocation.surface === "takoserver-worker" || fresh100NormalCode) &&
+      invocation.environment !== "production";
 
     if (
       target.schemaMaintenanceMode !== undefined &&
@@ -1066,7 +1071,7 @@ export async function runWorker(
       throw preflightError("TAKOSERVER_TEST_WORKERS must be a worker count from 1 to 99");
     }
     const ownerGate = async () => {
-      const gates = ordinaryFresh100
+      const gates = fresh100NormalCode
         ? [
             {
               label: "ordinary fresh100 Worker typecheck",
@@ -1252,7 +1257,7 @@ export async function runWorker(
         options,
         run,
         sourceRepositoryRoot,
-        ordinaryFresh100,
+        fresh100NormalCode,
       );
       assertFreshV2StorageProofUnchanged("preflight", v2StorageBefore, finalStorage);
     }
@@ -1385,7 +1390,7 @@ export async function runWorker(
         options,
         run,
         sourceRepositoryRoot,
-        ordinaryFresh100,
+        fresh100NormalCode,
       );
       assertFreshV2StorageProofUnchanged("verification", v2StorageBefore, servedStorage);
     }
