@@ -465,6 +465,21 @@ const select = "SELECT " + fields.map(({ column, key }) => column + " AS " + key
 const fail: () => never = (): never => {
   throw new TypeError("Docker Core owner authority refused");
 };
+
+async function waitForOriginalApplicationClose(close: Promise<void>, signal: AbortSignal) {
+  let onAbort!: () => void;
+  const revoked = new Promise<never>((_resolve, reject) => {
+    onAbort = () => reject(new TypeError("Docker Core owner application close revoked"));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try {
+    await Promise.race([revoked, close]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
 const text = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= 2048;
 const hex = (value: unknown): value is string =>
@@ -3444,8 +3459,8 @@ export function createDockerContainerCoreOwner(
                 // allocation cleanup is authorized by this private handoff.
                 helper = read.observeHelperExited(signal);
                 // H result remains separate from the I/O-only saved fact.
-                // The last native stage still joins a pending original close.
-                if (application) await application.close();
+                // Revocation ends this stage's wait, not the original close.
+                if (terminal) await waitForOriginalApplicationClose(terminal, signal);
                 applicationFactCurrent = await beginApplicationSave();
                 localApplication();
                 if (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")) {

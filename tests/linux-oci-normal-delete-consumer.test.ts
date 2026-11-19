@@ -343,11 +343,12 @@ test("normal-delete-consumer actual HTTP terminal gates erasure then evicts only
   const { f, accepted } = await live(),
     io = ownedRawHttp();
   const actualSource = originalBundle.originalLinuxOciHttpRetirementSource;
-  let sourceCalls = 0;
+  let applicationClose: ReturnType<typeof observeRawPromise<void>> | undefined;
   const source = spyOn(originalBundle, "originalLinuxOciHttpRetirementSource").mockImplementation(
     (...args) => {
-      sourceCalls++;
-      return actualSource(...args);
+      const runtime = actualSource(...args);
+      if (runtime && !applicationClose) applicationClose = observeRawPromise(runtime.close());
+      return runtime;
     },
   );
   const deleted: { owner: Map<unknown, unknown>; key: unknown }[] = [];
@@ -382,16 +383,17 @@ test("normal-delete-consumer actual HTTP terminal gates erasure then evicts only
     let waiting: ReturnType<typeof pendingStep> | undefined;
     for (let phase = 0; phase < 16; phase++) {
       const pending = pendingStep();
-      for (let tick = 0; tick < 100 && pending.state() === "pending" && !sourceCalls; tick++)
+      for (let tick = 0; tick < 100 && pending.state() === "pending" && !applicationClose; tick++)
         await rawTick();
-      if (sourceCalls) {
+      if (applicationClose) {
         waiting = pending;
         break;
       }
       expect(await pending.value).toHaveProperty("result");
     }
-    if (!waiting) throw Error("NONSECRET actual Core application handoff not reached");
-    expect(waiting.state()).toBe("pending");
+    if (!waiting || !applicationClose)
+      throw Error("NONSECRET actual Core application handoff not reached");
+    expect(applicationClose.state()).toBe("pending");
     expect(
       (await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"))[0],
     ).toEqual({ state: "bound", allocation_cleanup: "untouched" });
@@ -422,12 +424,24 @@ test("normal-delete-consumer actual HTTP terminal gates erasure then evicts only
     });
     io.closeResponse();
     await rawTick();
-    expect(waiting.state()).toBe("pending");
+    expect(applicationClose.state()).toBe("pending");
     expect(deleted).toHaveLength(0);
     io.closeRequest();
-    expect(await waiting.value).toMatchObject({
-      result: { id: removal.id, effect: "complete", status: "succeeded" },
-    });
+    expect(await applicationClose.value).toHaveProperty("result");
+    const first = await waiting.value;
+    if ("error" in first) throw first.error;
+    // STOP/JOIN can finish their own pass independently of the application close.
+    const final =
+      first.result?.status === "succeeded"
+        ? first.result
+        : await through(f, async () => {
+            const [claim] = await f.sql.query(
+              "SELECT state FROM tf_v2_container_create_claims WHERE resource_uid=?",
+              [accepted.resourceUid],
+            );
+            return claim?.state === "removed";
+          });
+    expect(final).toMatchObject({ id: removal.id, effect: "complete", status: "succeeded" });
     const owner = deleted.find((item) => item.key === accepted.id)?.owner;
     expect(owner).toBeDefined();
     expect(deleted.some((item) => item.owner === owner && item.key === removal.id)).toBe(true);
@@ -455,6 +469,59 @@ test("normal-delete-consumer actual HTTP terminal gates erasure then evicts only
     await f.cleanup();
   }
 });
+
+test("normal-delete-consumer reports unknown at the original deadline while HTTP close stays pending", async () => {
+  const { f, accepted } = await live();
+  const io = ownedRawHttp();
+  let pending: ReturnType<typeof observeRawPromise<Awaited<ReturnType<typeof step>>>> | undefined;
+  try {
+    const response = f.composition.fetchServingHttp(
+      f.recordedCreate(),
+      new Request("http://ignored.invalid/NONSECRET-still-open"),
+    );
+    for (let tick = 0; tick < 50 && !io.counts().calls; tick++) await rawTick();
+    expect(io.counts().calls).toBe(1);
+    io.head();
+    await response;
+    const removal = await deleting(f, accepted.resourceUid);
+    const beyondDeadline = Symbol("still awaiting original HTTP close");
+    let deadlineReached = false;
+    for (let phase = 0; phase < 16; phase++) {
+      const started = performance.now();
+      pending = observeRawPromise(step(f));
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          pending.value,
+          new Promise<typeof beyondDeadline>((resolve) => {
+            timer = setTimeout(() => resolve(beyondDeadline), 6500);
+          }),
+        ]);
+        expect(result).not.toBe(beyondDeadline);
+        expect(result).toMatchObject({ result: { id: removal.id, effect: "unknown" } });
+        if (performance.now() - started >= 4900) {
+          deadlineReached = true;
+          break;
+        }
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+      }
+    }
+    expect(deadlineReached).toBe(true);
+    expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-stop-init@1")).toHaveLength(1);
+    expect(io.counts().requestDestroy).toBe(1);
+    expect(
+      (await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"))[0],
+    ).toEqual({ state: "bound", allocation_cleanup: "untouched" });
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    io.closeResponse();
+    io.closeRequest();
+    await pending?.value;
+    io.restore();
+    await f.cleanup();
+  }
+}, 20000);
 
 test("normal-delete-consumer delayed original UPDATE prepare cannot recapture secrets or cancel the final DELETE while another Resource is retained", async () => {
   const { f, accepted } = await live();
