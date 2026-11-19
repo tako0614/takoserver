@@ -466,18 +466,29 @@ const fail: () => never = (): never => {
   throw new TypeError("Docker Core owner authority refused");
 };
 
-async function waitForOriginalApplicationClose(close: Promise<void>, signal: AbortSignal) {
-  let onAbort!: () => void;
-  const revoked = new Promise<never>((_resolve, reject) => {
-    onAbort = () => reject(new TypeError("Docker Core owner application close revoked"));
-    signal.addEventListener("abort", onAbort, { once: true });
-    if (signal.aborted) onAbort();
-  });
-  try {
-    await Promise.race([revoked, close]);
-  } finally {
-    signal.removeEventListener("abort", onAbort);
+async function waitForOriginalApplicationClose(
+  close: Promise<void>,
+  finished: AbortSignal,
+  signal: AbortSignal,
+) {
+  if (!finished.aborted && !signal.aborted) {
+    let onChange!: () => void;
+    try {
+      await new Promise<void>((resolve) => {
+        onChange = () => {
+          if (finished.aborted || signal.aborted) resolve();
+        };
+        finished.addEventListener("abort", onChange);
+        signal.addEventListener("abort", onChange);
+        onChange();
+      });
+    } finally {
+      finished.removeEventListener("abort", onChange);
+      signal.removeEventListener("abort", onChange);
+    }
   }
+  if (signal.aborted) return fail();
+  await close;
 }
 
 const text = (value: unknown): value is string =>
@@ -3420,6 +3431,7 @@ export function createDockerContainerCoreOwner(
               return applicationSave;
             };
             let watchingClose = false;
+            let detachCloseListener: (() => void) | undefined;
             try {
               await read.begin(signal); // original P outcome only; H writes still zero
               await assertSnapshot(loaded.proof);
@@ -3445,12 +3457,26 @@ export function createDockerContainerCoreOwner(
               // fulfillment. Pending close never delays STOP/JOIN advancement.
               watchingClose = true;
               const terminal = application?.close();
-              void terminal?.then(
-                () => {
-                  if (watchingClose && !signal.aborted) beginApplicationSave();
-                },
-                () => undefined,
-              );
+              const closeFinished = application?.closeFinished;
+              if (terminal && closeFinished) {
+                // A stage can be retried indefinitely while the same close is
+                // pending. Subscribe to a removable notification until it settles.
+                const onCloseFinished = () => {
+                  if (!closeFinished.aborted) return;
+                  void terminal.then(
+                    () => {
+                      if (watchingClose && !signal.aborted) beginApplicationSave();
+                    },
+                    () => undefined,
+                  );
+                };
+                if (closeFinished.aborted) onCloseFinished();
+                else {
+                  closeFinished.addEventListener("abort", onCloseFinished);
+                  detachCloseListener = () =>
+                    closeFinished.removeEventListener("abort", onCloseFinished);
+                }
+              }
               observation = await (boundPhase === "exited"
                 ? read.advanceNamespace(input.nativeId, signal)
                 : read.advance(input.nativeId, signal));
@@ -3460,7 +3486,8 @@ export function createDockerContainerCoreOwner(
                 helper = read.observeHelperExited(signal);
                 // H result remains separate from the I/O-only saved fact.
                 // Revocation ends this stage's wait, not the original close.
-                if (terminal) await waitForOriginalApplicationClose(terminal, signal);
+                if (terminal && closeFinished)
+                  await waitForOriginalApplicationClose(terminal, closeFinished, signal);
                 applicationFactCurrent = await beginApplicationSave();
                 localApplication();
                 if (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")) {
@@ -3627,6 +3654,7 @@ export function createDockerContainerCoreOwner(
               complete = true;
             } finally {
               watchingClose = false;
+              detachCloseListener?.();
               try {
                 // No detached SQL: only work that already started is joined.
                 // An unresolved close is rearmed by the next legitimate stage.

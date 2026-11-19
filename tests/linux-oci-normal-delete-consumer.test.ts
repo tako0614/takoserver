@@ -476,10 +476,40 @@ test("normal-delete-consumer reports unknown at the deadline and resumes the sam
   const io = ownedRawHttp();
   const originalSource = originalBundle.originalLinuxOciHttpRetirementSource;
   let originalClose: ReturnType<typeof observeRawPromise<void>> | undefined;
+  let restoreCloseThen: (() => void) | undefined;
+  let closeObserversRemaining: (() => number) | undefined;
+  let restoreCloseObservers: (() => void) | undefined;
+  let pendingCloseSubscriptions = 0;
   const source = spyOn(originalBundle, "originalLinuxOciHttpRetirementSource").mockImplementation(
     (...args) => {
       const runtime = originalSource(...args);
-      if (runtime && !originalClose) originalClose = observeRawPromise(runtime.close());
+      if (runtime && !originalClose) {
+        const pending = runtime.close();
+        originalClose = observeRawPromise(pending);
+        const originalThen = pending.then;
+        // biome-ignore lint/suspicious/noThenProperty: Count subscriptions on this original pending promise without replacing it.
+        Object.defineProperty(pending, "then", {
+          configurable: true,
+          value: (...thenArgs: Parameters<typeof pending.then>) => {
+            pendingCloseSubscriptions++;
+            return Reflect.apply(originalThen, pending, thenArgs);
+          },
+        });
+        restoreCloseThen = () => {
+          Reflect.deleteProperty(pending, "then");
+        };
+        const add = spyOn(runtime.closeFinished, "addEventListener");
+        const remove = spyOn(runtime.closeFinished, "removeEventListener");
+        closeObserversRemaining = () =>
+          add.mock.calls.filter(
+            ([event, listener]) =>
+              !remove.mock.calls.some(([kind, removed]) => kind === event && removed === listener),
+          ).length;
+        restoreCloseObservers = () => {
+          add.mockRestore();
+          remove.mockRestore();
+        };
+      }
       return runtime;
     },
   );
@@ -534,6 +564,9 @@ test("normal-delete-consumer reports unknown at the deadline and resumes the sam
     });
     if (!originalClose) throw Error("NONSECRET original application close was not observed");
     expect(originalClose.state()).toBe("pending");
+    expect(pendingCloseSubscriptions).toBe(0);
+    expect(closeObserversRemaining?.()).toBe(0);
+    restoreCloseThen?.();
     io.closeResponse();
     io.closeRequest();
     expect(await originalClose.value).toHaveProperty("result");
@@ -561,6 +594,8 @@ test("normal-delete-consumer reports unknown at the deadline and resumes the sam
     io.closeResponse();
     io.closeRequest();
     await pending?.value;
+    restoreCloseThen?.();
+    restoreCloseObservers?.();
     source.mockRestore();
     io.restore();
     await f.cleanup();

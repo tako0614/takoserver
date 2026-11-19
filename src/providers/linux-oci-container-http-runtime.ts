@@ -46,6 +46,7 @@ export function createLinuxOciContainerHttpRuntime(
   >();
   let closed = false,
     closing: Promise<void> | undefined;
+  const closeFinished = new AbortController();
   const current = () => {
     if (closed || lifetime.signal.aborted) throw new Error("linux_oci_http_closed");
   };
@@ -140,7 +141,8 @@ export function createLinuxOciContainerHttpRuntime(
           invocation.assertJoined();
         }
       })();
-      void closing.catch(() => undefined);
+      const notifyCloseFinished = () => closeFinished.abort();
+      void closing.then(notifyCloseFinished, notifyCloseFinished);
     }
     return closing;
   }
@@ -184,5 +186,7 @@ export function createLinuxOciContainerHttpRuntime(
       return handle.invoke(revision, request);
     },
     close,
+    // Settlement only. Callers still have to read the original close result.
+    closeFinished: closeFinished.signal,
   });
 }

@@ -2301,8 +2301,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               // Promise; Core can save its fulfillment in the current stage
               // before H result, which still gates allocation cleanup.
               // Fresh creators gain no missing I/O fact.
-              const applicationClose = httpRuntimes.get(record.claimId)?.close();
-              void applicationClose?.catch(() => undefined);
+              // The runtime handles rejection on its one cached close.
+              void httpRuntimes.get(record.claimId)?.close();
               if (closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
               // Missing local runtime only selects recovery. Core authenticates
