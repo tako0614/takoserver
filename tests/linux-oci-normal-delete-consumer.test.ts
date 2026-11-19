@@ -6,6 +6,7 @@ import {
   v2FinalDeleteConfiguredUpdateDiscardTransition,
 } from "../src/takoform-v2/configured-update-inputs-schema.ts";
 import {
+  V2_CONTAINER_APPLICATION_IO_RESERVED,
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
   V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
@@ -470,9 +471,25 @@ test("normal-delete-consumer actual HTTP terminal gates erasure then evicts only
   }
 });
 
-test("normal-delete-consumer reports unknown at the original deadline while HTTP close stays pending", async () => {
+test("normal-delete-consumer reports unknown at the deadline and resumes the same DELETE after late HTTP close", async () => {
   const { f, accepted } = await live();
   const io = ownedRawHttp();
+  const originalSource = originalBundle.originalLinuxOciHttpRetirementSource;
+  let originalClose: ReturnType<typeof observeRawPromise<void>> | undefined;
+  const source = spyOn(originalBundle, "originalLinuxOciHttpRetirementSource").mockImplementation(
+    (...args) => {
+      const runtime = originalSource(...args);
+      if (runtime && !originalClose) originalClose = observeRawPromise(runtime.close());
+      return runtime;
+    },
+  );
+  const claim = async () =>
+    (
+      await f.sql.query(
+        "SELECT state,allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=?",
+        [accepted.resourceUid],
+      )
+    )[0];
   let pending: ReturnType<typeof observeRawPromise<Awaited<ReturnType<typeof step>>>> | undefined;
   try {
     const response = f.composition.fetchServingHttp(
@@ -510,14 +527,41 @@ test("normal-delete-consumer reports unknown at the original deadline while HTTP
     expect(deadlineReached).toBe(true);
     expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-stop-init@1")).toHaveLength(1);
     expect(io.counts().requestDestroy).toBe(1);
-    expect(
-      (await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"))[0],
-    ).toEqual({ state: "bound", allocation_cleanup: "untouched" });
+    expect(await claim()).toEqual({
+      state: "bound",
+      allocation_cleanup: "untouched",
+      application_io_cleanup: V2_CONTAINER_APPLICATION_IO_RESERVED,
+    });
+    if (!originalClose) throw Error("NONSECRET original application close was not observed");
+    expect(originalClose.state()).toBe("pending");
+    io.closeResponse();
+    io.closeRequest();
+    expect(await originalClose.value).toHaveProperty("result");
+    // The expired stage must not write a late completion under its old lease.
+    expect(await claim()).toEqual({
+      state: "bound",
+      allocation_cleanup: "untouched",
+      application_io_cleanup: V2_CONTAINER_APPLICATION_IO_RESERVED,
+    });
+    const final = await through(f, async () => (await claim())?.state === "removed");
+    expect(final).toMatchObject({ id: removal.id, effect: "complete", status: "succeeded" });
+    expect(await claim()).toMatchObject({ state: "removed", allocation_cleanup: "closed" });
+    const requests = f.nativeCounts().requests;
+    for (const kind of [
+      "linux-oci-create-stopped@1",
+      "linux-oci-start@1",
+      "linux-oci-stop-init@1",
+      "linux-oci-delete-born@1",
+    ]) {
+      expect(requests.filter((request) => request === kind)).toHaveLength(1);
+    }
+    expect(io.counts().calls).toBe(1);
     expect(f.network).not.toHaveBeenCalled();
   } finally {
     io.closeResponse();
     io.closeRequest();
     await pending?.value;
+    source.mockRestore();
     io.restore();
     await f.cleanup();
   }
