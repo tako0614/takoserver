@@ -202,6 +202,14 @@ export async function readD1SchemaState(
         "name",
       )
     : [];
+  return { applied, ...(await readD1SchemaShape(database, phase)) };
+}
+
+/** Read the actual canonical sqlite_schema shape without separately reading lineage. */
+export async function readD1SchemaShape(
+  database: RemoteD1,
+  phase: DeployPhase = "preflight",
+): Promise<Pick<D1SchemaState, "shape" | "shapeDigest">> {
   const rows = await database.query(
     phase,
     "D1 canonical schema shape",
@@ -209,7 +217,7 @@ export async function readD1SchemaState(
       "FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
   );
   const shape = canonicalSchemaShape(rows, phase);
-  return { applied, shape, shapeDigest: sha256(shape) };
+  return { shape, shapeDigest: sha256(shape) };
 }
 
 export function canonicalSchemaShape(
