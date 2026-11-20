@@ -103,13 +103,14 @@ enum { ROOT = 10, ROOTFS, RECEIPT, RUNTIME, BUNDLE, STATE, NETWORK,
 enum fault { NONE, WRONG_CONTROLLER, NOT_ROOT, CONFIG_CHANGED, BUNDLE_CHANGED,
   BIRTH_CHANGED, CLONE_FAILED, TIMED_OUT, POLL_TIMED_OUT, POLL_INTERRUPTED,
   WAIT_WRONG_PID, WAIT_LOST, CHILD_FAILED, CHILD_KILLED, SAME_EXE,
-  EXE_UNREADABLE, EXE_STAT_LOST, NET_CHANGED, INIT_DEAD, LATE_CONFIG, CANCEL_AFTER_SPAWN };
+  EXE_UNREADABLE, EXE_STAT_LOST, NET_CHANGED, INIT_DEAD, LATE_CONFIG, CANCEL_AFTER_SPAWN,
+  EXEC_AFTER_WAIT, EXEC_WAIT_EXIT, EXEC_WAIT_CANCEL };
 struct raw_model {
   struct tns_oci_owner *owner;
   enum fault fault;
   unsigned int clones, kills, joins, polls, birth_reads, net_reads, stops;
   int64_t milliseconds;
-  unsigned int config_reads, cancel_at_config_read;
+  unsigned int config_reads, cancel_at_config_read, exec_waits, admission_cuts;
 };
 static struct raw_model model;
 static unsigned long checks;
@@ -127,7 +128,9 @@ static void metadata(int fd, struct stat *out) {
     out->st_size = fd == RECEIPT ? 7 : 4;
   }
   if (fd == EXE) {
-    out->st_ino = (ino_t)(model.clones && model.fault != SAME_EXE ? 9001 : 1020);
+    int still_stopped = model.fault == SAME_EXE || model.fault == EXEC_WAIT_EXIT ||
+      model.fault == EXEC_WAIT_CANCEL || (model.fault == EXEC_AFTER_WAIT && !model.exec_waits);
+    out->st_ino = (ino_t)(model.clones && !still_stopped ? 9001 : 1020);
   }
   if (fd == NETNS) { out->st_dev = 5; out->st_ino = 77; }
   if (fd >= PARENT_PIDNS && fd <= PARENT_OF_INIT) {
@@ -263,6 +266,18 @@ static ssize_t raw_pread(int fd, void *out, size_t count, off_t offset) {
 static int raw_poll(struct pollfd *p, nfds_t count, int timeout) {
   CHECK(count == 1 && p->events == POLLIN);
   if (p->fd == INIT_PIDFD) {
+    if (timeout > 0) {
+      CHECK(model.owner->start_joined && model.owner->start_ok && model.clones == 1);
+      CHECK(timeout <= 10 && model.milliseconds + timeout <= 11000);
+      CHECK(model.fault == SAME_EXE || model.fault == EXEC_AFTER_WAIT ||
+            model.fault == EXEC_WAIT_EXIT || model.fault == EXEC_WAIT_CANCEL);
+      model.exec_waits++;
+      if (model.fault == EXEC_WAIT_EXIT) { p->revents = POLLIN; return 1; }
+      if (model.fault == EXEC_WAIT_CANCEL) tns_oci_note_cancel();
+      model.milliseconds += timeout;
+      p->revents = 0;
+      return 0;
+    }
     CHECK(timeout == 0);
     if (model.clones && model.fault == INIT_DEAD) { p->revents = POLLIN; return 1; }
     p->revents = 0; return 0;
@@ -334,6 +349,10 @@ static void start_cases(void) {
   for (enum fault f = WRONG_CONTROLLER; f <= CANCEL_AFTER_SPAWN; f++) {
     initialize(&owner, f);
     CHECK(tns_oci_start(&owner, &started) < 0);
+    if (f == SAME_EXE) {
+      CHECK(errno == ETIMEDOUT && owner.start_joined && model.kills == 0);
+      CHECK(model.exec_waits > 1 && model.milliseconds == 11000 && model.admission_cuts == 1);
+    }
     CHECK(owner.invalid);
     if (f == WRONG_CONTROLLER || f == NOT_ROOT || f == CONFIG_CHANGED || f == BUNDLE_CHANGED) {
       CHECK(model.clones == 0);
@@ -355,6 +374,27 @@ static void start_cases(void) {
   initialize(&owner, NONE); owner.stopped_exe = -1;
   CHECK(tns_oci_start(&owner, &started) == 0 && owner.stopped_exe == STOPPED_EXE);
   CHECK(tns_oci_release_uncreated(&(struct tns_oci_owner *){&owner}) < 0 && errno == EBUSY);
+}
+
+static void exec_wait_cases(void) {
+  struct tns_oci_owner owner;
+  struct tns_oci_started started;
+  initialize(&owner, EXEC_AFTER_WAIT);
+  CHECK(tns_oci_start(&owner, &started) == 0);
+  CHECK(model.exec_waits == 1 && model.clones == 1 && model.admission_cuts == 0);
+  CHECK(started.namespace_inode == owner.identity.inode && !owner.invalid);
+
+  const struct { enum fault fault; int expected_error; } refusals[] = {
+    {EXEC_WAIT_EXIT, ESRCH}, {EXEC_WAIT_CANCEL, ECANCELED},
+  };
+  for (size_t i = 0; i < sizeof(refusals) / sizeof(refusals[0]); i++) {
+    initialize(&owner, refusals[i].fault);
+    CHECK(tns_oci_start(&owner, &started) < 0 && errno == refusals[i].expected_error);
+    CHECK(model.exec_waits > 0 && model.clones == 1 && model.admission_cuts == 1);
+    CHECK(owner.invalid && owner.start_joined && model.kills == 0);
+    CHECK(tns_oci_start(&owner, &started) < 0 && errno == EALREADY && model.clones == 1);
+    retained(&owner);
+  }
 }
 
 static void parser_cases(void) {
@@ -405,7 +445,7 @@ static int late_cancel_cases(void) {
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--late-cancel")) return late_cancel_cases();
   if (argc != 1) return 2;
-  start_cases(); parser_cases();
+  start_cases(); exec_wait_cases(); parser_cases();
   printf("actual OCI START body + closed parser raw model: %lu checks\n", checks);
   return 0;
 }
@@ -427,10 +467,14 @@ int tns_owner_observe_creator(struct tns_owner *owner, struct tns_identity *iden
   (void)owner; (void)identity; abort();
 }
 
-/* Link-only compatibility for the new mandatory original admission ABI.
- * These older raw models do not implement it and must never fake success. */
+/* This fixture runs without a policy and can only model cutting admission. */
 int tns_owner_open_admission(struct tns_owner *owner) { (void)owner; abort(); }
-int tns_owner_cut_admission(struct tns_owner *owner) { (void)owner; abort(); }
+int tns_owner_cut_admission(struct tns_owner *owner) {
+  CHECK(owner == model.owner->birth && !model.owner->policy);
+  model.admission_cuts++;
+  if (model.fault == WRONG_CONTROLLER) { errno = EPERM; return -1; }
+  return 0;
+}
 int tns_owner_admission_current(struct tns_owner *owner) { (void)owner; abort(); }
 
 /* Link compatibility only; these old cohorts never model tracked join. */
