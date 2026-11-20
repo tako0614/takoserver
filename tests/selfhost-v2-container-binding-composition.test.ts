@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest, canonicalJson } from "../src/json.ts";
 import { createLinuxOciContainerBindingSource } from "../src/providers/linux-oci-container-binding-broker.ts";
@@ -451,7 +452,7 @@ test("OCI Composition original Version Form keeps absent-source refusal and repe
 
 test("OCI Composition actual Node source is selected by the same Sql Worker constructor only", async () => {
   const f = await originalOciNodeBindingFixture();
-  const root = await mkdtemp("/root/dev/tmp/oci-binding-composition-");
+  const root = await mkdtemp(join(tmpdir(), "oci-binding-composition-"));
   const node = f.compose();
   try {
     const source = node.containerBindingSource;

@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
@@ -61,7 +62,7 @@ function frame(body: string | Uint8Array): Buffer {
   return output;
 }
 function fixture(timeoutMs = 40) {
-  const root = mkdtempSync("/root/dev/tmp/linux-oci-start-raw-");
+  const root = mkdtempSync(join(tmpdir(), "linux-oci-start-raw-"));
   chmodSync(root, 0o700);
   const binary = join(root, "helper");
   writeFileSync(binary, "fixture never executed", { mode: 0o700 });
