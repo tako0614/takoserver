@@ -88,7 +88,7 @@ struct tns_oci_owner {
   struct stat rootfs_identity;
   struct stat config_identity;
   char id[65];
-  char rootpath[96], netpath[96], bundlepath[96], statepath[96], pidpath[128];
+  char rootpath[4096], netpath[96], bundlepath[96], statepath[96], pidpath[128];
   char receipt_bytes[8192];
   size_t receipt_size;
   /* Optional original-root input selects only an additional birth DROP guard.
@@ -185,6 +185,19 @@ static int oci_read_exact_file(int fd, const char *expected, size_t size) {
     if (used > size) { errno = EPROTO; return -1; }
   }
   if (used != size || memcmp(bytes, expected, size)) { errno = EPROTO; return -1; }
+  return 0;
+}
+
+/* runc requires the canonical filesystem path. The allocation and its
+ * parents are private to the trusted owner; re-open the name without
+ * symlinks and bind it to the original held rootfs inode. */
+static int oci_rootfs_path_current(struct tns_oci_owner *o) {
+  int fd = oci_open_absolute(o->rootpath, 1);
+  if (fd < 0) return -1;
+  struct stat st;
+  int same = fstat(fd, &st) == 0 && oci_same(&st, &o->rootfs_identity);
+  close(fd);
+  if (!same) { errno = ESTALE; return -1; }
   return 0;
 }
 
@@ -295,6 +308,7 @@ static _Noreturn void oci_command_child(struct tns_oci_owner *o, pid_t creator,
   /* DELETE is original-owner cleanup after consuming init/tracked joins.
    * Its parent checks cleanup-current; generic cancel still gates CREATE/START. */
   if (kind != OCI_COMMAND_DELETE && oci_not_canceled() < 0) _exit(125);
+  if (kind == OCI_COMMAND_CREATE && oci_rootfs_path_current(o) < 0) _exit(125);
   int executable = fcntl(o->runtime, F_DUPFD_CLOEXEC, 4);
   if (executable < 0 || dup3(executable, 3, O_CLOEXEC) < 0 ||
       syscall(SYS_close_range, 4u, UINT_MAX, 0u) < 0) _exit(125);
@@ -597,6 +611,35 @@ int tns_oci_stop_init(struct tns_oci_owner *o, struct tns_oci_init_reaped *reape
   return tns_oci_join_init(o, reaped);
 }
 
+/* A successful runc start may acknowledge the FIFO before the original
+ * init completes execve. Only the held init and its executable are sampled. */
+static int oci_started_executable(struct tns_oci_owner *o) {
+  int fd = openat(o->init_proc, "exe", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return -1;
+  struct stat original, actual;
+  int valid = fstat(o->stopped_exe, &original) == 0 && fstat(fd, &actual) == 0 &&
+              S_ISREG(actual.st_mode);
+  close(fd);
+  if (!valid) { errno = ESTALE; return -1; }
+  return !oci_same(&original, &actual);
+}
+
+static int oci_wait_started_executable(struct tns_oci_owner *o, int64_t deadline) {
+  for (;;) {
+    if (oci_not_canceled() < 0 || oci_private_init_current(o) < 0) return -1;
+    int64_t now = oci_now();
+    if (now < 0) return -1;
+    if (now >= deadline) { errno = ETIMEDOUT; return -1; }
+    int observed = oci_started_executable(o);
+    if (observed) return observed < 0 ? -1 : 0;
+    struct pollfd init = {.fd = o->init_pidfd, .events = POLLIN};
+    int64_t remaining = deadline - now;
+    int ready = poll(&init, 1, remaining < 10 ? (int)remaining : 10);
+    if (ready > 0) { errno = ESRCH; return -1; }
+    if (ready < 0 && errno != EINTR) return -1;
+  }
+}
+
 static int oci_observe_started_exec(struct tns_oci_owner *o, struct tns_oci_started *started) {
   if (!o || !started || o->invalid || !o->start_attempt || !o->start_joined ||
       !o->start_ok || o->stopped_exe < 0 || !o->init_custody) { errno = EINVAL; return -1; }
@@ -604,15 +647,11 @@ static int oci_observe_started_exec(struct tns_oci_owner *o, struct tns_oci_star
   if (oci_start_inputs(o) < 0 || tns_owner_observe(o->birth, &birth) < 0 ||
       !tns_identity_equal(&birth, &o->identity) || oci_private_init_current(o) < 0)
     goto fail;
-  int fd = openat(o->init_proc, "exe", O_RDONLY | O_CLOEXEC);
-  if (fd < 0) goto fail;
-  struct stat original, actual;
-  int ok = fstat(o->stopped_exe, &original) == 0 && fstat(fd, &actual) == 0 &&
-           S_ISREG(actual.st_mode) && !oci_same(&original, &actual);
-  close(fd);
-  /* runc's FIFO ACK can precede execve. Same executable is UNKNOWN, never
-   * evidence that the image process has executed. No delay/replay repairs it. */
-  if (!ok) { errno = ESTALE; goto fail; }
+  int observed = oci_started_executable(o);
+  if (observed <= 0) {
+    if (!observed) errno = ESTALE;
+    goto fail;
+  }
   if (oci_private_init_current(o) < 0 || tns_owner_observe(o->birth, &birth) < 0 ||
       !tns_identity_equal(&birth, &o->identity) || oci_start_inputs(o) < 0)
     goto fail;
@@ -663,9 +702,13 @@ int tns_oci_start(struct tns_oci_owner *o, struct tns_oci_started *started) {
   if (elapsed < now || elapsed - now >= 10000) { errno = ETIMEDOUT; goto fail; }
   if (oci_join_start_command(o, 10000 - (int)(elapsed - now)) < 0) goto fail;
   if (!o->start_ok) { errno = EPROTO; goto fail; }
+  const int64_t deadline = now + 10000;
   struct tns_oci_started executed;
-  if (oci_observe_started_exec(o, &executed) < 0 || oci_admission_open(o) < 0 ||
-      tns_oci_observe_started(o, started) < 0) goto fail;
+  if (oci_wait_started_executable(o, deadline) < 0 ||
+      oci_observe_started_exec(o, &executed) < 0) goto fail;
+  elapsed = oci_now();
+  if (elapsed < now || elapsed >= deadline) { errno = ETIMEDOUT; goto fail; }
+  if (oci_admission_open(o) < 0 || tns_oci_observe_started(o, started) < 0) goto fail;
   return 0;
 fail: {
   int saved = errno ? errno : EPROTO;
@@ -753,6 +796,9 @@ static int oci_create_profile(const struct tns_oci_options *options,
   if (o->rootfs < 0 || o->receipt < 0 || o->runtime < 0 ||
       fstat(o->runtime, &o->runtime_identity) < 0 ||
       fstat(o->rootfs, &o->rootfs_identity) < 0) goto fail;
+  int rootlen = snprintf(o->rootpath, sizeof(o->rootpath), "%s/rootfs", options->allocation_root);
+  if (rootlen < 0 || (size_t)rootlen >= sizeof(o->rootpath)) { errno = EOVERFLOW; goto fail; }
+  if (oci_rootfs_path_current(o) < 0) goto fail;
   unsigned char magic[4];
   if (!(o->runtime_identity.st_mode & 0100) ||
       pread(o->runtime, magic, sizeof(magic), 0) != (ssize_t)sizeof(magic) ||
@@ -783,7 +829,6 @@ static int oci_create_profile(const struct tns_oci_options *options,
   o->state = openat(o->root, "runtime-state", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   if (o->bundle < 0 || o->state < 0 || oci_owned(o->bundle, 1, 0700) < 0 ||
       oci_owned(o->state, 1, 0700) < 0 ||
-      oci_fd_path(o->rootpath, sizeof(o->rootpath), o->rootfs) < 0 ||
       oci_fd_path(o->netpath, sizeof(o->netpath), o->network) < 0 ||
       oci_fd_path(o->bundlepath, sizeof(o->bundlepath), o->bundle) < 0 ||
       oci_fd_path(o->statepath, sizeof(o->statepath), o->state) < 0) goto fail;
@@ -824,6 +869,13 @@ static int oci_create_profile(const struct tns_oci_options *options,
   if (oci_join_command(o, 10000 - (int)(elapsed - now)) < 0 || !o->command_ok)
     goto fail;
   if (oci_pin_init(o) < 0 || oci_pin_pidns(o) < 0) goto fail;
+  int init_root = openat(o->init_proc, "root", O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (init_root < 0) goto fail;
+  struct stat actual_root;
+  int same_root = fstat(init_root, &actual_root) == 0 &&
+                  oci_same(&actual_root, &o->rootfs_identity);
+  close(init_root);
+  if (!same_root) { errno = ESTALE; goto fail; }
   struct tns_oci_created observed;
   if (tns_oci_observe(o, &observed) < 0) goto fail;
   return 0;
