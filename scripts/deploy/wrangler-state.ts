@@ -16,7 +16,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { DeployError, mutationError, preflightError } from "./errors.ts";
 import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
@@ -632,7 +632,7 @@ function publicationLeasePaths(input: {
   readonly workerName: string;
   readonly root?: string;
 }): { readonly root: string; readonly lockPath: string; readonly ownerPath: string } {
-  const root = input.root ?? join(tmpdir(), "takoserver-worker-publication-locks");
+  const root = input.root ?? defaultPublicationLeaseRoot();
   if (!isAbsolute(root)) {
     throw preflightError("Worker Version publication lease root must be absolute");
   }
@@ -644,6 +644,27 @@ function publicationLeasePaths(input: {
     lockPath: join(root, targetDigest),
     ownerPath: join(root, `${targetDigest}.owner.json`),
   };
+}
+
+function defaultPublicationLeaseRoot(): string {
+  try {
+    // The OS account home is stable across per-process HOME and scratch overrides.
+    const { homedir, uid } = userInfo();
+    if (isAbsolute(homedir) && process.getuid?.() === uid) {
+      const state = lstatSync(homedir);
+      if (
+        state.isDirectory() &&
+        !state.isSymbolicLink() &&
+        state.uid === uid &&
+        (state.mode & 0o022) === 0
+      ) {
+        return join(homedir, ".takoserver-worker-publication-locks");
+      }
+    }
+  } catch {
+    // An unavailable account home cannot supply the default lock namespace.
+  }
+  throw preflightError("Worker Version publication lease requires a safe Unix account home");
 }
 
 function ensurePrivateLeaseRoot(root: string, create = true): void {

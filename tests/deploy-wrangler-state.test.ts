@@ -3,13 +3,16 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   lstatSync,
+  mkdirSync,
+  mkdtempSync,
   readdirSync,
   readFileSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { resolve } from "node:path";
+import { tmpdir, userInfo } from "node:os";
+import { join, resolve } from "node:path";
 import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -668,6 +671,87 @@ describe("Wrangler version publication output", () => {
       await second.release();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("shares the default same-owner kernel lease across process scratch directories", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "takoserver-default-publication-lease-"));
+    const holderScratch = join(scratch, "holder");
+    const contenderScratch = join(scratch, "contender");
+    const fixture = {
+      accountId: crypto.randomUUID().replaceAll("-", ""),
+      workerName: "fixture-worker-publication",
+    };
+    const digest = createHash("sha256")
+      .update(`${fixture.accountId}\0${fixture.workerName}`)
+      .digest("hex");
+    const lockFile = join(userInfo().homedir, ".takoserver-worker-publication-locks", digest);
+    const moduleUrl = new URL("../scripts/deploy/wrangler-state.ts", import.meta.url).href;
+    const fixtureScript = `
+      import { acquireWranglerVersionPublicationLease as acquire, inspectWranglerVersionPublicationLease as inspect } from ${JSON.stringify(moduleUrl)};
+      const target = ${JSON.stringify(fixture)};
+    `;
+    mkdirSync(holderScratch);
+    mkdirSync(contenderScratch);
+    const holder = Bun.spawn(
+      [
+        process.execPath,
+        "--no-env-file",
+        "-e",
+        `${fixtureScript}
+          const lease = await acquire(target);
+          try {
+            process.stdout.write("ready\\n");
+            await Bun.stdin.text();
+          } finally {
+            await lease.release();
+          }
+        `,
+      ],
+      { env: { ...process.env, TMPDIR: holderScratch }, stdin: "pipe", stdout: "pipe" },
+    );
+    const contend = () => {
+      const contender = Bun.spawnSync(
+        [
+          process.execPath,
+          "--no-env-file",
+          "-e",
+          `${fixtureScript}
+            const status = inspect(target).state;
+            let acquired = false;
+            try {
+              const lease = await acquire(target);
+              acquired = true;
+              await lease.release();
+            } catch (error) {
+              if (!error.message.includes("holds the active kernel lease")) throw error;
+            }
+            console.log(JSON.stringify({ status, acquired }));
+          `,
+        ],
+        { env: { ...process.env, TMPDIR: contenderScratch }, stdout: "pipe" },
+      );
+      expect(contender.exitCode).toBe(0);
+      return JSON.parse(contender.stdout.toString("utf8"));
+    };
+    try {
+      try {
+        const ready = holder.stdout.getReader();
+        try {
+          expect(new TextDecoder().decode((await ready.read()).value)).toBe("ready\n");
+        } finally {
+          ready.releaseLock();
+        }
+        expect(contend()).toEqual({ status: "active", acquired: false });
+      } finally {
+        await holder.stdin.end();
+        expect(await holder.exited).toBe(0);
+      }
+      expect(contend()).toEqual({ status: "available", acquired: true });
+    } finally {
+      rmSync(lockFile, { force: true });
+      rmSync(`${lockFile}.owner.json`, { force: true });
+      rmSync(scratch, { recursive: true, force: true });
     }
   });
 

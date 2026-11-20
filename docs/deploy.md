@@ -15,6 +15,13 @@ bun run deploy -- <surface> --status --environment=<integration|rehearsal|produc
 bun run deploy -- <surface> --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha>
 ```
 
+The default Worker publication lock lives in `.takoserver-worker-publication-locks`
+under the Unix account's home and is keyed by Cloudflare account and Worker name.
+Process scratch directories can vary while publications still share the lock.
+Finish in-flight Worker publications using the earlier temporary-directory locks
+before switching to the home-directory lock. The two roots hold separate kernel
+locks.
+
 Catalog Offering IDs are durable references shared by the catalog, provision
 tokens, and Deployments: they must be 3–255 characters and use the token
 reference alphabet (`A–Z`, `a–z`, `0–9`, `.`, `_`, `:`, `/`, `-`). Hosted
