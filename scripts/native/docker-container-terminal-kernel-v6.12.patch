@@ -687,7 +687,7 @@ diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
 new file mode 100644
 --- /dev/null
 +++ b/net/core/tako_terminal.c
-@@ -0,0 +1,618 @@
+@@ -0,0 +1,617 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/* Linux v6.12 first mechanical ownership unit. This is NOT a full lifetime
 + * barrier: skb/queues, device/offload continuations,
@@ -1291,7 +1291,6 @@ new file mode 100644
 +	.release = tako_release,
 +	.unlocked_ioctl = tako_ioctl,
 +	.compat_ioctl = compat_ptr_ioctl,
-+	.llseek = no_llseek,
 +};
 +
 +static struct miscdevice tako_device = {
