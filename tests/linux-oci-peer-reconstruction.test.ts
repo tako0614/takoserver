@@ -10,6 +10,7 @@ import {
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
 import { V2_CONTAINER_OWNER_ALLOCATION_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
+import { LinuxOciPhysicalSession } from "../src/providers/linux-oci-physical-session.ts";
 import {
   acceptedHttpSelection,
   acceptedRawHttp,
@@ -135,6 +136,13 @@ async function fixture(
     throw error;
   }
 }
+test("runtime3 stdin detach refuses an unbranded physical session before touching IO", async () => {
+  const session = Object.create(LinuxOciPhysicalSession.prototype) as LinuxOciPhysicalSession;
+  await expect(session.detachForPeerReconstruction(new AbortController().signal)).rejects.toThrow(
+    "linux_oci_physical_session_parent_peer_retained",
+  );
+});
+
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 async function run(f: Fixture) {
   await f.create();

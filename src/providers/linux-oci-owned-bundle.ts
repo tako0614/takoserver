@@ -48,6 +48,7 @@ import { createLinuxOciHttpHealthProbe } from "./linux-oci-http-health.ts";
 import {
   createLinuxOciParentBootstrap,
   createLinuxOciPhysicalSession,
+  detachOriginalLinuxOciRuntimePeer,
   type LinuxOciApplicationOwnerExit,
   type LinuxOciCreateStoppedRequest,
   type LinuxOciDisposedHelperObservation,
@@ -76,6 +77,7 @@ type OriginalPeerRead = {
 };
 type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
+  readonly runtime3: boolean;
   readonly artifactRoot: string;
   readonly physicalBinary: string | undefined;
   readonly hostTopology: LinuxOciHostTopology | undefined;
@@ -719,7 +721,7 @@ export async function prepareOriginalLinuxOciPeerInit(
         return fail("parent_custody");
       return control.observeJoined(actualSignal);
     },
-    begin(actualSignal: AbortSignal) {
+    async begin(actualSignal: AbortSignal) {
       if (
         signal !== actualSignal ||
         custody.peerReads.get(record.claimId) !== previous ||
@@ -727,6 +729,18 @@ export async function prepareOriginalLinuxOciPeerInit(
         custody.signal.aborted
       )
         return fail("parent_custody");
+      if (custody.runtime3) {
+        const session = custody.sessions.get(record.claimId);
+        if (!session) return fail("parent_custody");
+        await detachOriginalLinuxOciRuntimePeer(session, actualSignal);
+        if (
+          signal !== actualSignal ||
+          custody.peerReads.get(record.claimId) !== previous ||
+          actualSignal.aborted ||
+          custody.signal.aborted
+        )
+          return fail("parent_custody");
+      }
       custody.peerReads.set(
         record.claimId,
         Object.freeze({ custody: control, settlement: control.settlement, management: control }),
@@ -1382,6 +1396,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const nativeLifetime = new AbortController();
   originalOciCustodies.set(originalNativeCustody, {
     core,
+    runtime3: parentMode === "sealed-peer-runtime@1",
     artifactRoot,
     physicalBinary,
     hostTopology,

@@ -505,6 +505,7 @@ const parentHandoffs = new WeakMap<
   object,
   { readonly child: ChildProcessWithoutNullStreams; readonly current: () => void }
 >();
+const originalRuntime3Sessions = new WeakSet<LinuxOciPhysicalSession>();
 
 /** Holds its ORIGINAL child even when protocol/custody becomes unknown.
  * Its owner must retain this object; close cannot manufacture runtime deletion. */
@@ -523,6 +524,7 @@ export class LinuxOciPhysicalSession {
   #initStopAttempted = false;
   #initStopSent = false;
   #initIdentity: LinuxOciInitReapedObservation | undefined;
+  #inputWrites = 0;
   #namespaceReleaseAttempted = false;
   #namespaceReleaseSent = false;
   #namespaceLifetime: LinuxOciNamespaceLifetimeObservation | undefined;
@@ -540,6 +542,10 @@ export class LinuxOciPhysicalSession {
   #claim: string | undefined;
   #identity: LinuxOciStoppedObservation | undefined;
   #mustRetain = false;
+  #peerDetachState: "available" | "attempted" | "detached" | "unknown" = "available";
+  #peerDetachPromise: Promise<void> | undefined;
+  #peerDetachReject: ((error: Error) => void) | undefined;
+  #peerDetachTimer: ReturnType<typeof setTimeout> | undefined;
   #releasedUncreated = false;
   #exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   #closed = false;
@@ -961,7 +967,92 @@ export class LinuxOciPhysicalSession {
       throw failure("custody_retained");
   }
 
+  /** Close original runtime3 admission and detach only its idle P stdin.
+   * P/H remain alive; the caller must use the authenticated same-owner socket
+   * before sending any subsequent H operation. */
+  detachForPeerReconstruction(signal: AbortSignal): Promise<void> {
+    if (!originalRuntime3Sessions.has(this) || !(signal instanceof AbortSignal) || signal.aborted)
+      return Promise.reject(failure("parent_peer_retained"));
+    if (this.#peerDetachState === "detached") return Promise.resolve();
+    if (this.#peerDetachState === "attempted")
+      return this.#peerDetachPromise ?? Promise.reject(failure("parent_peer_retained"));
+    if (this.#peerDetachState === "unknown") return Promise.reject(failure("parent_peer_retained"));
+    if (
+      !this.#usable ||
+      !this.#mustRetain ||
+      !this.#identity ||
+      this.#pending !== undefined ||
+      this.#inputWrites !== 0 ||
+      this.#buffer.length !== 0 ||
+      this.#exit !== undefined ||
+      this.#closed ||
+      this.#child.stdin.destroyed
+    )
+      return Promise.reject(failure("parent_peer_retained"));
+    // A refusal above leaves the existing session usable for its current
+    // admitted operation. Only the one-way detach attempt revokes admission.
+    this.#admissionClosed = true;
+    this.#peerDetachState = "attempted";
+    this.#peerDetachPromise = new Promise<void>((resolve, reject) => {
+      this.#peerDetachReject = reject;
+      const stream = this.#child.stdin;
+      const cleanup = () => {
+        stream.removeListener("error", onError);
+        stream.removeListener("close", onClose);
+      };
+      const unknown = () => {
+        if (this.#peerDetachState !== "attempted") return;
+        this.#peerDetachState = "unknown";
+        if (this.#peerDetachTimer) clearTimeout(this.#peerDetachTimer);
+        this.#peerDetachTimer = undefined;
+        cleanup();
+        const rejectPending = this.#peerDetachReject;
+        this.#peerDetachReject = undefined;
+        rejectPending?.(failure("parent_peer_retained"));
+      };
+      const onError = () => unknown();
+      const onClose = () => {
+        if (!stream.writableFinished) unknown();
+      };
+      const finished = () => {
+        if (this.#peerDetachState !== "attempted") return;
+        if (
+          !this.#usable ||
+          this.#exit !== undefined ||
+          this.#closed ||
+          stream.destroyed ||
+          stream.errored !== null ||
+          !stream.writableFinished
+        ) {
+          unknown();
+          return;
+        }
+        this.#peerDetachState = "detached";
+        if (this.#peerDetachTimer) clearTimeout(this.#peerDetachTimer);
+        this.#peerDetachTimer = undefined;
+        cleanup();
+        this.#peerDetachReject = undefined;
+        resolve();
+      };
+      stream.once("error", onError);
+      stream.once("close", onClose);
+      this.#peerDetachTimer = setTimeout(() => {
+        unknown();
+      }, this.#timeout);
+      try {
+        // This one-shot EOF is the runtime3 ownership handoff. Never call
+        // cancel(), close(), signal P/H, or start a replacement process here.
+        stream.end(finished);
+      } catch {
+        unknown();
+      }
+    });
+    return this.#peerDetachPromise;
+  }
+
   cancel(): Promise<LinuxOciCancelObservation> {
+    if (this.#peerDetachState !== "available")
+      return Promise.reject(failure("parent_peer_retained"));
     this.#admissionClosed = true;
     this.#cancelPromise ??= (async () => {
       await this.#pending?.done;
@@ -976,6 +1067,8 @@ export class LinuxOciPhysicalSession {
   }
 
   close(): Promise<void> {
+    if (this.#peerDetachState !== "available")
+      return Promise.reject(failure("parent_peer_retained"));
     this.#admissionClosed = true;
     this.#closePromise ??= (async () => {
       try {
@@ -1013,6 +1106,14 @@ export class LinuxOciPhysicalSession {
 
   #break() {
     this.#usable = false;
+    if (this.#peerDetachState === "attempted") {
+      this.#peerDetachState = "unknown";
+      if (this.#peerDetachTimer) clearTimeout(this.#peerDetachTimer);
+      this.#peerDetachTimer = undefined;
+      const reject = this.#peerDetachReject;
+      this.#peerDetachReject = undefined;
+      reject?.(failure("parent_peer_retained"));
+    }
     this.#localDisposalReply = false;
     this.#localDisposalObserved = false;
     this.#buffer = Buffer.alloc(0);
@@ -1154,6 +1255,7 @@ export class LinuxOciPhysicalSession {
 
   #request(operation: Operation, value: unknown, signal?: AbortSignal): Promise<Reply> {
     if (
+      this.#peerDetachState !== "available" ||
       !this.#usable ||
       this.#pending ||
       this.#localDisposalReply ||
@@ -1196,7 +1298,9 @@ export class LinuxOciPhysicalSession {
         if (operation === "begin-tracked-join") this.#trackedJoinSent = true;
         if (operation === "delete-born") this.#bornDeleteSent = true;
         if (operation === "dispose-born") this.#bornDisposalSent = true;
+        this.#inputWrites++;
         this.#child.stdin.write(frame, (error) => {
+          this.#inputWrites = Math.max(0, this.#inputWrites - 1);
           if (error) this.#break();
         });
       } catch {
@@ -1211,6 +1315,17 @@ export function createLinuxOciPhysicalSession(options: {
   readonly timeoutMs?: number;
 }): LinuxOciPhysicalSession {
   return new LinuxOciPhysicalSession(options);
+}
+
+/** Only a session born from this module's original runtime3 P handoff can
+ * consume the one-shot stdin detach used by live authenticated reconstruction. */
+export function detachOriginalLinuxOciRuntimePeer(
+  session: LinuxOciPhysicalSession,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!originalRuntime3Sessions.has(session))
+    return Promise.reject(failure("parent_peer_retained"));
+  return session.detachForPeerReconstruction(signal);
 }
 
 /** Original P bootstrap facts only. The cookie is lossless, not H identity,
@@ -1668,6 +1783,7 @@ export class LinuxOciParentBootstrap {
     const observation = await session.createStopped(request, signal);
     this.assertCurrent(signal);
     this.#created = true;
+    if (this.#runtimeFirst && !this.#localCleanup) originalRuntime3Sessions.add(session);
     return Object.freeze({ session, observation });
   }
 
