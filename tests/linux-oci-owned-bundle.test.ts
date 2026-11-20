@@ -8,6 +8,7 @@ import * as filesystem from "node:fs/promises";
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import * as http from "node:http";
 import { request as importedRequest } from "node:http";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
@@ -147,7 +148,7 @@ async function fixture(
     readonly configuredKey?: "sql" | "selection" | "owner";
   } = {},
 ) {
-  const scratch = await mkdtemp("/root/dev/tmp/linux-oci-owned-bundle-");
+  const scratch = await mkdtemp(join(tmpdir(), "linux-oci-owned-bundle-"));
   await chmod(scratch, 0o700);
   const artifactRoot = join(scratch, "artifacts");
   const unpackerParent = adversarial.unsafeUnpackerParent ? join(scratch, "unsafe") : scratch;
