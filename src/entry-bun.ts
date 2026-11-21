@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { isMainThread } from "node:worker_threads";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
 import { parseBillingConfig } from "./billing-config.ts";
@@ -179,6 +180,9 @@ import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linu
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor } from "./workerd-supervisor.ts";
 
+// Process-lifecycle bookkeeping only; selection and authority stay in arguments.
+const SELFHOST_BUN_HOST_STARTUP_SENTINEL = Symbol.for("takoserver.selfhost-bun-host-startup@v1");
+
 /**
  * The self-hosted entry and its local or account-backed provisioners.
  *
@@ -198,1811 +202,1942 @@ import { createWorkerdSupervisor } from "./workerd-supervisor.ts";
  */
 
 /**
- * A used v1.0.0 installation is refused before anything was written to it, and
- * the message is the whole explanation; a stack trace would only bury it.
+ * Run the ordinary Bun Host with an optional explicit, code-owned Linux
+ * Container backend selection. Omitting it preserves the existing disabled
+ * default. This is the same initialization used by direct `bun src/entry-bun.ts`.
+ * This process-owned startup is single-use: preflight failures reject before
+ * state opens, while failures after resource initialization terminate the process.
  */
-function exitWithUsedV1Refusal(error: UsedV1InstallationError): never {
-  process.stderr.write(`${error.message}\n`);
-  process.exit(1);
-}
-
-function required(name: string): string {
-  const value = process.env[name];
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-}
-
-/**
- * The account credential, read at the moment it is used.
- *
- * A token captured once at startup is a token that expires while the process
- * keeps running — every call then fails with an authorization error that looks
- * nothing like "your credential aged out". Reading a file per call lets an
- * operator rotate or refresh without a restart.
- */
-function cloudflareToken(): string {
-  const path = process.env.TAKOSERVER_CF_TOKEN_FILE;
-  if (!path) return required("CLOUDFLARE_API_TOKEN");
-  return readFileSync(path, "utf8").trim();
-}
-
-function aiGateway() {
-  const baseUrl = process.env.TAKOSERVER_AI_BASE_URL;
-  const models = process.env.TAKOSERVER_AI_MODELS;
-  const tokenFile = process.env.TAKOSERVER_AI_TOKEN_FILE;
-  const token = process.env.TAKOSERVER_AI_TOKEN;
-  if (!baseUrl && !models && !tokenFile && !token) return undefined;
-  if (!baseUrl || !models || (!tokenFile && !token)) {
-    throw new Error(
-      "TAKOSERVER_AI_BASE_URL, TAKOSERVER_AI_MODELS, and one AI token source are required together",
-    );
+export async function startSelfhostBunHost(
+  options: { readonly linuxContainerSelection?: SelfhostLinuxContainerNodeSelectionSource } = {},
+): Promise<void> {
+  /**
+   * A Bun Host owns process-global listeners, timers, signal handlers and one
+   * SQLite lifecycle. It can be started once in this process, even if a
+   * preflight later rejects and the caller catches that rejection.
+   */
+  if (!isMainThread) {
+    return Promise.reject(new TypeError("selfhost_bun_host_main_thread_required"));
   }
-  return createOpenAiGateway({
-    baseUrl,
-    models: parseOpenAiModelConfig(models),
-    authorize: () => {
-      const secret = tokenFile ? readFileSync(tokenFile, "utf8").trim() : token;
-      if (!secret) throw new Error("AI upstream token is empty");
-      return `Bearer ${secret}`;
-    },
+  if (Reflect.get(process, SELFHOST_BUN_HOST_STARTUP_SENTINEL) !== undefined) {
+    return Promise.reject(new TypeError("selfhost_bun_host_already_started"));
+  }
+  Object.defineProperty(process, SELFHOST_BUN_HOST_STARTUP_SENTINEL, {
+    value: true,
+    configurable: false,
+    enumerable: false,
+    writable: false,
+  });
+
+  let selectionSource: SelfhostLinuxContainerNodeSelectionSource | undefined;
+  try {
+    if (
+      options === null ||
+      typeof options !== "object" ||
+      (Object.getPrototypeOf(options) !== Object.prototype &&
+        Object.getPrototypeOf(options) !== null)
+    )
+      throw new TypeError("invalid self-host Bun startup options");
+    const keys = Reflect.ownKeys(options);
+    if (keys.some((key) => key !== "linuxContainerSelection") || keys.length > 1) {
+      throw new TypeError("invalid self-host Bun startup options");
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(options, "linuxContainerSelection");
+    if (descriptor && (!descriptor.enumerable || !("value" in descriptor))) {
+      throw new TypeError("invalid self-host Bun startup options");
+    }
+    const value: unknown = descriptor?.value;
+    if (value !== undefined && (typeof value !== "object" || value === null)) {
+      throw new TypeError("invalid self-host Linux Container selection");
+    }
+    selectionSource = value as SelfhostLinuxContainerNodeSelectionSource | undefined;
+  } catch (cause) {
+    return Promise.reject(cause);
+  }
+
+  let processResourcesStarted = false;
+  return runSelfhostBunHost(selectionSource, () => {
+    processResourcesStarted = true;
+  }).catch((cause: unknown) => {
+    if (!processResourcesStarted) throw cause;
+    if (import.meta.main) throw cause;
+    try {
+      process.stderr.write(
+        "self-host Bun startup failed after process resources opened; exiting\n",
+      );
+    } finally {
+      process.exit(1);
+    }
   });
 }
 
-if (process.env.TAKOSERVER_D1_DATABASE_ID !== undefined) {
-  throw new Error(
-    "TAKOSERVER_D1_DATABASE_ID is not supported by the Bun entry; use local SQLite control state",
-  );
-}
-if (process.env.TAKOSERVER_R2_BUCKET !== undefined) {
-  throw new Error(
-    "TAKOSERVER_R2_BUCKET is not supported by the Bun entry; use its local exact-identity artifact store",
-  );
-}
-
-const takoformV2Config = parseTakoformV2ApplicationConfig({
-  TAKOSERVER_TAKOFORM_V2_CONFIG: process.env.TAKOSERVER_TAKOFORM_V2_CONFIG,
-  TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
-});
-// File-backed tariff loading can be designed separately; this release accepts inline JSON only.
-const billingConfig = parseBillingConfig(process.env.TAKOSERVER_BILLING_CONFIG);
-const hostedPricing = parseHostedPricing(process.env.TAKOSERVER_HOSTED_PRICING);
-if (hostedPricing) assertHostedPricingMatchesBilling(hostedPricing, billingConfig);
-const hostedBillingSelection = process.env.TAKOSERVER_HOSTED_BILLING;
-if (
-  hostedBillingSelection !== undefined &&
-  hostedBillingSelection !== "" &&
-  hostedBillingSelection !== "canonical-test"
-) {
-  throw new TypeError("TAKOSERVER_HOSTED_BILLING must be canonical-test or absent");
-}
-const canonicalHostedBilling = hostedBillingSelection === "canonical-test";
-
-function parseHostedOnDemandEnvironment(
-  raw: string | undefined,
-  canonicalHostedBilling: boolean,
-): HostedOnDemandConfiguration | undefined {
-  if (raw === undefined) return undefined;
-  if (!canonicalHostedBilling) {
-    throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND requires canonical-test");
+async function runSelfhostBunHost(
+  selectionSource: SelfhostLinuxContainerNodeSelectionSource | undefined,
+  markProcessResourcesStarted: () => void,
+): Promise<void> {
+  /**
+   * A used v1.0.0 installation is refused before anything was written to it, and
+   * the message is the whole explanation; a stack trace would only bury it.
+   */
+  function exitWithUsedV1Refusal(error: UsedV1InstallationError): never {
+    process.stderr.write(`${error.message}\n`);
+    process.exit(1);
   }
-  try {
-    if (typeof raw !== "string") throw new TypeError();
-    const bytes = new TextEncoder().encode(raw);
-    const value = parseStrictJson(bytes, bytes.byteLength);
-    if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError();
-    const fields = value as Record<string, unknown>;
-    if (
-      Object.keys(fields).length !== 3 ||
-      !["terms", "cardSetupReturnUrls", "setupDisclosureRevision"].every((key) =>
-        Object.hasOwn(fields, key),
-      ) ||
-      typeof fields.setupDisclosureRevision !== "string" ||
-      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(fields.setupDisclosureRevision)
-    )
-      throw new TypeError();
-    const terms = parseOrgOnDemandTerms(fields.terms);
-    const urls = fields.cardSetupReturnUrls;
-    if (typeof urls !== "object" || urls === null || Array.isArray(urls)) throw new TypeError();
-    const returns = urls as Record<string, unknown>;
-    if (
-      Object.keys(returns).length !== 2 ||
-      !["successUrl", "cancelUrl"].every((key) => Object.hasOwn(returns, key))
-    )
-      throw new TypeError();
-    const returnUrl = (value: unknown): string => {
-      if (typeof value !== "string" || value.length > 2048) throw new TypeError();
-      const parsed = new URL(value);
+
+  function required(name: string): string {
+    const value = process.env[name];
+    if (!value) throw new Error(`${name} is required`);
+    return value;
+  }
+
+  /**
+   * The account credential, read at the moment it is used.
+   *
+   * A token captured once at startup is a token that expires while the process
+   * keeps running — every call then fails with an authorization error that looks
+   * nothing like "your credential aged out". Reading a file per call lets an
+   * operator rotate or refresh without a restart.
+   */
+  function cloudflareToken(): string {
+    const path = process.env.TAKOSERVER_CF_TOKEN_FILE;
+    if (!path) return required("CLOUDFLARE_API_TOKEN");
+    return readFileSync(path, "utf8").trim();
+  }
+
+  function aiGateway() {
+    const baseUrl = process.env.TAKOSERVER_AI_BASE_URL;
+    const models = process.env.TAKOSERVER_AI_MODELS;
+    const tokenFile = process.env.TAKOSERVER_AI_TOKEN_FILE;
+    const token = process.env.TAKOSERVER_AI_TOKEN;
+    if (!baseUrl && !models && !tokenFile && !token) return undefined;
+    if (!baseUrl || !models || (!tokenFile && !token)) {
+      throw new Error(
+        "TAKOSERVER_AI_BASE_URL, TAKOSERVER_AI_MODELS, and one AI token source are required together",
+      );
+    }
+    return createOpenAiGateway({
+      baseUrl,
+      models: parseOpenAiModelConfig(models),
+      authorize: () => {
+        const secret = tokenFile ? readFileSync(tokenFile, "utf8").trim() : token;
+        if (!secret) throw new Error("AI upstream token is empty");
+        return `Bearer ${secret}`;
+      },
+    });
+  }
+
+  if (process.env.TAKOSERVER_D1_DATABASE_ID !== undefined) {
+    throw new Error(
+      "TAKOSERVER_D1_DATABASE_ID is not supported by the Bun entry; use local SQLite control state",
+    );
+  }
+  if (process.env.TAKOSERVER_R2_BUCKET !== undefined) {
+    throw new Error(
+      "TAKOSERVER_R2_BUCKET is not supported by the Bun entry; use its local exact-identity artifact store",
+    );
+  }
+
+  const takoformV2Config = parseTakoformV2ApplicationConfig({
+    TAKOSERVER_TAKOFORM_V2_CONFIG: process.env.TAKOSERVER_TAKOFORM_V2_CONFIG,
+    TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
+  });
+  // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
+  const billingConfig = parseBillingConfig(process.env.TAKOSERVER_BILLING_CONFIG);
+  const hostedPricing = parseHostedPricing(process.env.TAKOSERVER_HOSTED_PRICING);
+  if (hostedPricing) assertHostedPricingMatchesBilling(hostedPricing, billingConfig);
+  const hostedBillingSelection = process.env.TAKOSERVER_HOSTED_BILLING;
+  if (
+    hostedBillingSelection !== undefined &&
+    hostedBillingSelection !== "" &&
+    hostedBillingSelection !== "canonical-test"
+  ) {
+    throw new TypeError("TAKOSERVER_HOSTED_BILLING must be canonical-test or absent");
+  }
+  const canonicalHostedBilling = hostedBillingSelection === "canonical-test";
+
+  function parseHostedOnDemandEnvironment(
+    raw: string | undefined,
+    canonicalHostedBilling: boolean,
+  ): HostedOnDemandConfiguration | undefined {
+    if (raw === undefined) return undefined;
+    if (!canonicalHostedBilling) {
+      throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND requires canonical-test");
+    }
+    try {
+      if (typeof raw !== "string") throw new TypeError();
+      const bytes = new TextEncoder().encode(raw);
+      const value = parseStrictJson(bytes, bytes.byteLength);
+      if (typeof value !== "object" || value === null || Array.isArray(value))
+        throw new TypeError();
+      const fields = value as Record<string, unknown>;
       if (
-        parsed.protocol !== "https:" ||
-        parsed.username ||
-        parsed.password ||
-        parsed.hash ||
-        [...parsed.searchParams.keys()].some((key) => /secret|token/iu.test(key))
+        Object.keys(fields).length !== 3 ||
+        !["terms", "cardSetupReturnUrls", "setupDisclosureRevision"].every((key) =>
+          Object.hasOwn(fields, key),
+        ) ||
+        typeof fields.setupDisclosureRevision !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(fields.setupDisclosureRevision)
       )
         throw new TypeError();
-      return value;
-    };
-    const successUrl = returnUrl(returns.successUrl);
-    const cancelUrl = returnUrl(returns.cancelUrl);
-    if (new URL(successUrl).origin !== new URL(cancelUrl).origin) throw new TypeError();
-    return Object.freeze({
-      terms,
-      cardSetupReturnUrls: Object.freeze({ successUrl, cancelUrl }),
-      setupDisclosureRevision: fields.setupDisclosureRevision,
-    });
-  } catch {
-    throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND must be complete valid JSON");
-  }
-}
-
-const hostedOnDemandConfiguration = parseHostedOnDemandEnvironment(
-  process.env.TAKOSERVER_HOSTED_BILLING_ON_DEMAND,
-  canonicalHostedBilling,
-);
-const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
-  process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
-);
-const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN;
-if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
-  throw new Error("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
-}
-const port = Number(process.env.PORT ?? 8787);
-// Loopback unless the operator names an interface: see selfhost-listen-address.
-// Read before any state opens, so a mistyped address refuses to start rather
-// than serving on an interface nobody chose.
-const listenHost = parseSelfhostListenHost(process.env[SELFHOST_LISTEN_HOST_VARIABLE]);
-const forceOperatorAssertionPrint = parseSelfhostOperatorAssertionPrint(
-  process.env[SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE],
-);
-
-/**
- * Everything this machine keeps lives under one directory, resolved once to an
- * absolute canonical path: the default is relative to the working directory,
- * and the Actor, Workflow and private-plane owners accept nothing else.
- */
-const configuredDataRoot = process.env[SELFHOST_DATA_ROOT_VARIABLE];
-const dataRoot = resolveSelfhostDataRoot(configuredDataRoot);
-if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
-  process.stdout.write(
-    `${SELFHOST_DATA_ROOT_VARIABLE} ${configuredDataRoot === undefined ? `(default ${SELFHOST_DEFAULT_DATA_ROOT})` : JSON.stringify(configuredDataRoot)} resolved to ${dataRoot}\n`,
-  );
-}
-/**
- * Where state that has no memory form lives: the data root itself, or for
- * memory control state the default root, resolved like any other.
- */
-const durableRoot =
-  dataRoot === SELFHOST_MEMORY_DATA_ROOT ? resolveSelfhostDataRoot(undefined) : dataRoot;
-// An explicitly selected v2 capability whose sockets cannot fit below this root
-// is a configuration error now, not an Operation that never confirms later.
-if (v2RuntimeSelection) assertSelfhostV2RuntimeSocketBudget(v2RuntimeSelection, dataRoot);
-const v2WorkerTargetKey = "selfhost-v2-worker-primary";
-const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
-  ? Number(process.env.TAKOSERVER_WORKERD_PORT)
-  : 8788;
-const workerEndpointPort = process.env.TAKOSERVER_WORKER_ENDPOINT_PORT
-  ? Number(process.env.TAKOSERVER_WORKER_ENDPOINT_PORT)
-  : workerdPort;
-if (
-  !Number.isSafeInteger(workerEndpointPort) ||
-  workerEndpointPort < 1 ||
-  workerEndpointPort > 65_535
-) {
-  throw new Error("TAKOSERVER_WORKER_ENDPOINT_PORT must be a TCP port between 1 and 65535");
-}
-const parsedContainerConfiguration = parseSelfhostContainerBootstrapConfiguration(process.env);
-const containerEndpointHttpsConfiguration = parseSelfhostContainerEndpointHttpsConfiguration(
-  process.env,
-  {
-    containerRuntimeConfigured: parsedContainerConfiguration !== undefined,
-    controlPort: port,
-    workerdPort,
-    workerEndpointPort,
-  },
-);
-/**
- * Keep the existing Workerd TLS inputs and parsing semantics as the one source
- * of certificate material. Container HTTPS validates and handshakes its own
- * listener independently; Workerd's socket and published scheme remain owned
- * by the existing Workerd configuration.
- */
-const workerdTls = (() => {
-  const read = (path: string, name: string): string => {
-    try {
-      return readFileSync(path, "utf8");
+      const terms = parseOrgOnDemandTerms(fields.terms);
+      const urls = fields.cardSetupReturnUrls;
+      if (typeof urls !== "object" || urls === null || Array.isArray(urls)) throw new TypeError();
+      const returns = urls as Record<string, unknown>;
+      if (
+        Object.keys(returns).length !== 2 ||
+        !["successUrl", "cancelUrl"].every((key) => Object.hasOwn(returns, key))
+      )
+        throw new TypeError();
+      const returnUrl = (value: unknown): string => {
+        if (typeof value !== "string" || value.length > 2048) throw new TypeError();
+        const parsed = new URL(value);
+        if (
+          parsed.protocol !== "https:" ||
+          parsed.username ||
+          parsed.password ||
+          parsed.hash ||
+          [...parsed.searchParams.keys()].some((key) => /secret|token/iu.test(key))
+        )
+          throw new TypeError();
+        return value;
+      };
+      const successUrl = returnUrl(returns.successUrl);
+      const cancelUrl = returnUrl(returns.cancelUrl);
+      if (new URL(successUrl).origin !== new URL(cancelUrl).origin) throw new TypeError();
+      return Object.freeze({
+        terms,
+        cardSetupReturnUrls: Object.freeze({ successUrl, cancelUrl }),
+        setupDisclosureRevision: fields.setupDisclosureRevision,
+      });
     } catch {
-      throw new Error(`${name} could not be read: ${path}`);
+      throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND must be complete valid JSON");
     }
-  };
-  const certificateFile = process.env[SELFHOST_TLS_ENVIRONMENT.certificateFile]?.trim();
-  const privateKeyFile = process.env[SELFHOST_TLS_ENVIRONMENT.privateKeyFile]?.trim();
-  const certificate = process.env[SELFHOST_TLS_ENVIRONMENT.certificate]?.trim();
-  const privateKey = process.env[SELFHOST_TLS_ENVIRONMENT.privateKey]?.trim();
-  const certificateChain = certificateFile
-    ? read(certificateFile, SELFHOST_TLS_ENVIRONMENT.certificateFile)
-    : certificate;
-  const key = privateKeyFile
-    ? read(privateKeyFile, SELFHOST_TLS_ENVIRONMENT.privateKeyFile)
-    : privateKey;
-  if (!certificateChain && !key) return undefined;
-  if (!certificateChain || !key) {
-    throw new Error(
-      `a Worker socket certificate needs both halves: set ${SELFHOST_TLS_ENVIRONMENT.certificateFile}` +
-        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile}, or ${SELFHOST_TLS_ENVIRONMENT.certificate}` +
-        ` and ${SELFHOST_TLS_ENVIRONMENT.privateKey}`,
+  }
+
+  const hostedOnDemandConfiguration = parseHostedOnDemandEnvironment(
+    process.env.TAKOSERVER_HOSTED_BILLING_ON_DEMAND,
+    canonicalHostedBilling,
+  );
+  const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
+    process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
+  );
+  const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN;
+  if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
+    throw new Error("TAKOSERVER_PUBLIC_ORIGIN must be a canonical HTTPS bare origin");
+  }
+  const port = Number(process.env.PORT ?? 8787);
+  // Loopback unless the operator names an interface: see selfhost-listen-address.
+  // Read before any state opens, so a mistyped address refuses to start rather
+  // than serving on an interface nobody chose.
+  const listenHost = parseSelfhostListenHost(process.env[SELFHOST_LISTEN_HOST_VARIABLE]);
+  const forceOperatorAssertionPrint = parseSelfhostOperatorAssertionPrint(
+    process.env[SELFHOST_OPERATOR_ASSERTION_PRINT_VARIABLE],
+  );
+
+  /**
+   * Everything this machine keeps lives under one directory, resolved once to an
+   * absolute canonical path: the default is relative to the working directory,
+   * and the Actor, Workflow and private-plane owners accept nothing else.
+   */
+  const configuredDataRoot = process.env[SELFHOST_DATA_ROOT_VARIABLE];
+  const dataRoot = resolveSelfhostDataRoot(configuredDataRoot);
+  if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
+    process.stdout.write(
+      `${SELFHOST_DATA_ROOT_VARIABLE} ${configuredDataRoot === undefined ? `(default ${SELFHOST_DEFAULT_DATA_ROOT})` : JSON.stringify(configuredDataRoot)} resolved to ${dataRoot}\n`,
     );
   }
-  return { certificateChain, privateKey: key };
-})();
-if (containerEndpointHttpsConfiguration) {
-  if (!workerdTls) {
-    throw new Error(
-      "Container Endpoint HTTPS requires the existing Worker TLS certificate and key material",
-    );
+  /**
+   * Where state that has no memory form lives: the data root itself, or for
+   * memory control state the default root, resolved like any other.
+   */
+  const durableRoot =
+    dataRoot === SELFHOST_MEMORY_DATA_ROOT ? resolveSelfhostDataRoot(undefined) : dataRoot;
+  // An explicitly selected v2 capability whose sockets cannot fit below this root
+  // is a configuration error now, not an Operation that never confirms later.
+  if (v2RuntimeSelection) assertSelfhostV2RuntimeSocketBudget(v2RuntimeSelection, dataRoot);
+  const v2WorkerTargetKey = "selfhost-v2-worker-primary";
+  const workerdPort = process.env.TAKOSERVER_WORKERD_PORT
+    ? Number(process.env.TAKOSERVER_WORKERD_PORT)
+    : 8788;
+  const workerEndpointPort = process.env.TAKOSERVER_WORKER_ENDPOINT_PORT
+    ? Number(process.env.TAKOSERVER_WORKER_ENDPOINT_PORT)
+    : workerdPort;
+  if (
+    !Number.isSafeInteger(workerEndpointPort) ||
+    workerEndpointPort < 1 ||
+    workerEndpointPort > 65_535
+  ) {
+    throw new Error("TAKOSERVER_WORKER_ENDPOINT_PORT must be a TCP port between 1 and 65535");
   }
-  validateSelfhostContainerEndpointHttpsCertificate({
-    configuredSuffix: containerEndpointHttpsConfiguration.configuredSuffix,
-    certificateChain: workerdTls.certificateChain,
-    privateKey: workerdTls.privateKey,
+  const parsedContainerConfiguration = parseSelfhostContainerBootstrapConfiguration(process.env);
+  const containerEndpointHttpsConfiguration = parseSelfhostContainerEndpointHttpsConfiguration(
+    process.env,
+    {
+      containerRuntimeConfigured: parsedContainerConfiguration !== undefined,
+      controlPort: port,
+      workerdPort,
+      workerEndpointPort,
+    },
+  );
+  /**
+   * Keep the existing Workerd TLS inputs and parsing semantics as the one source
+   * of certificate material. Container HTTPS validates and handshakes its own
+   * listener independently; Workerd's socket and published scheme remain owned
+   * by the existing Workerd configuration.
+   */
+  const workerdTls = (() => {
+    const read = (path: string, name: string): string => {
+      try {
+        return readFileSync(path, "utf8");
+      } catch {
+        throw new Error(`${name} could not be read: ${path}`);
+      }
+    };
+    const certificateFile = process.env[SELFHOST_TLS_ENVIRONMENT.certificateFile]?.trim();
+    const privateKeyFile = process.env[SELFHOST_TLS_ENVIRONMENT.privateKeyFile]?.trim();
+    const certificate = process.env[SELFHOST_TLS_ENVIRONMENT.certificate]?.trim();
+    const privateKey = process.env[SELFHOST_TLS_ENVIRONMENT.privateKey]?.trim();
+    const certificateChain = certificateFile
+      ? read(certificateFile, SELFHOST_TLS_ENVIRONMENT.certificateFile)
+      : certificate;
+    const key = privateKeyFile
+      ? read(privateKeyFile, SELFHOST_TLS_ENVIRONMENT.privateKeyFile)
+      : privateKey;
+    if (!certificateChain && !key) return undefined;
+    if (!certificateChain || !key) {
+      throw new Error(
+        `a Worker socket certificate needs both halves: set ${SELFHOST_TLS_ENVIRONMENT.certificateFile}` +
+          ` and ${SELFHOST_TLS_ENVIRONMENT.privateKeyFile}, or ${SELFHOST_TLS_ENVIRONMENT.certificate}` +
+          ` and ${SELFHOST_TLS_ENVIRONMENT.privateKey}`,
+      );
+    }
+    return { certificateChain, privateKey: key };
+  })();
+  if (containerEndpointHttpsConfiguration) {
+    if (!workerdTls) {
+      throw new Error(
+        "Container Endpoint HTTPS requires the existing Worker TLS certificate and key material",
+      );
+    }
+    validateSelfhostContainerEndpointHttpsCertificate({
+      configuredSuffix: containerEndpointHttpsConfiguration.configuredSuffix,
+      certificateChain: workerdTls.certificateChain,
+      privateKey: workerdTls.privateKey,
+    });
+  }
+  const v2WorkerEndpointHttpsSelection = parseSelfhostV2WorkerEndpointHttpsSelection(
+    process.env.TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS,
+    {
+      workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+      tlsConfigured: workerdTls !== undefined,
+      containerEndpointHttpsConfigured: containerEndpointHttpsConfiguration !== undefined,
+      reservedPorts: [
+        port,
+        workerdPort,
+        workerEndpointPort,
+        ...(process.env.TAKOSERVER_DATA_PLANE_PORT?.trim() === "443" ? [443] : []),
+      ],
+    },
+  );
+  const providerMode = resolveStandaloneProviderMode({
+    retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
+    cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
+    cloudflareCredentialConfigured: Boolean(
+      process.env.CLOUDFLARE_API_TOKEN?.trim() || process.env.TAKOSERVER_CF_TOKEN_FILE?.trim(),
+    ),
+    provisionerCredentialConfigured: Boolean(process.env.TAKOSERVER_PROVISIONER_TOKEN?.trim()),
+    cloudflareZones: process.env.TAKOSERVER_ZONES,
+    legacyEdgeForms: process.env.TAKOSERVER_EDGE_FORMS,
+    workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+    suffixes: process.env.TAKOSERVER_SUFFIXES,
+    workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
   });
-}
-const v2WorkerEndpointHttpsSelection = parseSelfhostV2WorkerEndpointHttpsSelection(
-  process.env.TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS,
-  {
+  let preflightRuntimeInputsAvailable: boolean | undefined;
+  let preflightRuntimeInputKeyAuthority:
+    | Awaited<ReturnType<typeof parseRuntimeInputKeyAuthority>>
+    | undefined;
+  let preflightLinuxContainerSelection: ReturnType<
+    typeof createSelfhostLinuxContainerNodeSelection
+  >;
+  if (selectionSource !== undefined) {
+    const rawSealKeys = process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING;
+    preflightRuntimeInputsAvailable =
+      Boolean(rawSealKeys) &&
+      runtimeInputCanonicalOriginSupported(publicOrigin) &&
+      providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN;
+    if (!preflightRuntimeInputsAvailable) {
+      if (providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN) {
+        throw new TypeError(
+          "Linux Container selection is unavailable in retired ObjectBucket drain mode",
+        );
+      }
+      throw new TypeError("Linux Container operator selection requires runtime input seal keys");
+    }
+    if (!rawSealKeys) {
+      throw new TypeError("Linux Container operator selection requires runtime input seal keys");
+    }
+    preflightRuntimeInputKeyAuthority = await parseRuntimeInputKeyAuthority(rawSealKeys);
+    preflightLinuxContainerSelection = createSelfhostLinuxContainerNodeSelection({
+      selection: selectionSource,
+      sealKeys: preflightRuntimeInputKeyAuthority.sealKeys,
+    });
+    if (!preflightLinuxContainerSelection) {
+      throw new TypeError("Linux Container operator selection is unavailable");
+    }
+  }
+  const currentCandidates = selectPublicHostFormSource(
+    process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE,
+  );
+  // Reject an invalid financial realm before creating a data root or opening
+  // SQLite; no invalid configuration may record a forward migration.
+  const stripeMode = parseStripeMode(process.env.TAKOSERVER_STRIPE_MODE);
+  const canonicalHostedInputs = canonicalHostedBilling
+    ? (() => {
+        if (process.env.TAKOSERVER_STRIPE_MODE !== "test" || !billingConfig || !hostedPricing) {
+          throw new TypeError(
+            "Canonical Hosted billing requires explicit TEST mode and complete published pricing",
+          );
+        }
+        const consoleOrigin = required("TAKOSERVER_CONSOLE_ORIGIN");
+        const origin = new URL(consoleOrigin);
+        const webhookSecret = required("STRIPE_WEBHOOK_SECRET").trim();
+        const settings = paymentSettingsFromEnvironment(process.env);
+        const publishedSettings = paymentSettingsFromEnvironment(hostedPricing.environment);
+        if (
+          origin.origin !== consoleOrigin ||
+          origin.username ||
+          origin.password ||
+          !["https:", "http:"].includes(origin.protocol) ||
+          !webhookSecret.startsWith("whsec_") ||
+          (settings.checkoutMinimumMinor !== undefined &&
+            settings.checkoutMinimumMinor !== publishedSettings.checkoutMinimumMinor) ||
+          (settings.checkoutMaximumMinor !== undefined &&
+            settings.checkoutMaximumMinor !== publishedSettings.checkoutMaximumMinor)
+        ) {
+          throw new TypeError(
+            "Canonical Hosted billing requires a canonical origin, webhook and published Checkout bounds",
+          );
+        }
+        return {
+          billingConfig,
+          pricing: hostedPricing,
+          client: createStripeBillingClient({
+            secretKey: required("STRIPE_SECRET_KEY"),
+            mode: "test",
+          }),
+          accountId: required("TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID"),
+          billingAuthority: required("TAKOSERVER_HOSTED_BILLING_AUTHORITY"),
+          consoleOrigin,
+          webhookSecret,
+          settings: Object.freeze(settings),
+          ...(hostedOnDemandConfiguration === undefined
+            ? {}
+            : { onDemand: hostedOnDemandConfiguration }),
+        };
+      })()
+    : undefined;
+
+  // Organizations, keys, and the ledger are as durable as the files are: a
+  // machine that forgets who its customers are, and what they are owed, on
+  // restart is not a platform. Memory is kept for tests, which say so by
+  // asking for it.
+  const databasePath =
+    process.env.TAKOSERVER_DB ??
+    (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
+  const controlInstallation: MigrationOptions = {
+    installation: {
+      dataRoot,
+      databasePath,
+      externalDatabase:
+        databasePath !== ":memory:" && resolve(databasePath) !== join(dataRoot, "control.sqlite"),
+    },
+  };
+  markProcessResourcesStarted();
+  // A used v1.0.0 installation is refused before this process writes anything:
+  // before it creates a missing data root and before it opens the database for
+  // writing, so neither an external TAKOSERVER_DB nor a new root is touched. The
+  // probe only reads; whatever it cannot read (a missing file, a lock, a hot
+  // journal a read-only handle may not roll back) is left to the ordinary open
+  // below, whose migration repeats the same check.
+  if (databasePath !== ":memory:" && existsSync(databasePath)) {
+    let refusal: UsedV1InstallationError | undefined;
+    let probe: Database | undefined;
+    try {
+      probe = new Database(databasePath, { readonly: true });
+      probe.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
+      refuseUsedV1Installation(probe, controlInstallation);
+    } catch (error) {
+      if (error instanceof UsedV1InstallationError) refusal = error;
+    } finally {
+      probe?.close();
+    }
+    if (refusal) exitWithUsedV1Refusal(refusal);
+  }
+
+  // Configuration is validated above without touching the filesystem. Keys,
+  // tenant data and sockets live here: a new root starts private, while an
+  // existing one keeps the permissions its operator gave it.
+  if (createSelfhostDataRootIfAbsent(dataRoot)) {
+    process.stdout.write(`created ${dataRoot} (mode 0700)\n`);
+  }
+  const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
+    process.env.TAKOSERVER_V2_WORKER_PRIVATE_PLANES,
+    {
+      dataRoot,
+      reservedPorts: [
+        port,
+        workerdPort,
+        workerEndpointPort,
+        ...(process.env.TAKOSERVER_DATA_PLANE_PORT
+          ? [Number(process.env.TAKOSERVER_DATA_PLANE_PORT)]
+          : []),
+        ...(v2WorkerEndpointHttpsSelection ? [v2WorkerEndpointHttpsSelection.port] : []),
+      ],
+    },
+  );
+  if (v2PrivatePlaneBoot && providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN) {
+    throw new Error("v2 Worker private planes are unavailable in retired ObjectBucket drain mode");
+  }
+  const selfhostContainer = createSelfhostContainerBootstrap({
+    environment: process.env,
+    dataRoot,
+    providerMode,
+  });
+
+  if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
+
+  // The Bun control plane always uses local SQLite. Shared D1 is not accepted
+  // here because its HTTP API cannot provide the atomic batch capability the app
+  // requires; the guard above runs before this database is opened or migrated.
+  const controlDatabase = new Database(databasePath);
+  // Before migration, which is the first writer: an operator's `sqlite3` or a
+  // backup tool reading this file must delay a Host write, not fail it.
+  controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
+  // A self-hosted deployment starts with an empty file, so it is brought up
+  // to this build's schema here. Forward only and recorded, so running it
+  // again applies nothing and a database from a newer build is refused
+  // rather than repaired.
+  const migrated = (() => {
+    try {
+      return migrateSqlite(controlDatabase, { ...controlInstallation, stripeMode });
+    } catch (error) {
+      if (!(error instanceof UsedV1InstallationError)) throw error;
+      controlDatabase.close();
+      exitWithUsedV1Refusal(error);
+    }
+  })();
+  if (migrated.applied.length > 0) {
+    process.stdout.write(
+      `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
+    );
+  }
+  const sql = createSqliteSql(controlDatabase);
+  // The sole migration writer has already committed the checked realm claim
+  // atomically with any forward schema change; this is read-only verification.
+  await assertStripeModeRealm(sql, stripeMode);
+  // Wallet reads use the micros ledger even when optional billing is disabled.
+  await assertOrgBillingSchema(sql, canonicalHostedBilling ? undefined : billingConfig);
+  if (hostedPricing) await assertStripeBillingSchema(sql);
+  /**
+   * The port a published Worker endpoint address carries.
+   *
+   * The socket's own port by default, because that is the one this machine can
+   * promise answers: a self-host on `28988` published a portless address while
+   * every request that reached the Worker carried `:28988`, so the identity the
+   * Worker pinned and the identity its Host advertised disagreed. A deployment
+   * that puts an ordinary front end on 443 in front of workerd says so here, and
+   * the scheme's default is normalized away rather than published.
+   */
+  /**
+   * The scheme Worker endpoints are published under, and the sentence an operator
+   * has to read when it is `http` on a name that is not this machine.
+   */
+  const workerEndpoint = selfhostWorkerEndpointScheme({
     workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
     tlsConfigured: workerdTls !== undefined,
-    containerEndpointHttpsConfigured: containerEndpointHttpsConfiguration !== undefined,
-    reservedPorts: [
-      port,
-      workerdPort,
-      workerEndpointPort,
-      ...(process.env.TAKOSERVER_DATA_PLANE_PORT?.trim() === "443" ? [443] : []),
-    ],
-  },
-);
-const providerMode = resolveStandaloneProviderMode({
-  retiredProviderMode: process.env.TAKOSERVER_RETIRED_PROVIDER_MODE,
-  cloudflareAccountId: process.env.CLOUDFLARE_ACCOUNT_ID,
-  cloudflareCredentialConfigured: Boolean(
-    process.env.CLOUDFLARE_API_TOKEN?.trim() || process.env.TAKOSERVER_CF_TOKEN_FILE?.trim(),
-  ),
-  provisionerCredentialConfigured: Boolean(process.env.TAKOSERVER_PROVISIONER_TOKEN?.trim()),
-  cloudflareZones: process.env.TAKOSERVER_ZONES,
-  legacyEdgeForms: process.env.TAKOSERVER_EDGE_FORMS,
-  workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
-  suffixes: process.env.TAKOSERVER_SUFFIXES,
-  workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
-});
-const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
-// Reject an invalid financial realm before creating a data root or opening
-// SQLite; no invalid configuration may record a forward migration.
-const stripeMode = parseStripeMode(process.env.TAKOSERVER_STRIPE_MODE);
-const canonicalHostedInputs = canonicalHostedBilling
-  ? (() => {
-      if (process.env.TAKOSERVER_STRIPE_MODE !== "test" || !billingConfig || !hostedPricing) {
-        throw new TypeError(
-          "Canonical Hosted billing requires explicit TEST mode and complete published pricing",
-        );
-      }
-      const consoleOrigin = required("TAKOSERVER_CONSOLE_ORIGIN");
-      const origin = new URL(consoleOrigin);
-      const webhookSecret = required("STRIPE_WEBHOOK_SECRET").trim();
-      const settings = paymentSettingsFromEnvironment(process.env);
-      const publishedSettings = paymentSettingsFromEnvironment(hostedPricing.environment);
-      if (
-        origin.origin !== consoleOrigin ||
-        origin.username ||
-        origin.password ||
-        !["https:", "http:"].includes(origin.protocol) ||
-        !webhookSecret.startsWith("whsec_") ||
-        (settings.checkoutMinimumMinor !== undefined &&
-          settings.checkoutMinimumMinor !== publishedSettings.checkoutMinimumMinor) ||
-        (settings.checkoutMaximumMinor !== undefined &&
-          settings.checkoutMaximumMinor !== publishedSettings.checkoutMaximumMinor)
-      ) {
-        throw new TypeError(
-          "Canonical Hosted billing requires a canonical origin, webhook and published Checkout bounds",
-        );
-      }
-      return {
-        billingConfig,
-        pricing: hostedPricing,
-        client: createStripeBillingClient({
-          secretKey: required("STRIPE_SECRET_KEY"),
-          mode: "test",
-        }),
-        accountId: required("TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID"),
-        billingAuthority: required("TAKOSERVER_HOSTED_BILLING_AUTHORITY"),
-        consoleOrigin,
-        webhookSecret,
-        settings: Object.freeze(settings),
-        ...(hostedOnDemandConfiguration === undefined
-          ? {}
-          : { onDemand: hostedOnDemandConfiguration }),
-      };
-    })()
-  : undefined;
-
-// Organizations, keys, and the ledger are as durable as the files are: a
-// machine that forgets who its customers are, and what they are owed, on
-// restart is not a platform. Memory is kept for tests, which say so by
-// asking for it.
-const databasePath =
-  process.env.TAKOSERVER_DB ??
-  (dataRoot === ":memory:" ? ":memory:" : `${dataRoot}/control.sqlite`);
-const controlInstallation: MigrationOptions = {
-  installation: {
-    dataRoot,
-    databasePath,
-    externalDatabase:
-      databasePath !== ":memory:" && resolve(databasePath) !== join(dataRoot, "control.sqlite"),
-  },
-};
-// A used v1.0.0 installation is refused before this process writes anything:
-// before it creates a missing data root and before it opens the database for
-// writing, so neither an external TAKOSERVER_DB nor a new root is touched. The
-// probe only reads; whatever it cannot read (a missing file, a lock, a hot
-// journal a read-only handle may not roll back) is left to the ordinary open
-// below, whose migration repeats the same check.
-if (databasePath !== ":memory:" && existsSync(databasePath)) {
-  let refusal: UsedV1InstallationError | undefined;
-  let probe: Database | undefined;
-  try {
-    probe = new Database(databasePath, { readonly: true });
-    probe.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
-    refuseUsedV1Installation(probe, controlInstallation);
-  } catch (error) {
-    if (error instanceof UsedV1InstallationError) refusal = error;
-  } finally {
-    probe?.close();
-  }
-  if (refusal) exitWithUsedV1Refusal(refusal);
-}
-
-// Configuration is validated above without touching the filesystem. Keys,
-// tenant data and sockets live here: a new root starts private, while an
-// existing one keeps the permissions its operator gave it.
-if (createSelfhostDataRootIfAbsent(dataRoot)) {
-  process.stdout.write(`created ${dataRoot} (mode 0700)\n`);
-}
-const v2PrivatePlaneBoot = parseSelfhostV2PrivatePlaneBoot(
-  process.env.TAKOSERVER_V2_WORKER_PRIVATE_PLANES,
-  {
-    dataRoot,
-    reservedPorts: [
-      port,
-      workerdPort,
-      workerEndpointPort,
-      ...(process.env.TAKOSERVER_DATA_PLANE_PORT
-        ? [Number(process.env.TAKOSERVER_DATA_PLANE_PORT)]
-        : []),
-      ...(v2WorkerEndpointHttpsSelection ? [v2WorkerEndpointHttpsSelection.port] : []),
-    ],
-  },
-);
-if (v2PrivatePlaneBoot && providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN) {
-  throw new Error("v2 Worker private planes are unavailable in retired ObjectBucket drain mode");
-}
-const selfhostContainer = createSelfhostContainerBootstrap({
-  environment: process.env,
-  dataRoot,
-  providerMode,
-});
-
-if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
-
-// The Bun control plane always uses local SQLite. Shared D1 is not accepted
-// here because its HTTP API cannot provide the atomic batch capability the app
-// requires; the guard above runs before this database is opened or migrated.
-const controlDatabase = new Database(databasePath);
-// Before migration, which is the first writer: an operator's `sqlite3` or a
-// backup tool reading this file must delay a Host write, not fail it.
-controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
-// A self-hosted deployment starts with an empty file, so it is brought up
-// to this build's schema here. Forward only and recorded, so running it
-// again applies nothing and a database from a newer build is refused
-// rather than repaired.
-const migrated = (() => {
-  try {
-    return migrateSqlite(controlDatabase, { ...controlInstallation, stripeMode });
-  } catch (error) {
-    if (!(error instanceof UsedV1InstallationError)) throw error;
-    controlDatabase.close();
-    exitWithUsedV1Refusal(error);
-  }
-})();
-if (migrated.applied.length > 0) {
-  process.stdout.write(
-    `applied ${migrated.applied.length} migration(s): ${migrated.applied.join(", ")}\n`,
-  );
-}
-const sql = createSqliteSql(controlDatabase);
-// The sole migration writer has already committed the checked realm claim
-// atomically with any forward schema change; this is read-only verification.
-await assertStripeModeRealm(sql, stripeMode);
-// Wallet reads use the micros ledger even when optional billing is disabled.
-await assertOrgBillingSchema(sql, canonicalHostedBilling ? undefined : billingConfig);
-if (hostedPricing) await assertStripeBillingSchema(sql);
-/**
- * The port a published Worker endpoint address carries.
- *
- * The socket's own port by default, because that is the one this machine can
- * promise answers: a self-host on `28988` published a portless address while
- * every request that reached the Worker carried `:28988`, so the identity the
- * Worker pinned and the identity its Host advertised disagreed. A deployment
- * that puts an ordinary front end on 443 in front of workerd says so here, and
- * the scheme's default is normalized away rather than published.
- */
-/**
- * The scheme Worker endpoints are published under, and the sentence an operator
- * has to read when it is `http` on a name that is not this machine.
- */
-const workerEndpoint = selfhostWorkerEndpointScheme({
-  workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
-  tlsConfigured: workerdTls !== undefined,
-});
-if (workerEndpoint.warning) process.stderr.write(`${workerEndpoint.warning}\n`);
-
-/**
- * Whether this machine can mint a Worker endpoint at all, said at boot.
- *
- * `WorkerEndpoint@0.1.0` publishes `https://<name>/` and nothing else, so a
- * deployment on plain HTTP or on a port that is not the scheme's default can
- * create no endpoint — and the only place that was discovered before was the
- * middle of somebody's `tofu apply`. It is a diagnostic and not a boot failure
- * because everything else on the machine works: Workers run, storage answers,
- * queues drain, cron fires, and the runtime serves on its own socket.
- */
-const workerEndpointBootNote = selfhostWorkerEndpointBootNote(
-  selfhostWorkerEndpointPublication({
-    workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
-    scheme: workerEndpoint.scheme,
-    port: workerEndpointPort,
-  }),
-  v2WorkerEndpointHttpsSelection !== undefined,
-);
-if (workerEndpointBootNote) process.stderr.write(`${workerEndpointBootNote}\n`);
-
-const workerdSelection = await selectClosedGraphWorkerd({
-  binary: process.env.TAKOSERVER_WORKERD_BINARY,
-  privateRoot: join(durableRoot, "runtime-probes"),
-});
-const workerdBinary = workerdSelection.binary;
-if (workerdSelection.diagnostic) process.stderr.write(`${workerdSelection.diagnostic}\n`);
-const workerd = createWorkerdSupervisor({
-  binary: workerdBinary,
-  listenerPort: workerdPort,
-  spawn: (command) =>
-    spawnWorkerdWithParentDeath(command, { stdout: "inherit", stderr: "inherit" }),
-  log: (message) => process.stdout.write(`${message}\n`),
-  readiness: async (_configPath, child, mode) => {
-    // HTTP alone can be answered by an orphan or a foreign listener. Require
-    // the kernel listener inode to be held by this exact spawned PID both
-    // before and after the response.
-    const attempts = mode === "startup" ? 20 : 1;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      try {
-        const before = await workerPortOwnership(workerdPort, child.pid);
-        if (before === "foreign") return false;
-        if (before !== "owned") {
-          await new Promise<void>((resolve) => setTimeout(resolve, 50));
-          continue;
-        }
-        // By address over loopback, so a certificate naming the endpoint suffix
-        // is not the thing being checked here — that the child is listening is.
-        const response = await fetch(
-          `${workerdTls ? "https" : "http"}://127.0.0.1:${workerdPort}/`,
-          {
-            ...(workerdTls ? { tls: { rejectUnauthorized: false } } : {}),
-            signal: AbortSignal.timeout(250),
-          },
-        );
-        discardSelfhostReadinessProbeBody(response);
-        if (
-          response.status >= 100 &&
-          (await workerPortOwnership(workerdPort, child.pid)) === "owned"
-        )
-          return true;
-      } catch {
-        // The child may still be starting, or /proc may be unavailable. The
-        // latter must never turn an unrelated HTTP listener into readiness.
-      }
-      if (mode === "startup") {
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    return false;
-  },
-});
-
-// This machine owns its control rows and artifact bytes together. The R2 HTTP
-// adapter remains a read-only/provisioner seam, but it cannot round-trip the
-// exact operation identity required by request-time artifact PUT recovery.
-const objects =
-  process.env.TAKOSERVER_OBJECTS_IN_MEMORY === "1"
-    ? createMemoryObjectStore()
-    : createFileObjectStore({ root: dataRoot });
-const clock = () => new Date();
-// F2 requires an explicit operator-code selection on this exact Sql. The legacy
-// Docker environment selects only its existing zero-only bootstrap. The candidate
-// remains retained-only, with no public support or realized activation here.
-const selfhostLinuxContainerOperatorSelection:
-  | SelfhostLinuxContainerNodeSelectionSource
-  | undefined = undefined;
-let selfhostLinuxContainerNode:
-  | ReturnType<typeof createSelfhostLinuxContainerNodeComposition>
-  | undefined;
-// Native startup and the application share these exact canonical ledgers.
-const resourceStores = createAppResourceStoreBundle(sql, clock);
-const edge = await buildEdgeForms();
-let selfhostContainerEndpointHttps: SelfhostContainerEndpointHttpsListener | undefined;
-if (containerEndpointHttpsConfiguration) {
-  // The listener itself proves its port and certificate after binding; it is
-  // created only after the exact Form package preflight and only for the
-  // explicit Container runtime opt-in.
-  selfhostContainerEndpointHttps = await createSelfhostContainerEndpointHttpsListenerIfSupported({
-    configuration: containerEndpointHttpsConfiguration,
-    containerRuntimeConfigured: selfhostContainer !== undefined,
-    exactCandidatePair: hasExactLocalContainerEndpointCandidatePair(currentCandidates.forms),
-    ...(workerdTls
-      ? { certificateChain: workerdTls.certificateChain, privateKey: workerdTls.privateKey }
-      : {}),
   });
-  if (!selfhostContainerEndpointHttps) {
-    process.stderr.write(
-      "Container Endpoint HTTPS is configured but unavailable: the exact supported Service/Endpoint package pair is absent; no HTTPS listener was opened.\n",
+  if (workerEndpoint.warning) process.stderr.write(`${workerEndpoint.warning}\n`);
+
+  /**
+   * Whether this machine can mint a Worker endpoint at all, said at boot.
+   *
+   * `WorkerEndpoint@0.1.0` publishes `https://<name>/` and nothing else, so a
+   * deployment on plain HTTP or on a port that is not the scheme's default can
+   * create no endpoint — and the only place that was discovered before was the
+   * middle of somebody's `tofu apply`. It is a diagnostic and not a boot failure
+   * because everything else on the machine works: Workers run, storage answers,
+   * queues drain, cron fires, and the runtime serves on its own socket.
+   */
+  const workerEndpointBootNote = selfhostWorkerEndpointBootNote(
+    selfhostWorkerEndpointPublication({
+      workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX,
+      scheme: workerEndpoint.scheme,
+      port: workerEndpointPort,
+    }),
+    v2WorkerEndpointHttpsSelection !== undefined,
+  );
+  if (workerEndpointBootNote) process.stderr.write(`${workerEndpointBootNote}\n`);
+
+  const workerdSelection = await selectClosedGraphWorkerd({
+    binary: process.env.TAKOSERVER_WORKERD_BINARY,
+    privateRoot: join(durableRoot, "runtime-probes"),
+  });
+  const workerdBinary = workerdSelection.binary;
+  if (workerdSelection.diagnostic) process.stderr.write(`${workerdSelection.diagnostic}\n`);
+  const workerd = createWorkerdSupervisor({
+    binary: workerdBinary,
+    listenerPort: workerdPort,
+    spawn: (command) =>
+      spawnWorkerdWithParentDeath(command, { stdout: "inherit", stderr: "inherit" }),
+    log: (message) => process.stdout.write(`${message}\n`),
+    readiness: async (_configPath, child, mode) => {
+      // HTTP alone can be answered by an orphan or a foreign listener. Require
+      // the kernel listener inode to be held by this exact spawned PID both
+      // before and after the response.
+      const attempts = mode === "startup" ? 20 : 1;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          const before = await workerPortOwnership(workerdPort, child.pid);
+          if (before === "foreign") return false;
+          if (before !== "owned") {
+            await new Promise<void>((resolve) => setTimeout(resolve, 50));
+            continue;
+          }
+          // By address over loopback, so a certificate naming the endpoint suffix
+          // is not the thing being checked here — that the child is listening is.
+          const response = await fetch(
+            `${workerdTls ? "https" : "http"}://127.0.0.1:${workerdPort}/`,
+            {
+              ...(workerdTls ? { tls: { rejectUnauthorized: false } } : {}),
+              signal: AbortSignal.timeout(250),
+            },
+          );
+          discardSelfhostReadinessProbeBody(response);
+          if (
+            response.status >= 100 &&
+            (await workerPortOwnership(workerdPort, child.pid)) === "owned"
+          )
+            return true;
+        } catch {
+          // The child may still be starting, or /proc may be unavailable. The
+          // latter must never turn an unrelated HTTP listener into readiness.
+        }
+        if (mode === "startup") {
+          await new Promise<void>((resolve) => setTimeout(resolve, 50));
+        }
+      }
+      return false;
+    },
+  });
+
+  // This machine owns its control rows and artifact bytes together. The R2 HTTP
+  // adapter remains a read-only/provisioner seam, but it cannot round-trip the
+  // exact operation identity required by request-time artifact PUT recovery.
+  const objects =
+    process.env.TAKOSERVER_OBJECTS_IN_MEMORY === "1"
+      ? createMemoryObjectStore()
+      : createFileObjectStore({ root: dataRoot });
+  const clock = () => new Date();
+  // F2 requires an explicit operator-code selection on this exact Sql. The legacy
+  // Docker environment selects only its existing zero-only bootstrap. The candidate
+  // remains retained-only, with no public support or realized activation here.
+  const selfhostLinuxContainerOperatorSelection = selectionSource;
+  let selfhostLinuxContainerNode:
+    | ReturnType<typeof createSelfhostLinuxContainerNodeComposition>
+    | undefined;
+  // Native startup and the application share these exact canonical ledgers.
+  const resourceStores = createAppResourceStoreBundle(sql, clock);
+  const edge = await buildEdgeForms();
+  let selfhostContainerEndpointHttps: SelfhostContainerEndpointHttpsListener | undefined;
+  if (containerEndpointHttpsConfiguration) {
+    // The listener itself proves its port and certificate after binding; it is
+    // created only after the exact Form package preflight and only for the
+    // explicit Container runtime opt-in.
+    selfhostContainerEndpointHttps = await createSelfhostContainerEndpointHttpsListenerIfSupported({
+      configuration: containerEndpointHttpsConfiguration,
+      containerRuntimeConfigured: selfhostContainer !== undefined,
+      exactCandidatePair: hasExactLocalContainerEndpointCandidatePair(currentCandidates.forms),
+      ...(workerdTls
+        ? { certificateChain: workerdTls.certificateChain, privateKey: workerdTls.privateKey }
+        : {}),
+    });
+    if (!selfhostContainerEndpointHttps) {
+      process.stderr.write(
+        "Container Endpoint HTTPS is configured but unavailable: the exact supported Service/Endpoint package pair is absent; no HTTPS listener was opened.\n",
+      );
+    }
+  }
+  // Register immediately after binding, before later async composition steps can
+  // fail. The listener close revokes assertServing before asking Bun to stop it.
+  if (selfhostContainerEndpointHttps) {
+    process.once("exit", () => {
+      void selfhostContainerEndpointHttps?.close();
+    });
+  }
+
+  // The provider reads committed bundles through the same artifact store the
+  // Host writes them to, so a Worker can only be published from bytes a tenant
+  // actually uploaded and had verified.
+  const artifactStore = createTakoformArtifacts({
+    sql,
+    objects,
+    clock,
+    randomId: () => crypto.randomUUID(),
+  });
+  /**
+   * The sealed path a sensitive Worker var travels on this machine.
+   *
+   * Constructed only when the operator has configured a key ring, because
+   * everything downstream is derived from its presence: without one the self-host
+   * provider advertises no runtime-input capability, admission refuses a
+   * `requiredSensitiveVars` declaration with `unsupported_capability`, and the
+   * private preparation route is not served at all. Generating a key here and
+   * keeping it beside the ciphertext would not be encryption at rest; it would be
+   * a lock with its key taped to it.
+   *
+   * Two more conditions have to hold, and both are refusals rather than
+   * workarounds. `TAKOSERVER_PUBLIC_ORIGIN` must be an `https` bare origin,
+   * because the released Takoform provider refuses any other scheme before it
+   * sends a value and this Host's own published schema says the same — a Host
+   * that accepted `http://localhost:8787` would advertise a capability no client
+   * can use. And the retired-ObjectBucket drain mode composes no lease port, so
+   * a preparation made there could never be delivered and would simply expire
+   * with secrets sealed on disk for an hour.
+   */
+  const runtimeInputsAvailable =
+    preflightRuntimeInputsAvailable ??
+    (Boolean(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING) &&
+      runtimeInputCanonicalOriginSupported(publicOrigin) &&
+      providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN);
+  if (process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING && !runtimeInputsAvailable) {
+    console.warn(
+      runtimeInputCanonicalOriginSupported(publicOrigin)
+        ? "sensitive Worker runtime inputs are disabled: the retired ObjectBucket drain mode composes no lease port"
+        : `sensitive Worker runtime inputs are disabled: TAKOSERVER_PUBLIC_ORIGIN must be an https bare origin (got ${publicOrigin})`,
     );
   }
-}
-// Register immediately after binding, before later async composition steps can
-// fail. The listener close revokes assertServing before asking Bun to stop it.
-if (selfhostContainerEndpointHttps) {
-  process.once("exit", () => {
-    void selfhostContainerEndpointHttps?.close();
-  });
-}
-
-// The provider reads committed bundles through the same artifact store the
-// Host writes them to, so a Worker can only be published from bytes a tenant
-// actually uploaded and had verified.
-const artifactStore = createTakoformArtifacts({
-  sql,
-  objects,
-  clock,
-  randomId: () => crypto.randomUUID(),
-});
-/**
- * The sealed path a sensitive Worker var travels on this machine.
- *
- * Constructed only when the operator has configured a key ring, because
- * everything downstream is derived from its presence: without one the self-host
- * provider advertises no runtime-input capability, admission refuses a
- * `requiredSensitiveVars` declaration with `unsupported_capability`, and the
- * private preparation route is not served at all. Generating a key here and
- * keeping it beside the ciphertext would not be encryption at rest; it would be
- * a lock with its key taped to it.
- *
- * Two more conditions have to hold, and both are refusals rather than
- * workarounds. `TAKOSERVER_PUBLIC_ORIGIN` must be an `https` bare origin,
- * because the released Takoform provider refuses any other scheme before it
- * sends a value and this Host's own published schema says the same — a Host
- * that accepted `http://localhost:8787` would advertise a capability no client
- * can use. And the retired-ObjectBucket drain mode composes no lease port, so
- * a preparation made there could never be delivered and would simply expire
- * with secrets sealed on disk for an hour.
- */
-const runtimeInputsAvailable =
-  Boolean(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING) &&
-  runtimeInputCanonicalOriginSupported(publicOrigin) &&
-  providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN;
-if (process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING && !runtimeInputsAvailable) {
-  console.warn(
-    runtimeInputCanonicalOriginSupported(publicOrigin)
-      ? "sensitive Worker runtime inputs are disabled: the retired ObjectBucket drain mode composes no lease port"
-      : `sensitive Worker runtime inputs are disabled: TAKOSERVER_PUBLIC_ORIGIN must be an https bare origin (got ${publicOrigin})`,
-  );
-}
-const runtimeInputKeyAuthority = runtimeInputsAvailable
-  ? await parseRuntimeInputKeyAuthority(process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string)
-  : undefined;
-const runtimeInputSealKeyRing = runtimeInputKeyAuthority?.sealKeys;
-const selfhostLinuxContainerSelection = createSelfhostLinuxContainerNodeSelection({
-  selection: selfhostLinuxContainerOperatorSelection,
-  sealKeys: runtimeInputSealKeyRing,
-});
-const runtimeInputs = runtimeInputSealKeyRing
-  ? createRuntimeInputAuthority({
-      sql,
+  const runtimeInputKeyAuthority = runtimeInputsAvailable
+    ? (preflightRuntimeInputKeyAuthority ??
+      (await parseRuntimeInputKeyAuthority(
+        process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING as string,
+      )))
+    : undefined;
+  const runtimeInputSealKeyRing = runtimeInputKeyAuthority?.sealKeys;
+  const selfhostLinuxContainerSelection =
+    preflightLinuxContainerSelection ??
+    createSelfhostLinuxContainerNodeSelection({
+      selection: selfhostLinuxContainerOperatorSelection,
       sealKeys: runtimeInputSealKeyRing,
-      canonicalPublicOrigin: publicOrigin,
-      clock,
-    })
-  : undefined;
-const v2ConfiguredInputSealer = runtimeInputSealKeyRing
-  ? createSelfhostV2ConfiguredInputSealer(runtimeInputSealKeyRing)
-  : undefined;
-
-/**
- * Where a Worker this machine runs finds its KV namespaces and SQL databases.
- *
- * On a listener of their own, bound to `127.0.0.1`, and never on the public
- * one. What authenticates here is a bearer token minted per Worker Version, and
- * the only thing that should ever hold one is a workerd service on this
- * machine; a route on the public origin would make that token an
- * internet-facing credential for arbitrary SQL, however loopback-only the
- * intent was. A generated Worker entrypoint reaches this listener through a
- * workerd `externalServer` addressed below, so nothing legitimate loses a path
- * and nothing else gains one.
- *
- * `127.0.0.1` and the port this listener actually got — not the public origin,
- * which on a real deployment is a TLS name in front of a proxy this process
- * cannot reach from inside itself, and not `localhost`, which may resolve to an
- * address the listener is not bound to. `TAKOSERVER_DATA_PLANE_PORT` fixes the
- * port for an operator who needs one; without it the kernel picks a free one
- * and this process records what it got.
- *
- * Retired-drain mode publishes no Worker Version, so it serves no plane and
- * composes no address; that keeps the KV table and the SQLite files untouched
- * on a machine whose only job is proving a historical Deployment is gone.
- */
-const configuredDataPlanePort = process.env.TAKOSERVER_DATA_PLANE_PORT;
-if (
-  configuredDataPlanePort !== undefined &&
-  !/^(?:[1-9][0-9]{0,4})$/u.test(configuredDataPlanePort.trim())
-) {
-  // The value ends up inside a generated `externalServer`, so a
-  // not-quite-a-number here becomes a configuration workerd refuses much later
-  // and for a reason that names neither this variable nor this process.
-  throw new Error("TAKOSERVER_DATA_PLANE_PORT must be a port number");
-}
-const selfhostDataAccess = createSelfhostDataPlaneAccess(dataRoot);
-const dataPlanes =
-  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
-    ? undefined
-    : serveSelfhostDataPlanes({
+    });
+  const runtimeInputs = runtimeInputSealKeyRing
+    ? createRuntimeInputAuthority({
         sql,
-        grant: (script, versionId) => selfhostDataAccess.grant(script, versionId),
-        databasePath: (name) => selfhostDataAccess.databasePath(name),
-        objectRoot: selfhostObjectsRoot(dataRoot),
+        sealKeys: runtimeInputSealKeyRing,
+        canonicalPublicOrigin: publicOrigin,
         clock,
-        ...(configuredDataPlanePort ? { port: Number(configuredDataPlanePort.trim()) } : {}),
-      });
+      })
+    : undefined;
+  const v2ConfiguredInputSealer = runtimeInputSealKeyRing
+    ? createSelfhostV2ConfiguredInputSealer(runtimeInputSealKeyRing)
+    : undefined;
 
-const providerArtifacts = {
-  manifest: (tenantRef: string, digest: string) => artifactStore.resolveManifest(tenantRef, digest),
-  async blob(digest: string) {
-    const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
-    return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
-  },
-};
-
-/**
- * Ordinary Bun always executes current Provider3 Edge Forms on the local
- * workerd-backed provider. Generic Cloudflare credentials may separately back
- * the Host's R2 object store or an explicitly composed current ObjectBucket
- * supply; they are neither provider-selection nor resale authority.
- *
- * The old Cloudflare ObjectBucket adapter remains reachable only through the
- * explicit recovery mode resolved before any local state is opened. That mode
- * reconstructs historical observation/deletion authority and publishes no
- * current Offering.
- */
-let actorRuntime: SelfhostActorPublicRuntime | undefined;
-const installedActorForm = currentCandidates.forms.find(
-  (form) => form.identity.formRef.kind === "ActorNamespace",
-);
-const implicitActorConfigured =
-  providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN &&
-  workerdBinary !== null &&
-  installedActorForm !== undefined;
-// Every Actor and Workflow listener directory lives in `<data root>/s`. Check
-// it once, before any of this process's listeners exist: an explicitly
-// selected v2 capability cannot start without it, and what a killed Host left
-// there is removed where its abandonment is proved.
-let socketRootProblem: string | undefined;
-if (dataRoot !== ":memory:" && (v2RuntimeSelection || implicitActorConfigured)) {
-  socketRootProblem = prepareSelfhostSocketRoot(dataRoot);
-  if (socketRootProblem && v2RuntimeSelection) {
-    throw new TypeError(`${socketRootProblem} (required by TAKOSERVER_V2_WORKER_RUNTIME_BOOT)`);
+  /**
+   * Where a Worker this machine runs finds its KV namespaces and SQL databases.
+   *
+   * On a listener of their own, bound to `127.0.0.1`, and never on the public
+   * one. What authenticates here is a bearer token minted per Worker Version, and
+   * the only thing that should ever hold one is a workerd service on this
+   * machine; a route on the public origin would make that token an
+   * internet-facing credential for arbitrary SQL, however loopback-only the
+   * intent was. A generated Worker entrypoint reaches this listener through a
+   * workerd `externalServer` addressed below, so nothing legitimate loses a path
+   * and nothing else gains one.
+   *
+   * `127.0.0.1` and the port this listener actually got — not the public origin,
+   * which on a real deployment is a TLS name in front of a proxy this process
+   * cannot reach from inside itself, and not `localhost`, which may resolve to an
+   * address the listener is not bound to. `TAKOSERVER_DATA_PLANE_PORT` fixes the
+   * port for an operator who needs one; without it the kernel picks a free one
+   * and this process records what it got.
+   *
+   * Retired-drain mode publishes no Worker Version, so it serves no plane and
+   * composes no address; that keeps the KV table and the SQLite files untouched
+   * on a machine whose only job is proving a historical Deployment is gone.
+   */
+  const configuredDataPlanePort = process.env.TAKOSERVER_DATA_PLANE_PORT;
+  if (
+    configuredDataPlanePort !== undefined &&
+    !/^(?:[1-9][0-9]{0,4})$/u.test(configuredDataPlanePort.trim())
+  ) {
+    // The value ends up inside a generated `externalServer`, so a
+    // not-quite-a-number here becomes a configuration workerd refuses much later
+    // and for a reason that names neither this variable nor this process.
+    throw new Error("TAKOSERVER_DATA_PLANE_PORT must be a port number");
   }
-  if (!socketRootProblem) {
-    const swept = await sweepSelfhostSocketRoot(dataRoot);
-    if (swept.removed.length > 0) {
-      process.stdout.write(
-        `removed ${swept.removed.length} abandoned socket director${
-          swept.removed.length === 1 ? "y" : "ies"
-        } in ${selfhostPrivateSocketRoot(dataRoot)}\n`,
+  const selfhostDataAccess = createSelfhostDataPlaneAccess(dataRoot);
+  const dataPlanes =
+    providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+      ? undefined
+      : serveSelfhostDataPlanes({
+          sql,
+          grant: (script, versionId) => selfhostDataAccess.grant(script, versionId),
+          databasePath: (name) => selfhostDataAccess.databasePath(name),
+          objectRoot: selfhostObjectsRoot(dataRoot),
+          clock,
+          ...(configuredDataPlanePort ? { port: Number(configuredDataPlanePort.trim()) } : {}),
+        });
+
+  const providerArtifacts = {
+    manifest: (tenantRef: string, digest: string) =>
+      artifactStore.resolveManifest(tenantRef, digest),
+    async blob(digest: string) {
+      const stored = await objects.get(`art/${digest.slice("sha256:".length)}`);
+      return stored ? new Uint8Array(await new Response(stored.body).arrayBuffer()) : null;
+    },
+  };
+
+  /**
+   * Ordinary Bun always executes current Provider3 Edge Forms on the local
+   * workerd-backed provider. Generic Cloudflare credentials may separately back
+   * the Host's R2 object store or an explicitly composed current ObjectBucket
+   * supply; they are neither provider-selection nor resale authority.
+   *
+   * The old Cloudflare ObjectBucket adapter remains reachable only through the
+   * explicit recovery mode resolved before any local state is opened. That mode
+   * reconstructs historical observation/deletion authority and publishes no
+   * current Offering.
+   */
+  let actorRuntime: SelfhostActorPublicRuntime | undefined;
+  const installedActorForm = currentCandidates.forms.find(
+    (form) => form.identity.formRef.kind === "ActorNamespace",
+  );
+  const implicitActorConfigured =
+    providerMode !== RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN &&
+    workerdBinary !== null &&
+    installedActorForm !== undefined;
+  // Every Actor and Workflow listener directory lives in `<data root>/s`. Check
+  // it once, before any of this process's listeners exist: an explicitly
+  // selected v2 capability cannot start without it, and what a killed Host left
+  // there is removed where its abandonment is proved.
+  let socketRootProblem: string | undefined;
+  if (dataRoot !== ":memory:" && (v2RuntimeSelection || implicitActorConfigured)) {
+    socketRootProblem = prepareSelfhostSocketRoot(dataRoot);
+    if (socketRootProblem && v2RuntimeSelection) {
+      throw new TypeError(`${socketRootProblem} (required by TAKOSERVER_V2_WORKER_RUNTIME_BOOT)`);
+    }
+    if (!socketRootProblem) {
+      const swept = await sweepSelfhostSocketRoot(dataRoot);
+      if (swept.removed.length > 0) {
+        process.stdout.write(
+          `removed ${swept.removed.length} abandoned socket director${
+            swept.removed.length === 1 ? "y" : "ies"
+          } in ${selfhostPrivateSocketRoot(dataRoot)}\n`,
+        );
+      }
+    }
+  }
+  const implicitActor = selfhostImplicitActorRuntime({
+    configured: implicitActorConfigured,
+    dataRoot,
+    temporaryDirectory: tmpdir(),
+    ...(socketRootProblem ? { socketRootProblem } : {}),
+  });
+  if (implicitActor.diagnostic) process.stderr.write(`${implicitActor.diagnostic}\n`);
+  if (implicitActor.open && workerdBinary && installedActorForm) {
+    try {
+      actorRuntime = await openSelfhostActorPublicRuntime({
+        dataRoot,
+        runtimeRoot: dataRoot,
+        socketParent: selfhostPrivateSocketRoot(dataRoot),
+        binary: workerdBinary,
+        graph: createActorResourceGraphReader({
+          store: resourceStores.inventory,
+          form: installedActorForm,
+        }),
+        deployments: resourceStores.deployments,
+        providerPackRef: "local",
+        providerInstallationRef: "local.primary",
+      });
+    } catch (error) {
+      process.stderr.write(
+        `the Actor owner could not restore: ${error instanceof Error ? error.message : "unknown error"}; Actor admission remains unavailable.\n`,
+      );
+    }
+  }
+  const workerdRuntime = createWorkerdRuntime({
+    root: dataRoot,
+    binary: workerdBinary,
+    port: workerdPort,
+    // The kernel may choose a different listener after a restart. Re-render
+    // Host transport from this process, not a Version's saved ephemeral port.
+    ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
+    ...(workerdTls ? { tls: workerdTls } : {}),
+    ...(actorRuntime
+      ? {
+          actorForwardSockets: () => actorRuntime?.actorForwardSockets() ?? [],
+          actorForwardLifecycle: actorRuntime.actorForwardLifecycle,
+        }
+      : {}),
+    beforeRender: () => workerd.assertMayRender(),
+    isReady: () => workerd.isReady(),
+    async onReload(configPath) {
+      // Started on the first publish rather than unconditionally, so a machine
+      // that never runs a Worker never runs a runtime for one. A machine that
+      // *has* published one starts it at boot instead — see the restore below.
+      // After that it watches the file itself: one tenant's deploy must not
+      // bounce every other tenant's in-flight requests.
+      await workerd.ensure(configPath);
+    },
+  });
+
+  // Restore the exact native socket graph before composing any Actor capability
+  // or opening the public listener. A failed restore is diagnosis, never proof of
+  // executable Actor admission.
+  let startupRestore: SelfhostStartupRestoreOutcome;
+  try {
+    const restored = await workerdRuntime.restore();
+    startupRestore = restored.length === 0 ? "empty" : "restored";
+    if (restored.length > 0) {
+      console.log(`restored ${restored.length} published Worker(s): ${restored.join(", ")}`);
+    }
+  } catch (error) {
+    startupRestore = "failed";
+    actorRuntime?.actorForwardLifecycle.uncertain();
+    await actorRuntime?.close();
+    actorRuntime = undefined;
+    process.stderr.write(
+      `the Worker runtime could not be restored at boot: ${
+        error instanceof Error ? error.message : "unknown error"
+      }. Published Workers will not answer until the next publication.\n`,
+    );
+  }
+
+  // Reopen every SQL-explained v2 Worker UID owner before the public listener.
+  // This does not register the incomplete Worker Forms or make an Endpoint HTTPS
+  // frontend claim. Unknown private namespaces and missing serving owners are
+  // startup failures, not silently forgotten native children.
+  if (v2PrivatePlaneBoot) prepareSelfhostV2PrivatePlaneRoots(v2PrivatePlaneBoot);
+  const v2SqliteStore = v2PrivatePlaneBoot?.sqlite
+    ? createSelfhostV2SQLiteStore({
+        sql,
+        root: v2PrivatePlaneBoot.sqlite.root,
+        targetKey: v2WorkerTargetKey,
+        now: clock,
+      })
+    : undefined;
+  const v2KvStore = v2PrivatePlaneBoot?.kv
+    ? createSelfhostV2KvStore({
+        sql,
+        root: v2PrivatePlaneBoot.kv.root,
+        clock,
+        runOperation: runSelfhostKvOperation,
+        operationErrorCode: selfhostKvOperationErrorCode,
+      })
+    : undefined;
+  const v2ObjectBucketStore = v2PrivatePlaneBoot?.objectBucket
+    ? createSelfhostV2ObjectBucketStore({
+        sql,
+        root: v2PrivatePlaneBoot.objectBucket.root,
+        clock,
+      })
+    : undefined;
+  const v2QueueCustody =
+    v2PrivatePlaneBoot?.queue || v2PrivatePlaneBoot?.queueProducer
+      ? createQueueCustody({ sql })
+      : undefined;
+  let workers: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
+  let queueCapability:
+    | NonNullable<ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]>
+    | undefined;
+  let ownersRestored = false;
+  let v2QueueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+  let v2RuntimeBoot: ReturnType<typeof createSelfhostV2RuntimeBoot> | undefined;
+  let restoredV2WorkerUids: readonly string[];
+  const clearV2BootKeys = () => {
+    for (const plane of [
+      v2PrivatePlaneBoot?.sqlite,
+      v2PrivatePlaneBoot?.kv,
+      v2PrivatePlaneBoot?.objectBucket,
+      v2PrivatePlaneBoot?.queue,
+      v2PrivatePlaneBoot?.queueProducer,
+    ]) {
+      plane?.signingKey.fill(0);
+    }
+  };
+  try {
+    if (v2RuntimeSelection) {
+      if (!takoformV2Config.workerBundle) {
+        throw new Error("v2 Actor/Workflow boot requires the configured held WorkerBundle backend");
+      }
+      v2RuntimeBoot = createSelfhostV2RuntimeBoot({
+        selection: v2RuntimeSelection,
+        sql,
+        clock,
+        targetKey: v2WorkerTargetKey,
+        dataRoot,
+        workerdBinary,
+        ...(process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY
+          ? { guardBinary: process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY }
+          : {}),
+        ownerForWorkerUid: async (uid) =>
+          workers ? await workers.actorOwnerForRecovery(uid) : null,
+        ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
+        ...(v2PrivatePlaneBoot?.sqlite
+          ? {
+              v2SqliteBindingAddress: `127.0.0.1:${v2PrivatePlaneBoot.sqlite.privatePort}`,
+            }
+          : {}),
+      });
+    }
+    if (v2PrivatePlaneBoot?.queue && v2QueueCustody) {
+      const requireQueueCapability = (): NonNullable<
+        ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]
+      > => {
+        if (!ownersRestored || !queueCapability) {
+          throw new Error("v2 Queue owner capability is not restored");
+        }
+        return queueCapability;
+      };
+      v2QueueComposition = createSelfhostV2QueueComposition({
+        sql,
+        custody: v2QueueCustody,
+        capability: {
+          observeQueueServingCapability: (input) =>
+            requireQueueCapability().observeQueueServingCapability(input),
+          observeCurrentServing: (input) => requireQueueCapability().observeCurrentServing(input),
+        },
+        settlementKey: v2PrivatePlaneBoot.queue.signingKey,
+        privatePort: v2PrivatePlaneBoot.queue.privatePort,
+        onCancelFailure: (cause) =>
+          process.stderr.write(
+            `self-host Queue reservation could not be refunded before send and will expire: ${describeBackgroundFailure(cause)}\n`,
+          ),
+        onClaimFailure: (cause) =>
+          process.stderr.write(
+            `self-host Queue batch selection failed: ${describeBackgroundFailure(cause)}\n`,
+          ),
+        ownerForWorkerUid: async (uid) => {
+          if (!ownersRestored || !workers) {
+            throw new Error("v2 Queue owner is not restored");
+          }
+          return await workers.ownerForWorkerUid(uid);
+        },
+      });
+    }
+    // The explicit OCI source exists before the native Worker owner is opened.
+    // The existing Form factory is evaluated only later by buildApp, after boot.
+    if (selfhostLinuxContainerSelection?.kind === "oci") {
+      selfhostLinuxContainerNode = createSelfhostLinuxContainerNodeComposition({
+        sql,
+        clock,
+        selection: selfhostLinuxContainerSelection,
+        privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
+        formSelectionFactory(context) {
+          if (!workers || !completeV2WorkerForms) return { forms: {}, retainedForms: {} };
+          const factory = runtimeInputKeyAuthority
+            ? workers.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
+            : workers.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint);
+          return factory(context);
+        },
+      });
+    }
+    const workerOptions: Parameters<typeof createSelfhostV2WorkerComposition>[0] = {
+      sql,
+      objects,
+      clock,
+      config: takoformV2Config,
+      rootDirectory: join(durableRoot, "v2-worker-owners"),
+      // Not below `v2-worker-owners`: boot refuses a namespace SQL cannot explain.
+      moduleInspectionRoot: join(durableRoot, "selfhost", "module-inspection"),
+      targetKey: v2WorkerTargetKey,
+      workerdBinary,
+      ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
+      ...(v2RuntimeBoot?.v2Workflow ? { v2Workflow: v2RuntimeBoot.v2Workflow } : {}),
+      ...(v2ConfiguredInputSealer ? { configuredInputSealer: v2ConfiguredInputSealer } : {}),
+      ...(v2SqliteStore && v2PrivatePlaneBoot?.sqlite
+        ? {
+            sqliteBinding: {
+              store: v2SqliteStore,
+              signingKey: v2PrivatePlaneBoot.sqlite.signingKey,
+              stagingRoot: v2PrivatePlaneBoot.sqlite.stagingRoot,
+              privatePort: v2PrivatePlaneBoot.sqlite.privatePort,
+            },
+          }
+        : {}),
+      ...(v2KvStore && v2PrivatePlaneBoot?.kv
+        ? {
+            v2KvBinding: {
+              store: v2KvStore,
+              signingKey: v2PrivatePlaneBoot.kv.signingKey,
+              privatePort: v2PrivatePlaneBoot.kv.privatePort,
+            },
+          }
+        : {}),
+      ...(v2ObjectBucketStore && v2PrivatePlaneBoot?.objectBucket
+        ? {
+            v2ObjectBucketBinding: {
+              store: v2ObjectBucketStore,
+              signingKey: v2PrivatePlaneBoot.objectBucket.signingKey,
+              privatePort: v2PrivatePlaneBoot.objectBucket.privatePort,
+            },
+          }
+        : {}),
+      ...(v2QueueComposition ? { queueSettlement: v2QueueComposition.settlementBinding } : {}),
+      ...(v2PrivatePlaneBoot?.queueProducer && v2QueueCustody
+        ? {
+            v2QueueProducerBinding: {
+              custody: v2QueueCustody,
+              signingKey: v2PrivatePlaneBoot.queueProducer.signingKey,
+              privatePort: v2PrivatePlaneBoot.queueProducer.privatePort,
+            },
+          }
+        : {}),
+    };
+    const containerBinding = selfhostLinuxContainerNode?.containerBindingSource;
+    workers = containerBinding
+      ? createSelfhostV2ContainerWorkerComposition({
+          ...workerOptions,
+          ociContainerBinding: containerBinding,
+        })
+      : createSelfhostV2WorkerComposition(workerOptions);
+    if (v2QueueComposition) {
+      if (!workers.queueCapability) throw new Error("v2 Queue native capability is unavailable");
+      queueCapability = workers.queueCapability;
+    }
+    // Both private broker and Queue authority have already copied the supplied
+    // bytes into their exact boot snapshot; do not retain a spare entry copy.
+    clearV2BootKeys();
+    restoredV2WorkerUids = await workers.restoreOwners();
+    ownersRestored = true;
+  } catch (error) {
+    clearV2BootKeys();
+    await workers?.closeScheduledHost();
+    await workers?.closeWorkflowHost();
+    await v2RuntimeBoot?.closeActor();
+    await v2QueueComposition?.close();
+    throw error;
+  }
+  const v2WorkerComposition = workers;
+  if (v2QueueComposition) {
+    // No delivery pass has run in this process yet, so an unsent reservation
+    // was left by an earlier one. Refusing it is the pre-send cancel, safe even
+    // against a live writer; its messages come back now instead of after 120 s.
+    await v2QueueComposition
+      .refuseReservationsBeforeFirstDelivery()
+      .then((refused) => {
+        if (refused > 0)
+          process.stdout.write(
+            `refused ${refused} unsent v2 Queue reservation(s) left by an earlier process\n`,
+          );
+      })
+      .catch((cause: unknown) =>
+        process.stderr.write(
+          `self-host Queue reservations left by an earlier process will expire: ${describeBackgroundFailure(cause)}\n`,
+        ),
+      );
+  }
+  const v2QueueScheduler =
+    v2QueueComposition && v2QueueCustody
+      ? createSelfhostV2QueueScheduler({
+          sql,
+          custody: v2QueueCustody,
+          composition: v2QueueComposition,
+          workerComposition: v2WorkerComposition,
+        })
+      : undefined;
+  if (restoredV2WorkerUids.length > 0) {
+    process.stdout.write(`restored ${restoredV2WorkerUids.length} v2 Worker owner(s)\n`);
+  }
+
+  /**
+   * The half of the Edge Family that is a clock rather than a request.
+   *
+   * A queue message and a cron match have no caller: something on this machine
+   * has to notice they are due and invoke the Worker itself. Both reach the
+   * Worker through the runtime above, on a hostname of this Host's own, past a
+   * gate holding a token the tenant cannot read.
+   *
+   * Retired-drain mode publishes no Worker Version, so it runs neither; the
+   * provider then reports a Consumer as not delivering and a Trigger as not
+   * firing, which is the truth on that machine.
+   */
+  const eventTargets = createSelfhostEventTargets(dataRoot);
+  const queuePump =
+    providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+      ? undefined
+      : createSelfhostQueuePump({ sql, runtime: workerdRuntime, targets: eventTargets, clock });
+  const workerScheduler =
+    providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+      ? undefined
+      : createSelfhostWorkerScheduler({
+          sql,
+          runtime: workerdRuntime,
+          targets: eventTargets,
+          clock,
+        });
+  const selfhostEvents = workerScheduler
+    ? {
+        forgetSchedules: (script: string, cron?: string) =>
+          workerScheduler.forgetSchedules(script, cron),
+      }
+    : undefined;
+
+  const providerComposition = createStandaloneProviderComposition({
+    mode: providerMode,
+    edge,
+    stableForms: currentCandidates.forms,
+    stableBindings: currentCandidates.bindings,
+    retainedForms: currentCandidates.retainedForms,
+    retainedBindings: currentCandidates.retainedBindings,
+    workerClassRuntimeContracts: currentCandidates.workerClassRuntimeContracts,
+    dataRoot,
+    // SQLiteDatabase records carry the configured string; keep matching them.
+    recordedDataRoot: configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT,
+    runtime: workerdRuntime,
+    ...(actorRuntime ? { actorRuntime } : {}),
+    workerRuntimeAvailable: workerdBinary !== null,
+    artifacts: providerArtifacts,
+    ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
+      ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
+      : {}),
+    // The scheme is the socket's, so it is composed here rather than defaulted
+    // inside the provider. The drain mode publishes no Worker at all and refuses
+    // every self-host setting, including this one.
+    ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+      ? {}
+      : { workerEndpointScheme: workerEndpoint.scheme, workerEndpointPort }),
+    ...(process.env.TAKOSERVER_SUFFIXES
+      ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
+      : {}),
+    ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
+    ...(selfhostContainer
+      ? {
+          container: {
+            runtime: selfhostContainer.runtime,
+            capacityProfile: selfhostContainer.capacityProfile,
+          },
+        }
+      : {}),
+    ...(selfhostContainerEndpointHttps
+      ? { containerEndpointIngress: selfhostContainerEndpointHttps.ingress }
+      : {}),
+    ...(dataPlanes
+      ? { dataPlaneAddress: dataPlanes.address, dataPlaneMaintenance: dataPlanes.maintenance }
+      : {}),
+    ...(selfhostEvents ? { events: selfhostEvents } : {}),
+    ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+      ? {}
+      : {
+          listCronOwners: createSelfhostCronOwnerReader({
+            inventory: resourceStores.inventory,
+            forms: [...currentCandidates.forms, ...currentCandidates.retainedForms, ...edge.forms],
+          }),
+        }),
+    now: clock(),
+    ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
+      ? {
+          retiredCloudflare: {
+            accountId: required("CLOUDFLARE_ACCOUNT_ID"),
+            authorize: () => `Bearer ${cloudflareToken()}`,
+            zones: [],
+            artifacts: providerArtifacts,
+          },
+        }
+      : {}),
+  });
+  const containerEndpointIngress = providerComposition.containerEndpointIngress;
+  if (selfhostContainerEndpointHttps && !containerEndpointIngress) {
+    await selfhostContainerEndpointHttps.close();
+    selfhostContainerEndpointHttps = undefined;
+    process.stderr.write(
+      "Container Endpoint HTTPS is configured but unsupported by this exact Provider composition; listener closed and no Endpoint Offering is active.\n",
+    );
+  }
+  const { providers, providerPacks, offerings } = providerComposition;
+
+  const unconfigured = {
+    async verify(): Promise<never> {
+      throw new Error("operator credentials are not configured");
+    },
+  };
+
+  // A machine with no identity provider would advertise no way in and refuse
+  // every sign-in, so it mints an operator key and offers that instead.
+  const operatorKeyPath = join(dataRoot, "operator-key.jwk");
+  const identityOnlyPublicKeyJwk = process.env.TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK
+    ? parseOperatorPublicKey(
+        process.env.TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK,
+        "TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK",
+      )
+    : undefined;
+  const legacyPublicKeyJwk = await ensureOperatorKey({
+    configured: process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK,
+    hasIdentityProvider:
+      Boolean(identityOnlyPublicKeyJwk) ||
+      Boolean(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID) ||
+      Boolean(process.env.GOOGLE_CLIENT_ID),
+    path: operatorKeyPath,
+    readFile: (path) =>
+      readFile(path, "utf8").then(
+        (text) => text,
+        () => null,
+      ),
+    async writeFile(path, contents) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, contents, { mode: 0o600 });
+      process.stdout.write(`generated an operator key at ${path}\n`);
+    },
+  });
+  const identityPublicKeyJwk = identityOnlyPublicKeyJwk ?? legacyPublicKeyJwk;
+
+  const payment: ReturnType<typeof resolvePayment> = canonicalHostedInputs
+    ? {}
+    : resolvePayment({
+        hostedPricing,
+        stripeMode,
+        stripeSecretKey: process.env.STRIPE_SECRET_KEY,
+        stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+        consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
+        settings: paymentSettingsFromEnvironment(process.env),
+      });
+  if (payment.settlement && !payment.checkout) {
+    // Said once at startup: a key with no console still decides funding.
+    console.warn(
+      "takoserver: Stripe funding is on without TAKOSERVER_CONSOLE_ORIGIN; Checkout is not served, " +
+        "and Stripe verification, the webhook and the reconcile pass replace operator-signed funding",
+    );
+  }
+
+  const identity = resolveIdentity({
+    ...(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID
+      ? {
+          takosId: {
+            issuer: process.env.TAKOS_ID_ISSUER,
+            clientId: process.env.TAKOS_ID_CLIENT_ID,
+          },
+        }
+      : {}),
+    googleClientId: process.env.GOOGLE_CLIENT_ID,
+    operatorPublicKeyJwk: identityPublicKeyJwk,
+    operatorAudience: publicOrigin,
+  });
+
+  /**
+   * The half that can reach a cloud account also answers for it.
+   *
+   * Served in front of the product's router because it is not part of the
+   * product: no tenant, no billing, no lifecycle — a provider call in, a
+   * classified ticket out. It is served only when a credential is configured.
+   */
+  const provision = createProvisionerEndpoint({
+    providers,
+    credential: process.env.TAKOSERVER_PROVISIONER_TOKEN,
+    applyOfferingIds: offerings.map((offering) => offering.id),
+  });
+
+  // A machine standing on its own makes a signing key, keeps it under the data
+  // root, and registers the half that verifies it.
+  const signingKeyId = process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local";
+  const selfhostTenantRunCredentialsEnabled =
+    process.env.TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS === "1";
+  const selfhostTenantRunCredentialKeyId =
+    process.env.TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID ??
+    "takoserver-selfhost-tenant-run";
+  if (selfhostTenantRunCredentialsEnabled) {
+    assertSelfhostTenantRunCredentialKeyConfiguration({
+      credentialKeyId: selfhostTenantRunCredentialKeyId,
+      ordinarySigningKeyId: signingKeyId,
+    });
+  }
+  const signingKey = await ensureSigningKey({
+    keyId: signingKeyId,
+    privateJwk: process.env.TAKOSERVER_SIGNING_KEY,
+    path: join(dataRoot, "signing-key.jwk"),
+    sql,
+    readFile: (path) =>
+      readFile(path, "utf8").then(
+        (text) => text,
+        () => null,
+      ),
+    async writeFile(path, contents) {
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, contents, { mode: 0o600 });
+      process.stdout.write(`generated a signing key at ${path}\n`);
+    },
+  });
+  const selfhostTenantRunCredentialSigningKey = selfhostTenantRunCredentialsEnabled
+    ? await ensureSigningKey({
+        keyId: selfhostTenantRunCredentialKeyId,
+        path: join(
+          dataRoot,
+          `selfhost-tenant-run-signing-key.${selfhostTenantRunCredentialKeyId}.jwk`,
+        ),
+        sql,
+        readFile: (path) =>
+          readFile(path, "utf8").then(
+            (text) => text,
+            () => null,
+          ),
+        async writeFile(path, contents) {
+          await mkdir(dirname(path), { recursive: true });
+          await writeFile(path, contents, { mode: 0o600 });
+          process.stdout.write(
+            "generated a self-host tenant-run signing key under the data root\n",
+          );
+        },
+      })
+    : undefined;
+  if (selfhostTenantRunCredentialSigningKey) {
+    await assertActiveSelfhostTenantRunCredentialSigningKey({
+      signingKey: selfhostTenantRunCredentialSigningKey,
+      runtimeGrantKeys: sql,
+    });
+  }
+
+  const configuredAi = aiGateway();
+  let selfhostEndpointIngressFetch: ((request: Request) => Promise<Response | null>) | undefined;
+  let selfhostV2WorkerEndpointBoot: SelfhostV2WorkerEndpointBoot | undefined;
+  if (v2WorkerEndpointHttpsSelection) {
+    if (!workerdTls) throw new Error("selected v2 Worker Endpoint HTTPS lost its TLS inputs");
+    try {
+      selfhostV2WorkerEndpointBoot = await createSelfhostV2WorkerEndpointBoot({
+        sql,
+        targetKey: v2WorkerTargetKey,
+        publicOrigin,
+        configuration: v2WorkerEndpointHttpsSelection,
+        certificateChain: workerdTls.certificateChain,
+        privateKey: workerdTls.privateKey,
+        publicationState: v2WorkerComposition.endpointPublicationState,
+        ownerForWorkerUid: async (uid) => {
+          if (!ownersRestored) throw new Error("v2 Worker owners are not restored");
+          return await v2WorkerComposition.ownerForWorkerUid(uid);
+        },
+      });
+      process.once("exit", () => {
+        void selfhostV2WorkerEndpointBoot?.close();
+      });
+    } catch (error) {
+      throw new Error("selected v2 Worker Endpoint HTTPS could not start", { cause: error });
+    }
+  }
+
+  // Exact Form support is all-or-nothing. A missing optional operator plane is
+  // not a narrower public WorkerVersion profile. Private admission additionally
+  // requires the complete validated operator-key custody, while existing sealed
+  // configured inputs remain recoverable even if the public Form is unavailable.
+  const completeV2WorkerForms =
+    workerdBinary !== null &&
+    takoformV2Config.workerBundle?.targetKey === v2WorkerTargetKey &&
+    takoformV2Config.staticAssetBundle?.targetKey === v2WorkerTargetKey &&
+    v2RuntimeBoot?.v2Actor !== undefined &&
+    v2RuntimeBoot.v2Workflow !== undefined &&
+    v2SqliteStore !== undefined &&
+    v2KvStore !== undefined &&
+    v2ObjectBucketStore !== undefined &&
+    v2QueueCustody !== undefined &&
+    v2QueueComposition !== undefined &&
+    v2PrivatePlaneBoot?.sqlite !== undefined &&
+    v2PrivatePlaneBoot.kv !== undefined &&
+    v2PrivatePlaneBoot.objectBucket !== undefined &&
+    v2PrivatePlaneBoot.queue !== undefined &&
+    v2PrivatePlaneBoot.queueProducer !== undefined &&
+    v2WorkerComposition.queueCapability !== undefined &&
+    ownersRestored;
+  async function closeBeforePublicIngress(): Promise<void> {
+    await selfhostV2WorkerEndpointBoot?.close(true);
+    const closed = await closeSelfhostEntryOwnedResources({
+      workerdShutdown: () => workerd.shutdown(),
+      mayCloseDependents: () => true,
+      v2WorkerSuspend: async () => {
+        await selfhostLinuxContainerNode?.close();
+        await v2WorkerComposition.closeScheduledHost();
+        await v2QueueScheduler?.close();
+        await v2WorkerComposition.closeWorkflowHost();
+        await v2RuntimeBoot?.closeActor();
+        await v2WorkerComposition.suspendOwnersRetainingCustody();
+        await v2QueueComposition?.close();
+      },
+      actorClose: async () => {
+        await actorRuntime?.close();
+      },
+      dataPlanesStop: async () => {
+        await dataPlanes?.stop(false);
+      },
+      controlDatabaseClose: () => controlDatabase.close(),
+      onFailure: (stage) => {
+        process.stderr.write(`self-host startup cleanup failed at ${stage}\n`);
+      },
+    });
+    if (!closed) throw new Error("self-host startup owner cleanup is unconfirmed");
+  }
+  let app: ReturnType<typeof buildApp>;
+  try {
+    // Qualify the selected existing realm; startup never binds or repairs one.
+    const hostedBilling = canonicalHostedInputs
+      ? await createCanonicalHostedBillingComposition({
+          sql,
+          clock,
+          billingConfig: canonicalHostedInputs.billingConfig,
+          pricing: canonicalHostedInputs.pricing,
+          client: canonicalHostedInputs.client,
+          realm: await verifyHostedBillingFinancialRealm({
+            sql,
+            reader: { client: canonicalHostedInputs.client },
+            expected: {
+              accountId: canonicalHostedInputs.accountId,
+              billingAuthority: canonicalHostedInputs.billingAuthority,
+              mode: "test",
+            },
+            prices: canonicalHostedInputs.pricing.hostedPlanTable.plans
+              .filter((plan) => plan.tier === "subscription")
+              .map((plan) => ({
+                priceId: plan.stripePriceId,
+                monthlyAmountMinor: plan.monthlyAmountMinor,
+              })),
+          }),
+          consoleOrigin: canonicalHostedInputs.consoleOrigin,
+          webhookSecret: canonicalHostedInputs.webhookSecret,
+          settings: canonicalHostedInputs.settings,
+          ...(canonicalHostedInputs.onDemand === undefined
+            ? {}
+            : { onDemand: canonicalHostedInputs.onDemand }),
+          warnings: { state: "unavailable", reason: "transport-not-composed" },
+        })
+      : undefined;
+    const v2FormSelectionFactory = completeV2WorkerForms
+      ? runtimeInputKeyAuthority
+        ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
+        : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
+      : undefined;
+    selfhostLinuxContainerNode ??= createSelfhostLinuxContainerNodeComposition({
+      sql,
+      clock,
+      selection: selfhostLinuxContainerSelection,
+      formSelectionFactory: v2FormSelectionFactory,
+      privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
+    });
+    app = buildApp({
+      sql,
+      resourceStores,
+      objects,
+      ...(signingKey ? { signingKey } : {}),
+      identity: identity.verifier,
+      identityProviders: identity.providers,
+      ...(configuredAi ? { ai: configuredAi } : {}),
+      settlement:
+        payment.settlement ??
+        (legacyPublicKeyJwk
+          ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
+          : unconfigured),
+      v2: takoformV2Config,
+      ...selfhostLinuxContainerNode.appPorts,
+      ...(billingConfig ? { billingConfig } : {}),
+      hostedPaidFreeExclusion: Boolean(hostedPricing),
+      ...(hostedBilling ? { hostedBilling } : {}),
+      v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
+      ...(payment.checkout ? { checkout: payment.checkout } : {}),
+      ...(payment.events ? { paymentEvents: payment.events } : {}),
+      ...((hostedBilling || payment.events) && identityPublicKeyJwk
+        ? {
+            operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
+              publicKeyJwk: identityPublicKeyJwk,
+              audience: publicOrigin,
+            }),
+          }
+        : {}),
+      // One process owns every pass here, and a pass outlives the request that
+      // started it, so the timer and the operator route may share one.
+      shareReconcilePass: true,
+      publicOrigin,
+      ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
+        ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
+        : {}),
+      forms: currentCandidates.forms,
+      bindings: currentCandidates.bindings,
+      hostForms: currentCandidates.forms,
+      hostBindings: currentCandidates.bindings,
+      providers,
+      providerPacks,
+      offerings,
+      artifacts: artifactStore,
+      ...(selfhostTenantRunCredentialSigningKey
+        ? {
+            selfhostTenantRunCredentialAuthority: (originReservations) =>
+              createSelfhostTenantRunCredentials({
+                issuer: publicOrigin,
+                signingKey: selfhostTenantRunCredentialSigningKey,
+                ordinarySigningKeyId: signingKey.keyId,
+                runtimeGrantKeys: sql,
+                originReservations,
+                clock,
+                randomId: () => crypto.randomUUID().replaceAll("-", ""),
+              }),
+          }
+        : {}),
+      ...(selfhostContainerEndpointHttps && selfhostContainer && containerEndpointIngress
+        ? {
+            selfhostEndpointIngressFactory: ({ store, deployments }) => {
+              selfhostEndpointIngressFetch = createSelfhostContainerEndpointIngress({
+                qualification: containerEndpointIngress,
+                store,
+                deployments,
+              });
+              return selfhostEndpointIngressFetch;
+            },
+          }
+        : {}),
+      ...(runtimeInputs ? { runtimeInputs } : {}),
+      clock,
+    });
+  } catch (error) {
+    try {
+      await closeBeforePublicIngress();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "self-host Form startup cleanup failed");
+    }
+    throw error;
+  }
+  // Install only the callback composed against this Host's canonical stores. A
+  // suffix miss becomes a private 404 on this dedicated listener and can never
+  // fall through to Host health, provisioning, or API routes.
+  if (selfhostContainerEndpointHttps) {
+    if (!selfhostEndpointIngressFetch) {
+      await selfhostContainerEndpointHttps.close();
+      selfhostContainerEndpointHttps = undefined;
+      throw new Error("Container Endpoint HTTPS could not install its exact Host ingress handler");
+    }
+    const endpointFetch = selfhostEndpointIngressFetch;
+    selfhostContainerEndpointHttps.installEndpointFetch(
+      createSelfhostContainerEndpointHttpsDispatch(endpointFetch),
+    );
+  }
+
+  /** Name plus a bounded cause: a lock, a refused port and a bug read differently. */
+  const reportBackgroundFailure = (name: string, cause?: unknown): void => {
+    process.stderr.write(
+      `self-host background pass failed: ${name}: ${describeBackgroundFailure(cause)}\n`,
+    );
+  };
+  // Every background pass below reports through this recorder as well as the
+  // log line, so a pass that fails on every tick is visible to the probe.
+  const backgroundPasses = createSelfhostBackgroundPassRecorder();
+  // Stuck Operations and sent-but-unretired Queue batches answered 200 with
+  // nothing to show for them. A background pass samples them; the public probe
+  // only reads the latest sample from memory and never runs this SQL itself.
+  const backlogSampler = createSelfhostBacklogSampler({
+    observer: createSelfhostBacklogObserver({ sql, now: clock, startedAtMs: clock().getTime() }),
+  });
+  // The first sample exists before the listener opens, so readiness never
+  // reports a missing sample for a Host that has just started.
+  await backgroundPasses
+    .observe("health-backlog", () => backlogSampler.refresh())()
+    .catch((cause: unknown) => reportBackgroundFailure("health-backlog", cause));
+
+  /**
+   * Bring the runtime back for the Workers this machine already published.
+   *
+   * `workerd` used to be started only by a publication, so a self-host that was
+   * restarted served nothing at all while its control plane reported healthy and
+   * `tofu plan` answered "No changes. Your infrastructure matches the
+   * configuration": every resource was observed Ready and no request could reach
+   * any Worker. A read or a refresh did not revive it either; only a fresh
+   * publication did, so surviving a reboot meant re-applying by hand.
+   *
+   * The configuration is re-rendered from the durable manifests rather than
+   * trusted as it stands, so a machine that was published by an older build comes
+   * back on this build's router. It runs before the listener opens, so this Host
+   * does not answer anything — readiness included — until the Workers it says it
+   * is serving are actually being served.
+   *
+   * A machine that has published nothing starts nothing, and a runtime that
+   * cannot be started is reported rather than fatal: the control plane is how an
+   * operator would diagnose it, and `has()` already fails closed, so nothing is
+   * observed Ready on a runtime that is not running.
+   */
+  const selfhostHealth = createSelfhostHealthHandler({
+    sql,
+    startupRestore,
+    supervisor: workerd,
+    // v2 Worker owners supervise their own children; without this a serving v2
+    // Worker read as "not-required" and a dead one was invisible.
+    ...(v2WorkerComposition
+      ? { v2Workers: { observe: () => v2WorkerComposition.observeOwnerHealth() } }
+      : {}),
+    backlog: backlogSampler,
+    backgroundPasses,
+  });
+  const takoformV2Ingress = createSelfhostTakoformV2Ingress({
+    publicOrigin,
+    appFetch: (request) => app.fetch(request),
+  });
+
+  const bunFetch = createSelfhostBunFetchHandler({
+    health: selfhostHealth,
+    provision,
+    appFetch: takoformV2Ingress,
+  });
+  let bunServer: ReturnType<typeof Bun.serve> | undefined;
+  let shutdownClean = true;
+  let closeSequenceFinished = false;
+  const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
+    selfhostContainer,
+    () => {
+      shutdownClean = false;
+      process.stderr.write("self-host shutdown failed at container-close\n");
+    },
+    async () => {
+      // `shutdown()` is the concrete supervisor's terminal, awaited lifecycle;
+      // the public WorkerdSupervisor port remains unchanged for runtime clients.
+      shutdownClean =
+        (await closeSelfhostEntryOwnedResources({
+          workerdShutdown: () => workerd.shutdown(),
+          mayCloseDependents: () => shutdownClean,
+          v2WorkerSuspend: async () => {
+            await selfhostLinuxContainerNode?.close();
+            await v2WorkerComposition.closeScheduledHost();
+            await v2QueueScheduler?.close();
+            await v2WorkerComposition.closeWorkflowHost();
+            await v2RuntimeBoot?.closeActor();
+            await v2WorkerComposition.suspendOwnersRetainingCustody();
+            await v2QueueComposition?.close();
+          },
+          actorClose: async () => {
+            await actorRuntime?.close();
+          },
+          dataPlanesStop: async () => {
+            await dataPlanes?.stop(false);
+          },
+          controlDatabaseClose: () => controlDatabase.close(),
+          onFailure: (stage) => {
+            shutdownClean = false;
+            process.stderr.write(`self-host shutdown failed at ${stage}\n`);
+          },
+        })) && shutdownClean;
+    },
+    () => {
+      // Only a proved ordered close and ingress/request/pass drain permit a
+      // successful exit. An unproved stop terminates the Host with status 1.
+      closeSequenceFinished = true;
+    },
+  );
+  const entryShutdown = createSelfhostEntryProcessShutdown({
+    stopIngress: async () => {
+      const endpointClosings: Promise<void>[] = [];
+      if (selfhostContainerEndpointHttps) {
+        try {
+          endpointClosings.push(selfhostContainerEndpointHttps.close(false));
+        } catch {
+          endpointClosings.push(
+            Promise.reject(new Error("Container Endpoint ingress close failed")),
+          );
+        }
+      }
+      if (selfhostV2WorkerEndpointBoot) {
+        try {
+          endpointClosings.push(selfhostV2WorkerEndpointBoot.close(false));
+        } catch {
+          endpointClosings.push(
+            Promise.reject(new Error("v2 Worker Endpoint ingress close failed")),
+          );
+        }
+      }
+
+      let serverStopping: Promise<void> = Promise.resolve();
+      try {
+        const stopped = bunServer?.stop(false);
+        serverStopping = Promise.resolve(stopped);
+      } catch {
+        serverStopping = Promise.reject(new Error("Bun ingress stop failed"));
+      }
+
+      const stopped = await Promise.allSettled([...endpointClosings, serverStopping]);
+      if (stopped.some((result) => result.status === "rejected")) {
+        throw new Error("one or more self-host ingress listeners did not stop cleanly");
+      }
+    },
+    finishShutdown: async () => {
+      await handleContainerAndWorkerdShutdown();
+      if (!closeSequenceFinished || !shutdownClean) {
+        throw new Error("self-host owned resources did not close cleanly");
+      }
+    },
+  });
+
+  /**
+   * Keep an idempotent best-effort child stop registered before listener startup:
+   * restore may have started Workerd even if Bun.serve cannot bind.
+   * This is not a substitute for the awaited shutdown proof above.
+   */
+  process.on("exit", () => {
+    workerd.stop();
+  });
+
+  try {
+    bunServer = Bun.serve({
+      port,
+      hostname: listenHost,
+      // Longer than the default, because publishing a site means uploading its
+      // files and a request that is doing real work is not an idle one.
+      idleTimeout: 120,
+      fetch: (request) => entryShutdown.fetch(request, bunFetch),
+    });
+  } catch (error) {
+    try {
+      await closeBeforePublicIngress();
+    } catch (closeError) {
+      throw new AggregateError(
+        [error, closeError],
+        "self-host Bun listener failed and owned startup cleanup was not confirmed",
+      );
+    }
+    throw error;
+  }
+
+  // Every pass body below is observed by the recorder; single-flight, the stop
+  // fence and failure reporting stay exactly the shutdown owner's.
+  const observedPasses = observeSelfhostBackgroundPasses(entryShutdown, backgroundPasses);
+  observedPasses.startInterval(
+    "health-backlog",
+    SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
+    () => backlogSampler.refresh(),
+    reportBackgroundFailure,
+  );
+
+  // Background settlement. The shutdown owner retains each timer and each pass
+  // promise, so no new work starts past the signal fence and accepted work drains.
+  observedPasses.startInterval(
+    "settlement",
+    30_000,
+    async () => {
+      await app.tick();
+      if (dataPlanes) {
+        await dataPlanes.maintenance.sweepExpiredKv();
+        await dataPlanes.maintenance.sweepExpiredObjectUploads();
+        await dataPlanes.maintenance.reconcileOrphanObjectFiles();
+      }
+      if (queuePump) await queuePump.sweep();
+    },
+    reportBackgroundFailure,
+  );
+  if (canonicalHostedInputs || payment.events) {
+    // The same cadence as the Worker's cron: payments whose payer never came
+    // back and whose webhook never arrived are credited within minutes.
+    observedPasses.startInterval(
+      "payment-reconcile",
+      5 * 60_000,
+      async () => {
+        await app.reconcilePayments();
+      },
+      reportBackgroundFailure,
+    );
+  }
+  observedPasses.startInterval(
+    "takoform-v2",
+    1_000,
+    async () => {
+      await app.tickTakoformV2();
+    },
+    reportBackgroundFailure,
+  );
+  startSelfhostV2ScheduledDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
+  if (v2RuntimeBoot?.v2Workflow) {
+    startSelfhostV2WorkflowDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
+  }
+  observedPasses.startInterval(
+    "queue-wake",
+    1_000,
+    () => {
+      // Share only the wake timer. A blocked recovery scan must not hold the
+      // other delivery lane; both named passes remain owned by shutdown.
+      void observedPasses
+        .runPass("takoform-v2-queue-delivery", async () => {
+          await v2QueueScheduler?.tick();
+        })
+        .catch((cause: unknown) => reportBackgroundFailure("takoform-v2-queue-delivery", cause));
+      void observedPasses
+        .runPass("queue-pump", async () => {
+          await queuePump?.tick();
+        })
+        .catch((cause: unknown) => reportBackgroundFailure("queue-pump", cause));
+    },
+    reportBackgroundFailure,
+  );
+  observedPasses.startInterval(
+    "worker-scheduler",
+    5_000,
+    async () => {
+      await workerScheduler?.tick();
+    },
+    reportBackgroundFailure,
+  );
+
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.on(signal, () => {
+      // Until the terminal shutdown proof completes, a natural event-loop exit
+      // must not be reported as a clean stop. A reported failure explicitly
+      // exits nonzero even if retained dependent listeners are still open.
+      process.exitCode = 1;
+      void entryShutdown.shutdown();
+    });
+  }
+  if (dataPlanes) {
+    // Recorded, because an operator debugging a Worker's storage needs to know
+    // which port to look at and the kernel usually chose it.
+    console.log(`self-host data planes listening on ${dataPlanes.address} (loopback only)`);
+  }
+  console.log(
+    // The bound address, not just the port: a loopback-only listener behind a
+    // proxy elsewhere is unreachable, and this line is where that shows.
+    `takoserver listening on ${formatSelfhostListenAddress(listenHost, bunServer?.port ?? port)} ` +
+      `as ${publicOrigin} ` +
+      // Named from what is actually configured. A banner that says Cloudflare on
+      // a machine with no account is the first thing an operator reads and the
+      // first thing that misleads them.
+      `(provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
+  );
+
+  // Having minted the way in, say what it is. A machine that generates a key and
+  // leaves the operator to discover how to present it has automated the easy half.
+  // The assertion is a credential written wherever stdout goes, so it is minted
+  // only until the operator has signed in (or when explicitly asked), and the
+  // session exchange refuses it a second time.
+  if (identity.providers.some((provider) => provider.method === "operator-assertion")) {
+    const stored = await readFile(operatorKeyPath, "utf8").catch(() => null);
+    if (stored) {
+      const assertion = (await selfhostOperatorAssertionDue({
+        sql,
+        forced: forceOperatorAssertionPrint,
+      }))
+        ? await signOperatorAssertion({
+            privateJwk: stored,
+            claims: {
+              purpose: "sign-in",
+              aud: publicOrigin,
+              provider: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.provider,
+              subject: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.subject,
+              email: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.email,
+              displayName: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.displayName,
+            },
+            nowSeconds: Math.floor(Date.now() / 1_000),
+            lifetimeSeconds: 600,
+          })
+        : undefined;
+      console.log(
+        renderSelfhostOperatorSignInInstructions({
+          publicOrigin,
+          ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
+            ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
+            : {}),
+          ...(assertion === undefined ? {} : { assertion }),
+          operatorKeyPath,
+        }),
       );
     }
   }
 }
-const implicitActor = selfhostImplicitActorRuntime({
-  configured: implicitActorConfigured,
-  dataRoot,
-  temporaryDirectory: tmpdir(),
-  ...(socketRootProblem ? { socketRootProblem } : {}),
-});
-if (implicitActor.diagnostic) process.stderr.write(`${implicitActor.diagnostic}\n`);
-if (implicitActor.open && workerdBinary && installedActorForm) {
-  try {
-    actorRuntime = await openSelfhostActorPublicRuntime({
-      dataRoot,
-      runtimeRoot: dataRoot,
-      socketParent: selfhostPrivateSocketRoot(dataRoot),
-      binary: workerdBinary,
-      graph: createActorResourceGraphReader({
-        store: resourceStores.inventory,
-        form: installedActorForm,
-      }),
-      deployments: resourceStores.deployments,
-      providerPackRef: "local",
-      providerInstallationRef: "local.primary",
-    });
-  } catch (error) {
-    process.stderr.write(
-      `the Actor owner could not restore: ${error instanceof Error ? error.message : "unknown error"}; Actor admission remains unavailable.\n`,
-    );
-  }
-}
-const workerdRuntime = createWorkerdRuntime({
-  root: dataRoot,
-  binary: workerdBinary,
-  port: workerdPort,
-  // The kernel may choose a different listener after a restart. Re-render
-  // Host transport from this process, not a Version's saved ephemeral port.
-  ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
-  ...(workerdTls ? { tls: workerdTls } : {}),
-  ...(actorRuntime
-    ? {
-        actorForwardSockets: () => actorRuntime?.actorForwardSockets() ?? [],
-        actorForwardLifecycle: actorRuntime.actorForwardLifecycle,
-      }
-    : {}),
-  beforeRender: () => workerd.assertMayRender(),
-  isReady: () => workerd.isReady(),
-  async onReload(configPath) {
-    // Started on the first publish rather than unconditionally, so a machine
-    // that never runs a Worker never runs a runtime for one. A machine that
-    // *has* published one starts it at boot instead — see the restore below.
-    // After that it watches the file itself: one tenant's deploy must not
-    // bounce every other tenant's in-flight requests.
-    await workerd.ensure(configPath);
-  },
-});
 
-// Restore the exact native socket graph before composing any Actor capability
-// or opening the public listener. A failed restore is diagnosis, never proof of
-// executable Actor admission.
-let startupRestore: SelfhostStartupRestoreOutcome;
-try {
-  const restored = await workerdRuntime.restore();
-  startupRestore = restored.length === 0 ? "empty" : "restored";
-  if (restored.length > 0) {
-    console.log(`restored ${restored.length} published Worker(s): ${restored.join(", ")}`);
-  }
-} catch (error) {
-  startupRestore = "failed";
-  actorRuntime?.actorForwardLifecycle.uncertain();
-  await actorRuntime?.close();
-  actorRuntime = undefined;
-  process.stderr.write(
-    `the Worker runtime could not be restored at boot: ${
-      error instanceof Error ? error.message : "unknown error"
-    }. Published Workers will not answer until the next publication.\n`,
-  );
-}
-
-// Reopen every SQL-explained v2 Worker UID owner before the public listener.
-// This does not register the incomplete Worker Forms or make an Endpoint HTTPS
-// frontend claim. Unknown private namespaces and missing serving owners are
-// startup failures, not silently forgotten native children.
-if (v2PrivatePlaneBoot) prepareSelfhostV2PrivatePlaneRoots(v2PrivatePlaneBoot);
-const v2SqliteStore = v2PrivatePlaneBoot?.sqlite
-  ? createSelfhostV2SQLiteStore({
-      sql,
-      root: v2PrivatePlaneBoot.sqlite.root,
-      targetKey: v2WorkerTargetKey,
-      now: clock,
-    })
-  : undefined;
-const v2KvStore = v2PrivatePlaneBoot?.kv
-  ? createSelfhostV2KvStore({
-      sql,
-      root: v2PrivatePlaneBoot.kv.root,
-      clock,
-      runOperation: runSelfhostKvOperation,
-      operationErrorCode: selfhostKvOperationErrorCode,
-    })
-  : undefined;
-const v2ObjectBucketStore = v2PrivatePlaneBoot?.objectBucket
-  ? createSelfhostV2ObjectBucketStore({
-      sql,
-      root: v2PrivatePlaneBoot.objectBucket.root,
-      clock,
-    })
-  : undefined;
-const v2QueueCustody =
-  v2PrivatePlaneBoot?.queue || v2PrivatePlaneBoot?.queueProducer
-    ? createQueueCustody({ sql })
-    : undefined;
-let workers: ReturnType<typeof createSelfhostV2WorkerComposition> | undefined;
-let queueCapability:
-  | NonNullable<ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]>
-  | undefined;
-let ownersRestored = false;
-let v2QueueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
-let v2RuntimeBoot: ReturnType<typeof createSelfhostV2RuntimeBoot> | undefined;
-let restoredV2WorkerUids: readonly string[];
-const clearV2BootKeys = () => {
-  for (const plane of [
-    v2PrivatePlaneBoot?.sqlite,
-    v2PrivatePlaneBoot?.kv,
-    v2PrivatePlaneBoot?.objectBucket,
-    v2PrivatePlaneBoot?.queue,
-    v2PrivatePlaneBoot?.queueProducer,
-  ]) {
-    plane?.signingKey.fill(0);
-  }
-};
-try {
-  if (v2RuntimeSelection) {
-    if (!takoformV2Config.workerBundle) {
-      throw new Error("v2 Actor/Workflow boot requires the configured held WorkerBundle backend");
-    }
-    v2RuntimeBoot = createSelfhostV2RuntimeBoot({
-      selection: v2RuntimeSelection,
-      sql,
-      clock,
-      targetKey: v2WorkerTargetKey,
-      dataRoot,
-      workerdBinary,
-      ...(process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY
-        ? { guardBinary: process.env.TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY }
-        : {}),
-      ownerForWorkerUid: async (uid) => (workers ? await workers.actorOwnerForRecovery(uid) : null),
-      ...(dataPlanes ? { dataPlaneAddress: dataPlanes.address } : {}),
-      ...(v2PrivatePlaneBoot?.sqlite
-        ? {
-            v2SqliteBindingAddress: `127.0.0.1:${v2PrivatePlaneBoot.sqlite.privatePort}`,
-          }
-        : {}),
-    });
-  }
-  if (v2PrivatePlaneBoot?.queue && v2QueueCustody) {
-    const requireQueueCapability = (): NonNullable<
-      ReturnType<typeof createSelfhostV2WorkerComposition>["queueCapability"]
-    > => {
-      if (!ownersRestored || !queueCapability) {
-        throw new Error("v2 Queue owner capability is not restored");
-      }
-      return queueCapability;
-    };
-    v2QueueComposition = createSelfhostV2QueueComposition({
-      sql,
-      custody: v2QueueCustody,
-      capability: {
-        observeQueueServingCapability: (input) =>
-          requireQueueCapability().observeQueueServingCapability(input),
-        observeCurrentServing: (input) => requireQueueCapability().observeCurrentServing(input),
-      },
-      settlementKey: v2PrivatePlaneBoot.queue.signingKey,
-      privatePort: v2PrivatePlaneBoot.queue.privatePort,
-      onCancelFailure: (cause) =>
-        process.stderr.write(
-          `self-host Queue reservation could not be refunded before send and will expire: ${describeBackgroundFailure(cause)}\n`,
-        ),
-      onClaimFailure: (cause) =>
-        process.stderr.write(
-          `self-host Queue batch selection failed: ${describeBackgroundFailure(cause)}\n`,
-        ),
-      ownerForWorkerUid: async (uid) => {
-        if (!ownersRestored || !workers) {
-          throw new Error("v2 Queue owner is not restored");
-        }
-        return await workers.ownerForWorkerUid(uid);
-      },
-    });
-  }
-  // The explicit OCI source exists before the native Worker owner is opened.
-  // The existing Form factory is evaluated only later by buildApp, after boot.
-  if (selfhostLinuxContainerSelection?.kind === "oci") {
-    selfhostLinuxContainerNode = createSelfhostLinuxContainerNodeComposition({
-      sql,
-      clock,
-      selection: selfhostLinuxContainerSelection,
-      privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
-      formSelectionFactory(context) {
-        if (!workers || !completeV2WorkerForms) return { forms: {}, retainedForms: {} };
-        const factory = runtimeInputKeyAuthority
-          ? workers.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
-          : workers.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint);
-        return factory(context);
-      },
-    });
-  }
-  const workerOptions: Parameters<typeof createSelfhostV2WorkerComposition>[0] = {
-    sql,
-    objects,
-    clock,
-    config: takoformV2Config,
-    rootDirectory: join(durableRoot, "v2-worker-owners"),
-    // Not below `v2-worker-owners`: boot refuses a namespace SQL cannot explain.
-    moduleInspectionRoot: join(durableRoot, "selfhost", "module-inspection"),
-    targetKey: v2WorkerTargetKey,
-    workerdBinary,
-    ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
-    ...(v2RuntimeBoot?.v2Workflow ? { v2Workflow: v2RuntimeBoot.v2Workflow } : {}),
-    ...(v2ConfiguredInputSealer ? { configuredInputSealer: v2ConfiguredInputSealer } : {}),
-    ...(v2SqliteStore && v2PrivatePlaneBoot?.sqlite
-      ? {
-          sqliteBinding: {
-            store: v2SqliteStore,
-            signingKey: v2PrivatePlaneBoot.sqlite.signingKey,
-            stagingRoot: v2PrivatePlaneBoot.sqlite.stagingRoot,
-            privatePort: v2PrivatePlaneBoot.sqlite.privatePort,
-          },
-        }
-      : {}),
-    ...(v2KvStore && v2PrivatePlaneBoot?.kv
-      ? {
-          v2KvBinding: {
-            store: v2KvStore,
-            signingKey: v2PrivatePlaneBoot.kv.signingKey,
-            privatePort: v2PrivatePlaneBoot.kv.privatePort,
-          },
-        }
-      : {}),
-    ...(v2ObjectBucketStore && v2PrivatePlaneBoot?.objectBucket
-      ? {
-          v2ObjectBucketBinding: {
-            store: v2ObjectBucketStore,
-            signingKey: v2PrivatePlaneBoot.objectBucket.signingKey,
-            privatePort: v2PrivatePlaneBoot.objectBucket.privatePort,
-          },
-        }
-      : {}),
-    ...(v2QueueComposition ? { queueSettlement: v2QueueComposition.settlementBinding } : {}),
-    ...(v2PrivatePlaneBoot?.queueProducer && v2QueueCustody
-      ? {
-          v2QueueProducerBinding: {
-            custody: v2QueueCustody,
-            signingKey: v2PrivatePlaneBoot.queueProducer.signingKey,
-            privatePort: v2PrivatePlaneBoot.queueProducer.privatePort,
-          },
-        }
-      : {}),
-  };
-  const containerBinding = selfhostLinuxContainerNode?.containerBindingSource;
-  workers = containerBinding
-    ? createSelfhostV2ContainerWorkerComposition({
-        ...workerOptions,
-        ociContainerBinding: containerBinding,
-      })
-    : createSelfhostV2WorkerComposition(workerOptions);
-  if (v2QueueComposition) {
-    if (!workers.queueCapability) throw new Error("v2 Queue native capability is unavailable");
-    queueCapability = workers.queueCapability;
-  }
-  // Both private broker and Queue authority have already copied the supplied
-  // bytes into their exact boot snapshot; do not retain a spare entry copy.
-  clearV2BootKeys();
-  restoredV2WorkerUids = await workers.restoreOwners();
-  ownersRestored = true;
-} catch (error) {
-  clearV2BootKeys();
-  await workers?.closeScheduledHost();
-  await workers?.closeWorkflowHost();
-  await v2RuntimeBoot?.closeActor();
-  await v2QueueComposition?.close();
-  throw error;
-}
-const v2WorkerComposition = workers;
-if (v2QueueComposition) {
-  // No delivery pass has run in this process yet, so an unsent reservation
-  // was left by an earlier one. Refusing it is the pre-send cancel, safe even
-  // against a live writer; its messages come back now instead of after 120 s.
-  await v2QueueComposition
-    .refuseReservationsBeforeFirstDelivery()
-    .then((refused) => {
-      if (refused > 0)
-        process.stdout.write(
-          `refused ${refused} unsent v2 Queue reservation(s) left by an earlier process\n`,
-        );
-    })
-    .catch((cause: unknown) =>
-      process.stderr.write(
-        `self-host Queue reservations left by an earlier process will expire: ${describeBackgroundFailure(cause)}\n`,
-      ),
-    );
-}
-const v2QueueScheduler =
-  v2QueueComposition && v2QueueCustody
-    ? createSelfhostV2QueueScheduler({
-        sql,
-        custody: v2QueueCustody,
-        composition: v2QueueComposition,
-        workerComposition: v2WorkerComposition,
-      })
-    : undefined;
-if (restoredV2WorkerUids.length > 0) {
-  process.stdout.write(`restored ${restoredV2WorkerUids.length} v2 Worker owner(s)\n`);
-}
-
-/**
- * The half of the Edge Family that is a clock rather than a request.
- *
- * A queue message and a cron match have no caller: something on this machine
- * has to notice they are due and invoke the Worker itself. Both reach the
- * Worker through the runtime above, on a hostname of this Host's own, past a
- * gate holding a token the tenant cannot read.
- *
- * Retired-drain mode publishes no Worker Version, so it runs neither; the
- * provider then reports a Consumer as not delivering and a Trigger as not
- * firing, which is the truth on that machine.
- */
-const eventTargets = createSelfhostEventTargets(dataRoot);
-const queuePump =
-  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
-    ? undefined
-    : createSelfhostQueuePump({ sql, runtime: workerdRuntime, targets: eventTargets, clock });
-const workerScheduler =
-  providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
-    ? undefined
-    : createSelfhostWorkerScheduler({
-        sql,
-        runtime: workerdRuntime,
-        targets: eventTargets,
-        clock,
-      });
-const selfhostEvents = workerScheduler
-  ? {
-      forgetSchedules: (script: string, cron?: string) =>
-        workerScheduler.forgetSchedules(script, cron),
-    }
-  : undefined;
-
-const providerComposition = createStandaloneProviderComposition({
-  mode: providerMode,
-  edge,
-  stableForms: currentCandidates.forms,
-  stableBindings: currentCandidates.bindings,
-  retainedForms: currentCandidates.retainedForms,
-  retainedBindings: currentCandidates.retainedBindings,
-  workerClassRuntimeContracts: currentCandidates.workerClassRuntimeContracts,
-  dataRoot,
-  // SQLiteDatabase records carry the configured string; keep matching them.
-  recordedDataRoot: configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT,
-  runtime: workerdRuntime,
-  ...(actorRuntime ? { actorRuntime } : {}),
-  workerRuntimeAvailable: workerdBinary !== null,
-  artifacts: providerArtifacts,
-  ...(process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX
-    ? { workerEndpointSuffix: process.env.TAKOSERVER_WORKER_ENDPOINT_SUFFIX }
-    : {}),
-  // The scheme is the socket's, so it is composed here rather than defaulted
-  // inside the provider. The drain mode publishes no Worker at all and refuses
-  // every self-host setting, including this one.
-  ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
-    ? {}
-    : { workerEndpointScheme: workerEndpoint.scheme, workerEndpointPort }),
-  ...(process.env.TAKOSERVER_SUFFIXES
-    ? { suffixes: process.env.TAKOSERVER_SUFFIXES.split(",").map((entry) => entry.trim()) }
-    : {}),
-  ...(runtimeInputs ? { runtimeInputs: runtimeInputs.leases } : {}),
-  ...(selfhostContainer
-    ? {
-        container: {
-          runtime: selfhostContainer.runtime,
-          capacityProfile: selfhostContainer.capacityProfile,
-        },
-      }
-    : {}),
-  ...(selfhostContainerEndpointHttps
-    ? { containerEndpointIngress: selfhostContainerEndpointHttps.ingress }
-    : {}),
-  ...(dataPlanes
-    ? { dataPlaneAddress: dataPlanes.address, dataPlaneMaintenance: dataPlanes.maintenance }
-    : {}),
-  ...(selfhostEvents ? { events: selfhostEvents } : {}),
-  ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
-    ? {}
-    : {
-        listCronOwners: createSelfhostCronOwnerReader({
-          inventory: resourceStores.inventory,
-          forms: [...currentCandidates.forms, ...currentCandidates.retainedForms, ...edge.forms],
-        }),
-      }),
-  now: clock(),
-  ...(providerMode === RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN
-    ? {
-        retiredCloudflare: {
-          accountId: required("CLOUDFLARE_ACCOUNT_ID"),
-          authorize: () => `Bearer ${cloudflareToken()}`,
-          zones: [],
-          artifacts: providerArtifacts,
-        },
-      }
-    : {}),
-});
-const containerEndpointIngress = providerComposition.containerEndpointIngress;
-if (selfhostContainerEndpointHttps && !containerEndpointIngress) {
-  await selfhostContainerEndpointHttps.close();
-  selfhostContainerEndpointHttps = undefined;
-  process.stderr.write(
-    "Container Endpoint HTTPS is configured but unsupported by this exact Provider composition; listener closed and no Endpoint Offering is active.\n",
-  );
-}
-const { providers, providerPacks, offerings } = providerComposition;
-
-const unconfigured = {
-  async verify(): Promise<never> {
-    throw new Error("operator credentials are not configured");
-  },
-};
-
-// A machine with no identity provider would advertise no way in and refuse
-// every sign-in, so it mints an operator key and offers that instead.
-const operatorKeyPath = join(dataRoot, "operator-key.jwk");
-const identityOnlyPublicKeyJwk = process.env.TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK
-  ? parseOperatorPublicKey(
-      process.env.TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK,
-      "TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK",
-    )
-  : undefined;
-const legacyPublicKeyJwk = await ensureOperatorKey({
-  configured: process.env.TAKOSERVER_OPERATOR_PUBLIC_JWK,
-  hasIdentityProvider:
-    Boolean(identityOnlyPublicKeyJwk) ||
-    Boolean(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID) ||
-    Boolean(process.env.GOOGLE_CLIENT_ID),
-  path: operatorKeyPath,
-  readFile: (path) =>
-    readFile(path, "utf8").then(
-      (text) => text,
-      () => null,
-    ),
-  async writeFile(path, contents) {
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, contents, { mode: 0o600 });
-    process.stdout.write(`generated an operator key at ${path}\n`);
-  },
-});
-const identityPublicKeyJwk = identityOnlyPublicKeyJwk ?? legacyPublicKeyJwk;
-
-const payment: ReturnType<typeof resolvePayment> = canonicalHostedInputs
-  ? {}
-  : resolvePayment({
-      hostedPricing,
-      stripeMode,
-      stripeSecretKey: process.env.STRIPE_SECRET_KEY,
-      stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
-      consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
-      settings: paymentSettingsFromEnvironment(process.env),
-    });
-if (payment.settlement && !payment.checkout) {
-  // Said once at startup: a key with no console still decides funding.
-  console.warn(
-    "takoserver: Stripe funding is on without TAKOSERVER_CONSOLE_ORIGIN; Checkout is not served, " +
-      "and Stripe verification, the webhook and the reconcile pass replace operator-signed funding",
-  );
-}
-
-const identity = resolveIdentity({
-  ...(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID
-    ? {
-        takosId: {
-          issuer: process.env.TAKOS_ID_ISSUER,
-          clientId: process.env.TAKOS_ID_CLIENT_ID,
-        },
-      }
-    : {}),
-  googleClientId: process.env.GOOGLE_CLIENT_ID,
-  operatorPublicKeyJwk: identityPublicKeyJwk,
-  operatorAudience: publicOrigin,
-});
-
-/**
- * The half that can reach a cloud account also answers for it.
- *
- * Served in front of the product's router because it is not part of the
- * product: no tenant, no billing, no lifecycle — a provider call in, a
- * classified ticket out. It is served only when a credential is configured.
- */
-const provision = createProvisionerEndpoint({
-  providers,
-  credential: process.env.TAKOSERVER_PROVISIONER_TOKEN,
-  applyOfferingIds: offerings.map((offering) => offering.id),
-});
-
-// A machine standing on its own makes a signing key, keeps it under the data
-// root, and registers the half that verifies it.
-const signingKeyId = process.env.TAKOSERVER_SIGNING_KEY_ID ?? "takoserver-local";
-const selfhostTenantRunCredentialsEnabled =
-  process.env.TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIALS === "1";
-const selfhostTenantRunCredentialKeyId =
-  process.env.TAKOSERVER_SELFHOST_TENANT_RUN_CREDENTIAL_KEY_ID ?? "takoserver-selfhost-tenant-run";
-if (selfhostTenantRunCredentialsEnabled) {
-  assertSelfhostTenantRunCredentialKeyConfiguration({
-    credentialKeyId: selfhostTenantRunCredentialKeyId,
-    ordinarySigningKeyId: signingKeyId,
-  });
-}
-const signingKey = await ensureSigningKey({
-  keyId: signingKeyId,
-  privateJwk: process.env.TAKOSERVER_SIGNING_KEY,
-  path: join(dataRoot, "signing-key.jwk"),
-  sql,
-  readFile: (path) =>
-    readFile(path, "utf8").then(
-      (text) => text,
-      () => null,
-    ),
-  async writeFile(path, contents) {
-    await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, contents, { mode: 0o600 });
-    process.stdout.write(`generated a signing key at ${path}\n`);
-  },
-});
-const selfhostTenantRunCredentialSigningKey = selfhostTenantRunCredentialsEnabled
-  ? await ensureSigningKey({
-      keyId: selfhostTenantRunCredentialKeyId,
-      path: join(
-        dataRoot,
-        `selfhost-tenant-run-signing-key.${selfhostTenantRunCredentialKeyId}.jwk`,
-      ),
-      sql,
-      readFile: (path) =>
-        readFile(path, "utf8").then(
-          (text) => text,
-          () => null,
-        ),
-      async writeFile(path, contents) {
-        await mkdir(dirname(path), { recursive: true });
-        await writeFile(path, contents, { mode: 0o600 });
-        process.stdout.write("generated a self-host tenant-run signing key under the data root\n");
-      },
-    })
-  : undefined;
-if (selfhostTenantRunCredentialSigningKey) {
-  await assertActiveSelfhostTenantRunCredentialSigningKey({
-    signingKey: selfhostTenantRunCredentialSigningKey,
-    runtimeGrantKeys: sql,
-  });
-}
-
-const configuredAi = aiGateway();
-let selfhostEndpointIngressFetch: ((request: Request) => Promise<Response | null>) | undefined;
-let selfhostV2WorkerEndpointBoot: SelfhostV2WorkerEndpointBoot | undefined;
-if (v2WorkerEndpointHttpsSelection) {
-  if (!workerdTls) throw new Error("selected v2 Worker Endpoint HTTPS lost its TLS inputs");
-  try {
-    selfhostV2WorkerEndpointBoot = await createSelfhostV2WorkerEndpointBoot({
-      sql,
-      targetKey: v2WorkerTargetKey,
-      publicOrigin,
-      configuration: v2WorkerEndpointHttpsSelection,
-      certificateChain: workerdTls.certificateChain,
-      privateKey: workerdTls.privateKey,
-      publicationState: v2WorkerComposition.endpointPublicationState,
-      ownerForWorkerUid: async (uid) => {
-        if (!ownersRestored) throw new Error("v2 Worker owners are not restored");
-        return await v2WorkerComposition.ownerForWorkerUid(uid);
-      },
-    });
-    process.once("exit", () => {
-      void selfhostV2WorkerEndpointBoot?.close();
-    });
-  } catch (error) {
-    throw new Error("selected v2 Worker Endpoint HTTPS could not start", { cause: error });
-  }
-}
-
-// Exact Form support is all-or-nothing. A missing optional operator plane is
-// not a narrower public WorkerVersion profile. Private admission additionally
-// requires the complete validated operator-key custody, while existing sealed
-// configured inputs remain recoverable even if the public Form is unavailable.
-const completeV2WorkerForms =
-  workerdBinary !== null &&
-  takoformV2Config.workerBundle?.targetKey === v2WorkerTargetKey &&
-  takoformV2Config.staticAssetBundle?.targetKey === v2WorkerTargetKey &&
-  v2RuntimeBoot?.v2Actor !== undefined &&
-  v2RuntimeBoot.v2Workflow !== undefined &&
-  v2SqliteStore !== undefined &&
-  v2KvStore !== undefined &&
-  v2ObjectBucketStore !== undefined &&
-  v2QueueCustody !== undefined &&
-  v2QueueComposition !== undefined &&
-  v2PrivatePlaneBoot?.sqlite !== undefined &&
-  v2PrivatePlaneBoot.kv !== undefined &&
-  v2PrivatePlaneBoot.objectBucket !== undefined &&
-  v2PrivatePlaneBoot.queue !== undefined &&
-  v2PrivatePlaneBoot.queueProducer !== undefined &&
-  v2WorkerComposition.queueCapability !== undefined &&
-  ownersRestored;
-async function closeBeforePublicIngress(): Promise<void> {
-  await selfhostV2WorkerEndpointBoot?.close(true);
-  const closed = await closeSelfhostEntryOwnedResources({
-    workerdShutdown: () => workerd.shutdown(),
-    mayCloseDependents: () => true,
-    v2WorkerSuspend: async () => {
-      await selfhostLinuxContainerNode?.close();
-      await v2WorkerComposition.closeScheduledHost();
-      await v2QueueScheduler?.close();
-      await v2WorkerComposition.closeWorkflowHost();
-      await v2RuntimeBoot?.closeActor();
-      await v2WorkerComposition.suspendOwnersRetainingCustody();
-      await v2QueueComposition?.close();
-    },
-    actorClose: async () => {
-      await actorRuntime?.close();
-    },
-    dataPlanesStop: async () => {
-      await dataPlanes?.stop(false);
-    },
-    controlDatabaseClose: () => controlDatabase.close(),
-    onFailure: (stage) => {
-      process.stderr.write(`self-host startup cleanup failed at ${stage}\n`);
-    },
-  });
-  if (!closed) throw new Error("self-host startup owner cleanup is unconfirmed");
-}
-let app: ReturnType<typeof buildApp>;
-try {
-  // Qualify the selected existing realm; startup never binds or repairs one.
-  const hostedBilling = canonicalHostedInputs
-    ? await createCanonicalHostedBillingComposition({
-        sql,
-        clock,
-        billingConfig: canonicalHostedInputs.billingConfig,
-        pricing: canonicalHostedInputs.pricing,
-        client: canonicalHostedInputs.client,
-        realm: await verifyHostedBillingFinancialRealm({
-          sql,
-          reader: { client: canonicalHostedInputs.client },
-          expected: {
-            accountId: canonicalHostedInputs.accountId,
-            billingAuthority: canonicalHostedInputs.billingAuthority,
-            mode: "test",
-          },
-          prices: canonicalHostedInputs.pricing.hostedPlanTable.plans
-            .filter((plan) => plan.tier === "subscription")
-            .map((plan) => ({
-              priceId: plan.stripePriceId,
-              monthlyAmountMinor: plan.monthlyAmountMinor,
-            })),
-        }),
-        consoleOrigin: canonicalHostedInputs.consoleOrigin,
-        webhookSecret: canonicalHostedInputs.webhookSecret,
-        settings: canonicalHostedInputs.settings,
-        ...(canonicalHostedInputs.onDemand === undefined
-          ? {}
-          : { onDemand: canonicalHostedInputs.onDemand }),
-        warnings: { state: "unavailable", reason: "transport-not-composed" },
-      })
-    : undefined;
-  const v2FormSelectionFactory = completeV2WorkerForms
-    ? runtimeInputKeyAuthority
-      ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
-      : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
-    : undefined;
-  selfhostLinuxContainerNode ??= createSelfhostLinuxContainerNodeComposition({
-    sql,
-    clock,
-    selection: selfhostLinuxContainerSelection,
-    formSelectionFactory: v2FormSelectionFactory,
-    privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
-  });
-  app = buildApp({
-    sql,
-    resourceStores,
-    objects,
-    ...(signingKey ? { signingKey } : {}),
-    identity: identity.verifier,
-    identityProviders: identity.providers,
-    ...(configuredAi ? { ai: configuredAi } : {}),
-    settlement:
-      payment.settlement ??
-      (legacyPublicKeyJwk
-        ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
-        : unconfigured),
-    v2: takoformV2Config,
-    ...selfhostLinuxContainerNode.appPorts,
-    ...(billingConfig ? { billingConfig } : {}),
-    hostedPaidFreeExclusion: Boolean(hostedPricing),
-    ...(hostedBilling ? { hostedBilling } : {}),
-    v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
-    ...(payment.checkout ? { checkout: payment.checkout } : {}),
-    ...(payment.events ? { paymentEvents: payment.events } : {}),
-    ...((hostedBilling || payment.events) && identityPublicKeyJwk
-      ? {
-          operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
-            publicKeyJwk: identityPublicKeyJwk,
-            audience: publicOrigin,
-          }),
-        }
-      : {}),
-    // One process owns every pass here, and a pass outlives the request that
-    // started it, so the timer and the operator route may share one.
-    shareReconcilePass: true,
-    publicOrigin,
-    ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
-      ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
-      : {}),
-    forms: currentCandidates.forms,
-    bindings: currentCandidates.bindings,
-    hostForms: currentCandidates.forms,
-    hostBindings: currentCandidates.bindings,
-    providers,
-    providerPacks,
-    offerings,
-    artifacts: artifactStore,
-    ...(selfhostTenantRunCredentialSigningKey
-      ? {
-          selfhostTenantRunCredentialAuthority: (originReservations) =>
-            createSelfhostTenantRunCredentials({
-              issuer: publicOrigin,
-              signingKey: selfhostTenantRunCredentialSigningKey,
-              ordinarySigningKeyId: signingKey.keyId,
-              runtimeGrantKeys: sql,
-              originReservations,
-              clock,
-              randomId: () => crypto.randomUUID().replaceAll("-", ""),
-            }),
-        }
-      : {}),
-    ...(selfhostContainerEndpointHttps && selfhostContainer && containerEndpointIngress
-      ? {
-          selfhostEndpointIngressFactory: ({ store, deployments }) => {
-            selfhostEndpointIngressFetch = createSelfhostContainerEndpointIngress({
-              qualification: containerEndpointIngress,
-              store,
-              deployments,
-            });
-            return selfhostEndpointIngressFetch;
-          },
-        }
-      : {}),
-    ...(runtimeInputs ? { runtimeInputs } : {}),
-    clock,
-  });
-} catch (error) {
-  try {
-    await closeBeforePublicIngress();
-  } catch (cleanupError) {
-    throw new AggregateError([error, cleanupError], "self-host Form startup cleanup failed");
-  }
-  throw error;
-}
-// Install only the callback composed against this Host's canonical stores. A
-// suffix miss becomes a private 404 on this dedicated listener and can never
-// fall through to Host health, provisioning, or API routes.
-if (selfhostContainerEndpointHttps) {
-  if (!selfhostEndpointIngressFetch) {
-    await selfhostContainerEndpointHttps.close();
-    selfhostContainerEndpointHttps = undefined;
-    throw new Error("Container Endpoint HTTPS could not install its exact Host ingress handler");
-  }
-  const endpointFetch = selfhostEndpointIngressFetch;
-  selfhostContainerEndpointHttps.installEndpointFetch(
-    createSelfhostContainerEndpointHttpsDispatch(endpointFetch),
-  );
-}
-
-/** Name plus a bounded cause: a lock, a refused port and a bug read differently. */
-const reportBackgroundFailure = (name: string, cause?: unknown): void => {
-  process.stderr.write(
-    `self-host background pass failed: ${name}: ${describeBackgroundFailure(cause)}\n`,
-  );
-};
-// Every background pass below reports through this recorder as well as the
-// log line, so a pass that fails on every tick is visible to the probe.
-const backgroundPasses = createSelfhostBackgroundPassRecorder();
-// Stuck Operations and sent-but-unretired Queue batches answered 200 with
-// nothing to show for them. A background pass samples them; the public probe
-// only reads the latest sample from memory and never runs this SQL itself.
-const backlogSampler = createSelfhostBacklogSampler({
-  observer: createSelfhostBacklogObserver({ sql, now: clock, startedAtMs: clock().getTime() }),
-});
-// The first sample exists before the listener opens, so readiness never
-// reports a missing sample for a Host that has just started.
-await backgroundPasses
-  .observe("health-backlog", () => backlogSampler.refresh())()
-  .catch((cause: unknown) => reportBackgroundFailure("health-backlog", cause));
-
-/**
- * Bring the runtime back for the Workers this machine already published.
- *
- * `workerd` used to be started only by a publication, so a self-host that was
- * restarted served nothing at all while its control plane reported healthy and
- * `tofu plan` answered "No changes. Your infrastructure matches the
- * configuration": every resource was observed Ready and no request could reach
- * any Worker. A read or a refresh did not revive it either; only a fresh
- * publication did, so surviving a reboot meant re-applying by hand.
- *
- * The configuration is re-rendered from the durable manifests rather than
- * trusted as it stands, so a machine that was published by an older build comes
- * back on this build's router. It runs before the listener opens, so this Host
- * does not answer anything — readiness included — until the Workers it says it
- * is serving are actually being served.
- *
- * A machine that has published nothing starts nothing, and a runtime that
- * cannot be started is reported rather than fatal: the control plane is how an
- * operator would diagnose it, and `has()` already fails closed, so nothing is
- * observed Ready on a runtime that is not running.
- */
-const selfhostHealth = createSelfhostHealthHandler({
-  sql,
-  startupRestore,
-  supervisor: workerd,
-  // v2 Worker owners supervise their own children; without this a serving v2
-  // Worker read as "not-required" and a dead one was invisible.
-  ...(v2WorkerComposition
-    ? { v2Workers: { observe: () => v2WorkerComposition.observeOwnerHealth() } }
-    : {}),
-  backlog: backlogSampler,
-  backgroundPasses,
-});
-const takoformV2Ingress = createSelfhostTakoformV2Ingress({
-  publicOrigin,
-  appFetch: (request) => app.fetch(request),
-});
-
-const bunFetch = createSelfhostBunFetchHandler({
-  health: selfhostHealth,
-  provision,
-  appFetch: takoformV2Ingress,
-});
-let bunServer: ReturnType<typeof Bun.serve> | undefined;
-let shutdownClean = true;
-let closeSequenceFinished = false;
-const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
-  selfhostContainer,
-  () => {
-    shutdownClean = false;
-    process.stderr.write("self-host shutdown failed at container-close\n");
-  },
-  async () => {
-    // `shutdown()` is the concrete supervisor's terminal, awaited lifecycle;
-    // the public WorkerdSupervisor port remains unchanged for runtime clients.
-    shutdownClean =
-      (await closeSelfhostEntryOwnedResources({
-        workerdShutdown: () => workerd.shutdown(),
-        mayCloseDependents: () => shutdownClean,
-        v2WorkerSuspend: async () => {
-          await selfhostLinuxContainerNode?.close();
-          await v2WorkerComposition.closeScheduledHost();
-          await v2QueueScheduler?.close();
-          await v2WorkerComposition.closeWorkflowHost();
-          await v2RuntimeBoot?.closeActor();
-          await v2WorkerComposition.suspendOwnersRetainingCustody();
-          await v2QueueComposition?.close();
-        },
-        actorClose: async () => {
-          await actorRuntime?.close();
-        },
-        dataPlanesStop: async () => {
-          await dataPlanes?.stop(false);
-        },
-        controlDatabaseClose: () => controlDatabase.close(),
-        onFailure: (stage) => {
-          shutdownClean = false;
-          process.stderr.write(`self-host shutdown failed at ${stage}\n`);
-        },
-      })) && shutdownClean;
-  },
-  () => {
-    // Only a proved ordered close and ingress/request/pass drain permit a
-    // successful exit. An unproved stop terminates the Host with status 1.
-    closeSequenceFinished = true;
-  },
-);
-const entryShutdown = createSelfhostEntryProcessShutdown({
-  stopIngress: async () => {
-    const endpointClosings: Promise<void>[] = [];
-    if (selfhostContainerEndpointHttps) {
-      try {
-        endpointClosings.push(selfhostContainerEndpointHttps.close(false));
-      } catch {
-        endpointClosings.push(Promise.reject(new Error("Container Endpoint ingress close failed")));
-      }
-    }
-    if (selfhostV2WorkerEndpointBoot) {
-      try {
-        endpointClosings.push(selfhostV2WorkerEndpointBoot.close(false));
-      } catch {
-        endpointClosings.push(Promise.reject(new Error("v2 Worker Endpoint ingress close failed")));
-      }
-    }
-
-    let serverStopping: Promise<void> = Promise.resolve();
-    try {
-      const stopped = bunServer?.stop(false);
-      serverStopping = Promise.resolve(stopped);
-    } catch {
-      serverStopping = Promise.reject(new Error("Bun ingress stop failed"));
-    }
-
-    const stopped = await Promise.allSettled([...endpointClosings, serverStopping]);
-    if (stopped.some((result) => result.status === "rejected")) {
-      throw new Error("one or more self-host ingress listeners did not stop cleanly");
-    }
-  },
-  finishShutdown: async () => {
-    await handleContainerAndWorkerdShutdown();
-    if (!closeSequenceFinished || !shutdownClean) {
-      throw new Error("self-host owned resources did not close cleanly");
-    }
-  },
-});
-
-/**
- * Keep an idempotent best-effort child stop registered before listener startup:
- * restore may have started Workerd even if Bun.serve cannot bind.
- * This is not a substitute for the awaited shutdown proof above.
- */
-process.on("exit", () => {
-  workerd.stop();
-});
-
-try {
-  bunServer = Bun.serve({
-    port,
-    hostname: listenHost,
-    // Longer than the default, because publishing a site means uploading its
-    // files and a request that is doing real work is not an idle one.
-    idleTimeout: 120,
-    fetch: (request) => entryShutdown.fetch(request, bunFetch),
-  });
-} catch (error) {
-  try {
-    await closeBeforePublicIngress();
-  } catch (closeError) {
-    throw new AggregateError(
-      [error, closeError],
-      "self-host Bun listener failed and owned startup cleanup was not confirmed",
-    );
-  }
-  throw error;
-}
-
-// Every pass body below is observed by the recorder; single-flight, the stop
-// fence and failure reporting stay exactly the shutdown owner's.
-const observedPasses = observeSelfhostBackgroundPasses(entryShutdown, backgroundPasses);
-observedPasses.startInterval(
-  "health-backlog",
-  SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
-  () => backlogSampler.refresh(),
-  reportBackgroundFailure,
-);
-
-// Background settlement. The shutdown owner retains each timer and each pass
-// promise, so no new work starts past the signal fence and accepted work drains.
-observedPasses.startInterval(
-  "settlement",
-  30_000,
-  async () => {
-    await app.tick();
-    if (dataPlanes) {
-      await dataPlanes.maintenance.sweepExpiredKv();
-      await dataPlanes.maintenance.sweepExpiredObjectUploads();
-      await dataPlanes.maintenance.reconcileOrphanObjectFiles();
-    }
-    if (queuePump) await queuePump.sweep();
-  },
-  reportBackgroundFailure,
-);
-if (canonicalHostedInputs || payment.events) {
-  // The same cadence as the Worker's cron: payments whose payer never came
-  // back and whose webhook never arrived are credited within minutes.
-  observedPasses.startInterval(
-    "payment-reconcile",
-    5 * 60_000,
-    async () => {
-      await app.reconcilePayments();
-    },
-    reportBackgroundFailure,
-  );
-}
-observedPasses.startInterval(
-  "takoform-v2",
-  1_000,
-  async () => {
-    await app.tickTakoformV2();
-  },
-  reportBackgroundFailure,
-);
-startSelfhostV2ScheduledDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
-if (v2RuntimeBoot?.v2Workflow) {
-  startSelfhostV2WorkflowDuePass(observedPasses, v2WorkerComposition, reportBackgroundFailure);
-}
-observedPasses.startInterval(
-  "queue-wake",
-  1_000,
-  () => {
-    // Share only the wake timer. A blocked recovery scan must not hold the
-    // other delivery lane; both named passes remain owned by shutdown.
-    void observedPasses
-      .runPass("takoform-v2-queue-delivery", async () => {
-        await v2QueueScheduler?.tick();
-      })
-      .catch((cause: unknown) => reportBackgroundFailure("takoform-v2-queue-delivery", cause));
-    void observedPasses
-      .runPass("queue-pump", async () => {
-        await queuePump?.tick();
-      })
-      .catch((cause: unknown) => reportBackgroundFailure("queue-pump", cause));
-  },
-  reportBackgroundFailure,
-);
-observedPasses.startInterval(
-  "worker-scheduler",
-  5_000,
-  async () => {
-    await workerScheduler?.tick();
-  },
-  reportBackgroundFailure,
-);
-
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
-  process.on(signal, () => {
-    // Until the terminal shutdown proof completes, a natural event-loop exit
-    // must not be reported as a clean stop. A reported failure explicitly
-    // exits nonzero even if retained dependent listeners are still open.
-    process.exitCode = 1;
-    void entryShutdown.shutdown();
-  });
-}
-if (dataPlanes) {
-  // Recorded, because an operator debugging a Worker's storage needs to know
-  // which port to look at and the kernel usually chose it.
-  console.log(`self-host data planes listening on ${dataPlanes.address} (loopback only)`);
-}
-console.log(
-  // The bound address, not just the port: a loopback-only listener behind a
-  // proxy elsewhere is unreachable, and this line is where that shows.
-  `takoserver listening on ${formatSelfhostListenAddress(listenHost, bunServer?.port ?? port)} ` +
-    `as ${publicOrigin} ` +
-    // Named from what is actually configured. A banner that says Cloudflare on
-    // a machine with no account is the first thing an operator reads and the
-    // first thing that misleads them.
-    `(provisioning: ${providers.map((provider) => provider.id).join(", ") || "none"})`,
-);
-
-// Having minted the way in, say what it is. A machine that generates a key and
-// leaves the operator to discover how to present it has automated the easy half.
-// The assertion is a credential written wherever stdout goes, so it is minted
-// only until the operator has signed in (or when explicitly asked), and the
-// session exchange refuses it a second time.
-if (identity.providers.some((provider) => provider.method === "operator-assertion")) {
-  const stored = await readFile(operatorKeyPath, "utf8").catch(() => null);
-  if (stored) {
-    const assertion = (await selfhostOperatorAssertionDue({
-      sql,
-      forced: forceOperatorAssertionPrint,
-    }))
-      ? await signOperatorAssertion({
-          privateJwk: stored,
-          claims: {
-            purpose: "sign-in",
-            aud: publicOrigin,
-            provider: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.provider,
-            subject: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.subject,
-            email: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.email,
-            displayName: SELFHOST_OPERATOR_SIGN_IN_IDENTITY.displayName,
-          },
-          nowSeconds: Math.floor(Date.now() / 1_000),
-          lifetimeSeconds: 600,
-        })
-      : undefined;
-    console.log(
-      renderSelfhostOperatorSignInInstructions({
-        publicOrigin,
-        ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
-          ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
-          : {}),
-        ...(assertion === undefined ? {} : { assertion }),
-        operatorKeyPath,
-      }),
-    );
-  }
+// The supported `bun src/entry-bun.ts` command runs this module as main. Importing
+// it exposes the operator API without starting listeners or opening the database.
+if (import.meta.main) {
+  await startSelfhostBunHost();
 }
