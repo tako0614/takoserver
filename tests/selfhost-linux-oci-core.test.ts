@@ -3,6 +3,7 @@ import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
@@ -235,7 +236,7 @@ test("OCI Host selection refuses missing, symbolic and inherited fields before I
 
 test("OCI Host creator preserves original same-Sql acceptance, configured secret loan and accepted artifact method", async () => {
   const f = await settings();
-  const root = await mkdtemp("/root/dev/tmp/selfhost-oci-core-");
+  const root = await mkdtemp(join(tmpdir(), "selfhost-oci-core-"));
   await chmod(root, 0o700);
   const artifactRoot = join(root, "artifacts"),
     umociBinary = join(root, "umoci");

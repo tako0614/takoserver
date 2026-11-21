@@ -1,6 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
@@ -90,7 +91,7 @@ function wireKind(data: Buffer): unknown {
   return JSON.parse(data.subarray(4).toString()).kind;
 }
 function fixture(timeoutMs?: number) {
-  const root = mkdtempSync("/root/dev/tmp/linux-oci-pidns-raw-");
+  const root = mkdtempSync(join(tmpdir(), "linux-oci-pidns-raw-"));
   chmodSync(root, 0o700);
   const binary = join(root, "helper");
   writeFileSync(binary, "fixture never executed", { mode: 0o700 });
