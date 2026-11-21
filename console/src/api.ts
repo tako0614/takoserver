@@ -661,6 +661,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+/** Discovery must name a route this Console understands, rather than look unconfigured. */
+function isSupportedIdentityProvider(value: unknown): value is IdentityProvider {
+  if (
+    !isRecord(value) ||
+    typeof value.displayName !== "string" ||
+    value.displayName.trim() === "" ||
+    (value.clientId !== undefined &&
+      (typeof value.clientId !== "string" || value.clientId.trim() === "")) ||
+    (value.issuer !== undefined && (typeof value.issuer !== "string" || value.issuer.trim() === ""))
+  )
+    return false;
+  if (value.method === "operator-assertion") return value.id === "google" || value.id === "github";
+  if (value.method !== "oidc" || typeof value.clientId !== "string") return false;
+  return value.id === "google" || (value.id === "takos-id" && typeof value.issuer === "string");
+}
+
 function isExactRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return (
     isRecord(value) &&
@@ -965,6 +981,7 @@ export function createApi(options: ApiOptions) {
     clearSessionOnUnauthorized = true,
     includeAuthorization = true,
     cache?: RequestCache,
+    maxResponseBytes?: number,
   ): Promise<{ readonly status: number; readonly payload: Result }> => {
     const origin = options.origin;
     const sessionRevision = options.sessionRevision?.();
@@ -988,9 +1005,42 @@ export function createApi(options: ApiOptions) {
       throw new ApiError("unreachable", 0, path);
     }
 
-    const payload = await response
-      .json()
-      .catch(() => null as unknown as Record<string, unknown> | null);
+    let payload: unknown;
+    if (maxResponseBytes === undefined) {
+      payload = await response.json().catch(() => null);
+    } else {
+      // Page callers must not materialize an unbounded legacy or malformed body.
+      const reader = response.body?.getReader();
+      if (!reader) throw new ApiError("invalid_response", response.status, path);
+      const chunks: Uint8Array[] = [];
+      let bytes = 0;
+      try {
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          if (chunk.value.byteLength === 0) continue;
+          bytes += chunk.value.byteLength;
+          if (bytes > maxResponseBytes) {
+            await reader.cancel();
+            throw new ApiError("invalid_response", response.status, path);
+          }
+          chunks.push(chunk.value);
+        }
+      } finally {
+        reader.releaseLock();
+      }
+      const body = new Uint8Array(bytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        body.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      try {
+        payload = JSON.parse(new TextDecoder().decode(body));
+      } catch {
+        payload = null;
+      }
+    }
 
     if (!response.ok) {
       const envelope = (payload as { error?: { code?: unknown } } | null)?.error;
@@ -1105,8 +1155,18 @@ export function createApi(options: ApiOptions) {
         return unknown;
       }
     },
-    identityProviders: () =>
-      call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),
+    async identityProviders(): Promise<{ providers: readonly IdentityProvider[] }> {
+      const path = "/v1/identity/providers";
+      const { payload, status } = await request<unknown>("GET", path);
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        !Array.isArray(payload.providers) ||
+        !payload.providers.every(isSupportedIdentityProvider)
+      )
+        throw new ApiError("invalid_response", status, path);
+      return { providers: payload.providers };
+    },
 
     /** Reads a Hosted-selected continuation using only the real shared-session cookie. */
     async hostedBillingContinuation(selector: string): Promise<HostedBillingContinuation> {
@@ -1236,16 +1296,58 @@ export function createApi(options: ApiOptions) {
 
     signOut: () => call<void>("DELETE", "/v1/session"),
 
-    async me(): Promise<{ principal: Principal; organizations: readonly Organization[] }> {
-      const path = "/v1/me";
-      const { payload, status } = await request<unknown>("GET", path);
+    /** One explicit bounded page. Callers must never treat it as a complete roster. */
+    async me(cursor?: string): Promise<{
+      principal: Principal;
+      organizations: readonly Organization[];
+      nextOrganizationCursor: string | null;
+    }> {
+      const origin = options.origin;
+      const revision = options.sessionRevision?.();
+      const token = options.token();
+      const path = `/v1/me?organizationPageSize=100${cursor === undefined ? "" : `&organizationCursor=${encodeURIComponent(cursor)}`}`;
+      if (cursor !== undefined && (cursor.length === 0 || cursor.length > 2048))
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>(
+        "GET",
+        path,
+        undefined,
+        {},
+        true,
+        true,
+        "no-store",
+        65_536,
+      );
+      if (
+        origin !== options.origin ||
+        revision !== options.sessionRevision?.() ||
+        token !== options.token()
+      )
+        throw new ApiError("stale_identity", 0, path);
       try {
+        // Legacy servers can still supply a complete small roster, but only
+        // page one may omit metadata and every transport/output budget applies.
+        const nextCursor =
+          isRecord(payload) && Object.hasOwn(payload, "nextOrganizationCursor")
+            ? payload.nextOrganizationCursor
+            : cursor === undefined
+              ? null
+              : undefined;
         if (
+          status !== 200 ||
           !isRecord(payload) ||
           !isRecord(payload.principal) ||
-          !Array.isArray(payload.organizations)
+          !Array.isArray(payload.organizations) ||
+          payload.organizations.length > 100 ||
+          new TextEncoder().encode(JSON.stringify(payload.organizations)).byteLength > 32_768 ||
+          (nextCursor !== null &&
+            (typeof nextCursor !== "string" ||
+              nextCursor.length === 0 ||
+              nextCursor.length > 2048 ||
+              nextCursor === cursor ||
+              payload.organizations.length === 0))
         )
-          throw new TypeError("invalid identity response");
+          throw new TypeError();
         const identity = payload.principal;
         if (
           typeof identity.id !== "string" ||
@@ -1255,8 +1357,9 @@ export function createApi(options: ApiOptions) {
           typeof identity.email !== "string" ||
           typeof identity.displayName !== "string"
         )
-          throw new TypeError("invalid principal");
-        const decodedOrganizations = payload.organizations.map((value) => {
+          throw new TypeError();
+        const ids = new Set<string>();
+        for (const value of payload.organizations) {
           if (
             !isRecord(value) ||
             typeof value.id !== "string" ||
@@ -1265,14 +1368,16 @@ export function createApi(options: ApiOptions) {
             value.name === "" ||
             typeof value.ownerPrincipalId !== "string" ||
             value.ownerPrincipalId === "" ||
-            typeof value.createdAt !== "string"
+            typeof value.createdAt !== "string" ||
+            ids.has(value.id)
           )
-            throw new TypeError("invalid organization");
-          return value as unknown as Organization;
-        });
+            throw new TypeError();
+          ids.add(value.id);
+        }
         return {
           principal: identity as unknown as Principal,
-          organizations: decodedOrganizations,
+          organizations: payload.organizations as unknown as readonly Organization[],
+          nextOrganizationCursor: nextCursor as string | null,
         };
       } catch {
         throw new ApiError("invalid_response", status, path);

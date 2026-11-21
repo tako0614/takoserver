@@ -60,8 +60,16 @@ export interface V2ContainerParentIoOriginal {
   readonly outcome: "transport_io_complete";
   readonly receiptDigest: Digest;
 }
+/**
+ * `closed`: the fixed owner durably recorded that no native request was ever
+ * made with this child's one-use send key (never presented, or presented and
+ * provably not sent) and refuses any later presentation of it. bindingDigest
+ * names the exact binding whose key was closed. Terminal and settled; never a
+ * parent retirement verdict.
+ */
 export type V2ContainerParentIoReadback =
   | { readonly state: "absent" | "pending" | "unknown" }
+  | { readonly state: "closed"; readonly bindingDigest: Digest }
   | {
       readonly state: "complete";
       readonly original: V2ContainerParentIoOriginal;
@@ -89,6 +97,7 @@ export interface V2ContainerConsumerParentIoOriginal
 }
 export type V2ContainerConsumerParentIoReadback =
   | { readonly state: "absent" | "pending" | "unknown" }
+  | { readonly state: "closed"; readonly bindingDigest: Digest }
   | { readonly state: "complete"; readonly original: V2ContainerConsumerParentIoOriginal };
 
 type ParentIoTarget = V2ContainerParentIoTarget | V2ContainerConsumerParentIoTarget;
@@ -241,6 +250,20 @@ function selected(record: V2WorkerInvocationRecord): unknown {
   );
 }
 
+/** One construction for the qualifier and the internal derivation below. */
+async function parentIoBinding<T extends ParentIoTarget, B extends string, O extends string>(
+  profile: ParentIoProfile<T, B, O>,
+  parent: V2ContainerParentIoBindingScope["parent"] | null,
+  target: T,
+): Promise<V2ContainerParentIoBinding> {
+  const canonical = canonicalJson({ format: profile.bindingFormat, parent, target });
+  return {
+    producerId: target.producerId,
+    canonical,
+    digest: await hash(profile.bindingFormat, canonical),
+  };
+}
+
 /** Internal shared derivation. These digests are data, never custody authority. */
 export async function containerParentIoScope(
   input: V2ContainerParentIoParent,
@@ -283,6 +306,50 @@ export function containerParentIoMatchesRecord(
     record.handle.custodyToken === parent.handle.custodyToken &&
     canonicalJson(selected(record)) === canonicalJson(parent.expected)
   );
+}
+
+/**
+ * Internal: the exact @1 binding the qualifier produces for a stored inventory
+ * header parent scope and child target. Content only: it neither admits a send,
+ * checks currentness nor authenticates an issuer. Null for any foreign shape.
+ */
+export function deriveContainerParentIoBinding(
+  parent: V2ContainerParentIoBindingScope["parent"],
+  target: V2ContainerParentIoTarget,
+): Promise<V2ContainerParentIoBinding | null> {
+  return deriveParentIoBinding(parentProfile, parent, target);
+}
+
+/** Internal @2 counterpart, with the disjoint @2 format and hash domain. */
+export function deriveContainerConsumerParentIoBinding(
+  parent: V2ContainerParentIoBindingScope["parent"],
+  target: V2ContainerConsumerParentIoTarget,
+): Promise<V2ContainerParentIoBinding | null> {
+  return deriveParentIoBinding(consumerProfile, parent, target);
+}
+
+async function deriveParentIoBinding<T extends ParentIoTarget, B extends string, O extends string>(
+  profile: ParentIoProfile<T, B, O>,
+  parentInput: unknown,
+  targetInput: unknown,
+): Promise<V2ContainerParentIoBinding | null> {
+  try {
+    const parent = structuredClone(parentInput);
+    const target = structuredClone(targetInput);
+    if (
+      !exact(parent, ["invocationId", "custodyDigest", "selectionDigest"]) ||
+      !text(parent.invocationId) ||
+      !isSha256Digest(parent.custodyDigest) ||
+      !isSha256Digest(parent.selectionDigest) ||
+      !profile.isTarget(target)
+    )
+      return null;
+    return Object.freeze(
+      await parentIoBinding(profile, parent as V2ContainerParentIoBindingScope["parent"], target),
+    );
+  } catch {
+    return null;
+  }
 }
 
 export const isContainerParentIoTarget = target;
@@ -368,15 +435,11 @@ function createParentIoQualifier<T extends ParentIoTarget, B extends string, O e
         }
       };
       if (!(await stillCurrent())) return null;
-      const canonical = canonicalJson({
-        format: profile.bindingFormat,
-        parent: await containerParentIoScope({
-          handle: claim.handle,
-          expected: claim.expected,
-        }),
-        target: claim.target,
-      });
-      const digest = await hash(profile.bindingFormat, canonical);
+      const { canonical, digest } = await parentIoBinding(
+        profile,
+        await containerParentIoScope({ handle: claim.handle, expected: claim.expected }),
+        claim.target,
+      );
       if (!(await stillCurrent())) return null;
       return Object.freeze({
         producerId: claim.target.producerId,
@@ -478,6 +541,10 @@ export function v2ContainerConsumerParentIoOriginalDigest(
  * readOriginal must be the fixed trusted owner durable reader, never tenant JSON.
  * A digest validates content, not origin/durability. No direct complete()/finish()
  * authority is supplied. Every nonpositive or unreadable state remains nonpositive.
+ * Exactly `{ state: "closed", bindingDigest }` is that owner's durable
+ * never-sent terminal, accepted only when bindingDigest equals this binding's
+ * digest (checked like complete's); it is trusted only as far as `complete` is.
+ * The result has the same shape, so a chained re-validation accepts it again.
  */
 export async function readV2ContainerParentIoOriginal(
   input: V2ContainerParentIoBinding,
@@ -500,6 +567,7 @@ async function readParentIoOriginal<T extends ParentIoTarget, B extends string, 
   profile: ParentIoProfile<T, B, O>,
 ): Promise<
   | { readonly state: "absent" | "pending" | "unknown" }
+  | { readonly state: "closed"; readonly bindingDigest: Digest }
   | { readonly state: "complete"; readonly original: ParentIoOriginal<O> }
 > {
   try {
@@ -515,6 +583,11 @@ async function readParentIoOriginal<T extends ParentIoTarget, B extends string, 
       (result.state === "absent" || result.state === "pending" || result.state === "unknown")
     )
       return { state: result.state as "absent" | "pending" | "unknown" };
+    // A closed key must name exactly this binding; a bare or foreign close is unknown.
+    if (exact(result, ["state", "bindingDigest"]) && result.state === "closed")
+      return isSha256Digest(result.bindingDigest) && result.bindingDigest === binding.digest
+        ? { state: "closed", bindingDigest: binding.digest }
+        : { state: "unknown" };
     if (!exact(result, ["state", "original"]) || result.state !== "complete")
       return { state: "unknown" };
     const o = result.original;

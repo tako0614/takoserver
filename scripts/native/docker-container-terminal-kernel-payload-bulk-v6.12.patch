@@ -1,0 +1,94 @@
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1271,66 +1271,89 @@
+ sk_skb_reason_drop(struct sock *sk, struct sk_buff *skb, enum skb_drop_reason reason)
+ {
+ 	if (__sk_skb_reason_drop(sk, skb, reason))
+ 		__kfree_skb(skb);
+ }
+ EXPORT_SYMBOL(sk_skb_reason_drop);
+ 
+ #define KFREE_SKB_BULK_SIZE	16
+ 
+ struct skb_free_array {
+ 	unsigned int skb_count;
+ 	void *skb_array[KFREE_SKB_BULK_SIZE];
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Independent original refs, never pointers into a freed skb/blob. */
++	struct tako_terminal_skb_refs terminal_refs[KFREE_SKB_BULK_SIZE];
++#endif
+ };
++
++static void kfree_skb_bulk_refs_put(struct skb_free_array *sa)
++{
++#ifdef CONFIG_TAKO_TERMINAL
++	unsigned int i;
++
++	/* Only after actual bulk free returns; skb_array can be overwritten. */
++	for (i = 0; i < sa->skb_count; i++)
++		tako_terminal_skb_refs_put(&sa->terminal_refs[i]);
++#endif
++}
+ 
+ static void kfree_skb_add_bulk(struct sk_buff *skb,
+ 			       struct skb_free_array *sa,
+ 			       enum skb_drop_reason reason)
+ {
+ 	/* if SKB is a clone, don't handle this case */
+ 	if (unlikely(skb->fclone != SKB_FCLONE_UNAVAILABLE)) {
+ 		__kfree_skb(skb);
+ 		return;
+ 	}
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Every appended slot is initialized before the original metadata free. */
++	sa->terminal_refs[sa->skb_count] = (struct tako_terminal_skb_refs){0};
++	tako_skb_snapshot(skb, &sa->terminal_refs[sa->skb_count]);
++#endif
+ 	skb_release_all(skb, reason);
+ 	sa->skb_array[sa->skb_count++] = skb;
+ 
+ 	if (unlikely(sa->skb_count == KFREE_SKB_BULK_SIZE)) {
+ 		kmem_cache_free_bulk(net_hotdata.skbuff_cache, KFREE_SKB_BULK_SIZE,
+ 				     sa->skb_array);
++		kfree_skb_bulk_refs_put(sa);
+ 		sa->skb_count = 0;
+ 	}
+ }
+ 
+ void __fix_address
+ kfree_skb_list_reason(struct sk_buff *segs, enum skb_drop_reason reason)
+ {
+ 	struct skb_free_array sa;
+ 
+ 	sa.skb_count = 0;
+ 
+ 	while (segs) {
+ 		struct sk_buff *next = segs->next;
+ 
+ 		if (__sk_skb_reason_drop(NULL, segs, reason)) {
+ 			skb_poison_list(segs);
+ 			kfree_skb_add_bulk(segs, &sa, reason);
+ 		}
+ 
+ 		segs = next;
+ 	}
+ 
+-	if (sa.skb_count)
++	if (sa.skb_count) {
+ 		kmem_cache_free_bulk(net_hotdata.skbuff_cache, sa.skb_count, sa.skb_array);
++		kfree_skb_bulk_refs_put(&sa);
++	}
+ }
+ EXPORT_SYMBOL(kfree_skb_list_reason);
+ 
+ /* Dump skb information and contents.
+  *
+  * Must only be called from net_ratelimit()-ed paths.
+  *
+  * Dumps whole packets if full_pkt, only headers otherwise.
+  */
+ void skb_dump(const char *level, const struct sk_buff *skb, bool full_pkt)
+ {
+ 	struct skb_shared_info *sh = skb_shinfo(skb);

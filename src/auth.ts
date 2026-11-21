@@ -103,6 +103,55 @@ export interface Organization {
   readonly createdAt: string;
 }
 
+/** Finite retrieval and output budgets for both complete and paged roster reads. */
+export const ORGANIZATION_PAGE_MAX_ROWS = 100;
+export const ORGANIZATION_PAGE_MAX_BYTES = 32_768;
+export interface OrganizationPage {
+  readonly organizations: readonly Organization[];
+  readonly nextCursor: string | null;
+}
+
+// A cursor is an opaque position, not an authorization token or snapshot.
+// Every use still requires this principal's current membership at its anchor.
+function organizationCursor(principalId: string, organization: Organization): string {
+  return btoa(
+    encodeURIComponent(JSON.stringify([principalId, organization.createdAt, organization.id])),
+  )
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/u, "");
+}
+
+function readOrganizationCursor(principalId: string, cursor: string): readonly [string, string] {
+  try {
+    if (cursor.length > 2048 || !/^[A-Za-z0-9_-]+$/u.test(cursor)) throw new Error();
+    const value: unknown = JSON.parse(
+      decodeURIComponent(atob(cursor.replaceAll("-", "+").replaceAll("_", "/"))),
+    );
+    if (
+      !Array.isArray(value) ||
+      value.length !== 3 ||
+      value[0] !== principalId ||
+      typeof value[1] !== "string" ||
+      value[1].length === 0 ||
+      value[1].length > 128 ||
+      typeof value[2] !== "string" ||
+      value[2].length === 0 ||
+      value[2].length > 256 ||
+      organizationCursor(principalId, {
+        createdAt: value[1],
+        id: value[2],
+        name: "",
+        ownerPrincipalId: "",
+      }) !== cursor
+    )
+      throw new Error();
+    return [value[1], value[2]];
+  } catch {
+    throw new AuthError("invalid");
+  }
+}
+
 export interface ApiKey {
   readonly id: string;
   readonly organizationId: string;
@@ -429,6 +478,14 @@ export class AuthError extends Error {
   }
 }
 
+/** A complete roster cannot fit; callers must explicitly request bounded pages. */
+export class OrganizationPaginationRequiredError extends AuthError {
+  constructor() {
+    super("invalid");
+    this.name = "OrganizationPaginationRequiredError";
+  }
+}
+
 /** Unmapped historical ownership and damaged personal tuples require owner resolution. */
 export class PersonalOrganizationError extends Error {
   readonly code = "personal_organization_unavailable";
@@ -725,8 +782,13 @@ export interface Accounts {
   organization(id: string): Promise<Organization | null>;
   /** The person behind a session, for a console to greet and to audit against. */
   principal(id: string): Promise<Principal | null>;
-  /** Every organization this principal belongs to, oldest first; never a partial roster. */
+  /** Complete roster, oldest first; refuses when one bounded page cannot contain it. */
   organizations(principalId: string): Promise<readonly Organization[]>;
+  /** Bounded current membership page; a removed anchor requires restarting at page one. */
+  organizationPage(
+    principalId: string,
+    input: { readonly limit: number; readonly cursor?: string | undefined },
+  ): Promise<OrganizationPage>;
   /**
    * The organization's live keys. Secrets are never stored, so they cannot be
    * listed — what a console shows is which keys exist, what they may do, and
@@ -1996,18 +2058,83 @@ function createAccountsInternal(
     },
 
     async organizations(principalId) {
-      const rows = await sql.query(
-        `SELECT o.id, o.name, o.owner_principal_id, o.created_at FROM orgs o
-         JOIN org_memberships m ON m.org_id = o.id
-         WHERE m.principal_id = ? ORDER BY o.created_at ASC, o.id ASC`,
-        [principalId],
+      const page = await accounts.organizationPage(principalId, {
+        limit: ORGANIZATION_PAGE_MAX_ROWS,
+      });
+      if (page.nextCursor !== null) throw new OrganizationPaginationRequiredError();
+      return [...page.organizations].sort((a, b) =>
+        a.createdAt < b.createdAt
+          ? -1
+          : a.createdAt > b.createdAt
+            ? 1
+            : a.id < b.id
+              ? -1
+              : a.id > b.id
+                ? 1
+                : 0,
       );
-      return rows.map((row) => ({
-        id: String(row.id),
-        name: String(row.name),
-        ownerPrincipalId: String(row.owner_principal_id),
-        createdAt: String(row.created_at),
-      }));
+    },
+
+    async organizationPage(principalId, { limit, cursor }) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > ORGANIZATION_PAGE_MAX_ROWS)
+        throw new AuthError("invalid");
+      const anchor = cursor === undefined ? null : readOrganizationCursor(principalId, cursor);
+      if (anchor) {
+        const current = await sql.query(
+          `SELECT o.id FROM orgs o JOIN org_memberships m ON m.org_id = o.id
+           WHERE m.principal_id = ? AND o.created_at = ? AND o.id = ? LIMIT 1`,
+          [principalId, anchor[0], anchor[1]],
+        );
+        if (current.length !== 1) throw new AuthError("invalid");
+      }
+      const rows = await sql.query(
+        `SELECT
+         CASE WHEN length(CAST(o.id AS BLOB)) <= ${ORGANIZATION_PAGE_MAX_BYTES} THEN o.id END AS id,
+         CASE WHEN length(CAST(o.name AS BLOB)) <= ${ORGANIZATION_PAGE_MAX_BYTES} THEN o.name END AS name,
+         CASE WHEN length(CAST(o.owner_principal_id AS BLOB)) <= ${ORGANIZATION_PAGE_MAX_BYTES} THEN o.owner_principal_id END AS owner_principal_id,
+         CASE WHEN length(CAST(o.created_at AS BLOB)) <= ${ORGANIZATION_PAGE_MAX_BYTES} THEN o.created_at END AS created_at FROM
+         (SELECT org_id FROM org_memberships
+          WHERE principal_id = ?${anchor ? " AND org_id > ?" : ""}
+          ORDER BY org_id ASC LIMIT ?) page
+         LEFT JOIN orgs o ON o.id = page.org_id ORDER BY page.org_id ASC`,
+        anchor ? [principalId, anchor[1], limit + 1] : [principalId, limit + 1],
+      );
+      // Memberships are not FK-cascaded in retained schemas. Never infer a
+      // terminal page from rows silently dropped by an Organization join.
+      if (
+        rows.some((row) =>
+          [row.id, row.name, row.owner_principal_id, row.created_at].some(
+            (value) => typeof value !== "string",
+          ),
+        )
+      )
+        throw new SqlError("unavailable", "organization page membership unavailable");
+      const organizations: Organization[] = [];
+      let bytes = 2; // JSON array brackets.
+      for (const row of rows.slice(0, limit)) {
+        const organization = {
+          id: String(row.id),
+          name: String(row.name),
+          ownerPrincipalId: String(row.owner_principal_id),
+          createdAt: String(row.created_at),
+        };
+        const nextBytes =
+          new TextEncoder().encode(JSON.stringify(organization)).byteLength +
+          (organizations.length > 0 ? 1 : 0);
+        if (bytes + nextBytes > ORGANIZATION_PAGE_MAX_BYTES) {
+          if (organizations.length === 0)
+            throw new SqlError("unavailable", "organization row exceeds page budget");
+          break;
+        }
+        organizations.push(organization);
+        bytes += nextBytes;
+      }
+      const last = organizations.at(-1);
+      return {
+        organizations,
+        nextCursor:
+          last && rows.length > organizations.length ? organizationCursor(principalId, last) : null,
+      };
     },
 
     async apiKeys({ actor, organizationId }) {

@@ -1,0 +1,107 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] synchronize original CUT with admission-to-hook RCU readers
+
+Apply after kernel-v6.12.patch e92d9c69; compatible with disjoint retained
+netdev/skb/queue source deltas. This closes only nf_hook/NF_HOOK_LIST gate-to-
+lookup/dispatch reader sections. NF_HOOK_COND cond=false, caller okfn,
+queued/stolen/GRO/device/offload continuations remain outside this barrier.
+No all-packet/lifetime/terminal operation or positive authority is added.
+No kernel build/runtime qualification; no ordinary/config-off verdict change.
+
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -229,20 +229,33 @@
+ 	struct nf_hook_entries *hook_head = NULL;
+ 	int ret = 1;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* CUT waits this reader: enter before the admission decision. */
++	rcu_read_lock();
++#endif
+ 	/* Owned birth gate precedes the no-hooks static-key fast path. */
+ 	if (unlikely(tako_terminal_block(net, pf))) {
+ 		kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
++#ifdef CONFIG_TAKO_TERMINAL
++		rcu_read_unlock();
++#endif
+ 		return -EPERM;
+ 	}
+ 
+ #ifdef CONFIG_JUMP_LABEL
+ 	if (__builtin_constant_p(pf) &&
+ 	    __builtin_constant_p(hook) &&
+-	    !static_key_false(&nf_hooks_needed[pf][hook]))
++	    !static_key_false(&nf_hooks_needed[pf][hook])) {
++#ifdef CONFIG_TAKO_TERMINAL
++		rcu_read_unlock();
++#endif
+ 		return 1;
+-#endif
+-
++	}
++#endif
++
++#ifndef CONFIG_TAKO_TERMINAL
+ 	rcu_read_lock();
++#endif
+ 	switch (pf) {
+ 	case NFPROTO_IPV4:
+ 		hook_head = rcu_dereference(net->nf.hooks_ipv4[hook]);
+@@ -334,6 +347,10 @@
+ {
+ 	struct nf_hook_entries *hook_head = NULL;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* CUT waits this reader: enter before the admission decision. */
++	rcu_read_lock();
++#endif
+ 	if (unlikely(tako_terminal_block(net, pf))) {
+ 		struct sk_buff *skb, *next;
+ 
+@@ -341,17 +358,26 @@
+ 			skb_list_del_init(skb);
+ 			kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
+ 		}
++#ifdef CONFIG_TAKO_TERMINAL
++		rcu_read_unlock();
++#endif
+ 		return;
+ 	}
+ 
+ #ifdef CONFIG_JUMP_LABEL
+ 	if (__builtin_constant_p(pf) &&
+ 	    __builtin_constant_p(hook) &&
+-	    !static_key_false(&nf_hooks_needed[pf][hook]))
++	    !static_key_false(&nf_hooks_needed[pf][hook])) {
++#ifdef CONFIG_TAKO_TERMINAL
++		rcu_read_unlock();
++#endif
+ 		return;
+-#endif
+-
++	}
++#endif
++
++#ifndef CONFIG_TAKO_TERMINAL
+ 	rcu_read_lock();
++#endif
+ 	switch (pf) {
+ 	case NFPROTO_IPV4:
+ 		hook_head = rcu_dereference(net->nf.hooks_ipv4[hook]);
+diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
+--- a/net/core/tako_terminal.c
++++ b/net/core/tako_terminal.c
+@@ -343,6 +343,12 @@
+ 	spin_lock_irqsave(&owner->lock, flags);
+ 	tako_terminal_admission_cut(&owner->admission);
+ 	spin_unlock_irqrestore(&owner->lock, flags);
++
++	/* Original ioctl/release contexts may sleep. Wait only the netfilter
++	 * readers bracketed before their gate, never packets/queues/offload
++	 * or okfn continuations already outside that RCU section.
++	 */
++	synchronize_net();
+ }
+ 
+ static void tako_seal(struct tako_terminal_owner *owner)

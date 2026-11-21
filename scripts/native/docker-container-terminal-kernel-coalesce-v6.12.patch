@@ -1,0 +1,31 @@
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -6029,8 +6029,10 @@
+ 		return false;
+ 
+ 	if (len <= skb_tailroom(to) && skb_frags_readable(from)) {
+-		if (len)
++		if (len) {
++			tako_terminal_skb_merge(to, from);
+ 			BUG_ON(skb_copy_bits(from, 0, skb_put(to, len), len));
++		}
+ 		*delta_truesize = 0;
+ 		return true;
+ 	}
+@@ -6058,6 +6060,7 @@
+ 		page = virt_to_head_page(from->head);
+ 		offset = from->data - (unsigned char *)page_address(page);
+ 
++		tako_terminal_skb_merge(to, from);
+ 		skb_fill_page_desc(to, to_shinfo->nr_frags,
+ 				   page, offset, skb_headlen(from));
+ 		*fragstolen = true;
+@@ -6067,6 +6070,7 @@
+ 			return false;
+ 
+ 		delta = from->truesize - SKB_TRUESIZE(skb_end_offset(from));
++		tako_terminal_skb_merge(to, from);
+ 	}
+ 
+ 	WARN_ON_ONCE(delta < len);

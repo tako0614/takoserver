@@ -1692,11 +1692,15 @@ function retainedContainerEntry(
     forms: { [FORM]: f.form },
     retainedForms: { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() },
   }),
+  retainedExecutionActions?: WorkerEntryOptions["v2RetainedExecutionActions"],
 ) {
   const contexts: V2HostDeleteAcceptanceContext[] = [];
   const counts = { forms: 0, containers: 0 };
   const entry = createWorkerEntry({
     retainedContainerRequestSql: true,
+    ...(retainedExecutionActions === undefined
+      ? {}
+      : { v2RetainedExecutionActions: retainedExecutionActions }),
     composeV2Forms: () => {
       counts.forms++;
       return selection() as never;
@@ -1962,3 +1966,93 @@ test("retained Form snapshot: a selection moved after capture cannot admit a fre
     await f.runtime.dispose();
   }
 }, 60_000);
+
+for (const requestOwned of [false, true]) {
+  test(`retained execution Worker: captured policy survives HTTP wake, scheduled and reconstruction (${requestOwned ? "request" : "cached"} App)`, async () => {
+    const f = await fixture(`entry-retained-execution-${requestOwned}`, false);
+    try {
+      const retainedForm = "https://forms.example.test/fixture/RetainedExecution/1.0.0";
+      const setup = createTakoformV2Engine({
+        sql: f.sql,
+        replayWindowSeconds: 120,
+        authorize: async () => true,
+        forms: { [retainedForm]: f.form },
+      });
+      const seed = (name: string) =>
+        setup.acceptCreate({
+          principal: `org:${ORG}`,
+          key: `retained-worker-create-${name}`,
+          input: { form: retainedForm, name, space: ORG, spec: {} },
+        });
+      const ready = await seed("ready");
+      await setup.runNext();
+      const held = await seed("held");
+      const snapshot = () =>
+        Promise.all([
+          f.sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [held.id]),
+          f.sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [held.resourceUid]),
+        ]);
+      const before = await snapshot();
+      const selection = () => ({
+        forms: { [FORM]: f.form },
+        retainedForms: {
+          [retainedForm]: f.form,
+          ...(requestOwned ? { [CONTAINER_CONTRACT.formUrl]: retainedContainerForm() } : {}),
+        },
+      });
+      const allowed: ("create" | "update" | "delete")[] = ["delete"];
+      const policy = { [retainedForm]: allowed };
+      const makeEntry = () =>
+        requestOwned
+          ? retainedContainerEntry(f, selection, policy).entry
+          : createWorkerEntry({ composeV2Forms: selection, v2RetainedExecutionActions: policy });
+      const entry = makeEntry();
+      allowed.push("create"); // Mutation after entry creation must not alter its captured policy.
+      const work: Promise<unknown>[] = [];
+      const response = await entry.fetch(
+        new Request(`${BASE}/resources/${ready.resourceUid}`, {
+          method: "DELETE",
+          headers: {
+            authorization: `Bearer ${TOKEN}`,
+            "idempotency-key": "retained-worker-delete-0001",
+            "takoform-expected-generation": "1",
+          },
+        }),
+        f.env,
+        {
+          waitUntil: (promise) => {
+            work.push(promise);
+          },
+        },
+      );
+      expect(response.status).toBe(202);
+      const deleted = (await response.json()) as { id: string };
+      expect(work.length).toBeGreaterThan(0);
+      await Promise.all(work);
+      expect(
+        await f.sql.query("SELECT status FROM tf_v2_operations WHERE id = ?", [deleted.id]),
+      ).toEqual([{ status: "succeeded" }]);
+      expect(await snapshot()).toEqual(before);
+      expect(f.effects()).toBe(2);
+      await entry.scheduled({}, f.env);
+      expect(await snapshot()).toEqual(before);
+      expect(f.effects()).toBe(2);
+      policy[retainedForm] = ["delete"];
+      const reconstructed = makeEntry();
+      await reconstructed.scheduled({}, f.env);
+      expect(await snapshot()).toEqual(before);
+      expect(f.effects()).toBe(2);
+      policy[retainedForm] = ["create", "update", "delete"];
+      const released = makeEntry();
+      await released.scheduled({}, f.env);
+      expect(
+        await f.sql.query("SELECT status FROM tf_v2_operations WHERE id = ?", [held.id]),
+      ).toEqual([{ status: "succeeded" }]);
+      expect(f.effects()).toBe(3);
+      expect(f.providerCalls()).toBe(0);
+      if (requestOwned) expect(f.primaries.length).toBeGreaterThanOrEqual(4);
+    } finally {
+      await f.runtime.dispose();
+    }
+  }, 60_000);
+}

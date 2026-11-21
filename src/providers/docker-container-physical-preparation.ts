@@ -43,6 +43,7 @@ export interface DockerPhysicalOwnerPort extends DockerContainerCreateOwnerPort 
     record: DockerContainerCreateRecord,
     native: DockerContainerNativeIdentity,
     policy: DockerContainerRuntimePolicy,
+    phase?: "remove",
   ): Promise<void>;
 }
 

@@ -107,7 +107,7 @@ import type {
   V2HostDeleteAcceptanceContext,
 } from "./takoform-v2/host-acceptance.ts";
 import type { V2PrivateInputCustody } from "./takoform-v2/private-inputs.ts";
-import type { V2Operation } from "./takoform-v2/types.ts";
+import type { V2Operation, V2RetainedExecutionActions } from "./takoform-v2/types.ts";
 import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
 import {
   createTokenService,
@@ -215,6 +215,8 @@ export interface AppPorts {
   readonly v2ContainerHostAcceptance?: V2HostAcceptance;
   /** Code-selected fresh CREATE/UPDATE policy; absent preserves normal admission. */
   readonly v2AllowFreshCreateAndUpdate?: boolean;
+  /** Code-only pre-claim execution selection, independent of fresh admission. */
+  readonly v2RetainedExecutionActions?: V2RetainedExecutionActions;
   /** Code-selected source for configured v2 artifact Forms; absent remains held-only. */
   readonly v2ArtifactSourceFactory?: V2OperatorArtifactSourceFactory;
   /** Explicit operator-private v2 keyring; absent disables privateInputs. */
@@ -672,6 +674,9 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
     config: ports.v2,
     clock,
+    ...(ports.v2RetainedExecutionActions === undefined
+      ? {}
+      : { retainedExecutionActions: ports.v2RetainedExecutionActions }),
     ...(v2AllowFreshCreateAndUpdate === undefined
       ? {}
       : { allowFreshCreateAndUpdate: v2AllowFreshCreateAndUpdate }),

@@ -13,6 +13,7 @@ import {
   summarizeNativeEvidence,
 } from "../scripts/native-evidence.ts";
 import { WORKERD_CLOSED_GRAPH_ARTIFACT } from "../src/workerd-artifact.ts";
+import { nativeEvidenceBinary, nativeEvidenceHostAvailable } from "./helpers/native-evidence.ts";
 
 const WORKERD_DIGEST = WORKERD_CLOSED_GRAPH_ARTIFACT.sha256;
 const DOCKER_LIFECYCLE_ENV = "TAKOSERVER_NATIVE_CONTAINER_LIFECYCLE";
@@ -21,6 +22,106 @@ const WORKERD_PARENT_LIFETIME_ENV = "TAKOSERVER_NATIVE_WORKERD_PARENT_LIFETIME";
 const V2_ENTRY_ENV = "TAKOSERVER_V2_ENTRY_NATIVE";
 const V2_PUBLIC_URL_ENV = "TAKOSERVER_V2_PUBLIC_URL_NATIVE";
 const V2_PUBLIC_URL_FULL_ENV = "TAKOSERVER_V2_PUBLIC_URL_FULL_NATIVE";
+
+test("classifies every automatically selected tmpfs regression without an operator opt-in", () => {
+  const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));
+  const own = gates.filter((gate) => gate.file === "tests/bounded-miniflare-state.test.ts");
+  expect(own).toHaveLength(7);
+  for (const gate of own) {
+    expect(gate.environments).toEqual([]);
+    expect(gate.capabilities).toEqual(["linux-tmpfs"]);
+    expect(gate.capability).toBe("linux-tmpfs");
+  }
+});
+
+test("automatic host readiness never claims execution and unavailable probes stay unproven", () => {
+  const gates: NativeEvidenceGate[] = [
+    {
+      file: "tmpfs.test.ts",
+      environments: [],
+      capabilities: ["linux-tmpfs"],
+      capability: "linux-tmpfs",
+    },
+  ];
+  const readyProbe = {
+    ...probe(),
+    isLinuxTmpfsDirectory: (path: string) => path === "/dev/shm",
+  };
+  const summaries = summarizeNativeEvidence({ gates, environment: {}, probe: readyProbe });
+  const summary = summaries.find((entry) => entry.capability === "linux-tmpfs");
+  expect(summary).toMatchObject({ state: "ready", readinessOnly: true, tests: 1, files: 1 });
+  expect(summary?.environment).toBeUndefined();
+  const report = renderNativeEvidenceReport({ summaries, gates }).join("\n");
+  expect(report).toContain("automatic host prerequisite");
+  expect(report).toContain("runtime execution is not proven by this inspection");
+  expect(report).not.toContain("proven by this run");
+  expect(report).not.toContain("(undefined)");
+  expect(nativeEvidenceExitCode({ summaries, gates })).toBe(0);
+  expect(nativeEvidenceHostAvailable("linux-tmpfs", readyProbe)).toBe(true);
+
+  for (const unavailable of [
+    probe(),
+    { ...probe(), isLinuxTmpfsDirectory: () => false },
+    {
+      ...probe(),
+      isLinuxTmpfsDirectory: () => {
+        throw new Error("cannot inspect tmpfs");
+      },
+    },
+  ]) {
+    const summaries = summarizeNativeEvidence({ gates, environment: {}, probe: unavailable });
+    expect(summaries.find((entry) => entry.capability === "linux-tmpfs")?.state).toBe(
+      "unconfigured",
+    );
+    expect(nativeEvidenceHostAvailable("linux-tmpfs", unavailable)).toBe(false);
+    expect(nativeEvidenceExitCode({ summaries, gates })).toBe(0);
+    expect(renderNativeEvidenceReport({ summaries, gates }).join("\n")).toContain(
+      "NOT PROVEN BY THIS RUN: 1 tests in 1 files did not execute",
+    );
+  }
+});
+
+test("automatic host and environment capability helpers reject each other's selection modes", () => {
+  expect(() => nativeEvidenceHostAvailable("missing", probe())).toThrow("unknown native evidence");
+  expect(() => nativeEvidenceHostAvailable("workerd-artifact", probe())).toThrow(
+    "environment opt-in",
+  );
+  expect(() => nativeEvidenceBinary("linux-tmpfs")).toThrow("has no environment opt-in");
+  expect(() => nativeEvidenceBinary("linux-tmpfs", "UNRELATED_SWITCH")).toThrow(
+    "has no environment opt-in",
+  );
+});
+
+test("automatic host gates require an explicit known capability without foreign environments", async () => {
+  const root = await fixture({
+    "host.test.ts": [
+      'const tmpfs = nativeEvidenceHostAvailable("linux-tmpfs");',
+      'test.skipIf(!tmpfs)("alias", () => {});',
+      'test.skipIf(!nativeEvidenceHostAvailable("linux-tmpfs"))("direct", () => {});',
+      'test.skipIf(!nativeEvidenceHostAvailable("missing"))("unknown", () => {});',
+      'test.skipIf(!tmpfs || process.env.UNRELATED_NATIVE_SWITCH === undefined)("foreign", () => {});',
+      'test.skipIf(!tmpfs || !nativeEvidenceBinary("workerd-artifact"))("mixed", () => {});',
+      'test.skipIf(!someUnclassifiedCondition)("empty", () => {});',
+    ].join("\n"),
+  });
+  try {
+    const gates = collectNativeEvidenceGates(root);
+    expect(gates.map((gate) => gate.capability)).toEqual([
+      "linux-tmpfs",
+      "linux-tmpfs",
+      null,
+      null,
+      null,
+      null,
+    ]);
+    for (const gate of gates.slice(2)) {
+      const summaries = summarizeNativeEvidence({ gates: [gate], environment: {}, probe: probe() });
+      expect(nativeEvidenceExitCode({ summaries, gates: [gate] })).toBe(1);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("classifies the normal Bun v2 entry journey as readiness, not execution", () => {
   const gates = collectNativeEvidenceGates(join(import.meta.dir, ".."));

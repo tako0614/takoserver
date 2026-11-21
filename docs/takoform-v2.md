@@ -39,6 +39,33 @@ code composer; its previous bare map still means complete public Forms. Neither
 map placement nor a private fixture by itself proves conformance to a Form's
 whole required ABI. The normal Bun entry retains its complete-capability gate.
 
+Operator code may additionally select `retainedExecutionActions` on the engine
+or application, or `v2RetainedExecutionActions` on `createWorkerEntry`/`buildApp`.
+This map lists allowed actions (`create`, `update`, `delete`) for exact
+retained-only Form URLs. Omission, an empty map, and unlisted Forms preserve
+ordinary execution; an empty action list holds all actions for that Form. Public
+or absent Forms and malformed action lists refuse construction. Selection is
+copied before asynchronous Worker composition and bound to each selected
+retained adapter's backend ID and target key at engine construction.
+
+For that exact Form/backend/target, held queued or uncertain operations are
+excluded before claim, deferral, private-input validation or dispatch. Their
+status, lease, retry time and Resource state remain unchanged, while later
+eligible work can progress. Adapter identity drift after construction cannot
+select a different accepted target; that candidate follows the existing
+unavailable-adapter deferral. Same-Resource busy-operation admission remains
+unchanged. Removing the selection resumes ordinary execution; an uncertain
+operation still reconciles its original identity rather than repeating execute.
+
+This is independent of `allowFreshCreateAndUpdate` and grants no authority. It
+neither cancels running work nor fences serving, external effects or other
+executors. Every HTTP wake, scheduled pass and reconstructed entry that must
+hold work must select the policy in its own code. An old/default engine sharing
+the database can still execute that work. SQL uses one JSON bind for the holds
+in addition to the two time parameters, avoiding a bind count proportional to
+Form count; unusually large maps can still increase query cost. This capability
+alone does not select a managed Root transition or establish deployment readiness.
+
 Read requests never execute an operation. The embedding application runs the
 executor independently, including after a process restart. The accepted backend
 identity, target and execution key survive that restart. If their outcome is
@@ -1121,8 +1148,14 @@ content-digest validator through a **fixed trusted owner readback port**. The
 hash authenticates neither issuer nor durability. Synthetic contract tests do
 not qualify the private journal, Container execution or a live provider.
 
-Readback distinguishes absent, pending, unknown and complete. Missing or malformed
-originals, wrong scope and unreadable acknowledgements remain nonpositive. A
+Readback distinguishes absent, pending, unknown, closed and complete. Missing or
+malformed originals, wrong scope and unreadable acknowledgements remain
+nonpositive. Exactly `{ state: "closed", bindingDigest }` means the fixed owner
+durably recorded that no native request was ever made with the child's one-use
+send key (never presented, or presented and provably not sent) and refuses any
+later presentation of that key. Its `bindingDigest` must equal the child's
+binding digest, checked as for a complete original; a bare or foreign `closed`
+reads `unknown`. It is trusted only as far as a complete original. A
 complete child original proves only that exact transport attempt. Parent
 retirement or Deployment DELETE additionally requires durable inventory of all
 children, a closed-admission seal, aggregation of every admitted attempt and the
@@ -1180,6 +1213,40 @@ Neither that side effect nor a positive closed-set read proves parent retirement
 every consumer must independently reassert native retirement, complete source
 coverage and every child's fixed-owner original. The method closes admission
 only and does not release a process or authorize Deployment DELETE.
+
+An inventory constructed with the optional fixed `closeOriginal` port (the same
+trusted owner and journal keyspace as `readOriginal`) opts into
+`closeUnsentAfterNativeRetirement(parent)`. That method is an effect, never a
+verdict. It requires the fixed Core parent reader to match the full custody and
+selection and to supply a valid native retirement, then an existing sealed set.
+Callers cannot satisfy that precondition with a DTO: a close adds no send, but it
+would refuse a live parent's later presentation. It works in two passes. It first
+validates the whole stored set and reads every child's original; a missing,
+surplus or foreign child, a count mismatch, an unreadable page or a changed
+header refuses before any close. Only then does it ask the owner to close the
+children whose validated original reads exactly `absent`. The owner's
+compare-and-set writes `closed` only on a still-undefined key and never rewrites
+a row, so a presentation that commits `pending` first keeps its row, and
+`pending`, `unknown` and `complete` children are never touched. Repeating the
+call is idempotent. Its current-epoch checks stop a superseded inventory
+instance only on a best-effort basis; safety rests on the native retirement.
+
+This relies on an owner invariant. A defined one-use journal key never reverts
+to undefined for the life of the inventory: no delete, reset, re-key, prefix or
+version change, storage re-creation or class migration may re-home a binding.
+`absent` therefore means never defined in that owner's durable journal, and
+`readOriginal`, `closeOriginal` and every presentation of a binding must route
+to the same owner keyspace. The native journal pins what its code controls;
+durable storage re-creation and class migration are outside its reach and are
+preconditions of the deployment and the Host wiring. With the port, an unbound child (an issuance that never left
+`issue()`) is read and closed under the deterministic binding the qualifier would
+have produced; the stored intent stays unbound. Without the port, unbound
+children stay unresolved exactly as before. A sealed set whose children are all
+complete or closed, with at least one closed, reads
+`{ state: "sealed_io_settled", childCount, closedCount }`. With no closed child
+the read is exactly `sealed_io_complete`, and `pending`, `unknown` and `absent`
+never settle. A settled read reports child I/O only, under the same
+consumer obligations as `sealed_io_complete`.
 
 `sealed_io_complete` reports only all registered children's transport I/O. Even
 a sealed zero-child set requires a durable pre-dispatch open. Before this can

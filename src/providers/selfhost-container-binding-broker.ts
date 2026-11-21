@@ -16,12 +16,36 @@ const codes = [
 ];
 
 /** One listener capability is pinned to one accepted caller and target UID. */
-export function createSelfhostContainerBindingBroker(options: {
-  readonly claim: ContainerBindingClaim;
-  readonly resolve: (claim: ContainerBindingClaim) => Promise<SelfhostContainerIdentity | null>;
-  readonly runtime: Pick<SelfhostContainerRuntimeHandle, "fetch">;
-}) {
+export function createSelfhostContainerBindingBroker(
+  options:
+    | {
+        readonly claim: ContainerBindingClaim;
+        readonly resolve: (
+          claim: ContainerBindingClaim,
+        ) => Promise<SelfhostContainerIdentity | null>;
+        readonly runtime: Pick<SelfhostContainerRuntimeHandle, "fetch">;
+      }
+    | { readonly dispatch: (request: Request) => Promise<Response> },
+) {
+  if ("dispatch" in options) {
+    const dispatch = options.dispatch;
+    return createContainerBindingWire(async () => dispatch);
+  }
   const claim = structuredClone(options.claim);
+  return createContainerBindingWire(async () => {
+    const identity = await options.resolve(claim);
+    if (!identity || identity.resourceUid !== claim.targetUid)
+      throw new ContainerError(C.errors.backendUnavailable);
+    return (request) => options.runtime.fetch(identity, request);
+  });
+}
+
+/** Closed framing only. The owning source resolves its actual dispatch before
+ * the reconstructed request is delivered; this helper grants no native or SQL
+ * authority and cannot select a backend from request bytes. */
+export function createContainerBindingWire(
+  resolveDispatch: () => Promise<(request: Request) => Promise<Response>>,
+) {
   return async (request: Request): Promise<Response> => {
     let response: Response | undefined;
     try {
@@ -55,9 +79,7 @@ export function createSelfhostContainerBindingBroker(options: {
         )
       )
         throw new ContainerError(C.errors.invalidRequest);
-      const identity = await options.resolve(claim);
-      if (!identity || identity.resourceUid !== claim.targetUid)
-        throw new ContainerError(C.errors.backendUnavailable);
+      const dispatch = await resolveDispatch();
       const original = new Request(`http://logical.invalid${value.path}`, {
         method: value.method,
         headers: value.headers as [string, string][],
@@ -66,7 +88,7 @@ export function createSelfhostContainerBindingBroker(options: {
         signal: request.signal,
         ...({ duplex: "half" } as { duplex: "half" }),
       });
-      response = await options.runtime.fetch(identity, original);
+      response = await dispatch(original);
       const head = {
         status: response.status,
         statusText: response.statusText,
@@ -99,7 +121,7 @@ export function createSelfhostContainerBindingBroker(options: {
                 }
               },
               async cancel() {
-                await input.cancel().catch(() => {});
+                await input.cancel();
               },
             },
             { highWaterMark: 0 },

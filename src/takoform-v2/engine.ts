@@ -13,6 +13,10 @@ import {
   validatePrivateInputCustody,
 } from "./private-inputs.ts";
 import { createV2ExactReferencePreparation, prepareV2References } from "./references.ts";
+import {
+  bindV2RetainedExecution,
+  captureV2RetainedExecutionActions,
+} from "./retained-execution.ts";
 import { type AcceptRecord, createV2Store, type OperationRow, type ResourceRow } from "./store.ts";
 import {
   TakoformV2Error,
@@ -219,6 +223,10 @@ export function createTakoformV2Engine(
       throw new TypeError("retained Form URL must be exact and absent from public support");
     }
   }
+  const retainedExecution = bindV2RetainedExecution(
+    captureV2RetainedExecutionActions(options.retainedExecutionActions),
+    retainedForms,
+  );
   const privateInputsCapability = options.privateInputCustody !== undefined;
   for (const selected of [...Object.values(options.forms), ...Object.values(retainedForms)]) {
     const policy = selected.privateInputs;
@@ -449,7 +457,7 @@ export function createTakoformV2Engine(
     let unavailable = false;
     for (let attempts = 0; attempts < 100; attempts += 1) {
       const nowMs = now().getTime();
-      const candidate = await store.nextCandidate(nowMs);
+      const candidate = await store.nextCandidate(nowMs, retainedExecution.holdsJson);
       if (!candidate) {
         if (unavailable) fail("temporarily_unavailable", 503);
         return null;
@@ -459,6 +467,11 @@ export function createTakoformV2Engine(
       if (
         selected &&
         target &&
+        retainedExecution.matchesAdapter(
+          target.form_url,
+          selected.backend.id,
+          selected.backend.targetKey,
+        ) &&
         selected.backend.id === target.backend_id &&
         selected.backend.targetKey === target.target_key &&
         selected.backend.id === candidate.backend_id &&

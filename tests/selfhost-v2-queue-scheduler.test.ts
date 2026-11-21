@@ -3,7 +3,6 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import type { JsonObject, SqlParam } from "../src/ports.ts";
 import { createV2QueueScheduler } from "../src/provider-extension.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
@@ -925,10 +924,12 @@ test("dead-letter notice stays pending without a verified active target wake, th
 
 test("externally driven tick wakes an exact dead-letter target without starting an internal timer", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-queue-manual-notice-"));
-  const database = new Database(join(root, "state.sqlite"));
+  const path = join(root, "state.sqlite");
+  let database: Database | undefined;
   let scheduler: ReturnType<typeof createSelfhostV2QueueScheduler> | undefined;
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    writeMigratedDatabaseFile(path);
+    database = new Database(path);
     const accepted = await acceptedConsumer(database);
     const sourceQueueUid = await accepted.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "manual-source", {
       messageRetentionSeconds: 3_600,
@@ -1010,7 +1011,7 @@ test("externally driven tick wakes an exact dead-letter target without starting 
     expect(await custody.listTransferNotices(source)).toEqual([]);
   } finally {
     await scheduler?.close();
-    database.close();
+    database?.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

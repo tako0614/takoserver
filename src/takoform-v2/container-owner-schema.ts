@@ -529,10 +529,12 @@ const expectedRows = Object.freeze(
 );
 const readyPredicate = (
   encodeValue: (value: string, rowIndex: number, columnIndex: number) => string,
+  selectedRows = expectedRows,
+  selectedNames = names,
 ): string => `(
-  ${expectedRows.map((row, rowIndex) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`).join("\n  AND ")}
+  ${selectedRows.map((row, rowIndex) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`).join("\n  AND ")}
   AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE sql IS NOT NULL
-    AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${tableNames})) AND name NOT IN (${names}))
+    AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${tableNames})) AND name NOT IN (${selectedNames}))
   AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata')  AND source.sql IS NOT NULL AND instr(upper(source.sql), 'REFERENCES') = 0 THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
      WHERE  source.type = 'table' AND lower(fk."table") IN (${tableNames}) AND source.name NOT IN (${tableNames})) END)
   AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" IN (${tableNames}))
@@ -558,14 +560,489 @@ export async function inspectV2ContainerOwnerSchema(sql: Sql): Promise<boolean> 
   }
 }
 
+/** Explicit additive expand candidate only. Unregistered: not an applied
+ * migration, not part of the immutable legacy recipe, and never auto-applied.
+ * Old NULL rows cannot acquire a control binding. Only a fresh selected INSERT
+ * reserves this column, and only its one original pending save may seal it. */
+export const V2_CONTAINER_CONTROL_RESERVED = '{"kind":"linux-oci-control-reserved@1"}';
+const controlColumn =
+  "native_control TEXT CHECK (native_control IS NULL OR (typeof(native_control) = 'text' AND length(native_control) BETWEEN 1 AND 65536 AND json_valid(native_control)))";
+const controlGuards = Object.freeze([
+  trigger(
+    "native_control_insert",
+    Q,
+    "BEFORE INSERT",
+    refuse(
+      `NEW.native_control IS NULL OR (NEW.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)} AND NEW.state = 'pending' AND NEW.native_id IS NULL)`,
+    ),
+  ),
+  trigger(
+    "native_control_transition",
+    Q,
+    "BEFORE UPDATE",
+    refuse(`
+    (NEW.native_control IS OLD.native_control OR
+      (OLD.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)} AND OLD.state = 'pending' AND NEW.state = 'pending'
+       AND NEW.native_id IS NULL AND NEW.bound_at_ms IS NULL AND NEW.removed_at_ms IS NULL
+       AND json_valid(NEW.native_control) AND json_extract(NEW.native_control,'$.kind') = 'linux-oci-sealed-control@1'
+       AND json_extract(NEW.native_control,'$.scope.claimId') = OLD.claim_id
+       AND json_extract(NEW.native_control,'$.scope.resourceUid') = OLD.resource_uid
+       AND json_extract(NEW.native_control,'$.scope.generation') = OLD.generation
+       AND json_extract(NEW.native_control,'$.scope.installationId') = OLD.installation_id))
+    AND (NEW.state = 'pending' OR NEW.native_control IS NOT ${literal(V2_CONTAINER_CONTROL_RESERVED)})`),
+  ),
+]);
+const controlObjects = Object.freeze([
+  ...objects.map((item) =>
+    item.name === Q
+      ? object(
+          item.type,
+          item.name,
+          item.table,
+          item.sql.replace(
+            ",\n  PRIMARY KEY (resource_uid, generation),",
+            ", " + controlColumn + ",\n  PRIMARY KEY (resource_uid, generation),",
+          ),
+        )
+      : item,
+  ),
+  ...controlGuards,
+]);
+export const V2_CONTAINER_OWNER_CONTROL_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_RECIPE,
+  statements: Object.freeze([
+    `ALTER TABLE ${Q} ADD COLUMN ${controlColumn}`,
+    ...controlGuards.map((item) => item.sql),
+  ]),
+  objects: controlObjects,
+});
+const controlRows = Object.freeze(
+  controlObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const controlNames = controlObjects.map((item) => literal(item.name)).join(", ");
+const controlReadyParams = Object.freeze([JSON.stringify(controlRows)]);
+const controlReady =
+  "(WITH container_owner_control_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, rowIndex, columnIndex) =>
+      `json_extract((SELECT document FROM container_owner_control_values), '$[${rowIndex}][${columnIndex}]')`,
+    controlRows,
+    controlNames,
+  ) +
+  ")";
+/** Optional second additive expand. Existing recipes/statements are immutable.
+ * NULL is historical/unknown. Only one fresh reserved->sealed peer save may
+ * initialize untouched; consumed is persisted before rm and never rolls back.
+ * closed records this allocation's known local cleanup, not Resource removal. */
+const allocationColumn =
+  "allocation_cleanup TEXT CHECK (allocation_cleanup IS NULL OR allocation_cleanup IN ('untouched','consumed','closed'))";
+const allocationGuards = Object.freeze([
+  trigger(
+    "allocation_cleanup_insert",
+    Q,
+    "BEFORE INSERT",
+    refuse("NEW.allocation_cleanup IS NULL"),
+  ),
+  trigger(
+    "allocation_cleanup_transition",
+    Q,
+    "BEFORE UPDATE",
+    refuse(`
+    NEW.allocation_cleanup IS OLD.allocation_cleanup OR
+    (OLD.allocation_cleanup IS NULL AND NEW.allocation_cleanup = 'untouched'
+      AND OLD.state = 'pending' AND NEW.state = 'pending' AND NEW.native_id IS NULL
+      AND OLD.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)}
+      AND json_extract(NEW.native_control,'$.kind') = 'linux-oci-sealed-control@1'
+      AND json_extract(NEW.native_control,'$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1') OR
+    (OLD.allocation_cleanup = 'untouched' AND NEW.allocation_cleanup = 'consumed'
+      AND OLD.state = 'bound' AND NEW.state = 'bound' AND NEW.native_control IS OLD.native_control) OR
+    (OLD.allocation_cleanup = 'consumed' AND NEW.allocation_cleanup = 'closed'
+      AND OLD.state = 'bound' AND NEW.state = 'bound' AND NEW.native_control IS OLD.native_control)`),
+  ),
+]);
+const allocationObjects = Object.freeze([
+  ...controlObjects.map((item) =>
+    item.name === Q
+      ? object(
+          item.type,
+          item.name,
+          item.table,
+          item.sql.replace(
+            ",\n  PRIMARY KEY (resource_uid, generation),",
+            ", " + allocationColumn + ",\n  PRIMARY KEY (resource_uid, generation),",
+          ),
+        )
+      : item,
+  ),
+  ...allocationGuards,
+]);
+export const V2_CONTAINER_OWNER_ALLOCATION_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_CONTROL_EXPAND,
+  statements: Object.freeze([
+    `ALTER TABLE ${Q} ADD COLUMN ${allocationColumn}`,
+    ...allocationGuards.map((item) => item.sql),
+  ]),
+  objects: allocationObjects,
+});
+const allocationRows = Object.freeze(
+  allocationObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const allocationNames = allocationObjects.map((item) => literal(item.name)).join(", ");
+const allocationReadyParams = Object.freeze([JSON.stringify(allocationRows)]);
+const allocationReady =
+  "(WITH container_owner_allocation_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, rowIndex, columnIndex) =>
+      `json_extract((SELECT document FROM container_owner_allocation_values), '$[${rowIndex}][${columnIndex}]')`,
+    allocationRows,
+    allocationNames,
+  ) +
+  ")";
+/** Third optional additive expand. Historical NULL is never a close fact.
+ * Reserve only with the original pending peer-control save; seal only the
+ * original bound application's completed close. No runtime is reconstructed. */
+export const V2_CONTAINER_APPLICATION_IO_RESERVED =
+  '{"kind":"linux-oci-application-io-reserved@1"}';
+const applicationIoColumn =
+  "application_io_cleanup TEXT CHECK (application_io_cleanup IS NULL OR (typeof(application_io_cleanup) = 'text' AND length(application_io_cleanup) BETWEEN 1 AND 65536 AND json_valid(application_io_cleanup)))";
+const applicationIoGuards = Object.freeze([
+  trigger(
+    "application_io_cleanup_insert",
+    Q,
+    "BEFORE INSERT",
+    refuse("NEW.application_io_cleanup IS NULL"),
+  ),
+  trigger(
+    "application_io_cleanup_transition",
+    Q,
+    "BEFORE UPDATE",
+    refuse(`
+    NEW.application_io_cleanup IS OLD.application_io_cleanup OR
+    (OLD.application_io_cleanup IS NULL AND NEW.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+      AND OLD.state = 'pending' AND NEW.state = 'pending' AND NEW.native_id IS NULL
+      AND NEW.bound_at_ms IS NULL AND NEW.removed_at_ms IS NULL
+      AND OLD.native_control = ${literal(V2_CONTAINER_CONTROL_RESERVED)}
+      AND NEW.allocation_cleanup = 'untouched'
+      AND json_extract(NEW.native_control,'$.kind') = 'linux-oci-sealed-control@1'
+      AND json_extract(NEW.native_control,'$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1') OR
+    (OLD.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+      AND OLD.state = 'bound' AND NEW.state = 'bound' AND NEW.native_id IS OLD.native_id
+      AND NEW.native_control IS OLD.native_control
+      AND json_extract(NEW.application_io_cleanup,'$.kind') = 'linux-oci-sealed-application-io-close@1'
+      AND json_extract(NEW.application_io_cleanup,'$.scope.purpose') = 'takoserver.linux-oci-application-io-close@1'
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.claimId') = OLD.claim_id
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.resourceUid') = OLD.resource_uid
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.generation') = OLD.generation
+      AND json_extract(NEW.application_io_cleanup,'$.scope.original.installationId') = OLD.installation_id
+      AND json_extract(NEW.application_io_cleanup,'$.scope.nativeId') = OLD.native_id)`),
+  ),
+]);
+const applicationIoObjects = Object.freeze([
+  ...allocationObjects.map((item) =>
+    item.name === Q
+      ? object(
+          item.type,
+          item.name,
+          item.table,
+          item.sql.replace(
+            ",\n  PRIMARY KEY (resource_uid, generation),",
+            ", " + applicationIoColumn + ",\n  PRIMARY KEY (resource_uid, generation),",
+          ),
+        )
+      : item,
+  ),
+  ...applicationIoGuards,
+]);
+export const V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+  statements: Object.freeze([
+    `ALTER TABLE ${Q} ADD COLUMN ${applicationIoColumn}`,
+    ...applicationIoGuards.map((item) => item.sql),
+  ]),
+  objects: applicationIoObjects,
+});
+const applicationIoRows = Object.freeze(
+  applicationIoObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const applicationIoNames = applicationIoObjects.map((item) => literal(item.name)).join(", ");
+const applicationIoReadyParams = Object.freeze([JSON.stringify(applicationIoRows)]);
+const applicationIoReady =
+  "(WITH container_owner_application_io_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, rowIndex, columnIndex) =>
+      `json_extract((SELECT document FROM container_owner_application_io_values), '$[${rowIndex}][${columnIndex}]')`,
+    applicationIoRows,
+    applicationIoNames,
+  ) +
+  ")";
+/** Explicit successor only. Native removal is established by its owning
+ * consumer; this guard permits only final DELETE cipherpayload erasure and
+ * retains every accepted identity/fingerprint/audit field. No active rewrite. */
+const finalDeleteAcceptance = trigger(
+  "acceptance_immutable",
+  A,
+  "BEFORE UPDATE",
+  refuse(`OLD.configured_private_inputs_json IS NOT NULL
+    AND NEW.configured_private_inputs_json IS NULL
+    AND ${same(["operation_id", "resource_uid", "installation_id", "incarnation_id", "principal", "space", "name", "form_url", "backend_id", "target_key", "action", "generation", "backend_key", "replay_key", "fingerprint", "accepted_spec_json", "accepted_output_json", "references_json", "accepted_at", "retain_until", "revision"])}
+    AND EXISTS (SELECT 1 FROM tf_v2_resources resource
+      JOIN tf_v2_operations op ON op.id=resource.last_operation
+      JOIN ${I} instance ON instance.resource_uid=resource.uid
+      WHERE resource.uid=OLD.resource_uid AND resource.principal=OLD.principal
+        AND resource.space=OLD.space AND resource.name=OLD.name AND resource.form_url=OLD.form_url
+        AND resource.backend_id=OLD.backend_id AND resource.target_key=OLD.target_key
+        AND resource.phase='deleting' AND resource.deleted_at IS NULL
+        AND resource.generation=op.generation AND resource.busy_operation=op.id
+        AND resource.spec_json=op.accepted_spec_json AND op.resource_uid=resource.uid
+        AND op.principal=resource.principal AND op.backend_id=resource.backend_id AND op.target_key=resource.target_key
+        AND op.action='delete' AND op.generation>OLD.generation
+        AND op.status='reconciling' AND op.effect='unknown' AND op.dispatch_possible=1
+        AND op.lease_token IS NOT NULL AND op.lease_until_ms>(CAST(strftime('%s','now') AS INTEGER)+1)*1000
+        AND instance.installation_id=OLD.installation_id AND instance.incarnation_id=OLD.incarnation_id
+        AND instance.retire_operation_id=op.id AND instance.desired_generation=op.generation
+        AND EXISTS (SELECT 1 FROM ${Q} claim WHERE claim.resource_uid=resource.uid)
+        AND NOT EXISTS (SELECT 1 FROM ${Q} claim WHERE claim.resource_uid=resource.uid
+          AND (claim.state<>'removed' OR claim.allocation_cleanup IS NOT 'closed'
+            OR json_extract(claim.application_io_cleanup,'$.scope.operation.operationId') IS NOT op.id)))
+    AND NOT EXISTS (SELECT 1 FROM tf_v2_operation_configured_private_inputs material
+      WHERE material.resource_uid=OLD.resource_uid)`),
+);
+const finalDeleteObjects = Object.freeze(
+  applicationIoObjects.map((item) =>
+    item.name === finalDeleteAcceptance.name ? finalDeleteAcceptance : item,
+  ),
+);
+const finalDeleteRows = Object.freeze(
+  finalDeleteObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const finalDeleteNames = finalDeleteObjects.map((item) => literal(item.name)).join(", ");
+const finalDeleteReadyParams = Object.freeze([JSON.stringify(finalDeleteRows)]);
+const finalDeleteReady =
+  "(WITH container_owner_final_delete_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, row, column) =>
+      `json_extract((SELECT document FROM container_owner_final_delete_values), '$[${row}][${column}]')`,
+    finalDeleteRows,
+    finalDeleteNames,
+  ) +
+  ")";
+export const V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  objects: finalDeleteObjects,
+  statements: Object.freeze([
+    {
+      sql: "CREATE TABLE __tako_container_final_delete_transition (ok INTEGER NOT NULL CHECK(ok=1))",
+    },
+    {
+      sql: `INSERT INTO __tako_container_final_delete_transition VALUES (${applicationIoReady})`,
+      params: applicationIoReadyParams,
+    },
+    { sql: `DROP TRIGGER ${finalDeleteAcceptance.name}` },
+    { sql: finalDeleteAcceptance.sql },
+    { sql: "DROP TABLE __tako_container_final_delete_transition" },
+  ]),
+});
+export async function inspectV2ContainerOwnerFinalDeleteSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(`SELECT ${finalDeleteReady} AS ready`, finalDeleteReadyParams);
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+const selectedApplicationIoReady = "(" + applicationIoReady + " OR " + finalDeleteReady + ")";
+const selectedApplicationIoReadyParams = Object.freeze([
+  ...applicationIoReadyParams,
+  ...finalDeleteReadyParams,
+]);
+export async function inspectV2ContainerOwnerApplicationIoSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(
+      `SELECT ${selectedApplicationIoReady} AS ready`,
+      selectedApplicationIoReadyParams,
+    );
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+const selectedAllocationReady = "(" + allocationReady + " OR " + selectedApplicationIoReady + ")";
+const selectedAllocationReadyParams = Object.freeze([
+  ...allocationReadyParams,
+  ...selectedApplicationIoReadyParams,
+]);
+const selectedControlReady = "(" + controlReady + " OR " + selectedAllocationReady + ")";
+const selectedControlReadyParams = Object.freeze([
+  ...controlReadyParams,
+  ...selectedAllocationReadyParams,
+]);
+export async function inspectV2ContainerOwnerAllocationSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(
+      `SELECT ${selectedAllocationReady} AS ready`,
+      selectedAllocationReadyParams,
+    );
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+export async function inspectV2ContainerOwnerControlSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(
+      `SELECT ${selectedControlReady} AS ready`,
+      selectedControlReadyParams,
+    );
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+
+// Optional exact successor. Original final-delete DDL/inspectors remain exact:
+// only consumers selecting this full shape may recognize a past UPDATE close.
+const historicalUpdateClose = `EXISTS (
+  SELECT 1 FROM ${A} ha JOIN tf_v2_operations ho ON ho.id=ha.operation_id
+  JOIN ${R} hv ON hv.operation_id=ha.operation_id AND hv.resource_uid=ha.resource_uid
+    AND hv.generation=ha.generation AND hv.revision=ha.revision
+  WHERE ha.operation_id=json_extract(claim.application_io_cleanup,'$.scope.operation.operationId')
+    AND ha.resource_uid=resource.uid AND ha.installation_id=instance.installation_id
+    AND ha.incarnation_id=instance.incarnation_id AND ha.principal=resource.principal
+    AND ha.space=resource.space AND ha.name=resource.name AND ha.form_url=resource.form_url
+    AND ha.backend_id=resource.backend_id AND ha.target_key=resource.target_key
+    AND ha.action='update' AND ha.generation>claim.generation AND ha.generation<op.generation
+    AND ho.status='succeeded' AND ho.effect='complete'
+    AND ho.resource_uid=ha.resource_uid AND ho.principal=ha.principal AND ho.action=ha.action
+    AND ho.generation=ha.generation AND ho.replay_key=ha.replay_key
+    AND ho.request_fingerprint=ha.fingerprint AND ho.created_at=ha.accepted_at
+    AND ho.backend_id=ha.backend_id AND ho.target_key=ha.target_key AND ho.backend_key=ha.backend_key
+    AND ho.accepted_spec_json=ha.accepted_spec_json AND julianday(ho.retain_until)>=julianday(ha.retain_until)
+    AND ha.revision=CAST(ha.generation AS TEXT)||'-'||json_extract(ha.accepted_spec_json,'$.${C.fields.workloadRevision}')
+    AND json_extract(claim.application_io_cleanup,'$.scope.original') IS json_extract(claim.native_control,'$.scope')
+    AND json_extract(claim.application_io_cleanup,'$.scope.nativeId') IS claim.native_id
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.action') IS ha.action
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.generation') IS ha.generation
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.resourceUid') IS ha.resource_uid
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.principal') IS ha.principal
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.space') IS ha.space
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.name') IS ha.name
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.form') IS ha.form_url
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.backendId') IS ha.backend_id
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.targetKey') IS ha.target_key
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.backendKey') IS ha.backend_key
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.acceptedFingerprint') IS ha.fingerprint
+    AND json_extract(claim.application_io_cleanup,'$.scope.operation.revision') IS ha.revision)`;
+const historicalDeleteAcceptance = Object.freeze({
+  ...finalDeleteAcceptance,
+  sql: finalDeleteAcceptance.sql.replace(
+    "json_extract(claim.application_io_cleanup,'$.scope.operation.operationId') IS NOT op.id",
+    "NOT (json_extract(claim.application_io_cleanup,'$.scope.operation.operationId') IS op.id OR " +
+      historicalUpdateClose +
+      ")",
+  ),
+});
+const historicalDeleteObjects = Object.freeze(
+  finalDeleteObjects.map((item) =>
+    item.name === historicalDeleteAcceptance.name ? historicalDeleteAcceptance : item,
+  ),
+);
+const historicalDeleteRows = Object.freeze(
+  historicalDeleteObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const historicalDeleteNames = historicalDeleteObjects.map((item) => literal(item.name)).join(", ");
+const historicalDeleteParams = Object.freeze([JSON.stringify(historicalDeleteRows)]);
+const historicalDeleteReady =
+  "(WITH container_owner_historical_delete_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, row, column) =>
+      `json_extract((SELECT document FROM container_owner_historical_delete_values), '$[${row}][${column}]')`,
+    historicalDeleteRows,
+    historicalDeleteNames,
+  ) +
+  ")";
+export const V2_CONTAINER_OWNER_HISTORICAL_DELETE_EXPAND = Object.freeze({
+  objects: historicalDeleteObjects,
+  statements: Object.freeze([
+    {
+      sql: "CREATE TABLE __tako_container_historical_delete_transition (ok INTEGER NOT NULL CHECK(ok=1))",
+    },
+    {
+      sql: `INSERT INTO __tako_container_historical_delete_transition VALUES (${finalDeleteReady})`,
+      params: finalDeleteReadyParams,
+    },
+    { sql: `DROP TRIGGER ${historicalDeleteAcceptance.name}` },
+    { sql: historicalDeleteAcceptance.sql },
+    { sql: "DROP TABLE __tako_container_historical_delete_transition" },
+  ]),
+});
+export async function inspectV2ContainerOwnerHistoricalDeleteSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(
+      `SELECT ${historicalDeleteReady} AS ready`,
+      historicalDeleteParams,
+    );
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+/** Exact negative readiness only; optional successor does not alter old readers. */
+export async function inspectV2ContainerOwnerSelectedSchema(
+  sql: Sql,
+  layer: "control" | "allocation" | "application-io" | "final-delete",
+): Promise<boolean> {
+  const original =
+    layer === "control"
+      ? ([selectedControlReady, selectedControlReadyParams] as const)
+      : layer === "allocation"
+        ? ([selectedAllocationReady, selectedAllocationReadyParams] as const)
+        : layer === "application-io"
+          ? ([selectedApplicationIoReady, selectedApplicationIoReadyParams] as const)
+          : ([finalDeleteReady, finalDeleteReadyParams] as const);
+  try {
+    const rows = await sql.query(`SELECT (${original[0]} OR ${historicalDeleteReady}) AS ready`, [
+      ...original[1],
+      ...historicalDeleteParams,
+    ]);
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+const historicalSelectedControlReady =
+  "(" + selectedControlReady + " OR " + historicalDeleteReady + ")";
+const historicalSelectedControlParams = Object.freeze([
+  ...selectedControlReadyParams,
+  ...historicalDeleteParams,
+]);
+
 /** Internal construction only. No request DTO, SQL claim or callback mints native authority. */
 export function createV2ContainerHostAcceptance(options: {
   readonly sql: Sql;
   readonly installationId: string;
   readonly backendId: string;
   readonly targetKey: string;
+  readonly ociParentControl?: "sealed-original@1";
 }): V2HostAcceptance {
   const { sql, installationId, backendId, targetKey } = options;
+  const selectedReady =
+    options.ociParentControl === "sealed-original@1"
+      ? historicalSelectedControlReady
+      : runtimeReady;
+  const selectedReadyParams =
+    options.ociParentControl === "sealed-original@1"
+      ? historicalSelectedControlParams
+      : runtimeReadyParams;
   if (
     !sql ||
     typeof sql.query !== "function" ||
@@ -701,7 +1178,7 @@ export function createV2ContainerHostAcceptance(options: {
           ]
         : [];
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${
+        sql: `${selectedReady} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
@@ -709,7 +1186,7 @@ export function createV2ContainerHostAcceptance(options: {
             AND desired_generation = ? AND retired_at_ms IS NULL)`
         })${retainedMaterialGuard}`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           ...(c.action === "create"
             ? [c.resourceUid]
             : [
@@ -815,11 +1292,11 @@ export function createV2ContainerHostAcceptance(options: {
       if (typeof workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload))
         throw new TypeError("invalid Container F2 workload revision");
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+        sql: `${selectedReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           c.resourceUid,
           installationId,
           c.principal,
@@ -932,7 +1409,7 @@ export function createV2ContainerHostAcceptance(options: {
             ).join("")
           : null;
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${
+        sql: `${selectedReady} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
@@ -940,7 +1417,7 @@ export function createV2ContainerHostAcceptance(options: {
             AND desired_generation = ? AND retired_at_ms IS NULL)`
         })`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           ...(c.action === "create"
             ? [c.resourceUid]
             : [
@@ -1040,11 +1517,11 @@ export function createV2ContainerHostAcceptance(options: {
       )
         throw new TypeError("frozen Container Form cannot accept sensitive inputs");
       const guard: SqlStatement = {
-        sql: `${runtimeReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+        sql: `${selectedReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
         params: [
-          ...runtimeReadyParams,
+          ...selectedReadyParams,
           ...[
             c.resourceUid,
             installationId,

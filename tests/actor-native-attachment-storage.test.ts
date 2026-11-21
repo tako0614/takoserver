@@ -50,22 +50,38 @@ function fixture(options: {
     : { socketId, actorId, attachment: null, attachmentFormat: "owner-kv-v1" };
   if (options.pending) {
     const expiresAt = Date.now() + (options.pending === "valid" ? 30_000 : -1);
+    const reservation = {
+      bearer: "b".repeat(64),
+      expiresAt,
+      generationKey: "d".repeat(64),
+      epoch: "epoch-1",
+      variantKey: "one",
+    };
     metadata = {
       ...(metadata as Record<string, unknown>),
-      reservationBearer: "b".repeat(64),
-      reservationExpiresAt: expiresAt,
-      reservationGenerationKey: "d".repeat(64),
-      reservationEpoch: "epoch-1",
-      reservationVariantKey: "one",
+      reservationBearer: reservation.bearer,
+      reservationExpiresAt: reservation.expiresAt,
+      reservationGenerationKey: reservation.generationKey,
+      reservationEpoch: reservation.epoch,
+      reservationVariantKey: reservation.variantKey,
     };
+    if (options.pending === "valid") {
+      const payload = options.payload;
+      if (typeof payload !== "object" || payload === null)
+        throw new Error("valid reservation fixture requires its stored attachment");
+      kv.set(prefix + socketId, {
+        ...payload,
+        pending: { schema: "owner-kv-pending-v1", ...reservation, frames: [], queuedBytes: 0 },
+      });
+    }
     db.exec(
       "CREATE TABLE actor_socket_reservations (socket_id TEXT PRIMARY KEY, actor_id TEXT NOT NULL, bearer TEXT NOT NULL, expires_at INTEGER NOT NULL)",
     );
     db.query("INSERT INTO actor_socket_reservations VALUES (?, ?, ?, ?)").run(
       socketId,
       actorId,
-      "b".repeat(64),
-      expiresAt,
+      reservation.bearer,
+      reservation.expiresAt,
     );
   }
   const socket = Object.assign(new NativeWebSocket(), {

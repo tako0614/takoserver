@@ -13,7 +13,11 @@
  * its tests did not run instead of leaving an unexplained `(skip)`.
  */
 
-import { NATIVE_EVIDENCE_CAPABILITIES } from "../../scripts/native-evidence.ts";
+import {
+  hostProbe,
+  NATIVE_EVIDENCE_CAPABILITIES,
+  type NativeEvidenceProbe,
+} from "../../scripts/native-evidence.ts";
 
 const noticed = new Set<string>();
 
@@ -24,6 +28,9 @@ export function nativeEvidenceBinary(
   const capability = NATIVE_EVIDENCE_CAPABILITIES.find((entry) => entry.id === capabilityId);
   if (capability === undefined) {
     throw new Error(`unknown native evidence capability: ${capabilityId}`);
+  }
+  if (capability.environment === undefined) {
+    throw new Error(`native evidence capability ${capabilityId} has no environment opt-in`);
   }
   const name = environment ?? capability.environment;
   const configured = process.env[name];
@@ -39,4 +46,29 @@ export function nativeEvidenceBinary(
     return undefined;
   }
   return configured;
+}
+
+/** Automatic host selection, without adding an operator opt-in to portable tests. */
+export function nativeEvidenceHostAvailable(
+  capabilityId: string,
+  probe: NativeEvidenceProbe = hostProbe,
+): boolean {
+  const capability = NATIVE_EVIDENCE_CAPABILITIES.find((entry) => entry.id === capabilityId);
+  if (capability === undefined) {
+    throw new Error(`unknown native evidence capability: ${capabilityId}`);
+  }
+  if (capability.environment !== undefined) {
+    throw new Error(`native evidence capability ${capabilityId} requires its environment opt-in`);
+  }
+  const status = capability.inspect(undefined, {}, probe);
+  if (status.state === "invalid") throw new Error(status.detail);
+  if (status.state === "ready") return true;
+  if (!noticed.has(capabilityId)) {
+    noticed.add(capabilityId);
+    process.stderr.write(
+      `native evidence: ${status.detail}; NOT PROVEN here: ${capability.proves}. ` +
+        `Enable it with ${capability.enable}.\n`,
+    );
+  }
+  return false;
 }

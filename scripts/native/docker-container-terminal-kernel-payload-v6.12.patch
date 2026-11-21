@@ -1,0 +1,24 @@
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -1221,8 +1221,20 @@
+ 
+ void __kfree_skb(struct sk_buff *skb)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_skb_refs held = {0};
++
++	/* The extension can die before data/head/shell processing. Keep an
++	 * independent original reservation across this actual final chain.
++	 */
++	tako_skb_snapshot(skb, &held);
++#endif
+ 	skb_release_all(skb, SKB_DROP_REASON_NOT_SPECIFIED);
+ 	kfree_skbmem(skb);
++#ifdef CONFIG_TAKO_TERMINAL
++	/* skb may be freed: only the saved genuine refs may be accessed here. */
++	tako_terminal_skb_refs_put(&held);
++#endif
+ }
+ EXPORT_SYMBOL(__kfree_skb);
+ 

@@ -293,3 +293,19 @@ for (const path of ["src/index.ts", "src/provider-extension.ts", "src/takoform-v
     expect(result.stderr).toContain(`imports ${CONTAINER} (v2-container-owner-schema)`);
   });
 }
+
+for (const hostOnly of [
+  "src/selfhost-linux-container-node-composition.ts",
+  "src/providers/linux-oci-physical-session.ts",
+  "src/providers/linux-oci-http-health.ts",
+]) {
+  test(`a Workers entry cannot reach the host-only module ${hostOnly}`, async () => {
+    const entry = "src/entry-worker.ts";
+    const result = await probe((files) => {
+      files.set(entry, `import "./${hostOnly.slice("src/".length)}";\n`);
+      files.set(hostOnly, "export {};\n");
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(`${entry} transitively imports host-only module ${hostOnly}`);
+  });
+}

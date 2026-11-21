@@ -1141,7 +1141,38 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "401": errorResponse("A session credential is required"),
     },
   },
-  readPrincipal: described("Read the signed-in principal and the organizations it owns"),
+  readPrincipal: described("Read the signed-in principal and its organization membership", {
+    description:
+      "Without page parameters, success means the complete organization roster (oldest first), limited to 100 rows and 32768 UTF-8 bytes of roster JSON; otherwise 400 invalid_argument explicitly requires pagination. No partial roster is returned as complete. Set organizationPageSize (1–100) for bounded organization-ID keyset pages: organizations JSON is at most 32768 UTF-8 bytes. Every response is limited to 65536 UTF-8 bytes. The response adds nextOrganizationCursor (string or null); pass it unchanged with the same page size. Consumers should request one page per explicit action and retain selection independently from page contents. Cursors are principal-bound positions, not permissions or a continuous snapshot. Membership IDs are limited through the existing index before Organization rows are joined; these pages are ID-ordered, while legacy full-roster ordering is unchanged. A removed anchor returns 400; restart at the first page. Errors must never be adopted as partial or empty rosters.",
+    parameters: [
+      {
+        name: "organizationPageSize",
+        in: "query",
+        required: false,
+        schema: { type: "integer", minimum: 1, maximum: 100 },
+        description: "Opt in to bounded roster pages; required when organizationCursor is present.",
+      },
+      {
+        name: "organizationCursor",
+        in: "query",
+        required: false,
+        schema: { type: "string", minLength: 1, maxLength: 2048 },
+        description:
+          "Opaque position from the preceding response, used only for the same authenticated principal.",
+      },
+    ],
+    responses: {
+      "200": {
+        description:
+          "principal and organizations, plus nextOrganizationCursor only in explicit page mode. null means no further page.",
+      },
+      "400": errorResponse(
+        "Invalid page size, cursor, duplicate page parameters, removed membership anchor, or legacy roster exceeds its budget (request organizationPageSize)",
+      ),
+      "401": errorResponse("A current session is required"),
+      "503": errorResponse("Roster storage or bounded response unavailable"),
+    },
+  }),
   listAiModels: described(
     "List configured OpenAI-compatible models with canonical USD-micros pricing ceilings",
     {

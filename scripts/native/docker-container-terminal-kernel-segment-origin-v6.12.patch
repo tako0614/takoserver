@@ -1,0 +1,76 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] retain original leaf origins through known segmentation transfer
+
+Apply after formal19. Snapshot a live leaf's original private reservations
+before its known internal head-state transfer and restore immediately after
+parent low-level header copy. Existing snapshot/restore/COW/dedup/poison stay.
+No fallible path exists while the per-iteration held carrier is outstanding.
+Fresh allocations have an empty carrier. Generic public detach and arbitrary
+GRO callback poison remain unchanged. Not hardware/fullflow/terminal proof.
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -4704,6 +4704,9 @@
+ 	skb_shinfo(skb)->frag_list = NULL;
+ 
+ 	while (list_skb) {
++#ifdef CONFIG_TAKO_TERMINAL
++		struct tako_terminal_skb_refs held = {0};
++#endif
+ 		nskb = list_skb;
+ 		list_skb = list_skb->next;
+ 
+@@ -4736,9 +4739,18 @@
+ 
+ 		skb_push(nskb, -skb_network_offset(nskb) + offset);
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++		/* Known live leaf-to-parent header transfer, not generic detach. */
++		tako_skb_snapshot(nskb, &held);
++		__skb_release_head_state(nskb, true);
++#else
+ 		skb_release_head_state(nskb);
++#endif
+ 		len_diff = skb_network_header_len(nskb) - skb_network_header_len(skb);
+ 		__copy_skb_header(nskb, skb);
++#ifdef CONFIG_TAKO_TERMINAL
++		tako_skb_restore(nskb, &held);
++#endif
+ 
+ 		skb_headers_offset_update(nskb, skb_headroom(nskb) - skb_headroom(skb));
+ 		nskb->transport_header += len_diff;
+@@ -4889,6 +4901,9 @@
+ 
+ 	do {
+ 		struct sk_buff *nskb;
++#ifdef CONFIG_TAKO_TERMINAL
++		struct tako_terminal_skb_refs held = {0};
++#endif
+ 		skb_frag_t *nskb_frag;
+ 		int hsize;
+ 		int size;
+@@ -4943,7 +4958,13 @@
+ 			}
+ 
+ 			nskb->truesize += skb_end_offset(nskb) - hsize;
++#ifdef CONFIG_TAKO_TERMINAL
++			/* All trim/COW failures precede the held leaf reservation. */
++			tako_skb_snapshot(nskb, &held);
++			__skb_release_head_state(nskb, true);
++#else
+ 			skb_release_head_state(nskb);
++#endif
+ 			__skb_push(nskb, doffset);
+ 		} else {
+ 			if (hsize < 0)
+@@ -4969,6 +4990,9 @@
+ 		tail = nskb;
+ 
+ 		__copy_skb_header(nskb, head_skb);
++#ifdef CONFIG_TAKO_TERMINAL
++		tako_skb_restore(nskb, &held);
++#endif
+ 
+ 		skb_headers_offset_update(nskb, skb_headroom(nskb) - headroom);
+ 		skb_reset_mac_len(nskb);

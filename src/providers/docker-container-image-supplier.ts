@@ -245,7 +245,7 @@ function reference(image: string, selectedOrigin: string) {
  * through import/unknown-ACK reconciliation and persist retained custody.
  */
 export async function withDockerRetainedImageArchive<T>(
-  session: DockerContainerCreateSession,
+  session: Pick<DockerContainerCreateSession, "guard" | "signal">,
   options: {
     readonly image: string;
     readonly limits: DockerImageSupplyLimits;

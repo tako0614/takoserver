@@ -1,0 +1,30 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] retain original origins before skb_zerocopy payload effects
+
+Apply after the retained formal21 source graph. The actual NFQUEUE message
+builder allocates a distinct header and calls skb_zerocopy from entry->skb.
+Retain its original origin union through the existing merge/COW/poison helper
+before any positive payload copy or page reference, including partial-error
+paths. Zero length has no new effect. Every original statement and error is
+unchanged; CONFIG-off removes this addition. No new helper/API or relaxed
+poison. Generic caller evidence does not establish fixed OCI NFQUEUE
+reachability, physical page/net destruction, full traffic, or terminal zero.
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -3896,6 +3896,14 @@
+ 
+ 	BUG_ON(!from->head_frag && !hlen);
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Copy faults and orphan failures can follow payload changes. Retain
++	 * the original history before the first copy or page reference.
++	 */
++	if (len > 0)
++		tako_terminal_skb_merge(to, from);
++#endif
++
+ 	/* dont bother with small payloads */
+ 	if (len <= skb_tailroom(to))
+ 		return skb_copy_bits(from, 0, skb_put(to, len), len);

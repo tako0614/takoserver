@@ -201,3 +201,100 @@ export function v2ConfiguredUpdateDiscardTransition(): readonly SqlStatement[] {
     { sql: `DROP TABLE ${assertion}` },
   ]);
 }
+
+// Explicit successor of the unregistered discard leaf, never a numbered Host
+// migration. The same one-row gate is consumed by the existing DELETE trigger.
+// NULL preserves the old superseded-UPDATE purpose; only the new consumer
+// writes this closed final-DELETE scope. Neither scope is native evidence.
+const finalDeleteColumn = `final_delete TEXT CHECK (final_delete IS NULL OR (
+  typeof(final_delete) = 'text' AND length(final_delete) <= 4096
+  AND json_valid(final_delete)
+  AND json_type(final_delete) = 'object'
+  AND json_extract(final_delete, '$.purpose') IS 'final-resource-delete@1'
+  AND json_type(final_delete, '$.operationId') IS 'text'
+  AND length(json_extract(final_delete, '$.operationId')) BETWEEN 1 AND 1024
+  AND json_type(final_delete, '$.generation') IS 'integer'
+  AND json_extract(final_delete, '$.generation') BETWEEN 3 AND 9007199254740991
+  AND json_type(final_delete, '$.leaseToken') IS 'text'
+  AND length(json_extract(final_delete, '$.leaseToken')) BETWEEN 1 AND 1024
+  AND json_remove(final_delete, '$.purpose', '$.operationId', '$.generation', '$.leaseToken') = '{}'
+))`;
+const finalTableDDL = tableDDL.replace(
+  ",\n  FOREIGN KEY",
+  `, ${finalDeleteColumn},\n  FOREIGN KEY`,
+);
+const supersededCondition = insertGuardDDL.slice(
+  insertGuardDDL.indexOf("\nWHEN ") + "\nWHEN ".length,
+  insertGuardDDL.indexOf("\nBEGIN"),
+);
+const finalInsertGuardDDL = `CREATE TRIGGER ${v2ConfiguredUpdateDiscardObjects.insertGuard}
+BEFORE INSERT ON ${GATE}
+WHEN (NEW.final_delete IS NULL AND (${supersededCondition}))
+ OR (NEW.final_delete IS NOT NULL AND (EXISTS (SELECT 1 FROM ${GATE}) OR NOT EXISTS (
+  SELECT 1 FROM ${TABLE} material
+  JOIN tf_v2_operations source ON source.id = material.operation_id
+  JOIN tf_v2_resources resource ON resource.uid = material.resource_uid
+  JOIN tf_v2_operations removal ON removal.id = resource.busy_operation
+  WHERE material.operation_id = NEW.operation_id
+    AND material.resource_uid = NEW.resource_uid AND material.generation = NEW.generation
+    AND resource.uid = NEW.resource_uid AND resource.principal = NEW.principal
+    AND resource.space = NEW.space AND resource.name = NEW.name AND resource.form_url = NEW.form_url
+    AND resource.backend_id = NEW.backend_id AND resource.target_key = NEW.target_key
+    AND source.resource_uid = resource.uid AND source.principal = resource.principal
+    AND source.backend_id = resource.backend_id AND source.target_key = resource.target_key
+    AND source.generation = material.generation AND source.action = 'update'
+    AND source.private_inputs_present = 1
+    AND (SELECT COUNT(*) FROM ${TABLE} same_generation
+      WHERE same_generation.resource_uid = resource.uid
+        AND same_generation.generation = material.generation) = 1
+    AND resource.deleted_at IS NULL AND resource.phase = 'deleting'
+    AND resource.last_operation = removal.id AND resource.generation = removal.generation
+    AND removal.id = json_extract(NEW.final_delete, '$.operationId')
+    AND removal.generation = json_extract(NEW.final_delete, '$.generation')
+    AND removal.generation > material.generation
+    AND removal.resource_uid = resource.uid AND removal.principal = resource.principal
+    AND removal.backend_id = resource.backend_id AND removal.target_key = resource.target_key
+    AND removal.accepted_spec_json = resource.spec_json
+    AND removal.action = 'delete' AND removal.status = 'reconciling'
+    AND removal.effect = 'unknown' AND removal.dispatch_possible = 1
+    AND removal.lease_token = json_extract(NEW.final_delete, '$.leaseToken')
+    AND removal.lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000
+)))
+BEGIN
+  SELECT RAISE(ABORT, 'configured UPDATE discard not eligible');
+END`;
+
+/** Exact expanded shape; old helper uses only the NULL/superseded purpose. */
+export const v2FinalDeleteConfiguredUpdateDiscardSchema = Object.freeze({
+  ...v2ConfiguredUpdateDiscardSchema,
+  gate: finalTableDDL,
+  insertGuard: finalInsertGuardDDL,
+});
+
+/** Apply atomically after the exact old discard transition. No adoption of
+ * foreign/partial shapes, outstanding gate, data rewrite or registered apply.
+ * Upgrade the consumer before expansion: older exact-shape readers refuse
+ * this successor; the current superseded helper supports both exact shapes. */
+export function v2FinalDeleteConfiguredUpdateDiscardTransition(): readonly SqlStatement[] {
+  const assertion = `${GATE}_final_delete_transition_assertion`;
+  const oldObjects = [
+    [GATE, "table", GATE, tableDDL],
+    [v2ConfiguredUpdateDiscardObjects.index, "index", TABLE, indexDDL],
+    [v2ConfiguredUpdateDiscardObjects.insertGuard, "trigger", GATE, insertGuardDDL],
+    [DELETE_TRIGGER, "trigger", TABLE, deleteGuardDDL],
+    [v2ConfiguredUpdateDiscardObjects.consume, "trigger", TABLE, consumeDDL],
+  ];
+  return Object.freeze([
+    { sql: `CREATE TABLE ${assertion} (ok INTEGER NOT NULL CHECK (ok = 1))` },
+    {
+      sql: `INSERT INTO ${assertion} (ok) SELECT CASE WHEN
+        (SELECT COUNT(*) FROM sqlite_schema WHERE ${oldObjects.map(() => "(name=? AND type=? AND tbl_name=? AND sql=?)").join(" OR ")}) = 5
+        AND NOT EXISTS (SELECT 1 FROM ${GATE}) THEN 1 ELSE 0 END`,
+      params: oldObjects.flat(),
+    },
+    { sql: `ALTER TABLE ${GATE} ADD COLUMN ${finalDeleteColumn}` },
+    { sql: `DROP TRIGGER ${v2ConfiguredUpdateDiscardObjects.insertGuard}` },
+    { sql: finalInsertGuardDDL },
+    { sql: `DROP TABLE ${assertion}` },
+  ]);
+}

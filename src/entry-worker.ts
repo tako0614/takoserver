@@ -81,6 +81,10 @@ import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
 import type { V2HostAcceptance } from "./takoform-v2/host-acceptance.ts";
+import {
+  captureV2RetainedExecutionActions,
+  type V2RetainedExecutionActions,
+} from "./takoform-v2/retained-execution.ts";
 import { drainV2Operations } from "./takoform-v2/worker-wake.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
@@ -512,6 +516,8 @@ export interface WorkerEntryOptions {
   ) => void | Promise<void>;
   /** Operator code only; no request or environment field selects the composer. */
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
+  /** Operator code only; immutable pre-claim action selection for retained Forms. */
+  readonly v2RetainedExecutionActions?: V2RetainedExecutionActions;
   /** Operator code only; omission or an undefined result leaves origin acceptance unselected. */
   readonly composeV2WorkerEndpointOrigin?: WorkerEntryV2WorkerEndpointOriginComposer;
   /** Operator code only; omission leaves Container acceptance unselected. */
@@ -1068,6 +1074,7 @@ async function composeApp(
   composeV2FreshAdmission: WorkerEntryOptions["composeV2FreshAdmission"],
   composeV2WorkerEndpointOrigin: WorkerEntryOptions["composeV2WorkerEndpointOrigin"],
   composeV2ContainerHostAcceptance: WorkerEntryOptions["composeV2ContainerHostAcceptance"],
+  retainedExecutionActions: V2RetainedExecutionActions | undefined,
   request?: {
     readonly connection: WorkerRequestSql;
     readonly sharedAuth?: WorkerSharedAuthStaging;
@@ -1526,6 +1533,9 @@ async function composeApp(
       ...(selectedV2ContainerHostAcceptance !== undefined && hostedBilling === undefined
         ? { clock }
         : {}),
+      ...(retainedExecutionActions === undefined
+        ? {}
+        : { v2RetainedExecutionActions: retainedExecutionActions }),
       ...(allowFreshCreateAndUpdate === undefined
         ? {}
         : { v2AllowFreshCreateAndUpdate: allowFreshCreateAndUpdate }),
@@ -1600,6 +1610,9 @@ export { auth103NativeSourceCodeSelected };
 
 /** Cache only entries without a request-owned Sql/issuer composition. */
 export function createWorkerEntry(options: WorkerEntryOptions = {}) {
+  const retainedExecutionActions = captureV2RetainedExecutionActions(
+    options.v2RetainedExecutionActions,
+  );
   const composeV2Forms = options.composeV2Forms;
   const composeV2ArtifactSource = options.composeV2ArtifactSource;
   const composeV2FreshAdmission = options.composeV2FreshAdmission;
@@ -1667,6 +1680,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         composeV2FreshAdmission,
         composeV2WorkerEndpointOrigin,
         composeV2ContainerHostAcceptance,
+        retainedExecutionActions,
         {
           connection,
           ...(selectedSharedAuth === undefined ? {} : { sharedAuth: selectedSharedAuth }),
@@ -1684,6 +1698,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       composeV2FreshAdmission,
       composeV2WorkerEndpointOrigin,
       composeV2ContainerHostAcceptance,
+      retainedExecutionActions,
     ).catch((error: unknown) => {
       if (starts.get(env) === started) starts.delete(env);
       throw error;

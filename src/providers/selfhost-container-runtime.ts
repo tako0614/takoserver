@@ -42,7 +42,10 @@ export class SelfhostContainerError extends Error {
 }
 
 type Snapshot = HttpRevisionServingSnapshot<SelfhostContainerRevision, string>;
-type Backend = ReturnType<typeof createDockerHttpRevisionRuntime>;
+type Backend = Pick<
+  ReturnType<typeof createDockerHttpRevisionRuntime>,
+  "reconcile" | "observe" | "remove"
+>;
 type ServingBackend = HttpRevisionServingBackend<SelfhostContainerRevision, string, string>;
 type ServingCoordinator = HttpRevisionServingCoordinator<SelfhostContainerRevision>;
 

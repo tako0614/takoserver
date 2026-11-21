@@ -1,0 +1,27 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] wait matched NF readers before original namespace reference put
+
+Apply after the retained aggregate17. The direct RELEASE_NAMESPACE operation
+already irreversibly cuts admission and seals its original counters. Match
+CUT's synchronize_net after unlocking, before clearing the original context
+and putting its one net reference. Only the successful first release waits.
+This joins the existing matched NF reader interval only, never all task,
+packet/queue/okfn/GRO/offload lifetime or terminal/readiness authority.
+Existing net_free final callback and all admission/ownership APIs stay intact.
+
+diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
+--- a/net/core/tako_terminal.c
++++ b/net/core/tako_terminal.c
+@@ -445,6 +445,12 @@
+ 	tako_terminal_state_seal(&owner->state);
+ 	tako_terminal_state_seal(&owner->device_associations);
+ 	spin_unlock_irqrestore(&owner->lock, flags);
++
++	/* Direct RELEASE_NAMESPACE must wait the same pre-gate NF reader
++	 * sections as CUT before dropping this original net reference.
++	 * This does not join okfn/queued/GRO/offload continuations.
++	 */
++	synchronize_net();
+ 	/* Clear the original context BEFORE the one raw put, never adopt or
+ 	 * drop another FD/PID's namespace. File ref keeps owner independently.
+ 	 */

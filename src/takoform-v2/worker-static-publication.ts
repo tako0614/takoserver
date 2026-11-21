@@ -1,4 +1,5 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
+import type { LinuxOciWorkerdContainerClaim } from "../providers/linux-oci-container-binding-broker.ts";
 import type { V2KvBindingGrant } from "../providers/selfhost-v2-kv-binding-broker.ts";
 import type {
   V2QueueProducerBindingGrant,
@@ -264,6 +265,13 @@ export function createV2WorkerPublication(options: {
       binding: string,
     ): Promise<V2QueueProducerBindingResolution | null>;
   };
+  /** Present only for the original explicit OCI source; absence preserves rejection. */
+  readonly v2ContainerBindingForward?: {
+    issueBinding(
+      claim: LinuxOciWorkerdContainerClaim,
+      binding: V2ResolvedServiceBinding,
+    ): Promise<void>;
+  };
   /** Per-incarnation Host broker, opened before the native Version is published. */
   readonly v2ServiceBindingForward?: {
     issueBinding(
@@ -313,6 +321,10 @@ export function createV2WorkerPublication(options: {
   // write. Reuse only this incarnation's exact accepted Version/Binding vector:
   // each resolution otherwise mints a different broker token and leaves a
   // socket outside the final pinned native configuration after Host SIGKILL.
+  const containerProjection = new Map<
+    string,
+    { vector: string; bindings: Promise<readonly V2ResolvedServiceBinding[]> }
+  >();
   let serviceProjection:
     | {
         operationId: string;
@@ -364,10 +376,14 @@ export function createV2WorkerPublication(options: {
         version.form !== undefined
           ? parseForwardWorkerVersionSpec(version.spec)
           : parseWorkerVersionSpec(version.spec);
+      const containerDeclarations = version.form
+        ? parseForwardWorkerVersionSpec(versionSpec).containerBindings
+        : [];
       if (
         version.form &&
-        (parseForwardWorkerVersionSpec(versionSpec).containerBindings.length ||
-          !version.bucketBindings)
+        (!version.bucketBindings ||
+          (containerDeclarations.length > 0 &&
+            (!options.v2ContainerBindingForward || !versionSpec.bundle)))
       )
         throw new Error("forward bindings unavailable");
       if (versionSpec.bundle) {
@@ -758,6 +774,14 @@ export function createV2WorkerPublication(options: {
               : {}),
           },
           spec: versionSpec,
+          ...(containerDeclarations.length
+            ? {
+                resolvedContainerBindings: containerDeclarations.map((binding) => ({
+                  name: binding.name,
+                  resourceUid: binding.resource.resourceUid,
+                })),
+              }
+            : {}),
           ...(version.form === undefined ? {} : { sourceForm: version.form }),
           bundle: materials.bundle,
           assets: materials.assets,
@@ -800,6 +824,49 @@ export function createV2WorkerPublication(options: {
             : { eventDelivery: { token: options.scheduledEventToken } }),
           ...(queueSettlement === undefined ? {} : { queueSettlement }),
         });
+        let containerBindings: readonly V2ResolvedServiceBinding[] = [];
+        if (containerDeclarations.length) {
+          const key = canonicalJson([execution.operationId, version.uid]);
+          const vector = canonicalJson({
+            worker: snapshot.worker,
+            version,
+            sourceOperationId: snapshot.sourceOperationId,
+            bindings: containerDeclarations,
+          });
+          const prior = containerProjection.get(key);
+          if (prior && prior.vector !== vector)
+            throw new Error("Container accepted Version changed");
+          if (!prior)
+            containerProjection.set(key, {
+              vector,
+              bindings: projectV2ResolvedServiceBindings(containerDeclarations),
+            });
+          containerBindings = await containerProjection.get(key)!.bindings;
+          if (issueServiceBindings)
+            for (const [index, binding] of containerBindings.entries()) {
+              await options.v2ContainerBindingForward!.issueBinding(
+                Object.freeze({
+                  principal: snapshot.worker.principal,
+                  space: snapshot.worker.space,
+                  targetKey: options.targetKey,
+                  workerUid: snapshot.worker.uid,
+                  workerVersionUid: version.uid,
+                  workerVersionGeneration: version.generation,
+                  workerVersionFormUrl: version.form!,
+                  operationId: version.sourceOperationId,
+                  bindingName: binding.name,
+                  targetUid: binding.targetResourceUid,
+                  nativeVersionId: identity.versionId,
+                  incarnationId: execution.operationId,
+                  servingSourceOperationId: execution.operationId,
+                }),
+                {
+                  ...binding,
+                  name: workerdVersionServiceBindingName(serviceBindings.length + index, true),
+                },
+              );
+            }
+        }
         const graph = compileWorkerdVersionGraph({
           ...(version.form === undefined
             ? {}
@@ -823,7 +890,10 @@ export function createV2WorkerPublication(options: {
               ? ("secret_text" as const)
               : ("json" as const),
           })),
-          serviceBindings: serviceBindings.map((binding) => ({
+          ...(containerBindings.length
+            ? { ociContainerBindings: containerBindings.map((binding) => binding.name) }
+            : {}),
+          serviceBindings: [...serviceBindings, ...containerBindings].map((binding) => ({
             publicName: binding.name,
             target: binding.target,
             targetResourceUid: binding.targetResourceUid,
