@@ -1533,6 +1533,8 @@ const HOST_ONLY = [
   "src/selfhost-linux-docker-node-selection.ts",
   "src/selfhost-linux-oci-container-backend.ts",
   "src/selfhost-linux-oci-core.ts",
+  "src/providers/linux-oci-physical-session.ts",
+  "src/providers/linux-oci-http-health.ts",
   // Applies native Linux network namespace/firewall policy, outside Workers.
   "src/providers/linux-container-egress.ts",
   "src/providers/selfhost-container-lifecycle.ts",
