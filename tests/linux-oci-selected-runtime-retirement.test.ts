@@ -6,18 +6,24 @@ import {
   encodeContainerSecretBytes,
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
+import {
+  V2_CONTAINER_APPLICATION_IO_RESERVED,
+  V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+} from "../src/takoform-v2/container-owner-schema.ts";
 import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // Explicit NONSECRET fresh memorySql/original normal factory/raw streams.
 // Imported old tests register but only selected-runtime names are invoked.
-async function original(fault?: "delete-retained" | "delete-lost") {
+async function original(
+  options: { retirementFault?: "delete-retained" | "delete-lost"; applicationIo?: boolean } = {},
+) {
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
     runtimeFirst: true,
     allocationSchema: true,
-    ...(fault === undefined ? {} : { retirementFault: fault }),
+    ...(options.retirementFault === undefined ? {} : { retirementFault: options.retirementFault }),
   });
   const health = acceptedRawHttp();
   health.onEnd(() => {
@@ -25,6 +31,10 @@ async function original(fault?: "delete-retained" | "delete-lost") {
     health.join();
   });
   try {
+    if (options.applicationIo)
+      await f.sql.batch(
+        V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })),
+      );
     const accepted = await f.create();
     expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
     return { f, accepted };
@@ -39,8 +49,8 @@ type Original = Awaited<ReturnType<typeof original>>;
 const requests = (x: Original) => x.f.nativeCounts().requests;
 const count = (x: Original, op: string) =>
   requests(x).filter((v) => v === `linux-oci-${op}@1`).length;
-async function remove(x: Original) {
-  await x.f.engine.acceptDelete({
+function remove(x: Original) {
+  return x.f.engine.acceptDelete({
     principal: "synthetic-oci-parent",
     key: crypto.randomUUID(),
     uid: x.accepted.resourceUid,
@@ -62,7 +72,7 @@ async function row(x: Original) {
 }
 
 test("selected-runtime normal original DELETE precedes tracked join and feeds original cleanup", async () => {
-  const x = await original();
+  const x = await original({ applicationIo: true });
   let fresh: ReturnType<typeof x.f.reconstructNormal> | undefined;
   try {
     const saved = await row(x),
@@ -71,7 +81,8 @@ test("selected-runtime normal original DELETE precedes tracked join and feeds or
     expect(requests(x).filter((v) => v.startsWith("linux-oci-parent-bootstrap@"))).toEqual([
       "linux-oci-parent-bootstrap@3",
     ]);
-    await remove(x);
+    expect(saved.application_io_cleanup).toBe(V2_CONTAINER_APPLICATION_IO_RESERVED);
+    const acceptedDelete = await remove(x);
     await until(x, "delete-born");
     expect(count(x, "begin-tracked-join")).toBe(0);
     expect(count(x, "read-tracked-join")).toBe(0);
@@ -80,8 +91,18 @@ test("selected-runtime normal original DELETE precedes tracked join and feeds or
     // The genuine namespace reply supplied by the raw stream has netGone=0;
     // H's selected source still requires actual own-cleanup/release completion.
     await until(x, "join-born-delete");
-    // A new original normal factory reads the same sealed profile and actual
-    // files/peer; it cannot bootstrap or CREATE a replacement P/H.
+    const beforeRestart = await row(x);
+    expect(beforeRestart).toMatchObject({
+      allocation_cleanup: "untouched",
+      native_control: saved.native_control,
+      removed_at_ms: null,
+    });
+    expect(JSON.parse(String(beforeRestart.application_io_cleanup))).toMatchObject({
+      kind: "linux-oci-sealed-application-io-close@1",
+      scope: { operation: { operationId: acceptedDelete.id, action: "delete" } },
+    });
+    // Restart the owner only after it recorded its actual close for this DELETE.
+    // The new owner can only continue the original peer, never CREATE another.
     fresh = x.f.reconstructNormal();
     await until(x, "begin-tracked-join", fresh.engine);
     const q = requests(x);
@@ -104,8 +125,12 @@ test("selected-runtime normal original DELETE precedes tracked join and feeds or
       "dispose-born",
     ])
       expect(count(x, op)).toBe(1);
+    expect(requests(x).filter((v) => v.startsWith("linux-oci-parent-bootstrap@"))).toEqual([
+      "linux-oci-parent-bootstrap@3",
+    ]);
     expect(await row(x)).toMatchObject({
       native_control: saved.native_control,
+      application_io_cleanup: beforeRestart.application_io_cleanup,
       removed_at_ms: null,
     });
     expect(x.f.network).not.toHaveBeenCalled();
@@ -116,7 +141,7 @@ test("selected-runtime normal original DELETE precedes tracked join and feeds or
 });
 
 test("selected-runtime retained DELETE advances only same-original JOIN before tracked cleanup", async () => {
-  const x = await original("delete-retained");
+  const x = await original({ retirementFault: "delete-retained" });
   try {
     await remove(x);
     await until(x, "delete-born");
@@ -134,7 +159,7 @@ test("selected-runtime retained DELETE advances only same-original JOIN before t
 });
 
 test("selected-runtime lost DELETE reply keeps original UNKNOWN and never resends or begins tracked join", async () => {
-  const x = await original("delete-lost");
+  const x = await original({ retirementFault: "delete-lost" });
   try {
     await remove(x);
     await until(x, "delete-born");
