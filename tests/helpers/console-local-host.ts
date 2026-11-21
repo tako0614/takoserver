@@ -1,5 +1,5 @@
 import type { AiGateway } from "../../src/ai-port.ts";
-import { buildApp } from "../../src/app.ts";
+import { type AppPorts, buildApp } from "../../src/app.ts";
 import type { BillingConfig } from "../../src/billing-config.ts";
 import { resolveIdentity } from "../../src/identity-setup.ts";
 import { base64UrlEncode } from "../../src/json.ts";
@@ -174,6 +174,7 @@ export async function createSignedConsoleHost(
   billingConfig?: BillingConfig,
   ai?: AiGateway,
   rawClock?: () => Date,
+  providerComposition?: Pick<AppPorts, "offerings" | "providerPacks">,
 ) {
   const origin = "https://api.logout-cookie.test";
   const now = "2026-11-13T00:00:00.000Z";
@@ -240,7 +241,10 @@ export async function createSignedConsoleHost(
       consoleOrigin,
       forms: [],
       hostForms: [],
-      offerings: [],
+      offerings: providerComposition?.offerings ?? [],
+      ...(providerComposition?.providerPacks
+        ? { providerPacks: providerComposition.providerPacks }
+        : {}),
       driver: new InMemoryTakoformResourceDriver(),
       v2: {
         cursorSigningKey: new Uint8Array(32).fill(0x5a),

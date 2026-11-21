@@ -1,8 +1,12 @@
 import { expect, test } from "bun:test";
 import { parseBillingConfig } from "../src/billing-config.ts";
+import type { Offering } from "../src/catalog.ts";
+import { createProviderPack } from "../src/provider-pack.ts";
+import { FakeProvider } from "../src/providers/fake.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "../src/providers/openai.ts";
+import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import {
-  type ConsoleTestNode,
+  ConsoleTestNode,
   createSignedConsoleHost,
   installConsoleTestDom,
 } from "./helpers/console-local-host.ts";
@@ -54,6 +58,264 @@ function followRail(root: ConsoleTestNode, href: string): void {
       stopPropagation() {},
     } as unknown as Event);
 }
+
+test("a priced provider window survives checkpoint retry without a second charge and reaches only its own Console", async () => {
+  const billing = parseBillingConfig(
+    JSON.stringify({
+      schemaVersion: 1,
+      revision: "local-provider-window",
+      effectiveAt: "2026-11-01T00:00:00.000Z",
+      currency: "USD",
+      holdTtlSeconds: 60,
+      freeIncludedMinor: 2000,
+      purchaseCreditExpiry: { kind: "none" },
+      plans: {},
+      meters: {},
+    }),
+  );
+  if (!billing) throw new Error("local provider-window billing config missing");
+  const ownerOrg = "org-logout-a";
+  const providerId = "local-metered-provider";
+  const deploymentId = "dep_local_metered_provider";
+  const resourceUid = "uid_local_metered_provider";
+  const meter = "compute.requests";
+  const from = "2026-11-12T00:00:00.000Z";
+  const until = "2026-11-13T00:00:00.000Z";
+  let now = new Date(until);
+  const offering: Offering = {
+    id: "compute.edge.local-metered",
+    providerPackRef: providerId,
+    providerInstallationRef: `${providerId}.local`,
+    supplyContractRef: `${providerId}.contract`,
+    pricePlanRef: "compute.edge.local-metered.price-v1",
+    pricePlan: {
+      id: "compute.edge.local-metered.price-v1",
+      currency: "USD",
+      provisioning: { meter: "resource.create", amountMinor: 0 },
+      meters: [{ meter, amountMinor: 150 }],
+    },
+    resourceClass: "compute.edge",
+    deliveryMode: "embedded-binding",
+    supportPolicyRef: "support:local",
+    abusePolicyRef: "abuse:local",
+    kind: "worker",
+    displayName: "Local metered compute",
+    form: {
+      apiVersion: "example.forms.test",
+      kind: "ExampleWorkload",
+      definitionVersion: "1.0.0",
+      schemaDigest: `sha256:${"a".repeat(64)}`,
+    },
+    providedInterfaces: [],
+    bindingRefs: [],
+    regions: ["test"],
+    portability: { api: "portable", exportFormats: [], importFormats: [], migrationModes: [] },
+    isolation: "dedicated-resource",
+    available: true,
+  };
+  let reads = 0;
+  const pack = createProviderPack({
+    id: providerId,
+    providerType: providerId,
+    provisioners: [new FakeProvider({ id: providerId, offerings: [] })],
+    attachmentFactories: [],
+    transferEndpoints: [],
+    credentialIssuers: [],
+    meterSources: [
+      {
+        id: "local-provider-usage",
+        meters: [meter],
+        settlementDelaySeconds: 0,
+        maximumWindowSeconds: 86_400,
+        windowAlignment: "utc-day",
+        async read(input) {
+          if (
+            input.tenantId !== ownerOrg ||
+            input.deployment.id !== deploymentId ||
+            input.deployment.resourceUid !== resourceUid ||
+            input.from !== from ||
+            input.until !== until
+          )
+            throw new Error("unexpected provider window");
+          reads++;
+          return [{ meter, quantity: 2 }];
+        },
+      },
+    ],
+    costEstimators: [],
+  });
+  const dom = installConsoleTestDom("https://console.measured-usage.test/billing");
+  Object.assign(window, { localStorage });
+  let host: Awaited<ReturnType<typeof createSignedConsoleHost>> | undefined;
+  let state: typeof import("../console/src/state.ts") | undefined;
+  let stopIdentity: (() => void) | undefined;
+  try {
+    host = await createSignedConsoleHost(dom.origin, {}, billing, undefined, () => now, {
+      offerings: [offering],
+      providerPacks: [pack],
+    });
+    const fixture = host;
+    globalThis.fetch = fixture.transport;
+    state = await import("../console/src/state.ts");
+    const { setConsoleLocale } = await import("../console/src/i18n.ts");
+    const { billingPage } = await import("../console/src/pages/billing.ts");
+    setConsoleLocale("en");
+    const active = state;
+    active.setApiOrigin(fixture.origin);
+    stopIdentity = active.observeSessionIdentity(() => {});
+    const showBilling = async (subject: string) => {
+      expect(
+        await active.signInSession(
+          "google",
+          await fixture.assertion(subject),
+          "operator-assertion",
+        ),
+      ).toBe(true);
+      await waitFor(
+        `${subject} authenticated roster`,
+        () => active.organizationPageState() !== "loading",
+      );
+      expect(active.principal()?.id).toBe(subject);
+      const org = `org-${subject}`;
+      active.selectOrganization(org);
+      expect(active.currentOrganization()?.id).toBe(org);
+      const page = billingPage(org);
+      if (!(page instanceof ConsoleTestNode)) throw new Error("Console billing page missing");
+      dom.root.replaceChildren(page);
+    };
+    const uncharged = () =>
+      statValue(dom.root, "Available") === "$20" &&
+      statValue(dom.root, "Included usage") === "0%" &&
+      workspaceUsed(dom.root, "Organization total") === "—" &&
+      workspaceUsed(dom.root, "Unattributed") === "—";
+    await showBilling("logout-a");
+    await waitFor("uncharged provider wallet", uncharged);
+
+    // Only placement is a precondition. The original maintenance pass creates
+    // all usage, checkpoint, and debit records from the inert meter source.
+    await createResourceDeploymentStore(fixture.sql, () => new Date(from)).create({
+      tenantId: ownerOrg,
+      id: deploymentId,
+      resourceUid,
+      offeringId: offering.id,
+      providerPackRef: providerId,
+      providerInstallationRef: offering.providerInstallationRef,
+      nativeId: "local:metered-workload",
+      state: "active",
+      observed: {},
+      outputs: {},
+    });
+    // Fail after the measurement is durable, before its cursor can advance.
+    // Retry covers the same closed day and must reuse that exact usage row.
+    await fixture.sql.run(`
+      CREATE TEMP TRIGGER fail_provider_checkpoint BEFORE UPDATE OF cursor_at ON provider_meter_checkpoints
+      BEGIN SELECT RAISE(ABORT, 'fixture checkpoint write failure'); END
+    `);
+    expect(await fixture.tick()).toMatchObject({
+      providerMeterWindows: 0,
+      providerMeterFailures: [deploymentId],
+      meteredRows: 1,
+    });
+    expect(reads).toBe(1);
+    const readUsage = () =>
+      fixture.sql.query(
+        "SELECT request_id,org_id,resource_uid,meter,quantity,amount_micros,rollup_id FROM usage_events",
+      );
+    const usage = await readUsage();
+    expect(usage).toEqual([
+      {
+        request_id: expect.stringMatching(/^provider:/u),
+        org_id: ownerOrg,
+        resource_uid: resourceUid,
+        meter,
+        quantity: 2,
+        amount_micros: 3_000_000,
+        rollup_id: expect.any(String),
+      },
+    ]);
+    const readDebits = () =>
+      fixture.sql.query(
+        "SELECT org_id,type,ref,settled_delta_micros FROM ledger WHERE type IN ('usage_debit','capture')",
+      );
+    const debits = await readDebits();
+    expect(debits).toEqual([
+      {
+        org_id: ownerOrg,
+        type: "usage_debit",
+        ref: usage[0]?.rollup_id,
+        settled_delta_micros: -3_000_000,
+      },
+    ]);
+
+    await fixture.sql.run("DROP TRIGGER fail_provider_checkpoint");
+    now = new Date(now.getTime() + 300_000);
+    expect(await fixture.tick()).toMatchObject({
+      providerMeterWindows: 1,
+      providerMeterFailures: [],
+      meteredRows: 0,
+    });
+    expect(
+      await fixture.sql.query(
+        "SELECT tenant_id,deployment_id,meter_source_id,cursor_at FROM provider_meter_checkpoints",
+      ),
+    ).toEqual([
+      {
+        tenant_id: ownerOrg,
+        deployment_id: deploymentId,
+        meter_source_id: "local-provider-usage",
+        cursor_at: Date.parse(until),
+      },
+    ]);
+    expect(await fixture.tick()).toMatchObject({
+      providerMeterWindows: 0,
+      providerMeterFailures: [],
+      meteredRows: 0,
+    });
+    expect(reads).toBe(2);
+    expect(await readUsage()).toEqual(usage);
+    expect(await readDebits()).toEqual(debits);
+
+    find(
+      dom.root,
+      (node) => node.tag === "button" && node.textContent === "Refresh balance and usage",
+    ).click();
+    await waitFor(
+      "priced provider usage in Console",
+      () =>
+        statValue(dom.root, "Available") === "$17" &&
+        statValue(dom.root, "Included usage") === "15%" &&
+        workspaceUsed(dom.root, "Organization total") === "$3" &&
+        workspaceUsed(dom.root, "Unattributed") === "$3",
+    );
+    await active.signOut();
+    await showBilling("logout-b");
+    await waitFor("unrelated Organization provider usage", uncharged);
+    expect(
+      (
+        await fixture.transport(
+          `${fixture.origin}/v1/organizations/${ownerOrg}/wallet/usage-summary`,
+          { credentials: "include" },
+        )
+      ).status,
+    ).toBe(404);
+    expect(await readUsage()).toEqual(usage);
+    expect(await readDebits()).toEqual(debits);
+  } finally {
+    try {
+      stopIdentity?.();
+      state?.session.set(null);
+      state?.sessionKind.set(null);
+      if (host) await waitFor("provider Host IO drained", () => host?.pending() === 0);
+      await tick();
+    } finally {
+      try {
+        host?.close();
+      } finally {
+        dom.restore();
+      }
+    }
+  }
+}, 10_000);
 
 test("an original measured AI operation settles once, rolls up without a second charge, and reaches its own Console wallet and usage", async () => {
   const dom = installConsoleTestDom("https://console.measured-usage.test/billing");
