@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   type BigIntStats,
@@ -652,15 +651,18 @@ function defaultPublicationLeaseRoot(): string {
     if (uid !== undefined && uid === process.getuid?.()) {
       // Bun's userInfo() reads HOME. Query the Linux account database to keep
       // both the lock and its owner record anchored to the Unix account.
-      const result = execFileSync("/usr/bin/getent", ["passwd", String(uid)], {
+      const result = Bun.spawnSync(["/usr/bin/getent", "passwd", String(uid)], {
         cwd: "/",
         env: { LC_ALL: "C" },
-        stdio: ["ignore", "pipe", "ignore"],
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "ignore",
         timeout: 5_000,
         killSignal: "SIGKILL",
         maxBuffer: 4096,
       });
-      const record = new TextDecoder("utf-8", { fatal: true }).decode(result);
+      if (!result.success) throw new Error("Unix account lookup failed");
+      const record = new TextDecoder("utf-8", { fatal: true }).decode(result.stdout);
       if (record.endsWith("\n") && !/[\n\r\0]/u.test(record.slice(0, -1))) {
         const fields = record.slice(0, -1).split(":");
         const homedir = fields[5];
