@@ -20,7 +20,7 @@ function info(claim = CLAIM, generation = 1n, cookie = COOKIE): Buffer {
   return frame;
 }
 function fixture(timeoutMs = 40) {
-  const root = mkdtempSync(join(process.cwd(), ".oci-parent-raw-"));
+  const root = mkdtempSync(join(process.env.TMPDIR ?? process.cwd(), ".oci-parent-raw-"));
   chmodSync(root, 0o700);
   const binary = join(root, "helper");
   writeFileSync(binary, "NONEXECUTED RAW FIXTURE", { mode: 0o700 });
