@@ -6,10 +6,7 @@ import {
   encodeContainerSecretBytes,
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
-import {
-  V2_CONTAINER_APPLICATION_IO_RESERVED,
-  V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
-} from "../src/takoform-v2/container-owner-schema.ts";
+import { V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
 import { acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
 import { originalPeerDeleteFixture } from "./linux-oci-peer-reconstruction.test.ts";
 
@@ -109,10 +106,15 @@ test("application-owner original live creator keeps graceful close and STOP whil
     expect(await f.engine.runNext()).toMatchObject({ status: "reconciling", effect: "unknown" });
     expect(f.nativeCounts().requests).toContain("linux-oci-stop-init@1");
     expect(f.nativeCounts().requests).not.toContain("linux-oci-parent-read-application-owner@1");
-    expect(
-      (await f.sql.query("SELECT application_io_cleanup FROM tf_v2_container_create_claims"))[0]
-        ?.application_io_cleanup,
-    ).toBe(V2_CONTAINER_APPLICATION_IO_RESERVED);
+    const [claim] = await f.sql.query(
+      "SELECT application_io_cleanup,allocation_cleanup FROM tf_v2_container_create_claims",
+    );
+    if (typeof claim?.application_io_cleanup !== "string")
+      throw new Error("original application I/O close fact missing");
+    const closeFact = JSON.parse(claim.application_io_cleanup);
+    expect(closeFact.kind).toBe("linux-oci-sealed-application-io-close@1");
+    expect(closeFact.scope?.purpose).toBe("takoserver.linux-oci-application-io-close@1");
+    expect(claim.allocation_cleanup).toBe("untouched");
   } finally {
     await f.cleanup();
   }
