@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   type BigIntStats,
@@ -16,7 +17,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { userInfo } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { DeployError, mutationError, preflightError } from "./errors.ts";
 import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
@@ -648,17 +648,33 @@ function publicationLeasePaths(input: {
 
 function defaultPublicationLeaseRoot(): string {
   try {
-    // The OS account home is stable across per-process HOME and scratch overrides.
-    const { homedir, uid } = userInfo();
-    if (isAbsolute(homedir) && process.getuid?.() === uid) {
-      const state = lstatSync(homedir);
-      if (
-        state.isDirectory() &&
-        !state.isSymbolicLink() &&
-        state.uid === uid &&
-        (state.mode & 0o022) === 0
-      ) {
-        return join(homedir, ".takoserver-worker-publication-locks");
+    const uid = process.geteuid?.();
+    if (uid !== undefined && uid === process.getuid?.()) {
+      // Bun's userInfo() reads HOME. Query the Linux account database to keep
+      // both the lock and its owner record anchored to the Unix account.
+      const result = execFileSync("/usr/bin/getent", ["passwd", String(uid)], {
+        cwd: "/",
+        env: { LC_ALL: "C" },
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 5_000,
+        killSignal: "SIGKILL",
+        maxBuffer: 4096,
+      });
+      const record = new TextDecoder("utf-8", { fatal: true }).decode(result);
+      if (record.endsWith("\n") && !/[\n\r\0]/u.test(record.slice(0, -1))) {
+        const fields = record.slice(0, -1).split(":");
+        const homedir = fields[5];
+        if (fields.length === 7 && fields[2] === String(uid) && homedir && isAbsolute(homedir)) {
+          const state = lstatSync(homedir);
+          if (
+            state.isDirectory() &&
+            !state.isSymbolicLink() &&
+            state.uid === uid &&
+            (state.mode & 0o022) === 0
+          ) {
+            return join(homedir, ".takoserver-worker-publication-locks");
+          }
+        }
       }
     }
   } catch {

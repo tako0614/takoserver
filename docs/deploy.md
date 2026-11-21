@@ -17,10 +17,12 @@ bun run deploy -- <surface> --apply --environment=<integration|rehearsal|product
 
 The default Worker publication lock lives in `.takoserver-worker-publication-locks`
 under the Unix account's home and is keyed by Cloudflare account and Worker name.
-Process scratch directories can vary while publications still share the lock.
-Finish in-flight Worker publications using the earlier temporary-directory locks
-before switching to the home-directory lock. The two roots hold separate kernel
-locks.
+On Linux, the default lock uses `/usr/bin/getent passwd` to resolve the
+effective user's account home. Processes with different `HOME` or `TMPDIR`
+values share that account's lock. If the account home cannot be verified,
+publication stops at preflight. Before upgrading a writer, finish any in-flight
+publication using an earlier scratch or alternate home lock so its kernel lock
+has been released.
 
 Catalog Offering IDs are durable references shared by the catalog, provision
 tokens, and Deployments: they must be 3–255 characters and use the token
