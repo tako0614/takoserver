@@ -5,15 +5,9 @@ import {
   createSignedConsoleHost,
   installConsoleTestDom,
 } from "./helpers/console-local-host.ts";
+import { waitForConsole as waitFor } from "./helpers/console-test-wait.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 250; count++) {
-    if (check()) return;
-    await tick();
-  }
-  throw new Error(`local snapshot recovery did not reach ${label}`);
-}
 function find(root: ConsoleTestNode, check: (node: ConsoleTestNode) => boolean): ConsoleTestNode {
   const node = root.all().find(check);
   if (!node) throw new Error("actual snapshot recovery control missing");

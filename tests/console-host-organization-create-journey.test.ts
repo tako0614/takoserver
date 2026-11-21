@@ -4,15 +4,9 @@ import {
   createSignedConsoleHost,
   installConsoleTestDom,
 } from "./helpers/console-local-host.ts";
+import { waitForConsole as waitFor } from "./helpers/console-test-wait.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 200; count++) {
-    if (check()) return;
-    await tick();
-  }
-  throw new Error(`local organization journey did not reach ${label}`);
-}
 function find(root: ConsoleTestNode, check: (node: ConsoleTestNode) => boolean): ConsoleTestNode {
   const node = root.all().find(check);
   if (!node) throw new Error("actual organization journey control missing");
@@ -48,6 +42,7 @@ test("actual Console creates a first and paged Organization, then selects only a
   let createHeld = false;
   let state: typeof import("../console/src/state.ts") | undefined;
   let host: Awaited<ReturnType<typeof createSignedConsoleHost>> | undefined;
+  let cleanupFailure: { error: unknown } | undefined;
   const pages: Array<{ bounded: boolean; rows: number; cursor: boolean; next: boolean }> = [];
   try {
     host = await createSignedConsoleHost(dom.origin, {
@@ -220,16 +215,27 @@ test("actual Console creates a first and paged Organization, then selects only a
       ),
     ).toBe(true);
   } finally {
-    releaseCreate();
-    if (state) {
-      state.session.set(null);
-      state.sessionKind.set(null);
+    try {
+      try {
+        releaseCreate();
+        if (state) {
+          state.session.set(null);
+          state.sessionKind.set(null);
+        }
+        await tick();
+        await tick();
+        if (host) await waitFor("original Host IO drained", () => host?.pending() === 0);
+      } finally {
+        globalThis.fetch = dom.originalFetch;
+        try {
+          host?.close();
+        } finally {
+          dom.restore();
+        }
+      }
+    } catch (error) {
+      cleanupFailure = { error };
     }
-    await tick();
-    await tick();
-    for (let count = 0; count < 200 && host && host.pending() > 0; count++) await tick();
-    globalThis.fetch = dom.originalFetch;
-    host?.close();
-    dom.restore();
   }
+  if (cleanupFailure) throw cleanupFailure.error;
 }, 10_000);

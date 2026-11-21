@@ -4,15 +4,9 @@ import {
   createSignedConsoleHost,
   installConsoleTestDom,
 } from "./helpers/console-local-host.ts";
+import { waitForConsole as waitFor } from "./helpers/console-test-wait.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 200; count++) {
-    if (check()) return;
-    await tick();
-  }
-  throw new Error(`local logout journey did not reach ${label}`);
-}
 function gate() {
   let release = (): void => {
     throw new Error("local IO gate not initialized");
@@ -54,6 +48,7 @@ test("actual UI logout delivers cookie expiry before a replacement signed login 
   let logoutWaiting = false;
   let state: typeof import("../console/src/state.ts") | undefined;
   let host: Awaited<ReturnType<typeof createSignedConsoleHost>> | undefined;
+  let cleanupFailure: { error: unknown } | undefined;
   try {
     host = await createSignedConsoleHost(dom.origin, {
       beforeHost: async (request) => {
@@ -187,17 +182,28 @@ test("actual UI logout delivers cookie expiry before a replacement signed login 
       ),
     ).toBe(true);
   } finally {
-    read.release();
-    logout.release();
-    if (state) {
-      state.session.set(null);
-      state.sessionKind.set(null);
+    try {
+      try {
+        read.release();
+        logout.release();
+        if (state) {
+          state.session.set(null);
+          state.sessionKind.set(null);
+        }
+        await tick();
+        await tick();
+        if (host) await waitFor("original Host IO drained", () => host?.pending() === 0);
+      } finally {
+        globalThis.fetch = dom.originalFetch;
+        try {
+          host?.close();
+        } finally {
+          dom.restore();
+        }
+      }
+    } catch (error) {
+      cleanupFailure = { error };
     }
-    await tick();
-    await tick();
-    for (let count = 0; count < 200 && host && host.pending() > 0; count++) await tick();
-    globalThis.fetch = dom.originalFetch;
-    host?.close();
-    dom.restore();
   }
+  if (cleanupFailure) throw cleanupFailure.error;
 }, 10_000);

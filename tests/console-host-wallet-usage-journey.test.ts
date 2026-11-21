@@ -5,15 +5,9 @@ import {
   createSignedConsoleHost,
   installConsoleTestDom,
 } from "./helpers/console-local-host.ts";
+import { waitForConsole as waitFor } from "./helpers/console-test-wait.ts";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 250; count++) {
-    if (check()) return;
-    await tick();
-  }
-  throw new Error(`local wallet journey did not reach ${label}`);
-}
 function find(root: ConsoleTestNode, check: (node: ConsoleTestNode) => boolean): ConsoleTestNode {
   const node = root.all().find(check);
   if (!node) throw new Error("actual wallet journey control missing");
@@ -79,6 +73,7 @@ test("actual Host wallet and included usage render original SQL history and reti
   const held = new Set<string>();
   let state: typeof import("../console/src/state.ts") | undefined;
   let host: Awaited<ReturnType<typeof createSignedConsoleHost>> | undefined;
+  let cleanupFailure: { error: unknown } | undefined;
   try {
     host = await createSignedConsoleHost(
       dom.origin,
@@ -281,17 +276,28 @@ test("actual Host wallet and included usage render original SQL history and reti
       true,
     );
   } finally {
-    holdA = false;
-    releaseReads();
-    if (state) {
-      state.session.set(null);
-      state.sessionKind.set(null);
+    try {
+      try {
+        holdA = false;
+        releaseReads();
+        if (state) {
+          state.session.set(null);
+          state.sessionKind.set(null);
+        }
+        await tick();
+        await tick();
+        if (host) await waitFor("original Host IO drained", () => host?.pending() === 0);
+      } finally {
+        globalThis.fetch = dom.originalFetch;
+        try {
+          host?.close();
+        } finally {
+          dom.restore();
+        }
+      }
+    } catch (error) {
+      cleanupFailure = { error };
     }
-    await tick();
-    await tick();
-    for (let count = 0; count < 250 && host && host.pending() > 0; count++) await tick();
-    globalThis.fetch = dom.originalFetch;
-    host?.close();
-    dom.restore();
   }
+  if (cleanupFailure) throw cleanupFailure.error;
 }, 10_000);

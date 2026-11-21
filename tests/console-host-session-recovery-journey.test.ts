@@ -7,6 +7,7 @@ import { base64UrlEncode } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { waitForConsole as waitFor } from "./helpers/console-test-wait.ts";
 import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const globals = [
@@ -169,13 +170,6 @@ const NOW = "2026-11-13T00:00:00.000Z";
 const ORG_A = "org-recovery-a";
 const ORG_B = "org-recovery-b";
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 200; count++) {
-    if (check()) return;
-    await tick();
-  }
-  throw new Error(`local session recovery did not reach ${label}`);
-}
 function button(label: string): TestNode {
   const found = root.all().find((node) => node.tag === "button" && node.textContent === label);
   if (!found) throw new Error("local session recovery control missing");

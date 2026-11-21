@@ -6,6 +6,7 @@ import { bytesDigest } from "../src/json.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { waitForConsole as waitFor } from "./helpers/console-test-wait.ts";
 import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const globals = [
@@ -164,13 +165,6 @@ const ORG = "org-owner-100";
 const FOREIGN = "org-other-only";
 const KEY_NAME = "journey-reader";
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 200; count++) {
-    if (check()) return;
-    await tick();
-  }
-  throw new Error(`local key journey did not reach ${label}`);
-}
 function button(label: string, parent = body): TestNode {
   const found = parent.all().find((node) => node.tag === "button" && node.textContent === label);
   if (!found) throw new Error("local key journey control missing");
