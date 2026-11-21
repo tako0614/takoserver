@@ -9,11 +9,12 @@ import {
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 250; count++) {
-    if (check()) return;
-    await tick();
+  const deadline = performance.now() + 3_000;
+  while (!check()) {
+    if (performance.now() >= deadline)
+      throw new Error(`local measured journey did not reach ${label}`);
+    await Bun.sleep(10);
   }
-  throw new Error(`local measured journey did not reach ${label}`);
 }
 function find(root: ConsoleTestNode, check: (node: ConsoleTestNode) => boolean): ConsoleTestNode {
   const node = root.all().find(check);
@@ -128,6 +129,7 @@ test("an original measured AI operation settles once, rolls up without a second 
   let state: typeof import("../console/src/state.ts") | undefined;
   let host: Awaited<ReturnType<typeof createSignedConsoleHost>> | undefined;
   let apiSecret = "";
+  let cleanupFailure: { error: unknown } | undefined;
   try {
     host = await createSignedConsoleHost(dom.origin, {}, billing, gateway);
     const fixture = host;
@@ -322,15 +324,26 @@ test("an original measured AI operation settles once, rolls up without a second 
   } finally {
     apiSecret = "";
     upstreamAuthorization = "";
-    if (state) {
-      state.session.set(null);
-      state.sessionKind.set(null);
+    try {
+      try {
+        if (state) {
+          state.session.set(null);
+          state.sessionKind.set(null);
+        }
+        await tick();
+        await tick();
+        if (host) await waitFor("original Host IO drained", () => host?.pending() === 0);
+      } finally {
+        globalThis.fetch = dom.originalFetch;
+        try {
+          host?.close();
+        } finally {
+          dom.restore();
+        }
+      }
+    } catch (error) {
+      cleanupFailure = { error };
     }
-    await tick();
-    await tick();
-    for (let count = 0; count < 250 && host && host.pending() > 0; count++) await tick();
-    globalThis.fetch = dom.originalFetch;
-    host?.close();
-    dom.restore();
   }
+  if (cleanupFailure) throw cleanupFailure.error;
 }, 10_000);
