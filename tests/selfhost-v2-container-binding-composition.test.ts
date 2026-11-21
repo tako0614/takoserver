@@ -37,7 +37,11 @@ import type {
   WorkerdStaticSite,
 } from "../src/workerd-runtime.ts";
 import { compileWorkerdVersionGraph } from "../src/workerd-version-graph.ts";
-import { observeRawPromise, ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
+import {
+  observeRawPromise,
+  ownedRawHttp,
+  rawTick,
+} from "./helpers/container-http-transport-fixture.ts";
 import { bindingOriginal, rawNativeOwner } from "./linux-oci-container-binding-broker.test.ts";
 import { originalOciNodeBindingFixture } from "./selfhost-linux-container-node-composition.test.ts";
 

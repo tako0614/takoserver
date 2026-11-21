@@ -14,9 +14,13 @@ import {
   V2_CONTAINER_APPLICATION_IO_RESERVED,
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
-import { observeRawPromise, ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
-import { acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
-import { originalPeerDeleteFixture } from "./linux-oci-peer-reconstruction.test.ts";
+import {
+  observeRawPromise,
+  ownedRawHttp,
+  rawTick,
+} from "./helpers/container-http-transport-fixture.ts";
+import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
+import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // NONSECRET memorySQL/raw streams only. The explicit durable-application prefix
 // is selected; imported prior cases are registered but never invoked.

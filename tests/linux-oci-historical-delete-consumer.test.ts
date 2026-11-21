@@ -13,13 +13,13 @@ import {
   inspectV2ContainerOwnerSelectedSchema,
   V2_CONTAINER_OWNER_HISTORICAL_DELETE_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
-import { qualifiedNormalDeleteFixture } from "./linux-oci-normal-delete-consumer.test.ts";
+import { qualifiedNormalDeleteFixture } from "./helpers/linux-oci-normal-delete-fixture.ts";
+import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 import {
   acceptNormalUpdate,
   normalUpdateAlternateTopology,
   runNormalUpdateStep,
 } from "./linux-oci-normal-update-history-delete.test.ts";
-import { acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
 
 // Genuine original factory/Engine/crypto/atomic memorySql, raw process/HTTP
 // interception only. Assertions stay outside callbacks swallowed by Engine.

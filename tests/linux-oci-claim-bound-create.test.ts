@@ -10,7 +10,7 @@ import {
   V2_CONTAINER_CONTROL_RESERVED,
   V2_CONTAINER_OWNER_CONTROL_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
-import { originalOwnedOciFixture } from "./linux-oci-owned-bundle.test.ts";
+import { originalOwnedOciFixture } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 
 // Explicit NONSECRET test-only key/capability/nonce bytes. All native spawn and
 // streams are the original closed fixture, never actual umoci/P/H/AF_UNIX.

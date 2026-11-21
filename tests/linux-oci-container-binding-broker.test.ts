@@ -29,12 +29,16 @@ import {
   workerdServiceBindingRouterName,
   workerdV2ServiceBindingBrokerSocketPath,
 } from "../src/workerd-runtime.ts";
-import { observeRawPromise, ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
+import {
+  observeRawPromise,
+  ownedRawHttp,
+  rawTick,
+} from "./helpers/container-http-transport-fixture.ts";
 import {
   acceptedHttpSelection,
   acceptedRawHttp,
   originalOwnedOciFixture,
-} from "./linux-oci-owned-bundle.test.ts";
+} from "./helpers/linux-oci-owned-bundle-fixture.ts";
 
 // Only the selected new cases execute. Imported old case bodies never run.
 // Original signed Core/Engine/OCI creator + memorySQLite + raw P/H/HTTP streams.

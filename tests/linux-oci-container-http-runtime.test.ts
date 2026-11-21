@@ -1,11 +1,15 @@
 import { expect, spyOn, test } from "bun:test";
 import * as net from "node:net";
-import { observeRawPromise, ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
+import {
+  observeRawPromise,
+  ownedRawHttp,
+  rawTick,
+} from "./helpers/container-http-transport-fixture.ts";
 import {
   acceptedHttpSelection,
   acceptedRawHttp,
   originalOwnedOciFixture,
-} from "./linux-oci-owned-bundle.test.ts";
+} from "./helpers/linux-oci-owned-bundle-fixture.ts";
 
 // Original signed Core/acceptance/Engine/creator, memorySQLite and intercepted
 // P/H/HTTP streams only. Imported prior cases are filtered, never invoked.

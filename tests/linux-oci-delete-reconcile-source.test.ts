@@ -3,7 +3,7 @@ import {
   acceptNormalDelete,
   normalCreate,
   originalPeerDeleteFixture,
-} from "./linux-oci-peer-reconstruction.test.ts";
+} from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // Only this new selector runs. Actual original accepted Core/Engine/creator,
 // fresh memorySQLite and intercepted peer streams; imported prior cases never run.

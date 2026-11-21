@@ -8,11 +8,12 @@ import {
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 250; count++) {
-    if (check()) return;
-    await tick();
+  const deadline = performance.now() + 3_000;
+  while (!check()) {
+    if (performance.now() >= deadline)
+      throw new Error(`local billing refresh did not reach ${label}`);
+    await Bun.sleep(10);
   }
-  throw new Error(`local billing refresh did not reach ${label}`);
 }
 function find(root: ConsoleTestNode, check: (node: ConsoleTestNode) => boolean): ConsoleTestNode {
   const node = root.all().find(check);
@@ -70,6 +71,7 @@ test("ordinary billing refresh reads current Host balances and usage without nav
   const held = new Set<string>();
   let state: typeof import("../console/src/state.ts") | undefined;
   let host: Awaited<ReturnType<typeof createSignedConsoleHost>> | undefined;
+  let cleanupFailure: { error: unknown } | undefined;
   try {
     host = await createSignedConsoleHost(
       dom.origin,
@@ -220,17 +222,27 @@ test("ordinary billing refresh reads current Host balances and usage without nav
       ),
     ).toBe(true);
   } finally {
-    releaseReads();
-    if (state) {
-      state.session.set(null);
-      state.sessionKind.set(null);
-      await tick();
-      await tick();
+    try {
+      try {
+        releaseReads();
+        if (state) {
+          state.session.set(null);
+          state.sessionKind.set(null);
+          await tick();
+          await tick();
+        }
+        if (host) await waitFor("original Host IO drained", () => host?.pending() === 0);
+      } finally {
+        try {
+          host?.close();
+        } finally {
+          dom.restore();
+        }
+      }
+    } catch (error) {
+      cleanupFailure = { error };
     }
-    if (host) {
-      await waitFor("original Host IO drained", () => host?.pending() === 0);
-      host.close();
-    }
-    dom.restore();
   }
+  // A failure from the test body propagates through cleanup.
+  if (cleanupFailure) throw cleanupFailure.error;
 }, 10_000);

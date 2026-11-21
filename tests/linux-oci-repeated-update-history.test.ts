@@ -2,13 +2,16 @@ import { expect, spyOn, test } from "bun:test";
 import { CONTAINER_CONTRACT as C } from "../src/container-contract.ts";
 import { isJsonObject } from "../src/json.ts";
 import { V2_CONTAINER_OWNER_HISTORICAL_DELETE_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
-import { ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
-import { qualifiedNormalDeleteFixture } from "./linux-oci-normal-delete-consumer.test.ts";
+import { ownedRawHttp, rawTick } from "./helpers/container-http-transport-fixture.ts";
+import { qualifiedNormalDeleteFixture } from "./helpers/linux-oci-normal-delete-fixture.ts";
+import {
+  acceptedHttpSelection,
+  acceptedRawHttp,
+} from "./helpers/linux-oci-owned-bundle-fixture.ts";
 import {
   normalUpdateAlternateTopology,
   runNormalUpdateStep,
 } from "./linux-oci-normal-update-history-delete.test.ts";
-import { acceptedHttpSelection, acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
 
 type Fixture = Awaited<ReturnType<typeof qualifiedNormalDeleteFixture>>["f"];
 async function update(f: Fixture, uid: string, generation: number) {

@@ -7,8 +7,8 @@ import {
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
 import { V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
-import { acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
-import { originalPeerDeleteFixture } from "./linux-oci-peer-reconstruction.test.ts";
+import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
+import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // NONSECRET fixture keys/raw streams, fresh memorySql/files, original normal
 // factory/Engine. Imported old cases are registered but filtered, NEVER invoked.

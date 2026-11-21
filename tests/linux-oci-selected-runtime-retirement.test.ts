@@ -6,8 +6,8 @@ import {
   encodeContainerSecretBytes,
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
-import { acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
-import { originalPeerDeleteFixture } from "./linux-oci-peer-reconstruction.test.ts";
+import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
+import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // Explicit NONSECRET fresh memorySql/original normal factory/raw streams.
 // Imported old tests register but only selected-runtime names are invoked.

@@ -7,9 +7,16 @@ import {
   snapshotLinuxOciTopologyPair,
 } from "../src/providers/linux-oci-host-topology.ts";
 import * as originalBundle from "../src/providers/linux-oci-owned-bundle.ts";
-import { observeRawPromise, ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
-import { qualifiedNormalDeleteFixture } from "./linux-oci-normal-delete-consumer.test.ts";
-import { acceptedHttpSelection, acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
+import {
+  observeRawPromise,
+  ownedRawHttp,
+  rawTick,
+} from "./helpers/container-http-transport-fixture.ts";
+import { qualifiedNormalDeleteFixture } from "./helpers/linux-oci-normal-delete-fixture.ts";
+import {
+  acceptedHttpSelection,
+  acceptedRawHttp,
+} from "./helpers/linux-oci-owned-bundle-fixture.ts";
 
 // Original normal creator/Engine, real crypto and atomic memorySQLite. Native
 // processes/HTTP syscalls alone are intercepted. All assertions escape Engine.

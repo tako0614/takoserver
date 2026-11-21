@@ -1,8 +1,12 @@
 import { expect, spyOn, test } from "bun:test";
 import * as originalBundle from "../src/providers/linux-oci-owned-bundle.ts";
-import { observeRawPromise, ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
-import { acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
-import { originalPeerDeleteFixture } from "./linux-oci-peer-reconstruction.test.ts";
+import {
+  observeRawPromise,
+  ownedRawHttp,
+  rawTick,
+} from "./helpers/container-http-transport-fixture.ts";
+import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
+import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // Original accepted Core/normal Engine/creator and actual transport bodies.
 // NONSECRET memorySQLite + intercepted child/HTTP streams; imported cases never run.

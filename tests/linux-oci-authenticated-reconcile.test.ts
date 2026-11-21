@@ -9,7 +9,7 @@ import {
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
 import { V2_CONTAINER_CONTROL_RESERVED } from "../src/takoform-v2/container-owner-schema.ts";
-import { originalOwnedOciFixture } from "./linux-oci-owned-bundle.test.ts";
+import { originalOwnedOciFixture } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 
 // Explicit NONSECRET keys/random bytes, real fresh memorySQLite/engine/owner,
 // existing raw spawn+streams. No actual P/H/net/runc/AF_UNIX effects. The old
