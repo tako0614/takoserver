@@ -293,3 +293,14 @@ for (const path of ["src/index.ts", "src/provider-extension.ts", "src/takoform-v
     expect(result.stderr).toContain(`imports ${CONTAINER} (v2-container-owner-schema)`);
   });
 }
+
+test("a Workers entry cannot reach the Linux Container Node composition", async () => {
+  const entry = "src/entry-worker.ts";
+  const composition = "src/selfhost-linux-container-node-composition.ts";
+  const result = await probe((files) => {
+    files.set(entry, 'import "./selfhost-linux-container-node-composition.ts";\n');
+    files.set(composition, "export {};\n");
+  });
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain(`${entry} transitively imports host-only module ${composition}`);
+});

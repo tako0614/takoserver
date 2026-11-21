@@ -5,15 +5,16 @@ import {
   v2ConfiguredUpdateDiscardTransition,
   v2FinalDeleteConfiguredUpdateDiscardTransition,
 } from "../src/takoform-v2/configured-update-inputs-schema.ts";
-import {
-  V2_CONTAINER_APPLICATION_IO_RESERVED,
-  V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
-  V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
-} from "../src/takoform-v2/container-owner-schema.ts";
-import * as hostAcceptance from "../src/takoform-v2/host-acceptance.ts";
+import * as containerOwnerSchema from "../src/takoform-v2/container-owner-schema.ts";
 import { observeRawPromise, ownedRawHttp, rawTick } from "./container-http-transport.test.ts";
 import { acceptedRawHttp } from "./linux-oci-owned-bundle.test.ts";
 import { originalPeerDeleteFixture } from "./linux-oci-peer-reconstruction.test.ts";
+
+const {
+  V2_CONTAINER_APPLICATION_IO_RESERVED,
+  V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
+} = containerOwnerSchema;
 
 // Explicit NONSECRET bytes inside the original factory; actual normal Engine,
 // Core, crypto, atomic memorySQLite and closed raw P/H/HTTP model. Old registered
@@ -603,19 +604,36 @@ test("normal-delete-consumer reports unknown at the deadline and resumes the sam
 }, 20000);
 
 test("normal-delete-consumer delayed original UPDATE prepare cannot recapture secrets or cancel the final DELETE while another Resource is retained", async () => {
-  const { f, accepted } = await live();
-  const originalBuilder = hostAcceptance.prepareV2HostAcceptance;
   const descriptor = Object.getOwnPropertyDescriptor(Promise.prototype, "then");
   if (!descriptor) throw Error("NONSECRET original Promise descriptor absent");
   const originalThen = Promise.prototype.then,
     originalSet = Map.prototype.set;
-  let captured: Parameters<typeof originalBuilder>[1] | undefined;
-  let otherContext: Parameters<typeof originalBuilder>[1] | undefined;
+  const originalFactory = containerOwnerSchema.createV2ContainerHostAcceptance;
+  type Prepare = ReturnType<typeof originalFactory>["prepare"];
+  type Context = Parameters<Prepare>[0];
+  type Prepared = NonNullable<ReturnType<Prepare>>;
+  let observePrepare: ((context: Context, prepared: Prepared) => void) | undefined;
+  const factory = spyOn(containerOwnerSchema, "createV2ContainerHostAcceptance").mockImplementation(
+    (options) => {
+      const original = originalFactory(options);
+      return Object.freeze({
+        ...original,
+        prepare(context: Context) {
+          const prepared = original.prepare(context);
+          if (prepared !== undefined) observePrepare?.(context, prepared);
+          return prepared;
+        },
+      });
+    },
+  );
+  const { f, accepted } = await live().finally(() => factory.mockRestore());
+  let captured: Context | undefined;
+  let otherContext: Context | undefined;
   let otherOwner: Map<unknown, unknown> | undefined;
-  const capturedContext = (): Parameters<typeof originalBuilder>[1] | undefined => captured;
+  const capturedContext = (): Context | undefined => captured;
   const retainedOwner = (): Map<unknown, unknown> | undefined => otherOwner;
-  let interceptNext = false,
-    delayed = false,
+  let updatePrepare: Prepared | undefined;
+  let delayed = false,
     callbackCalls = 0,
     retained = 0,
     finalAwait = false;
@@ -623,22 +641,21 @@ test("normal-delete-consumer delayed original UPDATE prepare cannot recapture se
   const gate = new Promise<void>((resolve) => {
     release = resolve;
   });
-  const builder = spyOn(hostAcceptance, "prepareV2HostAcceptance").mockImplementation((...args) => {
-    const original = originalBuilder(...args);
-    if (args[1].action === "update" && args[1].resourceUid === accepted.resourceUid) {
-      captured = args[1];
-      interceptNext = true;
+  observePrepare = (context, prepared) => {
+    if (context.action === "update" && context.resourceUid === accepted.resourceUid) {
+      captured = context;
+      updatePrepare = prepared;
     }
-    if (args[1].action === "create" && args[1].resourceUid !== accepted.resourceUid)
-      otherContext = args[1];
-    return original; // same opaque prepared acceptance; never a replacement grant
-  });
+    if (context.action === "create" && context.resourceUid !== accepted.resourceUid)
+      otherContext = context;
+  };
   // biome-ignore lint/suspicious/noThenProperty: Raw fixture delays the actual Promise continuation.
   Object.defineProperty(Promise.prototype, "then", {
     ...descriptor,
     value: function (this: Promise<unknown>, fulfilled: unknown, rejected: unknown) {
-      if (!interceptNext) return Reflect.apply(originalThen, this, [fulfilled, rejected]);
-      interceptNext = false;
+      if (updatePrepare === undefined || this !== updatePrepare)
+        return Reflect.apply(originalThen, this, [fulfilled, rejected]);
+      updatePrepare = undefined;
       if (typeof fulfilled !== "function" || !String(fulfilled).includes("capture(context)"))
         throw Error("NONSECRET original Core capture callback not visited");
       delayed = true;
@@ -752,7 +769,8 @@ test("normal-delete-consumer delayed original UPDATE prepare cannot recapture se
     Object.defineProperty(Promise.prototype, "then", descriptor);
     batch.mockRestore();
     retaining.mockRestore();
-    builder.mockRestore();
+    observePrepare = undefined;
+    updatePrepare = undefined;
     captured = undefined;
     otherContext = undefined;
     await f.cleanup();
