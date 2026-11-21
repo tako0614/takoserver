@@ -8,6 +8,11 @@ import {
   type HostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
 
+// These fixtures must use the engine and routes from the same installed Core
+// module graph as their acceptance issuer.
+export { createTakoformV2Engine } from "../../src/takoform-v2/engine.ts";
+export { createTakoformV2Routes } from "../../src/takoform-v2/routes.ts";
+
 /**
  * The shape the operator's real integration target has: two supply halves that
  * name the *same* Cloudflare `SupplyContract`.
