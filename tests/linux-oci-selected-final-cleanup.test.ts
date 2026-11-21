@@ -185,13 +185,24 @@ test("selected-local retained disposal only continues original phase and consume
 test("selected-local missing actual H output EOF cannot authorize allocation cleanup", async () => {
   const x = await original({ hResultFault: "stdout" });
   try {
+    const original = await row(x);
+    expect(JSON.parse(String(original.application_io_cleanup)).kind).toBe(
+      "linux-oci-application-io-reserved@1",
+    );
     await remove(x);
     await until(x, "parent-read-result");
     expect(count(x, "dispose-born")).toBe(1);
     expect(count(x, "read-tracked-join")).toBe(0);
-    expect(await row(x)).toMatchObject({ allocation_cleanup: "untouched", removed_at_ms: null });
-    expect(JSON.parse(String((await row(x)).application_io_cleanup)).kind).toBe(
-      "linux-oci-application-io-reserved@1",
+    const closed = await row(x);
+    expect(closed).toMatchObject({
+      state: "bound",
+      allocation_cleanup: "untouched",
+      removed_at_ms: null,
+      native_control: original.native_control,
+    });
+    // The original I/O runtime can close before H output authorizes allocation cleanup.
+    expect(JSON.parse(String(closed.application_io_cleanup)).kind).toBe(
+      "linux-oci-sealed-application-io-close@1",
     );
     const before = requests(x).slice();
     await step(x);
@@ -199,10 +210,13 @@ test("selected-local missing actual H output EOF cannot authorize allocation cle
       "linux-oci-parent-read-outcome@2",
       "linux-oci-parent-read-result@1",
     ]); // Genuine retained P facts may be reread; no H effect is repeated.
-    expect(await row(x)).toMatchObject({ allocation_cleanup: "untouched", removed_at_ms: null });
-    expect(JSON.parse(String((await row(x)).application_io_cleanup)).kind).toBe(
-      "linux-oci-application-io-reserved@1",
-    );
+    expect(await row(x)).toMatchObject({
+      state: "bound",
+      allocation_cleanup: "untouched",
+      removed_at_ms: null,
+      native_control: original.native_control,
+      application_io_cleanup: closed.application_io_cleanup,
+    });
     expect(x.f.network).not.toHaveBeenCalled();
   } finally {
     await x.f.cleanup();
