@@ -169,21 +169,27 @@ test("shared-auth bootstrap adopts only after the oracle and /v1/me succeed", as
   }
 
   reset();
-  let calls = 0;
+  const unauthorizedRequests: string[] = [];
   globalThis.fetch = Object.assign(
-    async () => {
-      calls += 1;
-      return calls === 1
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const pathname = new URL(new Request(input, init).url).pathname;
+      unauthorizedRequests.push(pathname);
+      return pathname === "/auth/oidc/session"
         ? Response.json({ authenticated: true })
         : Response.json({ error: { code: "unauthenticated" } }, { status: 401 });
     },
     { preconnect: originalFetch.preconnect },
   );
-  await expect(state.bootstrapSharedSession()).rejects.toMatchObject({ status: 401 });
+  expect(await state.bootstrapSharedSession()).toBe(false);
+  expect(unauthorizedRequests).toEqual(["/auth/oidc/session", "/v1/me"]);
   expect(values.has("takoserver.session")).toBe(false);
+  expect(values.has("takoserver.session-kind")).toBe(false);
+  expect(state.session()).toBe(null);
+  expect(state.sessionKind()).toBe(null);
+  expect(state.principal()).toBe(null);
 
   reset();
-  calls = 0;
+  let calls = 0;
   globalThis.fetch = Object.assign(
     async () => {
       calls += 1;

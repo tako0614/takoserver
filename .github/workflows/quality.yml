@@ -76,4 +76,10 @@ jobs:
       - name: Run canonical Takoserver checks
         env:
           TAKOFORM_FORMS_ROOT: ${{ runner.temp }}/takoform-forms
-        run: bun run check
+        run: |
+          # The OCI fixture checks ownership on every component. The runner's
+          # home has a root-owned ancestor and /tmp is shared.
+          test_tmp="$(sudo mktemp -d /tks.XXXXXX)"
+          sudo chown "$(id -u):$(id -g)" "$test_tmp"
+          trap 'rmdir -- "$test_tmp" 2>/dev/null || true' EXIT
+          TMPDIR="$test_tmp" bun run check
