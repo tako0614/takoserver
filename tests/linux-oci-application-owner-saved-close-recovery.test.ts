@@ -373,10 +373,7 @@ test("saved-close-selection rejects transient application schema inspection loss
     let failed = false,
       ownerReads = 0;
     const read = spyOn(f.sql, "query").mockImplementation(async (sql, params) => {
-      if (
-        !failed &&
-        sql.startsWith("SELECT (WITH container_owner_application_io_values(document)")
-      ) {
+      if (!failed && sql.includes("container_owner_application_io_values(document)")) {
         failed = true;
         throw Error("NONSECRET only the first original app-schema query fails");
       }
