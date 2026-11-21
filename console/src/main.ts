@@ -428,13 +428,13 @@ function page(): Child {
   const organization = currentOrganization();
 
   if (!organization) {
+    const identity = principal();
     const pageState = organizationPageState();
     if (
-      pageState === "error" ||
-      (principal() !== null &&
-        (currentOrganizationId() !== null ||
-          organizations().length > 0 ||
-          organizationPageCursor() !== undefined))
+      identity !== null &&
+      (pageState === "error" ||
+        organizations().length > 0 ||
+        organizationPageCursor() !== undefined)
     ) {
       return card(
         null,
@@ -452,7 +452,7 @@ function page(): Child {
         ),
       );
     }
-    const knownIdentity = principal() !== null && pageState === "ready";
+    const knownIdentity = identity !== null && pageState === "ready";
     const canCreate = canCreateLocalOrganization();
     return card(
       null,

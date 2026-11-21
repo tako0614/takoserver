@@ -77,9 +77,13 @@ jobs:
         env:
           TAKOFORM_FORMS_ROOT: ${{ runner.temp }}/takoform-forms
         run: |
-          # The OCI fixture checks ownership on every component. The runner's
-          # home has a root-owned ancestor and /tmp is shared.
+          # The native executable fixture verifies every ancestor including /.
+          # Match the owning Linux gate's UID and keep its scratch private.
           test_tmp="$(sudo mktemp -d /tks.XXXXXX)"
-          sudo chown "$(id -u):$(id -g)" "$test_tmp"
-          trap 'rmdir -- "$test_tmp" 2>/dev/null || true' EXIT
-          TMPDIR="$test_tmp" bun run check
+          sudo mkdir -m 700 "$test_tmp/home"
+          trap 'sudo rmdir -- "$test_tmp/home" "$test_tmp" 2>/dev/null || true' EXIT
+          sudo -E env "HOME=$test_tmp/home" "PATH=$PATH" "TMPDIR=$test_tmp" \
+            GIT_CONFIG_COUNT=2 \
+            GIT_CONFIG_KEY_0=safe.directory "GIT_CONFIG_VALUE_0=$GITHUB_WORKSPACE" \
+            GIT_CONFIG_KEY_1=safe.directory "GIT_CONFIG_VALUE_1=$TAKOFORM_FORMS_ROOT" \
+            bun run check
