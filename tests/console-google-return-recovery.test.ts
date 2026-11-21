@@ -57,11 +57,12 @@ function find(root: ConsoleTestNode, check: (node: ConsoleTestNode) => boolean):
   return node;
 }
 async function waitFor(label: string, check: () => boolean): Promise<void> {
-  for (let count = 0; count < 250; count++) {
-    if (check()) return;
-    await tick();
+  const deadline = performance.now() + 3_000;
+  while (!check()) {
+    if (performance.now() >= deadline)
+      throw new Error(`Google callback recovery did not reach ${label}`);
+    await Bun.sleep(10);
   }
-  throw new Error(`Google callback recovery did not reach ${label}`);
 }
 
 beforeEach(() => {
@@ -190,6 +191,7 @@ test("Google callback preserves the original generated state, nonce and one-use 
 test("Google callback damaged pending resumes the actual Console sign-in and genuine local Host session", async () => {
   const fixture = await createSignedConsoleHost(dom.origin);
   globalThis.fetch = fixture.transport;
+  let cleanupFailure: { error: unknown } | undefined;
   try {
     state = await import("../console/src/state.ts");
     state.setApiOrigin(fixture.origin);
@@ -232,15 +234,36 @@ test("Google callback damaged pending resumes the actual Console sign-in and gen
     picker.change();
     await tick();
     expect(active.currentOrganization()?.id === "org-logout-a").toBe(true);
+    await waitFor("original Host overview requests", () => fixture.pending() === 0);
+    expect(
+      fixture.requests
+        .filter((request) => request.method !== "GET")
+        .map(({ method, path, status }) => ({ method, path, status })),
+    ).toEqual([{ method: "POST", path: "/v1/sessions", status: 200 }]);
+    expect(
+      fixture.requests.some(
+        (request) =>
+          request.method === "GET" && request.path === "/v1/me" && request.status === 200,
+      ),
+    ).toBe(true);
   } finally {
-    if (state) {
-      state.session.set(null);
-      state.sessionKind.set(null);
-      await tick();
-      await tick();
+    try {
+      try {
+        if (state) {
+          state.session.set(null);
+          state.sessionKind.set(null);
+          await tick();
+          await tick();
+        }
+        await waitFor("original Host IO complete", () => fixture.pending() === 0);
+      } finally {
+        globalThis.fetch = dom.originalFetch;
+        fixture.close();
+      }
+    } catch (error) {
+      cleanupFailure = { error };
     }
-    await waitFor("original Host IO complete", () => fixture.pending() === 0);
-    fixture.close();
-    globalThis.fetch = dom.originalFetch;
   }
+  // The assertion error takes precedence when the fixture also fails to settle.
+  if (cleanupFailure) throw cleanupFailure.error;
 }, 10_000);
