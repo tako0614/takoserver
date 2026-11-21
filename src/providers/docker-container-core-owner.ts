@@ -3356,16 +3356,15 @@ export function createDockerContainerCoreOwner(
           if (management) {
             if (typeof read === "function") return fail();
             let complete = false;
-            const application = originalLinuxOciHttpRetirementSource(
-              originalCustody,
-              result,
-              input,
-              signal,
-            );
             const applicationSchema = await inspectV2ContainerOwnerSelectedSchema(
               sql,
               "application-io",
             );
+            // The expanded schema persists the original close before helper
+            // completion. Legacy schemas keep the historical H-gated lookup.
+            let application = applicationSchema
+              ? originalLinuxOciHttpRetirementSource(originalCustody, result, input, signal)
+              : undefined;
             let applicationFactCurrent: (() => void) | undefined;
             const applicationLeaseSql = applicationSchema
               ? " AND EXISTS (SELECT 1 FROM tf_v2_operations WHERE id=? AND resource_uid=? AND lease_token=? AND lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000 AND status='reconciling' AND effect='unknown' AND dispatch_possible=1)"
@@ -3600,6 +3599,13 @@ export function createDockerContainerCoreOwner(
                 // Exact original P's H join/EOF record only; no removed CAS or
                 // allocation cleanup is authorized by this private handoff.
                 helper = read.observeHelperExited(signal);
+                if (!applicationSchema)
+                  application = originalLinuxOciHttpRetirementSource(
+                    originalCustody,
+                    result,
+                    input,
+                    signal,
+                  );
                 // H result remains separate from the I/O-only saved fact.
                 // Revocation ends this stage's wait, not the original close.
                 if (terminal && closeFinished)
