@@ -274,7 +274,7 @@ for (const fault of [
   });
 
 for (const fault of ["old-profile", "missing-owner", "foreign-owner"] as const)
-  test(`application-owner refuses validly sealed ${fault} origin without retrofit`, async () => {
+  test(`application-owner refuses a substituted sealed ${fault} read without retrofit`, async () => {
     const { f, row } = await original();
     f.applicationOwnerState(true);
     const sealed = JSON.parse(String(row.native_control)),
@@ -307,8 +307,16 @@ for (const fault of ["old-profile", "missing-owner", "foreign-owner"] as const)
     expect(roundtrip).toEqual(mutated);
     roundtrip.fill(0);
     mutated.fill(0);
-    const foreign = canonicalJson(sealed),
-      query = f.sql.query.bind(f.sql);
+    const foreign = canonicalJson(sealed);
+    const claimId = row.claim_id;
+    if (typeof claimId !== "string") throw new Error("original fixture claim ID missing");
+    await expect(
+      f.sql.run("UPDATE tf_v2_container_create_claims SET native_control=? WHERE claim_id=?", [
+        foreign,
+        claimId,
+      ]),
+    ).rejects.toMatchObject({ code: "constraint" });
+    const query = f.sql.query.bind(f.sql);
     let reached = false;
     const read = spyOn(f.sql, "query").mockImplementation(async (sql, params) => {
       const rows = await query(sql, params);
@@ -338,14 +346,8 @@ for (const fault of ["old-profile", "missing-owner", "foreign-owner"] as const)
         effect: "unknown",
       });
       expect(reached && refused).toBe(true);
-      expect(f.nativeCounts()).toEqual(
-        fault === "foreign-owner"
-          ? {
-              processes: before.processes + 1,
-              requests: [...before.requests, "linux-oci-parent-read-application-owner@1"],
-            }
-          : before,
-      );
+      // The selected control document must still match the owning SQL row.
+      expect(f.nativeCounts()).toEqual(before);
       expect((await query("SELECT * FROM tf_v2_container_create_claims"))[0]).toEqual(row);
     } finally {
       read.mockRestore();
