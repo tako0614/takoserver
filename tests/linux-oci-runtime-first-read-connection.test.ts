@@ -54,6 +54,8 @@ test("runtime-first-connection original READ and H result consume same applicati
       return actual;
     },
   );
+  let activeRun: ReturnType<typeof observeRawPromise> | undefined;
+  let joined: ReturnType<typeof observeRawPromise> | undefined;
   try {
     const response = f.composition.fetchServingHttp(
       f.recordedCreate(),
@@ -69,16 +71,28 @@ test("runtime-first-connection original READ and H result consume same applicati
       uid: accepted.resourceUid,
       expectedGeneration: 1,
     });
+    // The close source can be looked up earlier. Select the run that reads H's result.
+    const readHelperResult = () =>
+      f.nativeCounts().requests.includes("linux-oci-parent-read-result@1");
     let consuming: ReturnType<typeof observeRawPromise> | undefined;
     for (let phase = 0; phase < 16; phase++) {
       f.advanceNormalClock(61_000); // scheduling only; no real 30s qualification
+      const earlierSourceCount = sources.length;
       const running = observeRawPromise(f.engine.runNext());
-      for (let tick = 0; tick < 100 && running.state() === "pending" && !sources.length; tick++)
-        await rawTick();
-      if (sources.length) {
+      activeRun = running;
+      const readDeadline = performance.now() + 3_000;
+      while (
+        running.state() === "pending" &&
+        !readHelperResult() &&
+        performance.now() < readDeadline
+      )
+        await Bun.sleep(1);
+      if (readHelperResult()) {
+        expect(sources.length).toBeGreaterThan(earlierSourceCount);
         consuming = running;
         break;
       }
+      if (running.state() === "pending") throw Error("original runtime-first phase did not settle");
       expect(await running.value).toHaveProperty("result");
     }
     if (!consuming) throw Error("original runtime-first application consumer not reached");
@@ -86,8 +100,7 @@ test("runtime-first-connection original READ and H result consume same applicati
     if (!actual) throw Error("original application source missing");
     const close = actual.close();
     expect(actual.close()).toBe(close);
-    const joined = observeRawPromise(close);
-    for (let tick = 0; tick < 100 && sources.length < 3; tick++) await rawTick();
+    joined = observeRawPromise(close);
     expect(sources.length).toBeGreaterThanOrEqual(3);
     expect(sources.every((value) => value === actual)).toBe(true);
     expect(consuming.state()).toBe("pending");
@@ -162,9 +175,11 @@ test("runtime-first-connection original READ and H result consume same applicati
     expect(io.counts().calls).toBe(1);
     expect(f.network).not.toHaveBeenCalled();
   } finally {
-    source.mockRestore();
     io.closeResponse();
     io.closeRequest();
+    await joined?.value;
+    await activeRun?.value;
+    source.mockRestore();
     io.restore();
     await f.cleanup();
   }
