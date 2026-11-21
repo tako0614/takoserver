@@ -110,6 +110,16 @@ type OriginalOciCustody = {
 // Populated ONLY inside the real creator below. There is no registration API
 // and its opaque keys are never returned to a caller or serialized.
 const originalOciCustodies = new WeakMap<object, OriginalOciCustody>();
+const sealedCloseResumeBrand: unique symbol = Symbol("sealed-close-resume");
+const sealedCloseResumeTokens = new WeakMap<
+  object,
+  {
+    readonly original: object;
+    readonly core: DockerContainerCoreOwner;
+    readonly record: DockerContainerCreateRecord;
+    readonly signal: AbortSignal;
+  }
+>();
 // Only the current original CREATE loan may retain its environment-bearing
 // request. The persistent management record never owns this transient value.
 const originalParentRequests = new WeakMap<object, LinuxOciCreateStoppedRequest>();
@@ -605,6 +615,57 @@ async function prepareOriginalReadonlyPeer<T>(
   };
 }
 
+export interface LinuxOciSealedApplicationCloseResume {
+  readonly kind: "linux-oci-sealed-same-operation-close@1";
+  readonly [sealedCloseResumeBrand]: true;
+  assertCurrent(actualSignal: AbortSignal): Promise<void>;
+}
+
+/** Create an unforgeable continuation token only for an extant original
+ * runtime3 parent and its exact bound record. The caller's sealed-fact guard
+ * is rechecked by the token; it does not select or emit a native command. */
+export function createOriginalLinuxOciSealedApplicationCloseResume(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+  assertCurrent: () => Promise<void>,
+): LinuxOciSealedApplicationCloseResume | undefined {
+  const custody = originalOciCustodies.get(original);
+  if (
+    !custody ||
+    custody.core !== core ||
+    !custody.runtime3 ||
+    custody.signal.aborted ||
+    signal.aborted ||
+    record.state !== "bound" ||
+    !record.nativeId
+  )
+    return fail("parent_custody");
+  // A still-owned original session must keep its established detach route.
+  if (custody.sessions.has(record.claimId)) return undefined;
+  const token = Object.freeze({
+    kind: "linux-oci-sealed-same-operation-close@1" as const,
+    [sealedCloseResumeBrand]: true as const,
+    async assertCurrent(actualSignal: AbortSignal) {
+      const latest = originalOciCustodies.get(original);
+      if (
+        actualSignal !== signal ||
+        actualSignal.aborted ||
+        latest !== custody ||
+        latest.signal.aborted ||
+        latest.core !== core ||
+        !latest.runtime3 ||
+        latest.sessions.has(record.claimId)
+      )
+        return fail("parent_custody");
+      await assertCurrent();
+    },
+  });
+  sealedCloseResumeTokens.set(token, { original, core, record, signal });
+  return token;
+}
+
 export async function prepareOriginalLinuxOciPeerInit(
   original: object,
   core: DockerContainerCoreOwner,
@@ -612,7 +673,19 @@ export async function prepareOriginalLinuxOciPeerInit(
   artifact: unknown,
   binding: unknown,
   signal: AbortSignal,
+  sealedCloseResume?: LinuxOciSealedApplicationCloseResume,
 ) {
+  if (sealedCloseResume) {
+    const token = sealedCloseResumeTokens.get(sealedCloseResume);
+    if (
+      !token ||
+      token.original !== original ||
+      token.core !== core ||
+      token.record !== record ||
+      token.signal !== signal
+    )
+      return fail("parent_custody");
+  }
   const previous = originalOciCustodies.get(original)?.peerReads.get(record.claimId);
   if (previous) {
     if (
@@ -628,7 +701,7 @@ export async function prepareOriginalLinuxOciPeerInit(
     const joined = await Promise.race([previous.management.settlement, Promise.resolve(pending)]);
     if (joined === pending) return fail("parent_custody");
   }
-  const { custody, binary, allocation } = await authenticatedOriginalPeerSource(
+  const authenticated = await authenticatedOriginalPeerSource(
     original,
     core,
     record,
@@ -637,6 +710,7 @@ export async function prepareOriginalLinuxOciPeerInit(
     signal,
     previous,
   );
+  const { custody, binary, allocation } = authenticated;
   if (
     custody.peerReads.get(record.claimId) !== previous ||
     signal.aborted ||
@@ -731,8 +805,13 @@ export async function prepareOriginalLinuxOciPeerInit(
         return fail("parent_custody");
       if (custody.runtime3) {
         const session = custody.sessions.get(record.claimId);
-        if (!session) return fail("parent_custody");
-        await detachOriginalLinuxOciRuntimePeer(session, actualSignal);
+        if (session) {
+          await detachOriginalLinuxOciRuntimePeer(session, actualSignal);
+        } else {
+          if (sealedCloseResume?.kind !== "linux-oci-sealed-same-operation-close@1")
+            return fail("parent_custody");
+          await sealedCloseResume.assertCurrent(actualSignal);
+        }
         if (
           signal !== actualSignal ||
           custody.peerReads.get(record.claimId) !== previous ||
@@ -2323,20 +2402,28 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               // Missing local runtime only selects recovery. Core authenticates
               // a saved same-operation close first, or reads the original process
               // only while that close fact is genuinely missing. Neither is a grant.
-              const result = await (parentMode === "sealed-peer-application-owner@1" &&
-              !httpRuntimes.has(record.claimId)
-                ? core.readAcceptedApplicationRecovery(
-                    execution,
-                    record,
-                    originalNativeCustody,
-                    loan.signal,
-                  )
-                : core.manageAcceptedPeerInit(
-                    execution,
-                    record,
-                    originalNativeCustody,
-                    loan.signal,
-                  ));
+              let result:
+                | LinuxOciPeerInitProgress
+                | LinuxOciParentHResult
+                | LinuxOciApplicationOwnerExit;
+              if (
+                parentMode === "sealed-peer-application-owner@1" &&
+                !httpRuntimes.has(record.claimId)
+              ) {
+                result = await core.readAcceptedApplicationRecovery(
+                  execution,
+                  record,
+                  originalNativeCustody,
+                  loan.signal,
+                );
+              } else {
+                result = await core.manageAcceptedPeerInit(
+                  execution,
+                  record,
+                  originalNativeCustody,
+                  loan.signal,
+                );
+              }
               if (!result || closed || loan.signal.aborted || !(await held.stillCurrent()))
                 return fail("revoked");
               observations.push(result);

@@ -179,6 +179,76 @@ async function untouched(f: PendingIo["f"]) {
 const savesIo = (statement: string) =>
   statement.startsWith("UPDATE tf_v2_container_create_claims SET application_io_cleanup=");
 
+test("early-application-close-save cold recovery stops when cleanup advances after the parent read", async () => {
+  const { f, io, removal } = await pendingIo();
+  const requestCount = (kind: string) => f.nativeCounts().requests.filter((k) => k === kind).length;
+  const parentRead = "linux-oci-parent-read-outcome@2";
+  f.holdPeerManagementReply("linux-oci-stop-init@1");
+  const running = observeRawPromise(f.engine.runNext());
+  const query = f.sql.query.bind(f.sql);
+  let fresh: ReturnType<typeof f.reconstructNormal> | undefined;
+  let initialReads: number | undefined;
+  let observedCleanupAdvance = false;
+  let changed = 0;
+  const reader = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+    const rows = await query(statement, params);
+    if (
+      initialReads !== undefined &&
+      !observedCleanupAdvance &&
+      requestCount(parentRead) > initialReads &&
+      statement.startsWith("SELECT op.accepted_spec_json FROM tf_v2_operations op")
+    ) {
+      observedCleanupAdvance = true;
+      // Another lifecycle step has already consumed this allocation's cleanup slot.
+      const result = await f.sql.run(
+        "UPDATE tf_v2_container_create_claims SET allocation_cleanup='consumed' WHERE resource_uid=? AND state='bound' AND allocation_cleanup='untouched'",
+        [removal.resourceUid],
+      );
+      changed = result.changes;
+    }
+    return rows;
+  });
+  try {
+    await waitFor(() => requestCount("linux-oci-stop-init@1") === 1);
+    io.closeResponse();
+    io.closeRequest();
+    await waitFor(async () => {
+      const document = await closeDocument(f);
+      return typeof document === "string" && document !== V2_CONTAINER_APPLICATION_IO_RESERVED;
+    });
+    f.releasePeerManagementReply();
+    const first = await running.value;
+    if ("error" in first) throw first.error;
+    expect(first.result).toMatchObject({ id: removal.id, effect: "unknown" });
+    initialReads = requestCount(parentRead);
+    fresh = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    expect(await fresh.engine.runNext()).toMatchObject({
+      id: removal.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    expect(changed).toBe(1);
+    expect(requestCount(parentRead)).toBe(initialReads + 1);
+    expect(requestCount("linux-oci-stop-init@1")).toBe(1);
+    expect(requestCount("linux-oci-join-init@1")).toBe(0);
+    expect(
+      await query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
+    ).toEqual([{ state: "bound", allocation_cleanup: "consumed" }]);
+    expect(f.network).not.toHaveBeenCalled();
+    await expect(fresh.close()).rejects.toThrow("linux_oci_physical_session_parent_peer_retained");
+  } finally {
+    f.releasePeerManagementReply();
+    io.closeResponse();
+    io.closeRequest();
+    await running.value;
+    await fresh?.close().catch(() => undefined);
+    reader.mockRestore();
+    io.restore();
+    await f.cleanup();
+  }
+}, 20000);
+
 test("early-application-close-save started save stays joined after H stage reply", async () => {
   const { f, io, removal } = await pendingIo();
   const actualRun = f.sql.run.bind(f.sql);

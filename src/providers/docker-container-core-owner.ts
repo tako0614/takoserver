@@ -58,7 +58,9 @@ import {
 } from "./linux-oci-host-topology.ts";
 import {
   advanceOriginalLinuxOciOwnedDisposal,
+  createOriginalLinuxOciSealedApplicationCloseResume,
   disposeOriginalLinuxOciAllocation,
+  type LinuxOciSealedApplicationCloseResume,
   observeOriginalLinuxOciOwnedInitReaped,
   observeOriginalLinuxOciOwnedNamespaceLifetime,
   observeOriginalLinuxOciOwnedRunning,
@@ -3075,6 +3077,7 @@ export function createDockerContainerCoreOwner(
         return Object.freeze(Object.assign(currentRetired, { snapshot: applicationFact.snapshot })); // negative currentness only
       }
       let missingApplicationDocument: string | null | undefined;
+      let sealedCloseResume: LinuxOciSealedApplicationCloseResume | undefined;
       if (
         (parentMode === "sealed-peer-runtime@1" ||
           parentMode === "sealed-peer-local-cleanup@1" ||
@@ -3093,11 +3096,85 @@ export function createDockerContainerCoreOwner(
           ],
         );
         if (closed.length !== 1) return fail();
-        if (management === "application-recovery") {
+        if (management === "application-recovery" || management === true) {
           const document = closed[0]?.application_io_cleanup;
-          if (document === null || document === V2_CONTAINER_APPLICATION_IO_RESERVED)
-            missingApplicationDocument = document;
-          else if (closed[0]?.allocation_cleanup !== "closed") return fail();
+          if (document === null || document === V2_CONTAINER_APPLICATION_IO_RESERVED) {
+            if (management === "application-recovery") missingApplicationDocument = document;
+          } else if (
+            parentMode === "sealed-peer-runtime@1" &&
+            closed[0]?.allocation_cleanup === "untouched"
+          ) {
+            // A previously sealed close can resume the exact original P only
+            // after fresh same-operation, key, lease, row, and AEAD checks.
+            // P still independently refuses an attached frontend or foreign
+            // process and reports its exact native stage before any command.
+            const controlKeyId = envelope.keyId;
+            let factCurrent: (() => void) | undefined;
+            const guard = async () => {
+              await assertSnapshot(loaded.proof);
+              await assertExecution(execution);
+              if (!(await current(lease))) return fail();
+              if (!factCurrent) return fail();
+              const currentProof = fence(loaded.proof);
+              const row = await sql.query(
+                "SELECT native_control,allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=? AND " +
+                  currentProof.sql +
+                  " AND EXISTS (SELECT 1 FROM tf_v2_operations WHERE id=? AND resource_uid=? AND lease_token=? AND lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000 AND status='reconciling' AND effect='unknown' AND dispatch_possible=1)",
+                [
+                  input.intent.resourceUid,
+                  input.intent.policy.generation,
+                  input.claimId,
+                  input.nativeId,
+                  raw,
+                  ...currentProof.params,
+                  execution.operationId,
+                  execution.resourceUid,
+                  execution.leaseToken,
+                ],
+              );
+              if (
+                row.length !== 1 ||
+                row[0]?.native_control !== raw ||
+                row[0]?.allocation_cleanup !== "untouched" ||
+                row[0]?.application_io_cleanup !== document
+              )
+                return fail();
+              if (!controlDecryptionKey || controlDecryptionKey(controlKeyId) !== key)
+                return fail();
+              factCurrent();
+              if (
+                signal.aborted ||
+                !lease.active ||
+                lease.controller.signal.aborted ||
+                !leases.has(lease)
+              )
+                return fail();
+              executionScope(execution);
+            };
+            const resume = createOriginalLinuxOciSealedApplicationCloseResume(
+              originalCustody,
+              result,
+              input,
+              signal,
+              guard,
+            );
+            if (resume) {
+              const ioScope = await applicationCloseScope(
+                scope,
+                loaded.proof,
+                execution,
+                input,
+                raw,
+              );
+              factCurrent = await readApplicationCloseFact(document, ioScope);
+              await guard();
+              sealedCloseResume = resume;
+            }
+          } else if (
+            management === "application-recovery" &&
+            closed[0]?.allocation_cleanup !== "closed"
+          )
+            return fail();
           // A present/invalid/foreign saved fact cannot fall back to process exit.
           // The closed branch below authenticates the full same-operation AEAD.
         }
@@ -3183,7 +3260,7 @@ export function createDockerContainerCoreOwner(
           return observation; // same original readonly P/H result; optional owning CAS above
         }
       }
-      if (management === "application-recovery") {
+      if (management === "application-recovery" && !sealedCloseResume) {
         if (
           parentMode !== "sealed-peer-application-owner@1" ||
           phase !== "remove" ||
@@ -3244,10 +3321,24 @@ export function createDockerContainerCoreOwner(
       }
       let observation: LinuxOciParentHResult | LinuxOciPeerInitProgress | undefined;
       if (peerMode) {
-        const prepare = management
-          ? prepareOriginalLinuxOciPeerInit
-          : prepareOriginalLinuxOciPeerRead;
-        const read = await prepare(originalCustody, result, input, artifact, binding, signal);
+        const read = management
+          ? await prepareOriginalLinuxOciPeerInit(
+              originalCustody,
+              result,
+              input,
+              artifact,
+              binding,
+              signal,
+              sealedCloseResume,
+            )
+          : await prepareOriginalLinuxOciPeerRead(
+              originalCustody,
+              result,
+              input,
+              artifact,
+              binding,
+              signal,
+            );
         try {
           await assertSnapshot(loaded.proof);
           await assertExecution(execution);
@@ -3433,7 +3524,20 @@ export function createDockerContainerCoreOwner(
             let watchingClose = false;
             let detachCloseListener: (() => void) | undefined;
             try {
-              await read.begin(signal); // original P outcome only; H writes still zero
+              const originalOutcome = await read.begin(signal); // authenticated P outcome; H writes still zero
+              if (sealedCloseResume) {
+                // The sessionless path is continuation only. The cumulative
+                // original P ledger must prove a complete, known STOP; the
+                // exact request-specific next-stage checks remain in advance
+                // or advanceNamespace and emit no command when ambiguous.
+                if (
+                  originalOutcome.requestBytes === "0" ||
+                  originalOutcome.requestBytes !== originalOutcome.issuedBytes ||
+                  originalOutcome.replyBytes === "0" ||
+                  !(originalOutcome.effects & (1 << 6))
+                )
+                  return fail();
+              }
               await assertSnapshot(loaded.proof);
               await assertExecution(execution);
               const boundPhase = await boundInitPhase(await boundStartRecord(input));
@@ -3476,6 +3580,18 @@ export function createDockerContainerCoreOwner(
                   detachCloseListener = () =>
                     closeFinished.removeEventListener("abort", onCloseFinished);
                 }
+              }
+              if (sealedCloseResume) {
+                await sealedCloseResume.assertCurrent(signal);
+                if (
+                  signal.aborted ||
+                  !lease.active ||
+                  lease.controller.signal.aborted ||
+                  !leases.has(lease)
+                )
+                  return fail();
+                executionScope(execution);
+                read.assertCurrent();
               }
               observation = await (boundPhase === "exited"
                 ? read.advanceNamespace(input.nativeId, signal)
