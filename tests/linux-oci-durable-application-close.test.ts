@@ -92,6 +92,48 @@ async function deleting(x: Live) {
     expectedGeneration: 1,
   });
 }
+async function openApplicationStream(x: Live, io: ReturnType<typeof ownedRawHttp>) {
+  const response = x.f.composition.fetchServingHttp(
+    x.f.recordedCreate(),
+    new Request("http://ignored.invalid/durable-pending-close"),
+  );
+  for (let tick = 0; tick < 100 && !io.counts().calls; tick++) await rawTick();
+  expect(io.counts().calls).toBe(1);
+  io.head();
+  await response;
+}
+async function closeApplicationAtH(
+  x: Live,
+  io: ReturnType<typeof ownedRawHttp>,
+  engine = x.f.engine,
+) {
+  const before = count(x, "parent-read-result");
+  for (let pass = 0; pass < 16; pass++) {
+    x.f.advanceNormalClock(61_000);
+    const running = observeRawPromise(engine.runNext());
+    for (
+      let tick = 0;
+      tick < 100 && count(x, "parent-read-result") === before && running.state() === "pending";
+      tick++
+    )
+      await rawTick();
+    if (count(x, "parent-read-result") > before) {
+      const wasPending = running.state() === "pending";
+      io.closeResponse();
+      await rawTick();
+      io.closeRequest();
+      const result = await running.value;
+      if ("error" in result) throw result.error;
+      expect(wasPending).toBe(true);
+      expect(result.result).toMatchObject({ status: "reconciling", effect: "unknown" });
+      return;
+    }
+    const result = await running.value;
+    if ("error" in result) throw result.error;
+    expect(result.result).toMatchObject({ status: "reconciling", effect: "unknown" });
+  }
+  throw Error("original H close boundary not reached");
+}
 
 test("durable-application live terminal close seals same claim before allocation", async () => {
   const x = await live(),
@@ -169,40 +211,107 @@ async function claim(x: Live) {
 
 // A real commit followed by lost delivery deliberately stops the original
 // caller before allocation. Fresh authority can read that same committed fact.
-async function savedWithLostAck() {
+async function savedAtOriginalH(commit: "lost-ack" | "before-commit" = "lost-ack") {
   const x = await live(),
+    io = ownedRawHttp(),
     run = x.f.sql.run.bind(x.f.sql);
   let saves = 0;
+  const response = x.f.composition.fetchServingHttp(
+    x.f.recordedCreate(),
+    new Request("http://ignored.invalid/durable-lost-ack"),
+  );
+  let settle: (() => Promise<void>) | undefined,
+    restored = false;
   const spy = spyOn(x.f.sql, "run").mockImplementation(async (sql, params) => {
-    const result = await run(sql, params);
     if (ioSave(sql)) {
       saves++;
-      expect(result.changes).toBe(1);
+      if (commit === "lost-ack") {
+        const result = await run(sql, params);
+        expect(result.changes).toBe(1);
+      }
       throw Error("NONSECRET lost application save receipt");
     }
-    return result;
+    return run(sql, params);
   });
   try {
+    for (let tick = 0; tick < 100 && !io.counts().calls; tick++) await rawTick();
+    expect(io.counts().calls).toBe(1);
+    io.head();
+    await response;
     await deleting(x);
-    await toResult(x);
+    const before = count(x, "parent-read-result");
+    let reached = false;
+    for (let pass = 0; pass < 16 && !reached; pass++) {
+      x.f.advanceNormalClock(61_000);
+      const running = observeRawPromise(x.f.engine.runNext());
+      settle = async () => {
+        await running.value;
+      };
+      for (
+        let tick = 0;
+        tick < 100 && count(x, "parent-read-result") === before && running.state() === "pending";
+        tick++
+      )
+        await rawTick();
+      if (count(x, "parent-read-result") > before) {
+        reached = true;
+        expect(running.state()).toBe("pending");
+        io.closeResponse();
+        await rawTick();
+        io.closeRequest();
+        for (let tick = 0; tick < 100 && saves === 0; tick++) await rawTick();
+        expect(saves).toBe(1);
+        expect(await claim(x)).toMatchObject({
+          allocation_cleanup: "untouched",
+          state: "bound",
+          removed_at_ms: null,
+        });
+        expect(typeof (await claim(x)).application_io_cleanup).toBe("string");
+        const result = await running.value;
+        if ("error" in result) throw result.error;
+        expect(result.result).toMatchObject({ status: "reconciling", effect: "unknown" });
+      } else {
+        const result = await running.value;
+        if ("error" in result) throw result.error;
+        expect(result.result).toMatchObject({ status: "reconciling", effect: "unknown" });
+      }
+    }
+    expect(reached).toBe(true);
     expect(saves).toBe(1);
     expect(await claim(x)).toMatchObject({
       allocation_cleanup: "untouched",
       state: "bound",
       removed_at_ms: null,
     });
-    expect(typeof (await claim(x)).application_io_cleanup).toBe("string");
-    return x;
+    const document = (await claim(x)).application_io_cleanup;
+    if (commit === "lost-ack")
+      expect(
+        typeof document === "string" && document !== V2_CONTAINER_APPLICATION_IO_RESERVED,
+      ).toBe(true);
+    else expect(document).toBe(V2_CONTAINER_APPLICATION_IO_RESERVED);
+    return { x, saves };
   } catch (error) {
+    io.closeResponse();
+    io.closeRequest();
+    await settle?.();
+    spy.mockRestore();
+    io.restore();
+    restored = true;
     await x.f.cleanup();
     throw error;
   } finally {
-    spy.mockRestore();
+    io.closeResponse();
+    io.closeRequest();
+    await settle?.();
+    if (!restored) {
+      spy.mockRestore();
+      io.restore();
+    }
   }
 }
 
 test("durable-application fresh same-operation consumer recovers actual committed lost ACK without old runtime or reclose", async () => {
-  const x = await savedWithLostAck(),
+  const { x } = await savedAtOriginalH(),
     source = sourceObserver(),
     fresh = x.f.reconstructNormal();
   try {
@@ -277,51 +386,76 @@ test("durable-application historical bound NULL cannot backfill and fresh reserv
     await old.f.cleanup();
   }
   const x = await live(),
-    source = sourceObserver();
+    io = ownedRawHttp();
+  let source: ReturnType<typeof sourceObserver> | undefined,
+    fresh: ReturnType<typeof x.f.reconstructNormal> | undefined,
+    settleOriginal: (() => Promise<void>) | undefined;
   try {
+    const response = x.f.composition.fetchServingHttp(
+      x.f.recordedCreate(),
+      new Request("http://ignored.invalid/reserved-without-saved-source"),
+    );
+    for (let tick = 0; tick < 100 && !io.counts().calls; tick++) await rawTick();
+    expect(io.counts().calls).toBe(1);
+    io.head();
+    await response;
     await deleting(x);
-    expect(await x.f.engine.runNext()).toMatchObject({
+    x.f.holdPeerManagementReply("linux-oci-stop-init@1");
+    const original = observeRawPromise(x.f.engine.runNext());
+    settleOriginal = async () => {
+      await original.value;
+    };
+    for (let tick = 0; tick < 100 && count(x, "stop-init") === 0; tick++) await rawTick();
+    expect(count(x, "stop-init")).toBe(1);
+    expect(original.state()).toBe("pending");
+    expect(await claim(x)).toMatchObject({
+      application_io_cleanup: V2_CONTAINER_APPLICATION_IO_RESERVED,
+      allocation_cleanup: "untouched",
+      removed_at_ms: null,
+    });
+    source = sourceObserver();
+    fresh = x.f.reconstructNormal();
+    x.f.advanceNormalClock(61_000);
+    expect(await fresh.engine.runNext()).toMatchObject({
       status: "reconciling",
       effect: "unknown",
     });
-    const fresh = x.f.reconstructNormal();
-    try {
-      await toResult(x, fresh.engine);
-      expect(source.values.every((v) => v === undefined)).toBe(true);
-      expect(source.values.length).toBeGreaterThan(0);
-      expect(await claim(x)).toMatchObject({
-        application_io_cleanup: V2_CONTAINER_APPLICATION_IO_RESERVED,
-        allocation_cleanup: "untouched",
-        removed_at_ms: null,
-      });
-    } finally {
-      await fresh.close().catch(() => undefined);
-    }
+    expect(source.values.every((v) => v === undefined)).toBe(true);
+    expect(source.values.length).toBeGreaterThan(0);
+    expect(await claim(x)).toMatchObject({
+      application_io_cleanup: V2_CONTAINER_APPLICATION_IO_RESERVED,
+      allocation_cleanup: "untouched",
+      removed_at_ms: null,
+    });
   } finally {
-    source.restore();
+    io.closeResponse();
+    io.closeRequest();
+    x.f.releasePeerManagementReply();
+    await settleOriginal?.();
+    await fresh?.close().catch(() => undefined);
+    source?.restore();
+    io.restore();
     await x.f.cleanup();
   }
 });
 
 test("durable-application lost save before commit cannot be recovered by fresh empty runtime", async () => {
-  const x = await live(),
+  const { x, saves } = await savedAtOriginalH("before-commit"),
+    source = sourceObserver(),
     run = x.f.sql.run.bind(x.f.sql);
-  let saves = 0;
-  const spy = spyOn(x.f.sql, "run").mockImplementation(async (sql, params) => {
-    if (ioSave(sql)) {
-      saves++;
-      throw Error("NONSECRET application save not committed");
-    }
+  let freshSaves = 0;
+  const freshSave = spyOn(x.f.sql, "run").mockImplementation((sql, params) => {
+    if (ioSave(sql)) freshSaves++;
     return run(sql, params);
   });
   try {
-    await deleting(x);
-    await toResult(x);
-    spy.mockRestore();
     expect(saves).toBe(1);
     const fresh = x.f.reconstructNormal();
     try {
       await toResult(x, fresh.engine);
+      expect(freshSaves).toBe(0);
+      expect(source.values.every((v) => v === undefined)).toBe(true);
+      expect(source.values.length).toBeGreaterThan(0);
       expect(saves).toBe(1);
     } finally {
       await fresh.close().catch(() => undefined);
@@ -333,7 +467,8 @@ test("durable-application lost save before commit cannot be recovered by fresh e
     });
     expect(count(x, "stop-init")).toBe(1);
   } finally {
-    spy.mockRestore();
+    freshSave.mockRestore();
+    source.restore();
     await x.f.cleanup();
   }
 });
@@ -389,6 +524,7 @@ test("durable-application actual native close UNKNOWN never seals or lets a fres
 for (const fault of ["lease", "execution", "cancel"] as const) {
   test(`durable-application ${fault} in final awaited save window refuses before fact CAS`, async () => {
     const x = await live(),
+      io = ownedRawHttp(),
       encrypt = crypto.subtle.encrypt.bind(crypto.subtle),
       query = x.f.sql.query.bind(x.f.sql),
       run = x.f.sql.run.bind(x.f.sql);
@@ -432,8 +568,9 @@ for (const fault of ["lease", "execution", "cancel"] as const) {
       return rows;
     });
     try {
+      await openApplicationStream(x, io);
       await deleting(x);
-      await toResult(x);
+      await closeApplicationAtH(x, io);
       expect(armed).toBe(true);
       expect(reached).toBe(true);
       expect(reads).toBe(3);
@@ -446,13 +583,16 @@ for (const fault of ["lease", "execution", "cancel"] as const) {
     } finally {
       querying.mockRestore();
       sealing.mockRestore();
+      io.closeResponse();
+      io.closeRequest();
+      io.restore();
       await x.f.cleanup();
     }
-  });
+  }, 20_000);
 }
 
 test("durable-application authenticated envelope rejects foreign binding and actually decrypted wrong plaintext", async () => {
-  const x = await savedWithLostAck(),
+  const { x } = await savedAtOriginalH(),
     row = await claim(x);
   if (typeof row.application_io_cleanup !== "string") throw Error("original saved fact absent");
   const original = JSON.parse(row.application_io_cleanup),
@@ -538,7 +678,7 @@ test("durable-application exact schema refuses a missing third transition guard"
 });
 
 test("durable-application key revoked after actual fact decryption refuses before allocation", async () => {
-  const x = await savedWithLostAck(),
+  const { x } = await savedAtOriginalH(),
     ring = x.f.configuredInputs.keyring,
     originalKey = ring.keyForDecryption.bind(ring),
     decrypt = crypto.subtle.decrypt.bind(crypto.subtle),
@@ -633,6 +773,8 @@ test("durable-application save key revoked in final awaited window refuses befor
   const current = f.reconstructNormal(),
     health = acceptedRawHttp(),
     source = sourceObserver();
+  let io: ReturnType<typeof ownedRawHttp> | undefined,
+    healthRestored = false;
   health.onEnd(() => {
     health.reply();
     health.join();
@@ -676,13 +818,24 @@ test("durable-application save key revoked in final awaited window refuses befor
       status: "succeeded",
       effect: "complete",
     });
+    health.restore();
+    healthRestored = true;
+    io = ownedRawHttp();
+    const response = current.fetchServingHttp(
+      f.recordedCreate(),
+      new Request("http://ignored.invalid/key-revocation"),
+    );
+    for (let tick = 0; tick < 100 && !io.counts().calls; tick++) await rawTick();
+    expect(io.counts().calls).toBe(1);
+    io.head();
+    await response;
     await current.engine.acceptDelete({
       principal: "synthetic-oci-parent",
       key: crypto.randomUUID(),
       uid: accepted.resourceUid,
       expectedGeneration: 1,
     });
-    await toResult(x, current.engine);
+    await closeApplicationAtH(x, io, current.engine);
     expect(armed).toBe(true); // genuine application close passed before real AES
     expect(reached).toBe(true);
     expect(reads).toBe(3); // actual final load after the earlier same-key check
@@ -701,13 +854,16 @@ test("durable-application save key revoked in final awaited window refuses befor
     ).toHaveLength(1);
     expect(f.network).not.toHaveBeenCalled();
   } finally {
+    io?.closeResponse();
+    io?.closeRequest();
+    io?.restore();
     saving.mockRestore();
     reading.mockRestore();
     sealing.mockRestore();
     keys.mockRestore();
     source.restore();
-    health.restore();
+    if (!healthRestored) health.restore();
     await current.close().catch(() => undefined);
     await f.cleanup();
   }
-});
+}, 20_000);

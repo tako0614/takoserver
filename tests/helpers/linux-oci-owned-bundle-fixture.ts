@@ -1413,7 +1413,11 @@ async function fixture(
     reconstructNormal() {
       if (!recreateNormal) throw new Error("normal backend mode absent");
       const original = recreateNormal();
-      return { engine: normalEngine(original), close: original.close };
+      return {
+        engine: normalEngine(original),
+        fetchServingHttp: original.fetchServingHttp,
+        close: original.close,
+      };
     },
     physicalBinary,
     recordedCreate(): LinuxOciCreateStoppedRequest {
