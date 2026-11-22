@@ -48,6 +48,9 @@ static struct {
  int active, child, wrong_host, no_file, malformed, bad_ack, drop_ack, read_fault, close_fault, nack_at, bad_lock, unlock_fault, conflict, cookie_fault;
  short guest_channel_events;
  int guest_channel_eof, guest_channel_receives, guest_child_failed;
+ int route_exceptions_present, route_unsound_done, route_interrupted;
+ int route_unfiltered_exception_done, route_exception_without_done;
+ unsigned int route_base_reads, route_exception_reads;
  unsigned int mutations, creates, deletes, closes[600], joins, signals, sockets, dumps, steps;
  int created, removed, assigned[2][2], up[2], routes[2];
  struct nlmsghdr request; unsigned char request_bytes[4096];
@@ -432,6 +435,11 @@ static int raw_poll(struct pollfd *p, nfds_t count, int timeout) {
   if(p->fd>=2000 && p->fd<3006){CHECK((p->fd<2024 || p->fd>=3000) && count==1 && timeout>0);p->revents=p->events;return 1;}
 
   CHECK(count == 1);
+  if (up.route_exception_without_done && p->fd == 407 && up.request.nlmsg_type == RTM_GETROUTE) {
+    struct rtmsg route;
+    memcpy(&route, up.request_bytes + NLMSG_HDRLEN, sizeof(route));
+    if (route.rtm_flags == RTM_F_CLONED) return 0;
+  }
   if (p->fd == 400 && up.guest_channel_events) {
     CHECK(timeout > 0 && p->events == POLLIN);
     p->revents = up.guest_channel_events;
@@ -636,7 +644,19 @@ static int up_getsockname(int fd,struct sockaddr *address,socklen_t *size){CHECK
 static int up_bind(int fd,const struct sockaddr *address,socklen_t size){CHECK((fd==405 || fd==407) && size==sizeof(struct sockaddr_nl) && address->sa_family==AF_NETLINK);return 0;}
 static ssize_t up_sendmsg(int fd,const struct msghdr *m,int flags){CHECK(flags==MSG_NOSIGNAL && m->msg_iovlen==1);if(up.child){CHECK(fd==4 && eg.entered && eg.ranges==3 && m->msg_controllen==CMSG_SPACE(sizeof(int)));return (ssize_t)m->msg_iov[0].iov_len;}
  CHECK(fd==405 || fd==407);CHECK(m->msg_namelen==sizeof(struct sockaddr_nl) && ((struct sockaddr_nl*)m->msg_name)->nl_pid==0);memcpy(&up.request,m->msg_iov[0].iov_base,sizeof(up.request));CHECK(up.request.nlmsg_len==m->msg_iov[0].iov_len && up.request.nlmsg_len<=sizeof(up.request_bytes));memcpy(up.request_bytes,m->msg_iov[0].iov_base,up.request.nlmsg_len);
- if((up.request.nlmsg_flags & NLM_F_DUMP)==NLM_F_DUMP){up.dumps++;return (ssize_t)up.request.nlmsg_len;}
+ if ((up.request.nlmsg_flags & NLM_F_DUMP) == NLM_F_DUMP) {
+    ++up.dumps;
+    if (up.request.nlmsg_type == RTM_GETROUTE) {
+      struct rtmsg route;
+      CHECK(up.request.nlmsg_len == NLMSG_LENGTH(sizeof(route)));
+      memcpy(&route, up.request_bytes + NLMSG_HDRLEN, sizeof(route));
+      CHECK(route.rtm_family == AF_UNSPEC);
+      CHECK(!route.rtm_flags || route.rtm_flags == RTM_F_CLONED);
+      if (route.rtm_flags == RTM_F_CLONED) ++up.route_exception_reads;
+      else ++up.route_base_reads;
+    }
+    return (ssize_t)up.request.nlmsg_len;
+  }
  CHECK(lock_taken);up.mutations++;struct nlmsghdr h=up.request;if(up.nack_at && up.mutations==(unsigned int)up.nack_at)return (ssize_t)h.nlmsg_len;
  if(h.nlmsg_type==RTM_NEWLINK && (h.nlmsg_flags&NLM_F_CREATE)){CHECK(fd==407 && subject->create_sent && !up.creates && (h.nlmsg_flags&NLM_F_EXCL));up.creates++;up.created=!up.bad_ack && up.drop_ack!=2;}
  else if(h.nlmsg_type==RTM_NEWLINK){struct ifinfomsg a;memcpy(&a,up.request_bytes+NLMSG_HDRLEN,sizeof(a));CHECK(a.ifi_flags==IFF_UP && a.ifi_change==IFF_UP && a.ifi_index==(fd==405?51:50));up.up[fd==405]=1;}
@@ -659,9 +679,32 @@ static ssize_t up_recvmsg(int fd,struct msghdr *m,int flags){CHECK(m->msg_iovlen
  if((up.request.nlmsg_flags&NLM_F_DUMP)!=NLM_F_DUMP){struct nlmsghdr h={.nlmsg_len=NLMSG_LENGTH(sizeof(struct nlmsgerr)),.nlmsg_type=NLMSG_ERROR,.nlmsg_flags=NLM_F_CAPPED,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port};struct nlmsgerr e={.error=(up.bad_ack || (up.nack_at && up.mutations==(unsigned int)up.nack_at))?-EPERM:0,.msg=up.request};memcpy(out,&h,sizeof(h));memcpy(out+NLMSG_HDRLEN,&e,sizeof(e));return (ssize_t)h.nlmsg_len;}
  size_t at=0;struct oci_uplink_request r;if(up.request.nlmsg_type==RTM_GETLINK){if(fd==407){raw_link(&r,"eth0",2,IFF_UP,subject->expected.mac,0);((struct ifinfomsg*)r.body)->ifi_type=ARPHRD_ETHER;at=raw_append(out,at,&r,port);}else{raw_link(&r,"lo",1,IFF_LOOPBACK,NULL,0);at=raw_append(out,at,&r,port);}if(up.created && !up.removed){raw_link(&r,fd==405?subject->guest_name:subject->host_name,fd==405?51:50,up.up[fd==405]?IFF_UP:0,fd==405?subject->guest_mac:subject->host_mac,fd==405?50:51);at=raw_append(out,at,&r,port);}}
  else if(up.request.nlmsg_type==RTM_GETADDR)at=raw_addresses(out,fd==405,port);
- else if(up.request.nlmsg_type==RTM_GETROUTE)at=raw_routes(out,fd==405,port);
+ else if (up.request.nlmsg_type == RTM_GETROUTE) {
+   struct rtmsg route;
+   memcpy(&route, up.request_bytes + NLMSG_HDRLEN, sizeof(route));
+   if (!route.rtm_flags || up.route_exceptions_present) {
+     at = raw_routes(out, fd == 405, port);
+     for (size_t i = 0; i < at;) {
+       struct nlmsghdr h;
+       memcpy(&h, out + i, sizeof(h));
+       h.nlmsg_flags |= NLM_F_DUMP_FILTERED;
+       if (up.route_interrupted) h.nlmsg_flags |= NLM_F_DUMP_INTR;
+       memcpy(out + i, &h, sizeof(h));
+       i += NLMSG_ALIGN(h.nlmsg_len);
+     }
+   }
+ }
  else {CHECK(up.request.nlmsg_type==RTM_GETRULE);at=raw_rules(out,port);}
- struct {struct nlmsghdr h;int result;} done={.h={.nlmsg_len=NLMSG_LENGTH(sizeof(int)),.nlmsg_type=NLMSG_DONE,.nlmsg_flags=NLM_F_MULTI,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port}};if(up.read_fault)done.h.nlmsg_flags|=NLM_F_DUMP_INTR;memcpy(out+at,&done,sizeof(done));return (ssize_t)(at+sizeof(done));
+ struct {struct nlmsghdr h;int result;} done={.h={.nlmsg_len=NLMSG_LENGTH(sizeof(int)),.nlmsg_type=NLMSG_DONE,.nlmsg_flags=NLM_F_MULTI,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port}};if (up.request.nlmsg_type == RTM_GETROUTE) {
+   struct rtmsg route;
+   memcpy(&route, up.request_bytes + NLMSG_HDRLEN, sizeof(route));
+   if (route.rtm_flags == RTM_F_CLONED ? !up.route_unfiltered_exception_done
+                                     : up.route_unsound_done)
+     done.h.nlmsg_flags |= NLM_F_DUMP_FILTERED;
+ }
+ if (up.read_fault) done.h.nlmsg_flags |= NLM_F_DUMP_INTR;
+ memcpy(out + at, &done, sizeof(done));
+ return (ssize_t)(at + sizeof(done));
 }
 static void prepare(struct tns_oci_owner *o,struct tns_owner *b){memset(&up,0,sizeof(up));lock_busy=lock_taken=0;initialize_egress(o,b);CHECK(oci_egress_select(o,9)==0 && oci_egress_guard_install(o)==0);o->command_pid=0;up.active=1;
  int n=snprintf(up.file,sizeof(up.file),"{\"kind\":\"linux-oci-owned-topology@1\",\"artifact\":%s,\"topology\":{\"interfaceName\":\"eth0\",\"interfaceIndex\":2,\"interfaceMac\":\"02:11:22:33:44:55\",\"ipv4Address\":\"192.0.2.2/24\",\"ipv4Gateway\":\"192.0.2.1\",\"ipv6Address\":\"2001:db8::2/64\",\"ipv6Gateway\":\"2001:db8::1\",\"peerIpv4Host\":\"10.77.0.2\",\"peerIpv4Guest\":\"10.77.0.3\",\"peerIpv6Host\":\"fd77::2\",\"peerIpv6Guest\":\"fd77::3\"}}",eg.artifact);CHECK(n>0 && (size_t)n<sizeof(up.file));up.file_size=(size_t)n;
@@ -742,4 +785,46 @@ static void guest_channel_close_cases(void) {
   }
 }
 
-int main(int argc,char **argv){(void)codec_cases_uplink;(void)source_cases;(void)new_edge_cases;(void)child_case;CHECK(argc==2);if(!strcmp(argv[1],"--ack-loss"))ack_loss_cases();else if(!strcmp(argv[1],"--guest-channel-close"))guest_channel_close_cases();else{CHECK(!strcmp(argv[1],"--new-edges"));new_edge_cases();child_case();}printf("new selected actual uplink raw boundary: %lu checks\n",checks);return 0;}
+static void route_dump_contract_cases(void) {
+  struct tns_oci_owner o;
+  struct tns_owner b;
+  struct oci_uplink_dump *dump = malloc(sizeof(*dump));
+  CHECK(dump);
+
+  prepare(&o, &b);
+  CHECK(oci_uplink_guest_channel(&o, subject) == 0);
+  CHECK(oci_uplink_host_channel(subject) == 0);
+  CHECK(oci_uplink_dump_side(subject, 0, RTM_GETROUTE, dump) == 0);
+  CHECK(dump->records == 2 && oci_uplink_host_routes(subject, dump) == 0);
+  CHECK(up.route_base_reads == 1 && up.route_exception_reads == 1 && !up.mutations);
+  CHECK(oci_uplink_cleanup(&o.uplink) == 0);
+
+  prepare(&o, &b);
+  up.route_exceptions_present = 1;
+  CHECK(oci_uplink_install(&o, subject) < 0);
+  CHECK(up.route_base_reads == 1 && up.route_exception_reads == 1 && !up.mutations);
+  CHECK(oci_uplink_cleanup(&o.uplink) == 0);
+
+  for (int fault = 0; fault < 2; ++fault) {
+    prepare(&o, &b);
+    up.route_interrupted = fault == 0;
+    up.route_unsound_done = fault == 1;
+    CHECK(oci_uplink_install(&o, subject) < 0);
+    CHECK(up.route_base_reads == 1 && !up.route_exception_reads && !up.mutations);
+    CHECK(oci_uplink_cleanup(&o.uplink) == 0);
+  }
+  prepare(&o, &b);
+  up.route_unfiltered_exception_done = 1;
+  CHECK(oci_uplink_install(&o, subject) < 0);
+  CHECK(up.route_base_reads == 1 && up.route_exception_reads == 1 && !up.mutations);
+  CHECK(oci_uplink_cleanup(&o.uplink) == 0);
+
+  prepare(&o, &b);
+  up.route_exception_without_done = 1;
+  CHECK(oci_uplink_install(&o, subject) < 0 && subject->broken);
+  CHECK(up.route_base_reads == 1 && up.route_exception_reads == 1 && !up.mutations);
+  CHECK(oci_uplink_cleanup(&o.uplink) == 0);
+  free(dump);
+}
+
+int main(int argc,char **argv){(void)codec_cases_uplink;(void)source_cases;(void)new_edge_cases;(void)child_case;CHECK(argc==2);if(!strcmp(argv[1],"--ack-loss"))ack_loss_cases();else if(!strcmp(argv[1],"--guest-channel-close"))guest_channel_close_cases();else if(!strcmp(argv[1],"--route-dump"))route_dump_contract_cases();else{CHECK(!strcmp(argv[1],"--new-edges"));new_edge_cases();child_case();}printf("new selected actual uplink raw boundary: %lu checks\n",checks);return 0;}

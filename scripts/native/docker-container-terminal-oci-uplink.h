@@ -30,6 +30,7 @@ struct oci_uplink_topology {
 struct oci_uplink_dump {
   uint32_t sequence, port; uint16_t type;
   unsigned int done, failed, records;
+  int route_exceptions;
   size_t used;
   unsigned char bytes[OCI_UPLINK_DUMP_MAX];
 };
@@ -169,6 +170,20 @@ static int oci_uplink_topology(const char *bytes, size_t size, const char *artif
   *out = t; return 0;
 }
 
+static int oci_uplink_dump_flags(const struct oci_uplink_dump *d,
+                                 const struct nlmsghdr *h, const unsigned char *record) {
+  const unsigned int filtered = NLM_F_MULTI | NLM_F_DUMP_FILTERED;
+  if (d->route_exceptions) return h->nlmsg_flags == filtered;
+  if (h->nlmsg_flags == NLM_F_MULTI) return 1;
+  /* Linux strict GETROUTE marks IPv4 and IPv6 rows when it omits cached
+   * exceptions. The owning caller checks the complementary dump. */
+  if (d->type != RTM_NEWROUTE || h->nlmsg_type != RTM_NEWROUTE ||
+      h->nlmsg_flags != filtered || h->nlmsg_len < NLMSG_LENGTH(sizeof(struct rtmsg))) return 0;
+  struct rtmsg route;
+  memcpy(&route, record + NLMSG_HDRLEN, sizeof(route));
+  return route.rtm_family == AF_INET || route.rtm_family == AF_INET6;
+}
+
 /* Strict bounded multipart collector. It cannot turn interrupted/error/empty
  * transport into a completed snapshot. Collected bytes are observations only. */
 static int oci_uplink_dump_feed(struct oci_uplink_dump *d, const void *bytes, size_t size) {
@@ -179,7 +194,7 @@ static int oci_uplink_dump_feed(struct oci_uplink_dump *d, const void *bytes, si
     struct nlmsghdr h; memcpy(&h, p + at, sizeof(h));
     if (h.nlmsg_len < sizeof(h) || h.nlmsg_len > size - at ||
         h.nlmsg_seq != d->sequence || h.nlmsg_pid != d->port ||
-        h.nlmsg_flags != NLM_F_MULTI) goto fail;
+        !oci_uplink_dump_flags(d, &h, p + at)) goto fail;
     size_t aligned = NLMSG_ALIGN((size_t)h.nlmsg_len);
     if (aligned > size - at) goto fail;
     if (h.nlmsg_type == NLMSG_DONE) {
@@ -354,23 +369,29 @@ static int oci_uplink_guest_channel(struct tns_oci_owner *o, struct oci_uplink_o
   return 0;
 }
 
-static int oci_uplink_dump_side(struct oci_uplink_owner *u, int guest, uint16_t type, struct oci_uplink_dump *out) {
-  if (!out || oci_uplink_original(u) < 0 || !u->child_joined || !u->child_ok ||
+static int oci_uplink_dump_query(struct oci_uplink_owner *u, int guest, uint16_t type,
+                                  int route_exceptions, int64_t deadline,
+                                  struct oci_uplink_dump *out) {
+  if (oci_uplink_original(u) < 0 || !u->child_joined || !u->child_ok ||
       (guest ? u->guest : u->host) < 0 || u->sequence == UINT32_MAX) return -1;
   struct { struct nlmsghdr h; union {struct ifinfomsg link; struct ifaddrmsg addr; struct rtmsg route; struct fib_rule_hdr rule;} p; } request;
   memset(&request, 0, sizeof(request)); request.h.nlmsg_type = type;
   size_t fixed = type == RTM_GETLINK ? sizeof(request.p.link) : type == RTM_GETADDR ? sizeof(request.p.addr) :
     type == RTM_GETROUTE ? sizeof(request.p.route) : type == RTM_GETRULE ? sizeof(request.p.rule) : 0;
   if (!fixed) { errno = EINVAL; return -1; }
+  if (route_exceptions) request.p.route.rtm_flags = RTM_F_CLONED;
   request.h.nlmsg_len = (uint32_t)NLMSG_LENGTH(fixed); request.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
   request.h.nlmsg_seq = ++u->sequence;
   struct sockaddr_nl kernel = {.nl_family = AF_NETLINK};
   struct iovec iov = {&request, request.h.nlmsg_len};
   struct msghdr message = {.msg_name = &kernel, .msg_namelen = sizeof(kernel), .msg_iov = &iov, .msg_iovlen = 1};
-  int64_t now = oci_now(); if (now < 0) return -1; int64_t deadline = now + 2500;
+  if (oci_egress_left(deadline) < 0) return -1;
   int fd = guest ? u->guest : u->host;
   if (sendmsg(fd, &message, MSG_NOSIGNAL) != (ssize_t)request.h.nlmsg_len) goto fail;
-  memset(out, 0, sizeof(*out)); out->sequence = request.h.nlmsg_seq; out->port = guest ? u->guest_port : u->host_port;
+  out->done = 0;
+  out->route_exceptions = route_exceptions;
+  out->sequence = request.h.nlmsg_seq;
+  out->port = guest ? u->guest_port : u->host_port;
   out->type = type == RTM_GETLINK ? RTM_NEWLINK : type == RTM_GETADDR ? RTM_NEWADDR : type == RTM_GETROUTE ? RTM_NEWROUTE : RTM_NEWRULE;
   while (!out->done) {
     int left = oci_egress_left(deadline); if (left < 0 || (!u->cleaning && oci_not_canceled() < 0)) goto fail;
@@ -392,6 +413,30 @@ static int oci_uplink_dump_side(struct oci_uplink_owner *u, int guest, uint16_t 
 fail:
   u->broken = 1; if (!errno) errno = EPROTO; return -1;
 }
+static int oci_uplink_dump_side(struct oci_uplink_owner *u, int guest, uint16_t type,
+                                struct oci_uplink_dump *out) {
+  if (!out) return -1;
+  int64_t now = oci_now();
+  if (now < 0) return -1;
+  int64_t deadline = now + 2500;
+  memset(out, 0, sizeof(*out));
+  if (oci_uplink_dump_query(u, guest, type, 0, deadline, out) < 0) return -1;
+  if (type != RTM_GETROUTE) return 0;
+  /* An ordinary strict FIB dump omits its cloned exceptions. Establish that
+   * the complementary dump completed and was empty under the same deadline. */
+  unsigned int routes = out->records;
+  if (oci_uplink_dump_query(u, guest, type, 1, deadline, out) < 0) {
+    out->failed = 1;
+    return -1;
+  }
+  if (out->records != routes) {
+    out->failed = 1;
+    errno = ESTALE;
+    return -1;
+  }
+  return 0;
+}
+
 static int oci_uplink_file_current(struct oci_uplink_owner *u) {
   if (!u->file_selected) return 0;
   struct stat held, named;
