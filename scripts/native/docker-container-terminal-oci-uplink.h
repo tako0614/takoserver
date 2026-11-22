@@ -308,7 +308,9 @@ static int oci_uplink_guest_channel(struct tns_oci_owner *o, struct oci_uplink_o
   u->child = (pid_t)child;
   if (oci_uplink_original(u) < 0) return -1;
   struct pollfd p = {.fd = u->channel, .events = POLLIN}; int left = oci_egress_left(deadline);
-  if (left < 0 || poll(&p, 1, left) != 1 || p.revents != POLLIN) { errno = EPROTO; return -1; }
+  /* A complete reply can remain queued after the child closes its endpoint. */
+  if (left < 0 || poll(&p, 1, left) != 1 || !(p.revents & POLLIN) ||
+      (p.revents & ~(POLLIN | POLLHUP))) { errno = EPROTO; return -1; }
   struct { uint64_t device, inode, cookie; } fact;
   union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(int))]; } ancillary;
   struct iovec iov = {&fact, sizeof(fact)}; memset(&ancillary, 0, sizeof(ancillary));
