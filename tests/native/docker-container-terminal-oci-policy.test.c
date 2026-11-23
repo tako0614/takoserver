@@ -38,10 +38,22 @@ static mode_t policy_umask(mode_t mask);
 #define umask policy_umask
 static struct oci_policy_owner *policy_subject;
 static void policy_raw_readback(void);
+enum neighbor_fixture {
+  NEIGHBOR_ORDINARY,
+  NEIGHBOR_MULTICAST,
+  NEIGHBOR_WRONG_MAC,
+  NEIGHBOR_FLAGGED,
+  NEIGHBOR_PERMANENT_MULTICAST,
+  NEIGHBOR_WRONG_TYPE,
+  NEIGHBOR_OTHER_UNICAST,
+  NEIGHBOR_UNKNOWN_ATTRIBUTE,
+  NEIGHBOR_MISSING_PEER,
+};
 static struct {
  char file[16385],readback[1048576],sent[2][524288];size_t file_size,readback_size,read_at,sent_size[2];
  unsigned int active,child,spawns,joins[3],signals[3],pipes,neighbors[2][2];
  int fault,partial,applied,late_inventory;
+ enum neighbor_fixture neighbor;
 } pol;
 static int lock_busy, lock_taken;
 static int up_socket(int family,int type,int protocol);
@@ -665,10 +677,64 @@ static ssize_t up_recvmsg(int fd,struct msghdr *m,int flags){CHECK(m->msg_iovlen
  if((up.request.nlmsg_flags&NLM_F_DUMP)!=NLM_F_DUMP){struct nlmsghdr h={.nlmsg_len=NLMSG_LENGTH(sizeof(struct nlmsgerr)),.nlmsg_type=NLMSG_ERROR,.nlmsg_flags=NLM_F_CAPPED,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port};struct nlmsgerr e={.error=(up.bad_ack || (up.nack_at && up.mutations==(unsigned int)up.nack_at))?-EPERM:0,.msg=up.request};memcpy(out,&h,sizeof(h));memcpy(out+NLMSG_HDRLEN,&e,sizeof(e));return (ssize_t)h.nlmsg_len;}
  size_t at=0;struct oci_uplink_request r;if(up.request.nlmsg_type==RTM_GETLINK){if(fd==407){raw_link(&r,"eth0",2,IFF_UP,subject->expected.mac,0);((struct ifinfomsg*)r.body)->ifi_type=ARPHRD_ETHER;at=raw_append(out,at,&r,port);}else{raw_link(&r,"lo",1,IFF_LOOPBACK,NULL,0);at=raw_append(out,at,&r,port);}if(up.created && !up.removed){raw_link(&r,fd==405?subject->guest_name:subject->host_name,fd==405?51:50,up.up[fd==405]?IFF_UP:0,fd==405?subject->guest_mac:subject->host_mac,fd==405?50:51);at=raw_append(out,at,&r,port);}}
  else if(up.request.nlmsg_type==RTM_GETADDR)at=raw_addresses(out,fd==405,port);
- else if(up.request.nlmsg_type==RTM_GETROUTE)at=raw_routes(out,fd==405,port);
- else if(up.request.nlmsg_type==RTM_GETNEIGH){struct ndmsg request;memcpy(&request,up.request_bytes+NLMSG_HDRLEN,sizeof(request));int guest=fd==405,v6=request.ndm_family==AF_INET6;CHECK((request.ndm_family==AF_INET || v6) && !request.ndm_ifindex && !request.ndm_state && !request.ndm_flags && !request.ndm_type && pol.neighbors[guest][v6]==1);struct ndmsg a={.ndm_family=request.ndm_family,.ndm_ifindex=guest?51:50,.ndm_state=NUD_PERMANENT,.ndm_type=RTN_UNICAST};oci_uplink_request(&r,RTM_NEWNEIGH,0,&a,sizeof(a));const void *ip=v6?(const void*)(guest?subject->expected.host6:subject->expected.guest6):(const void*)(guest?subject->expected.host4:subject->expected.guest4);CHECK(oci_uplink_attr(&r,NDA_DST,ip,v6?16u:4u)==0 && oci_uplink_attr(&r,NDA_LLADDR,guest?subject->host_mac:subject->guest_mac,6)==0);if(pol.fault==2)((struct ndmsg*)r.body)->ndm_state=NUD_STALE;at=raw_append(out,at,&r,port);}
+ else if(up.request.nlmsg_type==RTM_GETROUTE){
+   struct rtmsg route;
+   memcpy(&route,up.request_bytes+NLMSG_HDRLEN,sizeof(route));
+   if(route.rtm_flags!=RTM_F_CLONED)at=raw_routes(out,fd==405,port);
+ }
+ else if(up.request.nlmsg_type==RTM_GETNEIGH){
+   struct ndmsg request;
+   memcpy(&request,up.request_bytes+NLMSG_HDRLEN,sizeof(request));
+   int guest=fd==405,v6=request.ndm_family==AF_INET6;
+   CHECK((request.ndm_family==AF_INET || v6) && !request.ndm_ifindex && !request.ndm_state &&
+         !request.ndm_flags && !request.ndm_type && pol.neighbors[guest][v6]==1);
+   if(v6 && !guest && pol.neighbor!=NEIGHBOR_ORDINARY){
+     struct ndmsg extra={.ndm_family=AF_INET6,.ndm_ifindex=50,.ndm_state=NUD_NOARP,
+                        .ndm_type=RTN_MULTICAST};
+     unsigned char group[16]={0xff,0x02,0,0,0,0,0,0,0,0,0,1,0xff,0,0,3};
+     unsigned char mac[6]={0x33,0x33,0xff,0,0,3};
+     if(pol.neighbor==NEIGHBOR_WRONG_MAC)mac[5]^=1;
+     if(pol.neighbor==NEIGHBOR_FLAGGED)extra.ndm_flags=NTF_PROXY;
+     if(pol.neighbor==NEIGHBOR_PERMANENT_MULTICAST)extra.ndm_state=NUD_PERMANENT;
+     if(pol.neighbor==NEIGHBOR_WRONG_TYPE)extra.ndm_type=RTN_UNICAST;
+     if(pol.neighbor==NEIGHBOR_OTHER_UNICAST){
+       group[0]=0xfd;
+       extra.ndm_type=RTN_UNICAST;
+       extra.ndm_state=NUD_PERMANENT;
+     }
+     oci_uplink_request(&r,RTM_NEWNEIGH,0,&extra,sizeof(extra));
+     struct nda_cacheinfo cache={0};
+     uint32_t probes=0;
+     CHECK(oci_uplink_attr(&r,NDA_DST,group,sizeof(group))==0 &&
+           oci_uplink_attr(&r,NDA_LLADDR,mac,sizeof(mac))==0 &&
+           oci_uplink_attr(&r,NDA_PROBES,&probes,sizeof(probes))==0 &&
+           oci_uplink_attr(&r,NDA_CACHEINFO,&cache,sizeof(cache))==0);
+     if(pol.neighbor==NEIGHBOR_UNKNOWN_ATTRIBUTE){
+       uint8_t protocol=1;
+       CHECK(oci_uplink_attr(&r,NDA_PROTOCOL,&protocol,sizeof(protocol))==0);
+     }
+     at=raw_append(out,at,&r,port);
+   }
+   if(!v6 || guest || pol.neighbor!=NEIGHBOR_MISSING_PEER){
+     struct ndmsg peer={.ndm_family=request.ndm_family,.ndm_ifindex=guest?51:50,
+                        .ndm_state=pol.fault==2?NUD_STALE:NUD_PERMANENT,.ndm_type=RTN_UNICAST};
+     oci_uplink_request(&r,RTM_NEWNEIGH,0,&peer,sizeof(peer));
+     const void *ip=v6?(const void*)(guest?subject->expected.host6:subject->expected.guest6):
+                       (const void*)(guest?subject->expected.host4:subject->expected.guest4);
+     CHECK(oci_uplink_attr(&r,NDA_DST,ip,v6?16u:4u)==0 &&
+           oci_uplink_attr(&r,NDA_LLADDR,guest?subject->host_mac:subject->guest_mac,6)==0);
+     at=raw_append(out,at,&r,port);
+   }
+ }
  else {CHECK(up.request.nlmsg_type==RTM_GETRULE);at=raw_rules(out,port);}
- struct {struct nlmsghdr h;int result;} done={.h={.nlmsg_len=NLMSG_LENGTH(sizeof(int)),.nlmsg_type=NLMSG_DONE,.nlmsg_flags=NLM_F_MULTI,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port}};if(up.read_fault)done.h.nlmsg_flags|=NLM_F_DUMP_INTR;memcpy(out+at,&done,sizeof(done));return (ssize_t)(at+sizeof(done));
+ struct {struct nlmsghdr h;int result;} done={.h={.nlmsg_len=NLMSG_LENGTH(sizeof(int)),.nlmsg_type=NLMSG_DONE,.nlmsg_flags=NLM_F_MULTI,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port}};if(up.request.nlmsg_type==RTM_GETROUTE){
+   struct rtmsg route;
+   memcpy(&route,up.request_bytes+NLMSG_HDRLEN,sizeof(route));
+   if(route.rtm_flags==RTM_F_CLONED)done.h.nlmsg_flags|=NLM_F_DUMP_FILTERED;
+ }
+ if(up.read_fault)done.h.nlmsg_flags|=NLM_F_DUMP_INTR;
+ memcpy(out+at,&done,sizeof(done));
+ return (ssize_t)(at+sizeof(done));
 }
 static void prepare(struct tns_oci_owner *o,struct tns_owner *b){memset(&up,0,sizeof(up));lock_busy=lock_taken=0;initialize_egress(o,b);CHECK(oci_egress_select(o,9)==0 && oci_egress_guard_install(o)==0);o->command_pid=0;up.active=1;
  int n=snprintf(up.file,sizeof(up.file),"{\"kind\":\"linux-oci-owned-topology@1\",\"artifact\":%s,\"topology\":{\"interfaceName\":\"eth0\",\"interfaceIndex\":2,\"interfaceMac\":\"02:11:22:33:44:55\",\"ipv4Address\":\"192.0.2.2/24\",\"ipv4Gateway\":\"192.0.2.1\",\"ipv6Address\":\"2001:db8::2/64\",\"ipv6Gateway\":\"2001:db8::1\",\"peerIpv4Host\":\"10.77.0.2\",\"peerIpv4Guest\":\"10.77.0.3\",\"peerIpv6Host\":\"fd77::2\",\"peerIpv6Guest\":\"fd77::3\"}}",eg.artifact);CHECK(n>0 && (size_t)n<sizeof(up.file));up.file_size=(size_t)n;
@@ -733,5 +799,47 @@ static void policy_source_cases(void){struct tns_oci_owner o;struct tns_owner b;
  policy_prepare(&o,&b);pol.active=1;pol.fault=2;CHECK(oci_policy_install(policy_subject)<0 && !pol.spawns && subject->broken && lock_taken);CHECK(tns_oci_close_transport(&o)<0 && !up.deletes && o.uplink && b.phase==TNS_HELD);policy_discard(&o);
 }
 static void policy_child_case(void){struct tns_oci_owner o;struct tns_owner b;policy_prepare(&o,&b);CHECK(oci_uplink_lock(subject)==0);pol.child=1;eg.child_mode=1;eg.ranges=eg.entered=0;if(!setjmp(child_exit))oci_policy_child(policy_subject,2,450,453);CHECK(lock_taken && eg.ranges==3 && eg.entered && eg.close_calls[4]>=1);pol.child=0;eg.child_mode=0;CHECK(oci_uplink_unlock(subject)==0);policy_discard(&o);}
+static void policy_multicast_neighbor_cases(void){
+  const enum neighbor_fixture cases[]={
+    NEIGHBOR_MULTICAST, NEIGHBOR_WRONG_MAC, NEIGHBOR_FLAGGED,
+    NEIGHBOR_PERMANENT_MULTICAST, NEIGHBOR_WRONG_TYPE, NEIGHBOR_OTHER_UNICAST,
+    NEIGHBOR_UNKNOWN_ATTRIBUTE, NEIGHBOR_MISSING_PEER,
+  };
+  for(size_t i=0;i<sizeof(cases)/sizeof(cases[0]);i++){
+    struct tns_oci_owner owner;
+    struct tns_owner namespace_owner;
+    policy_prepare(&owner,&namespace_owner);
+    pol.active=1;
+    pol.neighbor=cases[i];
+    int result=oci_policy_install(policy_subject);
+    if(cases[i]==NEIGHBOR_MULTICAST){
+      CHECK(result==0 && policy_subject->verified && pol.spawns==3 && !lock_taken);
+      for(size_t side=0;side<2;side++)
+        CHECK(pol.neighbors[side][0]==1 && pol.neighbors[side][1]==1);
+    }else{
+      CHECK(result<0 && !policy_subject->verified && !pol.spawns &&
+            subject->broken && lock_taken);
+    }
+    policy_discard(&owner);
+  }
+}
 static void recursive_health_case(void){CHECK(oci_policy_health("/%25x%2541")<0);CHECK(oci_policy_health("/%25x")==0);CHECK(oci_policy_health("/%E3%81%82")==0);CHECK(oci_policy_health("/%252e%252e/x")<0);}
-int main(int argc,char **argv){(void)codec_cases_uplink;(void)source_cases;(void)new_edge_cases;(void)child_case;(void)ack_loss_cases;CHECK(argc==2);if(!strcmp(argv[1],"--recursive-percent"))recursive_health_case();else{CHECK(!strcmp(argv[1],"--all"));policy_codec_cases();policy_source_cases();policy_child_case();}printf("new selected policy raw boundary: %lu checks\n",checks);return 0;}
+int main(int argc,char **argv){
+  (void)codec_cases_uplink;
+  (void)source_cases;
+  (void)new_edge_cases;
+  (void)child_case;
+  (void)ack_loss_cases;
+  CHECK(argc==2);
+  if(!strcmp(argv[1],"--recursive-percent"))recursive_health_case();
+  else if(!strcmp(argv[1],"--neighbor-multicast"))policy_multicast_neighbor_cases();
+  else{
+    CHECK(!strcmp(argv[1],"--all"));
+    policy_codec_cases();
+    policy_source_cases();
+    policy_multicast_neighbor_cases();
+    policy_child_case();
+  }
+  printf("new selected policy raw boundary: %lu checks\n",checks);
+  return 0;
+}

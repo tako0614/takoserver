@@ -288,10 +288,19 @@ static int oci_policy_neighbor_read(struct oci_policy_owner *p,int guest,int fam
         if((uint32_t)a.ndm_ifindex==(guest?u->guest_index:u->host_index)){
           const void *ip=family==AF_INET?(const void*)(guest?u->expected.host4:u->expected.guest4):(const void*)(guest?u->expected.host6:u->expected.guest6);
           size_t width=family==AF_INET?4u:16u;
-          if(++found!=1 || a.ndm_state!=NUD_PERMANENT || a.ndm_flags || a.ndm_type!=RTN_UNICAST || !attrs.p[NDA_DST] || attrs.size[NDA_DST]!=width || memcmp(attrs.p[NDA_DST],ip,width) ||
-              !attrs.p[NDA_LLADDR] || attrs.size[NDA_LLADDR]!=6 || memcmp(attrs.p[NDA_LLADDR],guest?u->host_mac:u->guest_mac,6))goto fail;
+          const unsigned char *address=attrs.p[NDA_DST],*link_address=attrs.p[NDA_LLADDR];
+          if(a.ndm_flags || !address || attrs.size[NDA_DST]!=width ||
+              !link_address || attrs.size[NDA_LLADDR]!=6)goto fail;
           for(unsigned int k=1;k<128;k++)if(attrs.p[k] && k!=NDA_DST && k!=NDA_LLADDR && k!=NDA_CACHEINFO && k!=NDA_PROBES)goto fail;
           if((attrs.p[NDA_CACHEINFO] && attrs.size[NDA_CACHEINFO]!=sizeof(struct nda_cacheinfo)) || (attrs.p[NDA_PROBES] && attrs.size[NDA_PROBES]!=4))goto fail;
+          /* Linux derives these IPv6 multicast cache entries on Ethernet.
+           * Only the exact permanent unicast peer counts as a peer observation. */
+          int multicast_cache=family==AF_INET6 && a.ndm_type==RTN_MULTICAST &&
+              a.ndm_state==NUD_NOARP && address[0]==0xff &&
+              link_address[0]==0x33 && link_address[1]==0x33 &&
+              !memcmp(link_address+2,address+12,4);
+          if(!multicast_cache && (++found!=1 || a.ndm_state!=NUD_PERMANENT || a.ndm_type!=RTN_UNICAST ||
+              memcmp(address,ip,width) || memcmp(link_address,guest?u->host_mac:u->guest_mac,6)))goto fail;
         }
       }
       at+=NLMSG_ALIGN((size_t)h.nlmsg_len);
