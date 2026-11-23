@@ -9,6 +9,10 @@
 #include <sys/vfs.h>
 #include <linux/magic.h>
 
+#ifndef PID_FS_MAGIC
+#define PID_FS_MAGIC 0x50494446 /* Linux UAPI, including v6.12 */
+#endif
+
 #ifndef SO_PEERPIDFD
 #define SO_PEERPIDFD 77 /* exact v6.12 asm-generic/socket.h */
 #endif
