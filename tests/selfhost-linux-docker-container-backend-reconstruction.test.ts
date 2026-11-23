@@ -25,6 +25,22 @@ import { SOURCE_SELECTION } from "./helpers/docker-container-configured-source-s
 import { createRawLinuxDockerStdio } from "./helpers/linux-docker-raw-stdio.ts";
 
 type Engine = NonNullable<DockerHttpRevisionOptions["engine"]>;
+type ServingInterleaving =
+  | "commit-held"
+  | "old-read-held"
+  | "old-read-error"
+  | "ack-lost"
+  | "wrong-epoch";
+
+function latch() {
+  let release = () => {};
+  const waiting = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { waiting, release };
+}
+
+const updateNativeId = "2".repeat(64);
 
 // Raw Node HTTP transport only: original request encoding, deadlines, status and
 // body parsing stay in production. No Docker engine option/factory is replaced.
@@ -75,7 +91,51 @@ function interceptHttp(raw: Engine) {
 async function fixture(fault: "helper-open" | "health-response" = "helper-open") {
   const database = new Database(":memory:");
   migrateSqlite(database);
-  const sql = createSqliteSql(database);
+  const baseSql = createSqliteSql(database);
+  const oldRead = { capture: false, entered: latch(), complete: latch() };
+  let servingInterleaving: ServingInterleaving | undefined;
+  let servingWrites = 0;
+  const sql: typeof baseSql = {
+    ...baseSql,
+    async query(query, params) {
+      const rows = await baseSql.query(query, params);
+      if (
+        oldRead.capture &&
+        params?.[1] === 2 &&
+        query.includes("i.runtime_epoch AS i_runtime_epoch") &&
+        query.endsWith(" WHERE i.resource_uid=? AND v.generation=?")
+      ) {
+        oldRead.capture = false;
+        oldRead.entered.release();
+        await oldRead.complete.waiting;
+        if (servingInterleaving === "old-read-error")
+          throw new Error("synthetic owner read failed during serving publication");
+      }
+      return rows;
+    },
+    async batch(statements) {
+      const result = await baseSql.batch(statements);
+      const publish = statements.find(
+        ({ sql, params }) =>
+          sql.startsWith(
+            "UPDATE tf_v2_container_instances SET serving_generation=?,runtime_epoch=runtime_epoch+1 ",
+          ) && params?.[0] === 2,
+      );
+      if (servingInterleaving && publish) {
+        servingWrites++;
+        if (servingInterleaving === "commit-held") await Bun.sleep(425);
+        if (servingInterleaving === "ack-lost")
+          throw new Error("synthetic serving publication acknowledgement lost");
+        if (servingInterleaving === "wrong-epoch") {
+          await baseSql.run(
+            "UPDATE tf_v2_container_instances SET runtime_epoch=runtime_epoch+1 WHERE resource_uid=?",
+            [publish.params?.[1] ?? null],
+          );
+        }
+      }
+      return result;
+    },
+  };
   await sql.batch(
     frameHostMigrationSql(additiveV2ConfiguredUpdateInputsDDL).map((sql) => ({ sql })),
   );
@@ -223,8 +283,22 @@ async function fixture(fault: "helper-open" | "health-response" = "helper-open")
         });
         if (!known) throw new Error("unknown raw health destination");
         healthRequests++;
+        if (
+          known.Id === updateNativeId &&
+          (servingInterleaving === "old-read-held" || servingInterleaving === "old-read-error")
+        ) {
+          // The main execution is awaiting this response. Only the previously
+          // armed runtime monitor can start the selected gen2 owner read.
+          oldRead.capture = true;
+          await Promise.race([
+            oldRead.entered.waiting,
+            Bun.sleep(800).then(() => {
+              throw new Error("runtime monitor did not start its owner read");
+            }),
+          ]);
+        }
         return new Response("", {
-          status: known.Id === "2".repeat(64) && !updateHealthAvailable ? 503 : 200,
+          status: known.Id === updateNativeId && !updateHealthAvailable ? 503 : 200,
         });
       },
       { preconnect: originalFetch.preconnect },
@@ -311,6 +385,11 @@ async function fixture(fault: "helper-open" | "health-response" = "helper-open")
     rawRequests: () => rawRequests,
     failedUpdateOpens: () => failedUpdateOpens,
     healthRequests: () => healthRequests,
+    interleaveServing(mode: ServingInterleaving | undefined) {
+      servingInterleaving = mode;
+    },
+    servingWrites: () => servingWrites,
+    releaseOldServingRead: oldRead.complete.release,
     create() {
       return engine.acceptCreate({
         principal: "synthetic-reconstruction-parent",
@@ -354,6 +433,7 @@ async function fixture(fault: "helper-open" | "health-response" = "helper-open")
       return engine.runNext();
     },
     async close() {
+      oldRead.complete.release();
       try {
         const closed = await composition.close().then(
           () => null,
@@ -492,7 +572,7 @@ test("original host reconstruction resumes bound UPDATE with fresh owner and no 
   }
 });
 
-test("running UPDATE reconstruction resumes the original closed lifetime without another START", async () => {
+async function runningUpdateReconstruction(interleaving?: ServingInterleaving) {
   const f = await fixture("health-response");
   try {
     const created = await f.create();
@@ -516,12 +596,53 @@ test("running UPDATE reconstruction resumes the original closed lifetime without
     const closedWire = f.physical.guestReadback("2".repeat(64));
     if (!closedWire || closedWire === originalWire)
       throw new Error("original closed lifetime deny missing");
-    expect(await f.retry(updated.id)).toMatchObject({
+    f.interleaveServing(interleaving);
+    const result = await f.retry(updated.id);
+    if (interleaving !== undefined) expect(f.servingWrites()).toBe(1);
+    if (interleaving === "ack-lost" || interleaving === "wrong-epoch") {
+      expect(result).toMatchObject({ id: updated.id, status: "reconciling", effect: "unknown" });
+      expect(f.physical.guestReadback(updateNativeId)).toBe(closedWire);
+      expect(f.docker.creates()).toHaveLength(2);
+      expect(f.physical.starts()).toBe(2);
+      expect(
+        f.physical.nativeCommands.filter(
+          ({ nativeId, operation }) => nativeId === updateNativeId && operation === "RESUMEGUEST",
+        ),
+      ).toHaveLength(1);
+      return;
+    }
+    expect(result).toMatchObject({
       id: updated.id,
       generation: 2,
       status: "succeeded",
       effect: "complete",
     });
+    if (interleaving === "old-read-error") {
+      f.releaseOldServingRead();
+      const closed = () => f.physical.guestReadback(updateNativeId) === closedWire;
+      const until = performance.now() + 500;
+      while (!closed() && performance.now() < until) await Bun.sleep(5);
+      expect(closed()).toBe(true);
+      expect(f.docker.creates()).toHaveLength(2);
+      expect(f.physical.starts()).toBe(2);
+      expect(
+        f.physical.nativeCommands.filter(
+          ({ nativeId, operation }) => nativeId === updateNativeId && operation === "RESUMEGUEST",
+        ),
+      ).toHaveLength(1);
+      return;
+    }
+    if (interleaving === "old-read-held") {
+      const renewals = () =>
+        f.physical.nativeCommands.filter(
+          ({ nativeId, operation }) => nativeId === updateNativeId && operation === "KEEPGUEST",
+        ).length;
+      const beforeRelease = renewals();
+      f.releaseOldServingRead();
+      const until = performance.now() + 500;
+      while (renewals() === beforeRelease && performance.now() < until) await Bun.sleep(5);
+      expect(renewals()).toBeGreaterThan(beforeRelease);
+    }
     expect(await f.sql.query("SELECT serving_generation FROM tf_v2_container_instances")).toEqual([
       { serving_generation: 2 },
     ]);
@@ -557,6 +678,30 @@ test("running UPDATE reconstruction resumes the original closed lifetime without
   } finally {
     await f.close();
   }
+}
+
+test("running UPDATE reconstruction resumes the original closed lifetime without another START", async () => {
+  await runningUpdateReconstruction();
+});
+
+test("running UPDATE reconstruction retains its lifetime during the original serving write acknowledgement", async () => {
+  await runningUpdateReconstruction("commit-held");
+});
+
+test("running UPDATE reconstruction renews after a stale pre-publication owner read", async () => {
+  await runningUpdateReconstruction("old-read-held");
+});
+
+test("running UPDATE reconstruction refuses an owner read error crossing publication", async () => {
+  await runningUpdateReconstruction("old-read-error");
+});
+
+test("running UPDATE reconstruction keeps a lost serving acknowledgement closed", async () => {
+  await runningUpdateReconstruction("ack-lost");
+});
+
+test("running UPDATE reconstruction rejects an unrelated serving epoch increment", async () => {
+  await runningUpdateReconstruction("wrong-epoch");
 });
 
 test("accepted old-generation owner observes native drain primitives before settlement and rejects foreign or stale execution", async () => {

@@ -139,12 +139,14 @@ type Context = V2HostAcceptanceContext | V2HostDeleteAcceptanceContext;
 type Proof = Record<string, string | number | null>;
 // Private negative SQL fence from a close already authenticated by this owner.
 type RetiredCurrent = (() => Promise<() => void>) & { readonly snapshot: SqlStatement };
+type ServingPublication = { readonly finished: Promise<void>; pending: boolean };
 type Lease = {
   readonly record: DockerContainerCreateRecord;
   readonly phase: DockerContainerCreatePhase;
   proof: Proof;
   readonly controller: AbortController;
   active: boolean;
+  servingPublication?: ServingPublication;
 };
 
 export interface DockerContainerCoreOwnerOptions {
@@ -1415,28 +1417,38 @@ export function createDockerContainerCoreOwner(
     );
   }
   async function current(lease: Lease): Promise<boolean> {
-    if (!lease.active || lease.controller.signal.aborted) return false;
     try {
-      const { intent, proof } = await load(lease.record.intent);
-      sameRecord(lease.record, record(intent, proof));
-      if (
-        !usable(proof, lease.phase) ||
-        ["i_runtime_epoch", "i_incarnation_id", "i_retired_at_ms"].some(
-          (key) => proof[key] !== lease.proof[key],
+      while (lease.active && !lease.controller.signal.aborted) {
+        const publication = lease.servingPublication;
+        if (publication?.pending) {
+          await publication.finished;
+          continue;
+        }
+        const loaded = await load(lease.record.intent);
+        // A read already under way at publication can return either side of the
+        // SQL commit. Re-read after the same owner finishes the handoff.
+        if (publication !== lease.servingPublication) continue;
+        const { intent, proof } = loaded;
+        sameRecord(lease.record, record(intent, proof));
+        if (
+          !usable(proof, lease.phase) ||
+          ["i_runtime_epoch", "i_incarnation_id", "i_retired_at_ms"].some(
+            (key) => proof[key] !== lease.proof[key],
+          )
         )
-      )
-        throw new Error();
-      if (
-        ["i_management_epoch", "r_last_operation"].some((key) => proof[key] !== lease.proof[key])
-      ) {
-        if (!retainedServing(lease, proof)) throw new Error();
-        lease.proof = proof;
+          throw new Error();
+        if (
+          ["i_management_epoch", "r_last_operation"].some((key) => proof[key] !== lease.proof[key])
+        ) {
+          if (!retainedServing(lease, proof)) throw new Error();
+          lease.proof = proof;
+        }
+        return lease.active && !lease.controller.signal.aborted;
       }
-      return lease.active && !lease.controller.signal.aborted;
     } catch {
       lease.controller.abort();
-      return false;
     }
+    return false;
   }
   async function activeRecord(
     input: DockerContainerCreateRecord,
@@ -1999,43 +2011,72 @@ export function createDockerContainerCoreOwner(
         runningAt,
       ],
     });
-    // The OCI loan can revoke during the final current/load Sql await.
-    // Its original lexical fence runs synchronously before the first write;
-    // the legacy Docker producer supplies no additional continuation.
-    beforePublish?.();
-    const writes = await sql.batch(statements);
-    if (writes.length !== statements.length || writes.some((write) => write.changes !== 1))
-      return fail();
-    const after = await reload();
-    if (
-      after.proof.i_serving_generation !== before.intent.policy.generation ||
-      after.proof.i_runtime_epoch !== oldEpoch + 1 ||
-      after.proof.i_management_epoch !== before.proof.i_management_epoch ||
-      after.proof.i_desired_generation !== before.proof.i_desired_generation ||
-      after.proof.v_retention !== "serving" ||
-      after.record.claimId !== before.record.claimId ||
-      after.record.nativeId !== before.record.nativeId
-    )
-      return fail();
-    // Advance only existing live leases for this exact accepted/native binding
-    // after reading the successful SQL transition. Other generations still revoke.
-    for (const held of leases) {
-      if (
+    const intentKey = intentJson(before.intent);
+    const matched = [...leases].filter(
+      (held) =>
         held.active &&
         !held.controller.signal.aborted &&
         held.phase !== "remove" &&
-        held.record.claimId === after.record.claimId &&
-        held.record.nativeId === after.record.nativeId &&
-        held.record.intent.policy.generation === after.intent.policy.generation &&
-        intentJson(held.record.intent) === intentJson(after.intent) &&
-        held.proof.i_management_epoch === before.proof.i_management_epoch &&
-        held.proof.i_runtime_epoch === before.proof.i_runtime_epoch &&
-        held.proof.i_desired_generation === before.proof.i_desired_generation &&
-        held.proof.q_claim_id === after.record.claimId &&
-        held.proof.q_native_id === after.record.nativeId
+        held.record.state === "bound" &&
+        held.record.claimId === before.record.claimId &&
+        held.record.nativeId === nativeId &&
+        intentJson(held.record.intent) === intentKey &&
+        [
+          "i_management_epoch",
+          "i_runtime_epoch",
+          "i_desired_generation",
+          "i_serving_generation",
+          "r_last_operation",
+          "v_operation_id",
+          "v_retention",
+          "q_claim_id",
+          "q_native_id",
+        ].every((key) => held.proof[key] === before.proof[key]),
+    );
+    if (!matched.includes(lease) || matched.some((held) => held.servingPublication?.pending))
+      return fail();
+    let finish = () => {};
+    const publication: ServingPublication = {
+      pending: true,
+      finished: new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
+    };
+    // The OCI loan can revoke during the final current/load SQL await.
+    // Its original lexical fence still precedes the write synchronously.
+    beforePublish?.();
+    for (const held of matched) held.servingPublication = publication;
+    try {
+      const writes = await sql.batch(statements);
+      if (writes.length !== statements.length || writes.some((write) => write.changes !== 1))
+        return fail();
+      const after = await reload();
+      if (
+        after.proof.i_serving_generation !== before.intent.policy.generation ||
+        after.proof.i_runtime_epoch !== oldEpoch + 1 ||
+        after.proof.i_management_epoch !== before.proof.i_management_epoch ||
+        after.proof.i_desired_generation !== before.proof.i_desired_generation ||
+        after.proof.r_last_operation !== before.proof.r_last_operation ||
+        after.proof.v_operation_id !== before.proof.v_operation_id ||
+        after.proof.v_retention !== "serving" ||
+        intentJson(after.intent) !== intentKey ||
+        after.record.claimId !== before.record.claimId ||
+        after.record.nativeId !== nativeId ||
+        !lease.active ||
+        lease.controller.signal.aborted
       )
-        held.proof = after.proof;
+        return fail();
+      for (const held of matched) {
+        if (held.active && !held.controller.signal.aborted) held.proof = after.proof;
+      }
+    } catch (error) {
+      for (const held of matched) held.controller.abort();
+      throw error;
+    } finally {
+      publication.pending = false;
+      finish();
     }
+    // These full checks may themselves read one of the advanced leases.
     await verify();
     if (!(await current(lease))) return fail();
   }
