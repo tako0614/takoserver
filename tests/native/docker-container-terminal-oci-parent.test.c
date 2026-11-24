@@ -35,6 +35,7 @@ enum descriptor_receive_fault {
 };
 enum { DESCRIPTOR_INIT = 94, DESCRIPTOR_REQUESTER = 97 };
 enum { HOLD_IDLE_SIGNAL = 13, HOLD_TAIL_RIGHT = 14, HOLD_END_RIGHT = 15 };
+enum { ADMISSION_H = 1, ADMISSION_P, ADMISSION_CONNECTOR, ADMISSION_SIDE = 85, ADMISSION_PASS = 86 };
 static const uint64_t descriptor_inode = UINT64_C(0x100000345);
 static struct {
   int wrong_controller, not_root, tamper, close_fault, wait_kind, host_eof, host_epipe;
@@ -82,6 +83,9 @@ static struct {
   int held, held_fault, held_loss;
   unsigned int hold_transfers, hold_receives, held_tail_reads, held_idle_wakes;
   unsigned char held_packet[129];
+  int admission, admission_fault;
+  unsigned int admission_reads, admission_requests, admission_proofs, admission_releases, admission_samples;
+  unsigned char admission_proof[192];
 } pm;
 static jmp_buf parent_jump;
 static int parent_exit_code;
@@ -113,6 +117,8 @@ static ssize_t parent_recv(int fd, void *bytes, size_t size, int flags);
 static ssize_t parent_recvmsg(int fd, struct msghdr *message, int flags);
 static ssize_t parent_sendmsg(int fd, const struct msghdr *message, int flags);
 static int parent_live_observe(struct tns_oci_owner *owner, struct tns_oci_started *started);
+static int parent_published_admission(struct tns_oci_owner *owner, uint64_t generation, int64_t deadline,
+  struct tns_oci_admission_read **slot, struct tns_oci_published_admission *out);
 static int parent_bind(int fd, const struct sockaddr *address, socklen_t size);
 static int parent_listen(int fd, int backlog);
 static int parent_getsockname(int fd, struct sockaddr *address, socklen_t *size);
@@ -150,6 +156,7 @@ static _Noreturn void parent_exit(int status);
 #define recvmsg parent_recvmsg
 #define sendmsg parent_sendmsg
 #define tns_oci_read_live_init parent_live_observe
+#define tns_oci_read_published_admission parent_published_admission
 #define bind parent_bind
 #define listen parent_listen
 #define getsockname parent_getsockname
@@ -169,6 +176,7 @@ static _Noreturn void parent_exit(int status);
 #undef listen
 #undef bind
 #undef tns_oci_read_live_init
+#undef tns_oci_read_published_admission
 #undef recv
 #undef recvmsg
 #undef sendmsg
@@ -210,14 +218,14 @@ static int parent_fstat(int fd, struct stat *out) {
        fd == 99 ? UINT64_C(0x100000555) : descriptor_inode)};
     return 0;
   }
-  if (pm.descriptor_mode && (fd == 80 || fd == DESCRIPTOR_INIT)) {
+  if ((pm.descriptor_mode || pm.admission == ADMISSION_P) && (fd == 80 || fd == DESCRIPTOR_INIT)) {
     *out = (struct stat){.st_dev = fd == 80 ? 42 : 45,
       .st_ino = (ino_t)(fd == 80 ? UINT64_C(0x100000111) : descriptor_inode)};
     return 0;
   }
-  if(fd==4){CHECK(pm.child);*out=(struct stat){.st_mode=S_IFSOCK|0600};return 0;}
+  if(fd==4 || (pm.admission == ADMISSION_H && fd == ADMISSION_PASS)){CHECK(pm.child);*out=(struct stat){.st_mode=S_IFSOCK|0600};return 0;}
   if(fd==93){CHECK(pm.application_profile);*out=(struct stat){.st_dev=42,.st_ino=pm.application_inode+(pm.application_stat_changed?1u:0u)};return 0;}
-  if(fd==61 || fd==92){*out=(struct stat){.st_dev=42,.st_ino=fd==61?pm.self_inode:pm.peer_inode,.st_mode=0700};return 0;}
+  if(fd==61 || fd==92 || (pm.admission==ADMISSION_CONNECTOR && fd==98)){*out=(struct stat){.st_dev=42,.st_ino=fd==61?pm.self_inode:pm.peer_inode,.st_mode=0700};return 0;}
   CHECK(fd == 60 || (pm.child && fd == 3));
   if(fd==60)pm.executable_stats++;
   *out = (struct stat){.st_dev=99,.st_ino=(pm.tamper || (pm.tamper_after && pm.executable_stats>1)) ? 2u : 1u,.st_mode=S_IFREG|0755,
@@ -227,13 +235,13 @@ static int parent_fstatfs(int fd,struct statfs *out){
   if (pm.held && (fd == 95 || fd == 99 || fd == DESCRIPTOR_INIT)) {
     memset(out,0,sizeof(*out));out->f_type=PID_FS_MAGIC;return 0;
   }
-  if (pm.descriptor_mode && (fd == 80 || fd == DESCRIPTOR_INIT)) {
+  if ((pm.descriptor_mode || pm.admission == ADMISSION_P) && (fd == 80 || fd == DESCRIPTOR_INIT)) {
     memset(out,0,sizeof(*out));
     out->f_type=(long)(fd==DESCRIPTOR_INIT && pm.descriptor_fault==DESCRIPTOR_FOREIGN_PIDFS ?
       ANON_INODE_FS_MAGIC : PID_FS_MAGIC);
     return 0;
   }
-  CHECK(fd==61 || fd==62 || fd==92 || (fd==93 && pm.application_profile));memset(out,0,sizeof(*out));
+  CHECK(fd==61 || fd==62 || fd==92 || (fd==93 && pm.application_profile) || (pm.admission==ADMISSION_CONNECTOR && fd==98));memset(out,0,sizeof(*out));
   out->f_type=fd==62?PROC_SUPER_MAGIC:pm.old_pidfs?ANON_INODE_FS_MAGIC:PID_FS_MAGIC;return 0;
 }
 static int parent_connect(int fd,const struct sockaddr *address,socklen_t size){
@@ -253,7 +261,9 @@ static int parent_pipe2(int ends[2], int flags) {
 static int parent_fcntl(int fd, int command, ...) {
   va_list ap; va_start(ap,command); int minimum=va_arg(ap,int); va_end(ap);
   if(command==F_SETFD){CHECK((fd==61 || fd==92 || (fd==93 && pm.application_profile) ||
-    (fd==4 && pm.child) || (fd==99 && pm.held)) && minimum==FD_CLOEXEC);return 0;}
+    (fd==4 && pm.child) || (fd==99 && pm.held) ||
+    (fd==ADMISSION_PASS && pm.admission==ADMISSION_H) ||
+    (fd==98 && pm.admission==ADMISSION_CONNECTOR)) && minimum==FD_CLOEXEC);return 0;}
   CHECK(pm.child && command==F_DUPFD_CLOEXEC && minimum==10);
   CHECK(fd==70 || fd==73 || fd==75 || fd==60 || (fd==77 && pm.live_sockets)); return 100+(int)pm.duplicates++;
 }
@@ -306,7 +316,7 @@ static int parent_clock(clockid_t kind,struct timespec *out) {
 }
 static int parent_getsockopt(int fd,int level,int option,void *out,socklen_t *size) {
   CHECK(level==SOL_SOCKET);
-  if(fd==4) {
+  if(fd==4 || (fd==ADMISSION_PASS && pm.admission==ADMISSION_H)) {
     CHECK(pm.child);
     if(option==SO_DOMAIN || option==SO_TYPE) {
       CHECK(*size==sizeof(int));*(int*)out=option==SO_DOMAIN?AF_UNIX:SOCK_SEQPACKET;return 0;
@@ -326,7 +336,7 @@ static int parent_getsockopt(int fd,int level,int option,void *out,socklen_t *si
   }
   if(fd==90){
     if(option==SO_PEERPIDFD){CHECK(pm.connector && *size==sizeof(int));pm.peer_gets++;
-      if(pm.pidfd_unsupported){errno=ENOPROTOOPT;return -1;}*(int*)out=92;*size=pm.pidfd_short?3:sizeof(int);return 0;}
+      if(pm.pidfd_unsupported){errno=ENOPROTOOPT;return -1;}*(int*)out=pm.admission==ADMISSION_CONNECTOR?98:92;*size=pm.pidfd_short?3:sizeof(int);return 0;}
     CHECK(option==SO_COOKIE && *size==sizeof(uint64_t));memcpy(out,&pm.instance_cookie,sizeof(uint64_t));return 0;
   }
   CHECK(fd==91 && option==SO_PEERCRED && *size==sizeof(struct ucred));
@@ -335,6 +345,7 @@ static int parent_getsockopt(int fd,int level,int option,void *out,socklen_t *si
 static int parent_socket(int family,int type,int protocol){CHECK(family==AF_UNIX && type==(SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC) && !protocol);pm.sockets++;return 90;}
 static int parent_socketpair(int family, int type, int protocol, int ends[2]) {
   CHECK(family==AF_UNIX && type==(SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC) && !protocol && pm.application_profile);
+  if (pm.admission==ADMISSION_P) { ends[0]=ADMISSION_SIDE;ends[1]=ADMISSION_PASS;return 0; }
   ends[0]=76;ends[1]=77;pm.live_sockets++;return 0;
 }
 static struct tns_oci_owner live_owner;
@@ -347,8 +358,36 @@ static int parent_live_observe(struct tns_oci_owner *owner, struct tns_oci_start
   started->namespace_inode=55;
   return 0;
 }
+static struct tns_oci_published_admission admission_fact(void) {
+  struct tns_oci_published_admission f = {.generation = 1,
+    .init = {.started = {.namespace_device = 4, .namespace_inode = 55},
+      .pidfd = DESCRIPTOR_INIT, .pidfd_device = 45, .pidfd_inode = descriptor_inode},
+    .topology = {.device = UINT64_MAX, .inode = 82, .size = 729, .mode = 33152,
+      .nlink = 1, .mtime_ns = UINT64_MAX, .ctime_ns = 1900000000000000010u}};
+  memcpy(f.init.started.native_id, CLAIM, 65);
+  return f;
+}
+static int parent_published_admission(struct tns_oci_owner *owner, uint64_t generation, int64_t deadline,
+  struct tns_oci_admission_read **slot, struct tns_oci_published_admission *out) {
+  CHECK(pm.admission==ADMISSION_H && owner==&live_owner && generation==1 && !*slot);
+  CHECK(deadline>pm.clock && deadline-pm.clock==2500 && ++pm.admission_samples==1);
+  if(pm.admission_fault==1) return -1;
+  *out=admission_fact();
+  return 0;
+}
 static ssize_t parent_send(int fd, const void *bytes, size_t size, int flags) {
   CHECK(flags==(MSG_DONTWAIT|MSG_NOSIGNAL));
+  if (pm.admission==ADMISSION_H) {
+    CHECK(fd==ADMISSION_PASS && size==8 && !memcmp(bytes,ocip_admission_h_released,8));
+    CHECK(pm.closes[DESCRIPTOR_INIT]==1 && ++pm.admission_releases==1);
+    return (ssize_t)size;
+  }
+  if (pm.admission==ADMISSION_P) {
+    CHECK(fd==91 && size==OCIP_ADMISSION_P_REPLY && ++pm.admission_proofs==1);
+    CHECK(pm.closes[DESCRIPTOR_INIT]==1 && pm.closes[ADMISSION_SIDE]==1 && pm.admission_reads==3);
+    memcpy(pm.admission_proof,bytes,size);
+    return (ssize_t)size;
+  }
   if (pm.descriptor_mode) {
     CHECK(fd == 76 && size == 8 && !memcmp(bytes, "TKOLIVE2", size));
     CHECK(++pm.descriptor_writes == 1);
@@ -379,7 +418,55 @@ static ssize_t parent_recv(int fd, void *bytes, size_t size, int flags) {
   size=pm.live_reply_size;memcpy(bytes,pm.live_reply,size);
   pm.live_reply_size=0;pm.live_receives++;return (ssize_t)size;
 }
+static void parent_deliver_rights(struct msghdr *message, const int *rights, size_t count) {
+  CHECK(count && CMSG_SPACE(count*sizeof(int))<=message->msg_controllen);
+  message->msg_controllen=CMSG_SPACE(count*sizeof(int));
+  struct cmsghdr *header=CMSG_FIRSTHDR(message);
+  CHECK(header);header->cmsg_level=SOL_SOCKET;header->cmsg_type=SCM_RIGHTS;
+  header->cmsg_len=CMSG_LEN(count*sizeof(int));
+  memcpy(CMSG_DATA(header),rights,count*sizeof(int));
+}
 static ssize_t parent_recvmsg(int fd, struct msghdr *message, int flags) {
+  CHECK(flags==(MSG_DONTWAIT|MSG_CMSG_CLOEXEC) && message->msg_iovlen==1);
+  if (fd==4) {
+    CHECK(message->msg_iov[0].iov_len==OCIP_ADMISSION_REQUEST);
+    if(pm.admission!=ADMISSION_H) {
+      message->msg_controllen=0;
+      return parent_recv(fd,message->msg_iov[0].iov_base,8,MSG_DONTWAIT|MSG_TRUNC);
+    }
+    unsigned char *body=message->msg_iov[0].iov_base;
+    memcpy(body,ocip_admission_h_request,8);ocipp_put64(body+8,1);ocipp_put64(body+16,(uint64_t)(pm.clock+4000));
+    static const int rights[]={ADMISSION_PASS,81};
+    parent_deliver_rights(message,rights,pm.admission_fault==2?2:1);
+    return OCIP_ADMISSION_REQUEST;
+  }
+  if (pm.admission==ADMISSION_P && fd==ADMISSION_SIDE) {
+    unsigned int phase=pm.admission_reads++;
+    unsigned char *body=message->msg_iov[0].iov_base;
+    if(!phase) {
+      CHECK(message->msg_iov[0].iov_len==OCIP_ADMISSION_H_REPLY);
+      struct tns_oci_published_admission f=admission_fact();
+      if(pm.admission_fault==2)f.generation++;
+      ocip_admission_encode(body,ocip_admission_h_proof,&f);
+      const int rights[]={DESCRIPTOR_INIT,95};
+      parent_deliver_rights(message,rights,pm.admission_fault==3?2:1);
+      return OCIP_ADMISSION_H_REPLY;
+    }
+    CHECK(phase<=2 && message->msg_iov[0].iov_len==8);
+    message->msg_controllen=0;
+    if(phase==1 && pm.admission_fault!=1) {memcpy(body,ocip_admission_h_released,8);return 8;}
+    if(phase==2 && pm.admission_fault==6) return 1;
+    return 0;
+  }
+  if (pm.admission==ADMISSION_CONNECTOR && fd==90) {
+    size_t capacity=message->msg_iov[0].iov_len;
+    if(capacity>17)capacity=17;
+    ssize_t n=parent_read(fd,message->msg_iov[0].iov_base,capacity);
+    if(pm.admission_fault==3 && n>0 && ++pm.admission_reads==2) {
+      int extra=96;parent_deliver_rights(message,&extra,1);
+    } else message->msg_controllen=0;
+    return n;
+  }
   if (pm.held && pm.connector && fd == 90) {
     CHECK(flags == (MSG_DONTWAIT | MSG_CMSG_CLOEXEC));
     if (pm.hold_receives) {
@@ -448,6 +535,25 @@ static ssize_t parent_recvmsg(int fd, struct msghdr *message, int flags) {
   return fault == DESCRIPTOR_SHORT ? 103 : 104;
 }
 static ssize_t parent_sendmsg(int fd, const struct msghdr *message, int flags) {
+  if (pm.admission==ADMISSION_H || pm.admission==ADMISSION_P) {
+    CHECK(flags==(MSG_DONTWAIT|MSG_NOSIGNAL) && message->msg_iovlen==1);
+    const unsigned char *body=message->msg_iov[0].iov_base;
+    struct cmsghdr *header=CMSG_FIRSTHDR(message);
+    CHECK(message->msg_controllen==CMSG_SPACE(sizeof(int)) && header &&
+      header->cmsg_level==SOL_SOCKET && header->cmsg_type==SCM_RIGHTS && header->cmsg_len==CMSG_LEN(sizeof(int)));
+    int right;memcpy(&right,CMSG_DATA(header),sizeof(right));
+    if(pm.admission==ADMISSION_H) {
+      struct tns_oci_published_admission f;
+      CHECK(fd==ADMISSION_PASS && right==DESCRIPTOR_INIT && message->msg_iov[0].iov_len==OCIP_ADMISSION_H_REPLY);
+      CHECK(ocip_admission_decode(body,ocip_admission_h_proof,&f)==0 && f.topology.device==UINT64_MAX);
+      CHECK(!pm.closes[DESCRIPTOR_INIT] && ++pm.admission_proofs==1);
+    } else {
+      CHECK(fd==76 && right==ADMISSION_PASS && message->msg_iov[0].iov_len==OCIP_ADMISSION_REQUEST);
+      CHECK(!memcmp(body,ocip_admission_h_request,8) && ocipp_u64(body+8)==1 && ocipp_u64(body+16)>=(uint64_t)pm.clock);
+      CHECK(++pm.admission_requests==1);
+    }
+    return (ssize_t)message->msg_iov[0].iov_len;
+  }
   CHECK(pm.held && !pm.connector && fd == 91 && flags == (MSG_DONTWAIT | MSG_NOSIGNAL));
   CHECK(++pm.hold_transfers == 1 && message->msg_iovlen == 1 &&
         message->msg_iov[0].iov_len == OCIPP_HOLD_PACKET);
@@ -543,6 +649,49 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
   CHECK(pm.delivered_size+size<=sizeof(pm.delivered));memcpy(pm.delivered+pm.delivered_size,bytes,size);pm.delivered_size+=size;return (ssize_t)size;
 }
 static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
+  if (pm.admission==ADMISSION_H && count==3 && fds[0].fd==0) {
+    CHECK(timeout==0 && fds[1].fd==ADMISSION_PASS);
+    for(nfds_t i=0;i<count;++i)fds[i].revents=0;
+    if(pm.admission_fault==4 && fds[2].fd==DESCRIPTOR_INIT){fds[2].revents=POLLIN;return 1;}
+    return 0;
+  }
+  if (pm.admission==ADMISSION_P) {
+    if(count==4 && fds[0].fd==ADMISSION_SIDE) {
+      CHECK(timeout>0 && timeout<=4000 && fds[1].fd==91 && fds[2].fd==80);
+      for(nfds_t i=0;i<count;++i)fds[i].revents=0;
+      if(pm.admission_fault==7){fds[1].revents=POLLRDHUP;return 1;}
+      fds[0].revents=POLLIN|POLLHUP;
+      return 1;
+    }
+    if((count==4 || count==3) && fds[0].fd==76) {
+      CHECK(timeout==0 && fds[1].fd==91 && fds[2].fd==80);
+      for(nfds_t i=0;i<count;++i)fds[i].revents=0;
+      if(pm.admission_fault==4 && pm.admission_reads==3 && count==4){fds[3].revents=POLLIN;return 1;}
+      if(pm.admission_fault==5 && !pm.admission_requests)pm.clock+=4000;
+      return 0;
+    }
+    if(count==1 && (fds[0].fd==ADMISSION_SIDE || fds[0].fd==80 || fds[0].fd==DESCRIPTOR_INIT)) {
+      CHECK(!timeout);
+      fds[0].revents=fds[0].fd==ADMISSION_SIDE?POLLHUP:0;
+      return !!fds[0].revents;
+    }
+  }
+  if (pm.admission==ADMISSION_CONNECTOR) {
+    if(count==6 && fds[0].fd==1) {
+      CHECK(timeout>0 && fds[5].fd==0 && fds[5].events==(POLLIN|POLLRDHUP));
+      for(nfds_t i=0;i<count;++i)fds[i].revents=0;
+      if(pm.admission_fault==6){fds[5].revents=POLLRDHUP;return 1;}
+      fds[0].revents=POLLOUT;return 1;
+    }
+    if(count==6 && fds[0].fd==90) {
+      CHECK(timeout>0 && timeout<=4000 && fds[1].fd==0);
+      for(nfds_t i=0;i<count;++i)fds[i].revents=0;
+      if(pm.admission_fault==4){fds[1].revents=POLLRDHUP;return 1;}
+      fds[0].revents=pm.connector_at<pm.connector_size?POLLIN:POLLHUP;
+      return 1;
+    }
+    if(count==1 && !timeout && (fds[0].fd==98 || fds[0].fd==0)){fds[0].revents=0;return 0;}
+  }
   if (pm.held && !pm.connector && count==3 && fds[0].fd==91) {
     CHECK(timeout==0 && fds[1].fd==80 && fds[2].fd==DESCRIPTOR_INIT);
     for (nfds_t i=0;i<count;++i)fds[i].revents=0;
@@ -1390,6 +1539,103 @@ static void authenticated_hold_connector(void) {
     dispose_fixture(&o);
   }
 }
+
+static void held_admission_h_wire(void) {
+  for(int fault=0;fault<5;++fault) {
+    memset(&pm,0,sizeof(pm));
+    interrupted=0;pm.child=1;pm.admission=ADMISSION_H;pm.admission_fault=fault;pm.clock=1000;
+    if(fault==3)pm.close_fault=DESCRIPTOR_INIT;
+    CHECK(ocip_live_init_read(4,&live_owner,0)==0);
+    CHECK(pm.admission_samples==(unsigned int)(fault!=2));
+    CHECK(pm.admission_proofs==(unsigned int)(fault==0 || fault==3));
+    CHECK(pm.admission_releases==(unsigned int)(fault==0));
+    CHECK(pm.closes[ADMISSION_PASS]==1 && !pm.closes[4]);
+    CHECK(pm.closes[81]==(unsigned int)(fault==2));
+  }
+}
+
+static void held_admission_p_wire(void) {
+  for(int fault=0;fault<9;++fault) {
+    struct ocipp_owner o;prepare_live_parent(&o);
+    pm.admission=ADMISSION_P;pm.admission_fault=fault;
+    unsigned int effects=o.effects,writes=pm.writes;
+    size_t reply_start=o.last_reply_start,reply_end=o.last_reply_end;
+    unsigned char auth[124];auth_bytes(&o,auth);memcpy(auth+4,"TKOAUTH4",8);
+    if(fault==8)auth[92]^=1;
+    pm.frontend_bytes=auth;pm.frontend_at=0;pm.frontend_size=sizeof(auth);pm.frontend_chunk=11;
+    CHECK(ocipp_accept(&o)==0);
+    for(unsigned int i=0;o.candidate>=0;++i){CHECK(i<20);(void)ocipp_read_authentication(&o);}
+    CHECK(o.host_lost && o.frontend<0 && !o.pending && !o.replay_required && !o.reply_unknown && !o.management_unknown);
+    CHECK(o.effects==effects && pm.writes==writes && o.last_reply_start==reply_start && o.last_reply_end==reply_end);
+    CHECK(o.live_init[0]==76 && !pm.closes[76] && !pm.closes[80] && pm.closes[91]==1);
+    CHECK(pm.admission_requests==(unsigned int)(fault!=5 && fault!=8));
+    CHECK(pm.closes[ADMISSION_SIDE]==(unsigned int)(fault!=8) && pm.closes[ADMISSION_PASS]==(unsigned int)(fault!=8));
+    CHECK(pm.admission_proofs==(unsigned int)(fault==0));
+    if(fault==3)CHECK(pm.closes[95]==1 && pm.closes[DESCRIPTOR_INIT]==1);
+    if(!fault) {
+      struct tns_oci_published_admission f;
+      CHECK(ocip_admission_decode(pm.admission_proof,ocip_admission_p_proof,&f)==0 && f.generation==1);
+      CHECK(ocipp_u64(pm.admission_proof+176)==42 && ocipp_u64(pm.admission_proof+184)==UINT64_C(0x100000111));
+    }
+    pm.admission=0;
+    if(fault==1) {
+      authenticate_frontend_for(&o,0,1);
+      CHECK(frontend_command(&o,live_command)==0 && pm.live_writes==1);
+      ocipp_host_lost(&o);
+    }
+    authenticate_frontend(&o,0);
+    CHECK(frontend_command(&o,live_outcome)==0 && !o.replay_required);
+    CHECK(frontend_command(&o,live_stop)==0 && o.pending && ocipp_flush_input(&o)==0);
+    CHECK(pm.writes==writes+1 && o.request_kind==TNS_OCIP_STOP_INIT);
+    dispose_fixture(&o);
+  }
+}
+
+static void held_admission_connector_wire(void) {
+  for(int fault=0;fault<7;++fault) {
+    struct ocipp_owner o;prepare_live_parent(&o);
+    interrupted=0;pm.held=pm.descriptor_mode=1;
+    unsigned char auth[124];auth_bytes(&o,auth);memcpy(auth+4,"TKOAUTH3",8);
+    pm.frontend_bytes=auth;pm.frontend_at=0;pm.frontend_size=sizeof(auth);pm.frontend_chunk=11;
+    CHECK(ocipp_accept(&o)==0);
+    for(unsigned int i=0;o.candidate>=0;++i)CHECK(i<20 && ocipp_read_authentication(&o)==0);
+    unsigned char peer[172];peer_request(&o,peer);
+    auth_bytes(&o,pm.expected_auth);memcpy(pm.expected_auth+4,"TKOAUTH3",8);
+    pm.connector_size=OCIPP_HOLD_PACKET;
+    memcpy(pm.connector_reply,pm.held_packet,pm.connector_size);
+    pm.connector=pm.manage_mode=1;
+    struct ocipp_held_init h={.caller=-1,.helper=-1,.init=-1,
+      .original={.parent_socket=-1,.peer_pidfd=-1,.custody.executable=-1}};
+    CHECK(ocipp_capture_held_caller(&h)==0 && ocipp_connector_hold_open(&h,peer,sizeof(peer))==0);
+    pm.admission=ADMISSION_CONNECTOR;pm.admission_fault=fault;
+    pm.connector_at=pm.connector_auth_at=0;
+    pm.connector_size=OCIP_ADMISSION_P_REPLY-(fault==2?1u:0u);
+    struct tns_oci_published_admission f=admission_fact();
+    if(fault==1)f.generation++;
+    ocip_admission_encode(pm.connector_reply,ocip_admission_p_proof,&f);
+    ocipp_put64(pm.connector_reply+176,42);
+    ocipp_put64(pm.connector_reply+184,fault==5?h.helper_inode+1:h.helper_inode);
+    auth_bytes(&o,pm.expected_auth);memcpy(pm.expected_auth+4,"TKOAUTH4",8);
+    unsigned char request[64];pm.host_size=frame_bytes(request,ocipp_held_admission_command);pm.host_bytes=request;
+    int64_t deadline=pm.clock+4000;
+    CHECK(ocipp_held_command(deadline)==3 && pm.host_at==pm.host_size);
+    CHECK(ocipp_held_admission_reply(&h,deadline)==(fault?-1:0));
+    CHECK(pm.closes[98]==1 && !pm.closes[92] && !pm.closes[95] && pm.closes[DESCRIPTOR_INIT]==1);
+    if(fault==3)CHECK(pm.closes[96]==1);
+    if(!fault) {
+      static const char json[]="{\"kind\":\"linux-oci-parent-held-admission-current@1\",\"nativeId\":\"" CLAIM
+        "\",\"generation\":\"1\",\"namespaceDevice\":\"4\",\"namespaceInode\":\"55\",\"topology\":{\"device\":\"18446744073709551615\","
+        "\"inode\":\"82\",\"size\":\"729\",\"uid\":\"0\",\"mode\":\"33152\",\"nlink\":\"1\",\"mtimeNs\":\"18446744073709551615\","
+        "\"ctimeNs\":\"1900000000000000010\"},\"barrier\":\"unproven\"}";
+      unsigned char frame[512];size_t length=frame_bytes(frame,json);
+      CHECK(pm.manage_output_size==length && !memcmp(pm.manage_output,frame,length));
+      CHECK(ocipp_held_init_current(&h)==0);
+    } else CHECK(!pm.manage_output_size);
+    CHECK(ocipp_held_init_close(&h)==0 && pm.closes[92]==1 && pm.closes[95]==1 && pm.closes[DESCRIPTOR_INIT]==2);
+    CHECK(!memcmp(h.peer,(unsigned char[172]){0},sizeof(h.peer)));
+    dispose_fixture(&o);
+  }
+}
 static void peer_server_replies(struct ocipp_owner *o,int pending) {
   CHECK(ocipp_first_create(o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
   CHECK(ocipp_spawn(o)==0 && ocipp_flush_input(o)==0);pm.wait_kind=1;CHECK(ocipp_wait(o)==0);
@@ -1623,6 +1869,10 @@ static void peer_instance_only(void) {
   pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"peer-held-admission")) {
+    held_admission_h_wire();held_admission_p_wire();held_admission_connector_wire();
+    printf("authenticated held-admission wire boundaries: %lu checks\n",checks);return 0;
+  }
   if(argc==2 && !strcmp(argv[1],"peer-held-live-init")) {
     authenticated_hold_connector();
     printf("authenticated P/connector held-init boundaries: %lu checks\n",checks);return 0;

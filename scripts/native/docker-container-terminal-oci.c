@@ -91,6 +91,7 @@ struct tns_oci_owner {
   struct stat rootfs_identity;
   struct stat config_identity;
   char id[65];
+  uint64_t generation;
   char rootpath[4096], netpath[96], bundlepath[96], statepath[96], pidpath[128];
   char receipt_bytes[8192];
   size_t receipt_size;
@@ -819,6 +820,63 @@ fail:
 #include "docker-container-terminal-oci-policy.h"
 #include "docker-container-terminal-oci-admission.h"
 
+struct tns_oci_admission_read { struct oci_held_admission_read scope; };
+
+int tns_oci_close_admission_read(struct tns_oci_admission_read **slot) {
+  if (!slot || !*slot) return 0;
+  if (oci_admission_read_close(&(*slot)->scope) < 0) return -1;
+  free(*slot);
+  *slot = NULL;
+  return 0;
+}
+
+static int oci_topology_timestamp(struct timespec time, uint64_t *nanoseconds) {
+  if (time.tv_sec < 0 || time.tv_nsec < 0 || time.tv_nsec >= 1000000000L ||
+      (uint64_t)time.tv_sec > (UINT64_MAX - (uint64_t)time.tv_nsec) / UINT64_C(1000000000)) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  *nanoseconds = (uint64_t)time.tv_sec * UINT64_C(1000000000) + (uint64_t)time.tv_nsec;
+  return 0;
+}
+
+int tns_oci_read_published_admission(struct tns_oci_owner *o, uint64_t generation, int64_t deadline,
+                                     struct tns_oci_admission_read **slot,
+                                     struct tns_oci_published_admission *out) {
+  if (!o || !slot || !out || !generation || generation != o->generation ||
+      o->controller_pid != getpid() || tns_oci_close_admission_read(slot) < 0) {
+    errno = EUCLEAN;
+    return -1;
+  }
+  *slot = calloc(1, sizeof(**slot));
+  if (!*slot) return -1;
+  struct oci_held_admission_observation observed;
+  int result = oci_admission_read_published(o, &(*slot)->scope, deadline, &observed);
+  int saved = errno;
+  if (tns_oci_close_admission_read(slot) < 0) return -1;
+  if (result < 0) { errno = saved; return -1; }
+  struct stat *st = &observed.topology;
+  struct tns_oci_published_admission actual = {.generation = generation};
+  if (!st->st_dev || !st->st_ino || st->st_size < 1 || st->st_size > 32768 || st->st_uid ||
+      st->st_mode != (S_IFREG | 0600) || st->st_nlink != 1) { errno = ESTALE; return -1; }
+  actual.topology = (struct tns_oci_topology_identity){.device = (uint64_t)st->st_dev,
+    .inode = (uint64_t)st->st_ino, .size = (uint64_t)st->st_size, .uid = st->st_uid,
+    .mode = st->st_mode, .nlink = st->st_nlink};
+  if (oci_topology_timestamp(st->st_mtim, &actual.topology.mtime_ns) < 0 ||
+      oci_topology_timestamp(st->st_ctim, &actual.topology.ctime_ns) < 0 ||
+      oci_egress_left(deadline) < 0 || tns_oci_duplicate_live_init(o, &actual.init) < 0) return -1;
+  if (memcmp(actual.init.started.native_id, observed.init.native_id, sizeof(observed.init.native_id)) ||
+      actual.init.started.namespace_device != observed.init.namespace_device ||
+      actual.init.started.namespace_inode != observed.init.namespace_inode ||
+      oci_egress_left(deadline) < 0 || oci_not_canceled() < 0) {
+    (void)close(actual.init.pidfd);
+    errno = ESTALE;
+    return -1;
+  }
+  *out = actual;
+  return 0;
+}
+
 int tns_oci_check_original_kernel_admission(struct tns_oci_owner *o) {
   if (!o || !o->policy || o->policy->original != o || !o->policy->selected ||
       !o->policy->verified || o->policy->close_unknown || o->policy->runtime ||
@@ -862,6 +920,7 @@ static int oci_create_profile(const struct tns_oci_options *options,
   if (tns_oci_once(&o->attempt) < 0 || tns_oci_data(options) < 0 ||
       tns_oci_metadata(options) < 0 || geteuid() != 0) { errno = EINVAL; goto fail; }
   memcpy(o->id, options->claim_id, sizeof(o->id));
+  o->generation = options->generation;
   o->root = oci_open_absolute(options->allocation_root, 1);
   if (o->root < 0 || oci_owned(o->root, 1, 0700) < 0 || oci_initial_contents(o->root) < 0)
     goto fail;

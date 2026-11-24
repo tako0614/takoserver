@@ -58,6 +58,9 @@ static const unsigned char ocip_live_init_request[] = "TKOLIVE1";
 static const unsigned char ocip_live_init_ok[] = "TKOLIVR1";
 static const unsigned char ocip_live_init_refused[] = "TKOLIVN1";
 static const unsigned char ocip_live_init_descriptor_request[] = "TKOLIVE2";
+static struct tns_oci_admission_read *ocip_admission_pending;
+static ssize_t ocipp_receive_rights(int fd, void *body, size_t capacity, int *descriptors,
+                                    size_t expected, int allow_empty);
 
 static int ocip_live_init_channel(int fd) {
   struct stat st;
@@ -66,13 +69,69 @@ static int ocip_live_init_channel(int fd) {
   return fcntl(fd, F_SETFD, FD_CLOEXEC);
 }
 
+static int ocip_admission_send_right(int fd, const void *bytes, size_t size, int right) {
+  union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(int))]; } control = {0};
+  struct iovec iov = {.iov_base = (void *)bytes, .iov_len = size};
+  struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1,
+    .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes)};
+  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &right, sizeof(right));
+  return sendmsg(fd, &message, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)size ? 0 : -1;
+}
+
+static int ocip_admission_current(int fd, int init, int64_t deadline) {
+  struct pollfd fds[] = {{.fd = 0, .events = POLLIN | POLLRDHUP},
+    {.fd = fd, .events = POLLIN | POLLRDHUP}, {.fd = init, .events = POLLIN}};
+  if (interrupted || poll(fds, 3, 0) != 0) return 0;
+  int64_t now = ocip_now();
+  return !interrupted && now >= 0 && now < deadline;
+}
+
+/* The one-shot response socket is independent of the permanent H channel.
+ * Even a lost or refused admission reply cannot be read as old liveness. */
+static void ocip_admission_request(int fd, const unsigned char request[OCIP_ADMISSION_REQUEST],
+                                   struct tns_oci_owner *owner, int unavailable) {
+  int64_t now = ocip_now();
+  uint64_t generation = ocip_admission_u64(request + 8), limit = ocip_admission_u64(request + 16);
+  if (unavailable || !owner || interrupted || now < 0 || now > INT64_MAX - OCIP_ADMISSION_H_MAX_MS ||
+      !generation || generation > UINT64_C(9007199254740991) || limit > INT64_MAX ||
+      limit <= (uint64_t)now || ocip_live_init_channel(fd) < 0) return;
+  int64_t deadline = (int64_t)limit;
+  if (deadline > now + OCIP_ADMISSION_H_MAX_MS) deadline = now + OCIP_ADMISSION_H_MAX_MS;
+  struct tns_oci_published_admission fact;
+  if (!ocip_admission_current(fd, -1, deadline) ||
+      tns_oci_read_published_admission(owner, generation, deadline, &ocip_admission_pending, &fact) < 0) return;
+  if (fact.init.pidfd < 0) return;
+  int sent = -1;
+  if (ocip_admission_valid(&fact) && fact.generation == generation) {
+    unsigned char body[OCIP_ADMISSION_H_REPLY];
+    ocip_admission_encode(body, ocip_admission_h_proof, &fact);
+    if (ocip_admission_current(fd, fact.init.pidfd, deadline))
+      sent = ocip_admission_send_right(fd, body, sizeof(body), fact.init.pidfd);
+  }
+  if (close(fact.init.pidfd) < 0 || sent < 0 || !ocip_admission_current(fd, -1, deadline)) return;
+  (void)send(fd, ocip_admission_h_released, sizeof(ocip_admission_h_released) - 1,
+             MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+
 static int ocip_live_init_read(int fd, struct tns_oci_owner *owner, int unavailable) {
-  unsigned char request[sizeof(ocip_live_init_request) - 1];
-  ssize_t n = recv(fd, request, sizeof(request), MSG_DONTWAIT | MSG_TRUNC);
-  if (n != (ssize_t)sizeof(request)) return -1;
-  if (!memcmp(request, ocip_live_init_descriptor_request, sizeof(request)))
+  unsigned char request[OCIP_ADMISSION_REQUEST] = {0};
+  int reply_fd = -1;
+  ssize_t n = ocipp_receive_rights(fd, request, sizeof(request), &reply_fd, 1, 1);
+  if (!memcmp(request, ocip_admission_h_request, 8)) {
+    if (n == OCIP_ADMISSION_REQUEST && reply_fd > 2 && reply_fd != fd)
+      ocip_admission_request(reply_fd, request, owner, unavailable);
+    if (reply_fd >= 0) (void)close(reply_fd);
+    return 0;
+  }
+  if (reply_fd >= 0) { (void)close(reply_fd); return -1; }
+  if (n != 8) return -1;
+  if (!memcmp(request, ocip_live_init_descriptor_request, 8))
     return tns_ocip_reply_live_init_descriptor(fd, owner, unavailable, &interrupted);
-  if (memcmp(request, ocip_live_init_request, sizeof(request))) return -1;
+  if (memcmp(request, ocip_live_init_request, 8)) return -1;
   unsigned char reply[OCIP_LIVE_INIT_REPLY];
   const size_t tag = sizeof(ocip_live_init_ok) - 1;
   struct tns_oci_started observed;
@@ -571,6 +630,7 @@ int main(int argc, char **argv) {
   struct ocip_retirement_state retirement_state = {.runtime_first = runtime_first};
   int cleanup_done = 0;
   for (;;) {
+    if (ocip_admission_pending) (void)tns_oci_close_admission_read(&ocip_admission_pending);
     ocip_live_init_wait(&live_init_fd, owner, sealed || namespace_state.entered || retirement_state.entered);
     unsigned char *body = NULL; uint32_t size = 0;
     int result = ocip_read(&body, &size);

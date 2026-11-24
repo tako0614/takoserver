@@ -13,6 +13,7 @@
 static inline void ocipp_put64(unsigned char *p, uint64_t value) {
   for (unsigned int i = 0; i < 8; ++i) { p[7 - i] = (unsigned char)value; value >>= 8; }
 }
+#include "docker-container-terminal-oci-admission-wire.h"
 
 /* Only H on its private P/H packet socket sends this descriptor. It never
  * enters parent mutation stdout or any application-facing protocol. */

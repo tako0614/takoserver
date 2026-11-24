@@ -508,11 +508,12 @@ static int ocipp_frontend_close(struct ocipp_owner *o, int *slot) {
 static const char ocipp_auth_ack[] = "{\"kind\":\"linux-oci-parent-authenticated@1\",\"barrier\":\"unproven\"}";
 static const char ocipp_live_init_ack[] = "{\"kind\":\"linux-oci-parent-live-init-authenticated@1\",\"barrier\":\"unproven\"}";
 static const char ocipp_live_init_command[] = "{\"kind\":\"linux-oci-parent-read-live-init@1\"}";
-enum ocipp_auth_mode { OCIPP_AUTH_CONTROL, OCIPP_AUTH_SNAPSHOT, OCIPP_AUTH_HOLD };
-static const char *const ocipp_auth_magic[] = {"TKOAUTH1", "TKOAUTH2", "TKOAUTH3"};
+enum ocipp_auth_mode { OCIPP_AUTH_CONTROL, OCIPP_AUTH_SNAPSHOT, OCIPP_AUTH_HOLD, OCIPP_AUTH_ADMISSION };
+static const char *const ocipp_auth_magic[] = {"TKOAUTH1", "TKOAUTH2", "TKOAUTH3", "TKOAUTH4"};
 static int ocipp_issue_live_init_hold(struct ocipp_owner *o, int requester);
+static int ocipp_issue_admission(struct ocipp_owner *o, int requester);
 
-/* Auth body: TKOAUTH{1,2,3} | claim64 | generationBE64 | actualCookieBE64 | cap32.
+/* Auth body: TKOAUTH{1,2,3,4} | claim64 | generationBE64 | actualCookieBE64 | cap32.
  * UID, endpoint and all public fields are insufficient without this original
  * capability AND original listener cookie/current executable/controller.
  * An older P rejects unsupported magic before promoting a candidate.
@@ -564,17 +565,18 @@ static int ocipp_read_authentication(struct ocipp_owner *o) {
   if (o->authentication_used >= 4 && memcmp(o->authentication, (unsigned char[]){0, 0, 0, 120}, 4))
     return ocipp_frontend_close(o, &o->candidate);
   if (o->authentication_used != sizeof(o->authentication)) return 0;
-  enum ocipp_auth_mode mode = !memcmp(o->authentication + 4, ocipp_auth_magic[OCIPP_AUTH_HOLD], 8)
+  enum ocipp_auth_mode mode = !memcmp(o->authentication + 4, ocipp_auth_magic[OCIPP_AUTH_ADMISSION], 8)
+    ? OCIPP_AUTH_ADMISSION : !memcmp(o->authentication + 4, ocipp_auth_magic[OCIPP_AUTH_HOLD], 8)
     ? OCIPP_AUTH_HOLD : !memcmp(o->authentication + 4, ocipp_auth_magic[OCIPP_AUTH_SNAPSHOT], 8)
     ? OCIPP_AUTH_SNAPSHOT : OCIPP_AUTH_CONTROL;
   if (ocipp_authenticate(o, o->authentication + 4, 120, mode) < 0)
     return ocipp_frontend_close(o, &o->candidate);
-  if (mode == OCIPP_AUTH_HOLD) {
+  if (mode == OCIPP_AUTH_HOLD || mode == OCIPP_AUTH_ADMISSION) {
     int requester = o->candidate;
     o->candidate = -1;
     explicit_bzero(o->authentication, sizeof(o->authentication));
     o->authentication_used = 0;
-    int result = ocipp_issue_live_init_hold(o, requester);
+    int result = mode == OCIPP_AUTH_ADMISSION ? ocipp_issue_admission(o, requester) : ocipp_issue_live_init_hold(o, requester);
     return close(requester) < 0 ? -1 : result;
   }
   int live_init = mode == OCIPP_AUTH_SNAPSHOT;
@@ -860,6 +862,79 @@ static int ocipp_issue_live_init_hold(struct ocipp_owner *o, int requester) {
   if (sendmsg(requester, &message, MSG_NOSIGNAL | MSG_DONTWAIT) == (ssize_t)sizeof(body)) result = 0;
 done:
   return close(observed.pidfd) < 0 ? -1 : result;
+}
+
+static int ocipp_admission_wait(struct ocipp_owner *o,
+    const struct ocipp_live_init_descriptor_request *r, int channel, int helper, int reply, int init) {
+  if (!ocipp_live_init_descriptor_current(o, r, channel, helper)) return -1;
+  int64_t now = ocip_now();
+  if (now < 0 || now >= r->deadline) return -1;
+  struct pollfd fds[] = {{.fd = reply, .events = POLLIN},
+    {.fd = r->requester, .events = POLLIN | POLLRDHUP}, {.fd = helper, .events = POLLIN},
+    {.fd = init, .events = POLLIN}};
+  if (poll(fds, 4, (int)(r->deadline - now)) != 1 || !(fds[0].revents & (POLLIN | POLLHUP)) ||
+      (fds[0].revents & ~(POLLIN | POLLHUP)) || fds[1].revents || fds[2].revents || fds[3].revents ||
+      !ocipp_live_init_descriptor_current(o, r, channel, helper)) return -1;
+  return 0;
+}
+
+/* AUTH4 never uses mutation stdin/stdout or the old reply channel. H only
+ * receives a fresh one-shot socket. On refusal its queued data dies there. */
+static int ocipp_issue_admission(struct ocipp_owner *o, int requester) {
+  struct ocipp_live_init_descriptor_request r = {.generation = o->generation, .requester = requester,
+    .deadline = o->authentication_started + OCIPP_AUTH_TIMEOUT};
+  memcpy(r.claim, o->claim, sizeof(r.claim));
+  int channel = o->live_init[0], helper = o->pidfd;
+  uint64_t h_device, h_inode;
+  if (!ocipp_live_init_descriptor_current(o, &r, channel, helper) ||
+      ocipp_self_current(o) < 0 || ocipp_pidfs(helper, &h_device, &h_inode) < 0) return -1;
+  int side[2], init = -1;
+  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, side) < 0) return -1;
+  int result = -1;
+  struct pollfd fds[] = {{.fd = channel, .events = POLLIN},
+    {.fd = requester, .events = POLLIN | POLLRDHUP}, {.fd = helper, .events = POLLIN},
+    {.fd = -1, .events = POLLIN}};
+  unsigned char request[OCIP_ADMISSION_REQUEST];
+  memcpy(request, ocip_admission_h_request, 8);
+  ocipp_put64(request + 8, r.generation);
+  ocipp_put64(request + 16, (uint64_t)r.deadline);
+  if (poll(fds, 4, 0) != 0 || !ocipp_live_init_descriptor_current(o, &r, channel, helper) ||
+      ocip_admission_send_right(channel, request, sizeof(request), side[1]) < 0) goto done;
+  int sent_side = side[1]; side[1] = -1;
+  if (close(sent_side) < 0) goto done;
+  unsigned char raw[OCIP_ADMISSION_H_REPLY];
+  struct tns_oci_published_admission fact;
+  uint64_t device, inode;
+  if (ocipp_admission_wait(o, &r, channel, helper, side[0], -1) < 0 ||
+      ocipp_receive_rights(side[0], raw, sizeof(raw), &init, 1, 0) != (ssize_t)sizeof(raw) ||
+      ocip_admission_decode(raw, ocip_admission_h_proof, &fact) < 0 ||
+      memcmp(fact.init.started.native_id, r.claim, sizeof(r.claim)) || fact.generation != r.generation ||
+      ocipp_pidfs(init, &device, &inode) < 0 || device != fact.init.pidfd_device || inode != fact.init.pidfd_inode)
+    goto done;
+  unsigned char released[8];
+  if (ocipp_admission_wait(o, &r, channel, helper, side[0], init) < 0 ||
+      ocipp_receive_rights(side[0], released, sizeof(released), NULL, 0, 1) != (ssize_t)sizeof(released) ||
+      memcmp(released, ocip_admission_h_released, sizeof(released)) ||
+      ocipp_admission_wait(o, &r, channel, helper, side[0], init) < 0 ||
+      ocipp_receive_rights(side[0], released, sizeof(released), NULL, 0, 1) != 0) goto done;
+  struct pollfd released_side = {.fd = side[0], .events = POLLIN};
+  if (poll(&released_side, 1, 0) != 1 || !(released_side.revents & POLLHUP) ||
+      ocipp_pidfs(helper, &device, &inode) < 0 || device != h_device || inode != h_inode) goto done;
+  fds[3].fd = init;
+  if (poll(fds, 4, 0) != 0 || !ocipp_live_init_descriptor_current(o, &r, channel, helper)) goto done;
+  int received_init = init; init = -1;
+  int received_side = side[0]; side[0] = -1;
+  int init_closed = close(received_init), side_closed = close(received_side);
+  if (init_closed < 0 || side_closed < 0) goto done;
+  unsigned char proof[OCIP_ADMISSION_P_REPLY];
+  ocip_admission_encode(proof, ocip_admission_p_proof, &fact);
+  ocipp_put64(proof + 176, h_device); ocipp_put64(proof + 184, h_inode);
+  if (poll(fds, 3, 0) == 0 && ocipp_live_init_descriptor_current(o, &r, channel, helper) &&
+      send(requester, proof, sizeof(proof), MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)sizeof(proof)) result = 0;
+done:
+  if (init >= 0) (void)close(init);
+  for (size_t i = 0; i < 2; ++i) if (side[i] >= 0) (void)close(side[i]);
+  return result;
 }
 
 static int ocipp_queue(struct ocipp_owner *o, const unsigned char *body, uint32_t size) {
@@ -1187,8 +1262,8 @@ static int ocipp_connector_result(const unsigned char *body, size_t size) {
   }
   return value ? 0 : -1;
 }
-static int ocipp_connector_open_for(struct ocipp_connector *c, const unsigned char *p, size_t size,
-                                    enum ocipp_auth_mode mode) {
+static int ocipp_connector_open_before(struct ocipp_connector *c, const unsigned char *p, size_t size,
+                                       enum ocipp_auth_mode mode, int64_t deadline) {
   if (!c || c->attempted || !p || size != 172 || memcmp(p, "TKOPEER2", 8)) return -1;
   c->attempted = 1; c->socket = c->peer_pidfd = -1;
   if (ocipp_initialize(&c->custody) < 0) return -1;
@@ -1208,11 +1283,13 @@ static int ocipp_connector_open_for(struct ocipp_connector *c, const unsigned ch
   memcpy(address.sun_path + 1, label, sizeof(label) - 1); memcpy(address.sun_path + sizeof(label), p + 8, 64);
   socklen_t length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + sizeof(label) + 64);
   int64_t now = ocip_now(); if (now < 0) return -1;
-  int64_t until = now + OCIPP_AUTH_TIMEOUT; c->deadline = until;
+  int64_t until = deadline ? deadline : now + OCIPP_AUTH_TIMEOUT;
+  if (now >= until || until - now > OCIPP_AUTH_TIMEOUT) return -1;
+  c->deadline = until;
   if (connect(c->socket, (struct sockaddr *)&address, length) < 0) {
     if (errno != EINPROGRESS) return -1;
     struct pollfd writable = {.fd = c->socket, .events = POLLOUT};
-    if (poll(&writable, 1, OCIPP_AUTH_TIMEOUT) != 1 || writable.revents != POLLOUT) return -1;
+    if (poll(&writable, 1, (int)(until - now)) != 1 || writable.revents != POLLOUT) return -1;
     int error = 0; length = sizeof(error);
     if (getsockopt(c->socket, SOL_SOCKET, SO_ERROR, &error, &length) < 0 ||
         length != sizeof(error) || error) return -1;
@@ -1226,12 +1303,16 @@ static int ocipp_connector_open_for(struct ocipp_connector *c, const unsigned ch
   memcpy(auth + 12, p + 8, 112);
   int result = ocip_io(c->socket, auth, sizeof(auth), 1, 0, until);
   explicit_bzero(auth, sizeof(auth)); if (result < 0) return -1;
-  if (mode == OCIPP_AUTH_HOLD) return ocipp_connector_current(c);
+  if (mode == OCIPP_AUTH_HOLD || mode == OCIPP_AUTH_ADMISSION) return ocipp_connector_current(c);
   unsigned char frame[512]; size_t n = 0;
   const char *ack = mode == OCIPP_AUTH_SNAPSHOT ? ocipp_live_init_ack : ocipp_auth_ack;
   if (ocipp_connector_frame(c->socket, frame, &n, until) < 0 || n != strlen(ack) ||
       memcmp(frame, ack, n) || ocipp_connector_current(c) < 0) return -1;
   return 0;
+}
+static int ocipp_connector_open_for(struct ocipp_connector *c, const unsigned char *p, size_t size,
+                                    enum ocipp_auth_mode mode) {
+  return ocipp_connector_open_before(c, p, size, mode, 0);
 }
 static int ocipp_connector_open(struct ocipp_connector *c, const unsigned char *p, size_t size) {
   return ocipp_connector_open_for(c, p, size, OCIPP_AUTH_CONTROL);
@@ -1404,6 +1485,7 @@ struct ocipp_held_init {
   uint64_t caller_device, caller_inode, helper_device, helper_inode, init_device, init_inode;
   uint64_t namespace_device, namespace_inode;
   char claim[65];
+  unsigned char peer[172]; /* Required only for same-P read authentication. */
 };
 static int ocipp_capture_held_caller(struct ocipp_held_init *h) {
   if (ocip_private_socket(0, SOCK_STREAM) < 0) return -1;
@@ -1480,18 +1562,22 @@ static int ocipp_connector_hold_open(struct ocipp_held_init *h, const unsigned c
       (h->helper_device == c->device && h->helper_inode == c->inode) ||
       (h->init_device == c->device && h->init_inode == c->inode) ||
       ocipp_close(&c->custody, &c->socket) < 0) return -1;
-  return ocipp_held_init_current(h);
+  if (ocipp_held_init_current(h) < 0) return -1;
+  memcpy(h->peer, p, sizeof(h->peer));
+  return 0;
 }
 
 static const char ocipp_held_read_command[] = "{\"kind\":\"linux-oci-parent-held-live-init-read@1\"}";
 static const char ocipp_held_close_command[] = "{\"kind\":\"linux-oci-parent-held-live-init-close@1\"}";
+static const char ocipp_held_admission_command[] = "{\"kind\":\"linux-oci-parent-held-admission-read@1\"}";
 static const char ocipp_held_current_reply[] = "{\"kind\":\"linux-oci-parent-held-live-init-current@1\",\"barrier\":\"unproven\"}";
 static const char ocipp_held_closed_reply[] = "{\"kind\":\"linux-oci-parent-held-live-init-closed@1\",\"barrier\":\"unproven\"}";
 
-static int ocipp_held_reply(struct ocipp_held_init *h, const char *body, int64_t deadline) {
+static int ocipp_held_reply_limit(struct ocipp_held_init *h, const char *body, size_t limit,
+                                  int64_t deadline, int watch_input) {
   size_t size = strlen(body);
-  unsigned char packet[260];
-  if (!size || size > sizeof(packet) - 4) return -1;
+  unsigned char packet[OCIP_ADMISSION_JSON_MAX + 4];
+  if (!size || size > limit || size > sizeof(packet) - 4) return -1;
   packet[0] = packet[1] = (unsigned char)0;
   packet[2] = (unsigned char)(size >> 8); packet[3] = (unsigned char)size;
   memcpy(packet + 4, body, size);
@@ -1500,13 +1586,66 @@ static int ocipp_held_reply(struct ocipp_held_init *h, const char *body, int64_t
   if (now < 0 || now >= deadline) return -1;
   struct pollfd events[] = {{.fd = 1, .events = POLLOUT}, {.fd = h->caller, .events = POLLIN},
     {.fd = h->original.peer_pidfd, .events = POLLIN}, {.fd = h->helper, .events = POLLIN},
-    {.fd = h->init, .events = POLLIN}};
-  if (poll(events, 5, (int)(deadline - now)) != 1 || events[0].revents != POLLOUT ||
+    {.fd = h->init, .events = POLLIN}, {.fd = 0, .events = POLLIN | POLLRDHUP}};
+  if (poll(events, watch_input ? 6 : 5, (int)(deadline - now)) != 1 || events[0].revents != POLLOUT ||
       events[1].revents || events[2].revents || events[3].revents || events[4].revents ||
+      (watch_input && events[5].revents) ||
       ocipp_held_init_current(h) < 0) return -1;
+  if (watch_input && poll(&events[5], 1, 0) != 0) return -1;
   now = ocip_now();
   if (now < 0 || now >= deadline || interrupted) return -1;
   return write(1, packet, size + 4) == (ssize_t)(size + 4) ? 0 : -1;
+}
+static int ocipp_held_reply(struct ocipp_held_init *h, const char *body, int64_t deadline) {
+  return ocipp_held_reply_limit(h, body, 256, deadline, 0);
+}
+
+static int ocipp_held_admission_receive(struct ocipp_held_init *h, int socket, unsigned char *body,
+                                        size_t size, int64_t deadline) {
+  size_t used = 0;
+  for (;;) {
+    if (ocipp_held_init_current(h) < 0) return -1;
+    int64_t now = ocip_now();
+    if (now < 0 || now >= deadline) return -1;
+    struct pollfd fds[] = {{.fd = socket, .events = POLLIN}, {.fd = 0, .events = POLLIN | POLLRDHUP},
+      {.fd = h->caller, .events = POLLIN}, {.fd = h->original.peer_pidfd, .events = POLLIN},
+      {.fd = h->helper, .events = POLLIN}, {.fd = h->init, .events = POLLIN}};
+    if (poll(fds, 6, (int)(deadline - now)) != 1 || !(fds[0].revents & (POLLIN | POLLHUP)) ||
+        (fds[0].revents & ~(POLLIN | POLLHUP)) || ocipp_held_init_current(h) < 0) return -1;
+    now = ocip_now();
+    if (now < 0 || now >= deadline || interrupted) return -1;
+    unsigned char trailing;
+    size_t remaining = size - used;
+    ssize_t n = ocipp_receive_rights(socket, remaining ? body + used : &trailing,
+                                    remaining ? remaining : 1, NULL, 0, 1);
+    if (!remaining) return n == 0 ? 0 : -1;
+    if (n <= 0 || (size_t)n > remaining) return -1;
+    used += (size_t)n;
+  }
+}
+
+static int ocipp_held_admission_reply(struct ocipp_held_init *h, int64_t deadline) {
+  if (ocipp_held_init_current(h) < 0) return -1;
+  struct ocipp_connector c = {.socket = -1, .peer_pidfd = -1, .custody.executable = -1};
+  int result = -1;
+  unsigned char proof[OCIP_ADMISSION_P_REPLY];
+  struct tns_oci_published_admission fact;
+  char reply[OCIP_ADMISSION_JSON_MAX];
+  if (ocipp_connector_open_before(&c, h->peer, sizeof(h->peer), OCIPP_AUTH_ADMISSION, deadline) == 0 &&
+      c.device == h->original.device && c.inode == h->original.inode &&
+      !memcmp(c.boot, h->original.boot, sizeof(c.boot)) &&
+      ocipp_held_admission_receive(h, c.socket, proof, sizeof(proof), deadline) == 0 &&
+      ocip_admission_decode(proof, ocip_admission_p_proof, &fact) == 0 &&
+      !memcmp(fact.init.started.native_id, h->claim, sizeof(h->claim)) &&
+      fact.generation == ocipp_u64(h->peer + 72) && fact.init.started.namespace_device == h->namespace_device &&
+      fact.init.started.namespace_inode == h->namespace_inode && fact.init.pidfd_device == h->init_device &&
+      fact.init.pidfd_inode == h->init_inode && ocipp_u64(proof + 176) == h->helper_device &&
+      ocipp_u64(proof + 184) == h->helper_inode && ocipp_connector_current(&c) == 0 &&
+      ocip_admission_json(reply, &fact) == 0) result = 0;
+  if (ocipp_connector_close(&c) < 0) result = -1;
+  ocipp_connector_free(&c);
+  if (result < 0) return -1;
+  return ocipp_held_reply_limit(h, reply, OCIP_ADMISSION_JSON_MAX, deadline, 1);
 }
 
 static int ocipp_held_initial_reply(struct ocipp_held_init *h) {
@@ -1523,12 +1662,15 @@ static int ocipp_held_command(int64_t deadline) {
   if (result) return result == 1 ? 0 : -1;
   uint32_t size;
   if (tns_ocip_frame(prefix, &size) < 0 ||
-      (size != sizeof(ocipp_held_read_command) - 1 && size != sizeof(ocipp_held_close_command) - 1) ||
+      (size != sizeof(ocipp_held_read_command) - 1 && size != sizeof(ocipp_held_close_command) - 1 &&
+       size != sizeof(ocipp_held_admission_command) - 1) || size > sizeof(body) ||
       ocip_io(0, body, size, 0, 0, deadline) < 0) return -1;
   if (size == sizeof(ocipp_held_read_command) - 1 &&
       !memcmp(body, ocipp_held_read_command, size)) return 1;
   if (size == sizeof(ocipp_held_close_command) - 1 &&
       !memcmp(body, ocipp_held_close_command, size)) return 2;
+  if (size == sizeof(ocipp_held_admission_command) - 1 &&
+      !memcmp(body, ocipp_held_admission_command, size)) return 3;
   return -1;
 }
 static int ocipp_held_loop(struct ocipp_held_init *h, int64_t *deadline) {
@@ -1548,6 +1690,10 @@ static int ocipp_held_loop(struct ocipp_held_init *h, int64_t *deadline) {
     if (now < 0) return -1;
     *deadline = now + OCIPP_AUTH_TIMEOUT;
     int command = ocipp_held_command(*deadline);
+    if (command == 3) {
+      if (ocipp_held_admission_reply(h, *deadline) < 0) return -1;
+      continue;
+    }
     if (command != 1) return command == 2 && ocipp_held_init_current(h) < 0 ? -1 : command;
     if (ocipp_held_reply(h, ocipp_held_current_reply, *deadline) < 0)
       return -1;
@@ -1555,6 +1701,7 @@ static int ocipp_held_loop(struct ocipp_held_init *h, int64_t *deadline) {
 }
 
 static int ocipp_held_init_close(struct ocipp_held_init *h) {
+  explicit_bzero(h->peer, sizeof(h->peer));
   struct ocipp_owner *o = &h->original.custody;
   (void)ocipp_close(o, &h->caller);
   (void)ocipp_close(o, &h->helper);

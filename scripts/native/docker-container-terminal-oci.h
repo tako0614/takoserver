@@ -54,6 +54,15 @@ struct tns_oci_live_init_descriptor {
   uint64_t pidfd_device, pidfd_inode;
   int pidfd;
 };
+struct tns_oci_topology_identity {
+  uint64_t device, inode, size, uid, mode, nlink, mtime_ns, ctime_ns;
+};
+struct tns_oci_published_admission {
+  struct tns_oci_live_init_descriptor init;
+  uint64_t generation;
+  struct tns_oci_topology_identity topology;
+};
+struct tns_oci_admission_read;
 
 /* One-use, including unknown failure. Rootfs/runtime verification precedes the
  * internally owned fresh namespace and exact runc CREATE. */
@@ -80,6 +89,12 @@ int tns_oci_read_live_init(struct tns_oci_owner *owner, struct tns_oci_started *
  * admission. The installed ruleset and live uplink require their own fresh
  * read before any physical admission fact can be sent. */
 int tns_oci_check_original_kernel_admission(struct tns_oci_owner *owner);
+/* Only H's existing authenticated private channel calls this. Retain any
+ * unknown read worker in its own slot, independent of ordinary retirement. */
+int tns_oci_read_published_admission(struct tns_oci_owner *owner, uint64_t generation, int64_t deadline,
+                                     struct tns_oci_admission_read **slot,
+                                     struct tns_oci_published_admission *out);
+int tns_oci_close_admission_read(struct tns_oci_admission_read **slot);
 /* Duplicate exactly the held original init after the same nonmutating read.
  * The private native caller owns the CLOEXEC duplicate on success. */
 int tns_oci_duplicate_live_init(struct tns_oci_owner *owner,
