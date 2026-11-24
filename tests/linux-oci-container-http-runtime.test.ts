@@ -420,6 +420,7 @@ async function verifySuccessorHttpClose(
     | "unknown"
     | "ack-lost"
     | "delete"
+    | "delete-late"
     | "delete-restart"
     | "delete-unknown",
 ) {
@@ -645,13 +646,45 @@ async function verifySuccessorHttpClose(
         }
       }
 
+      let submittedCloses = 0;
+      if (outcome === "delete-late") {
+        const run = f.sql.run.bind(f.sql);
+        const writes = spyOn(f.sql, "run").mockImplementation((statement, params) => {
+          if (
+            statement.startsWith(
+              "UPDATE main.tf_v2_container_application_successors SET close_document=",
+            )
+          )
+            submittedCloses++;
+          return run(statement, params);
+        });
+        const cleanup = cleanupIo;
+        cleanupIo = () => {
+          writes.mockRestore();
+          cleanup();
+        };
+      }
       const pass = observeRawPromise(engine.runNext());
-      if (outcome === "delete") {
+      let first: Awaited<typeof pass.value> | undefined;
+      if (outcome === "delete" || outcome === "delete-late") {
         for (let i = 0; i < 250 && !io.counts().requestDestroy; i++) await rawTick();
         expect(io.counts().requestDestroy).toBe(1);
         expect(stops()).toBe(0);
         expect(heldCloses).toBe(0);
         expect((await reservations())[0]?.close_document).toBeNull();
+        if (outcome === "delete-late") {
+          // Let the ordinary dispatch deadline expire with both original
+          // streams pending. The source must keep that exact join in custody.
+          first = await pass.value;
+          expect(first).toMatchObject({
+            result: { id: removing.id, status: "reconciling", effect: "unknown" },
+          });
+          expect(settled.state()).toBe("pending");
+          expect(stops()).toBe(0);
+          expect(heldCloses).toBe(0);
+          expect(submittedCloses).toBe(0);
+          expect((await reservations())[0]?.close_document).toBeNull();
+        }
         io.closeResponse();
         await rawTick();
         expect(stops()).toBe(0);
@@ -659,7 +692,7 @@ async function verifySuccessorHttpClose(
         io.closeRequest();
         expect(await settled.value).toHaveProperty("result");
       }
-      const first = await pass.value;
+      first ??= await pass.value;
       if ("error" in first) throw first.error;
       let final = first.result;
       for (let i = 0; i < 12 && final?.status !== "succeeded"; i++) {
@@ -669,6 +702,7 @@ async function verifySuccessorHttpClose(
       expect(final).toMatchObject({ id: removing.id, status: "succeeded", effect: "complete" });
       expect(stops()).toBe(1);
       expect(heldCloses).toBe(1);
+      if (outcome === "delete-late") expect(submittedCloses).toBe(1);
       const stored = (await reservations())[0]?.close_document;
       expect(typeof stored).toBe("string");
       if (priorClose !== undefined) expect(stored).toBe(priorClose);
@@ -872,6 +906,7 @@ test.each([
   "unknown",
   "ack-lost",
   "delete",
+  "delete-late",
   "delete-restart",
   "delete-unknown",
 ] as const)(

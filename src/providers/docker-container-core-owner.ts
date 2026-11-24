@@ -598,8 +598,8 @@ function captureCurrentOciSelector(selector: {
   return { resourceUid, incarnationId };
 }
 
-async function waitForOriginalApplicationClose(
-  close: Promise<void>,
+async function waitForOriginalApplicationClose<T>(
+  close: Promise<T>,
   finished: AbortSignal,
   signal: AbortSignal,
 ) {
@@ -620,7 +620,14 @@ async function waitForOriginalApplicationClose(
     }
   }
   if (signal.aborted) return fail();
-  await close;
+  return close;
+}
+
+function waitForSuccessorClose<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  const finished = new AbortController();
+  const finish = () => finished.abort();
+  void work.then(finish, finish);
+  return waitForOriginalApplicationClose(work, finished.signal, signal);
 }
 
 const text = (value: unknown): value is string =>
@@ -4780,7 +4787,11 @@ export function createDockerContainerCoreOwner(
   async function recordApplicationSuccessorClose(
     reservation: LinuxOciApplicationSuccessorReservation,
     held: LinuxOciHeldLiveInit,
-    deleting?: { readonly execution: V2Execution; readonly signal: AbortSignal },
+    deleting?: {
+      readonly execution: V2Execution;
+      readonly signal: AbortSignal;
+      readonly write: { submitted: boolean };
+    },
   ): Promise<"saved" | "not-written"> {
     const issued = LinuxOciApplicationSuccessorReservation.issuance(reservation);
     const { originalCustody, record, epoch, ownerToken, predecessor } = issued;
@@ -4801,7 +4812,8 @@ export function createDockerContainerCoreOwner(
       issued.assertKeys();
     };
     assertLocal();
-    await joined();
+    if (deleting) await waitForSuccessorClose(joined(), deleting.signal);
+    else await joined();
     assertLocal();
 
     const { intent, claimId, nativeId } = record;
@@ -4842,6 +4854,7 @@ export function createDockerContainerCoreOwner(
     // A thrown write can have committed. One exact readback resolves this
     // operation's already sealed bytes. It never issues another write.
     let writeError: unknown;
+    if (deleting) deleting.write.submitted = true;
     const saved = await sql
       .run(
         "UPDATE main.tf_v2_container_application_successors SET close_document=? WHERE close_document IS NULL AND " +
@@ -4851,7 +4864,10 @@ export function createDockerContainerCoreOwner(
       .catch((error: unknown) => {
         writeError = error;
       });
-    if (saved?.changes === 0 && !deleting) return "not-written";
+    if (saved?.changes === 0) {
+      if (deleting) deleting.write.submitted = false;
+      return "not-written";
+    }
     if (saved && saved.changes !== 1) return fail();
     // Read confirmation of only this immutable row. A later owner may
     // legitimately reserve from these bytes as soon as they commit.
@@ -4863,8 +4879,9 @@ export function createDockerContainerCoreOwner(
       if (writeError !== undefined) throw writeError;
       return fail();
     }
+    // Once submitted, only the owning receipt and keys decide whether this
+    // exact write committed. The dispatcher may already have stopped waiting.
     assertLocal();
-    if ("assertLocal" in guard) guard.assertLocal();
     selected.assertCurrent();
     keyCurrent();
     return "saved";
@@ -5643,7 +5660,8 @@ export function createDockerContainerCoreOwner(
       const { epoch, ownerToken } = LinuxOciApplicationSuccessorReservation.issuance(reservation);
       let idle: ReturnType<typeof recordApplicationSuccessorClose> | undefined;
       let closing: Promise<void> | undefined;
-      let accepted: { readonly operationId: string; readonly closing: Promise<void> } | undefined;
+      let acceptedOperationId: string | undefined;
+      let accepted: { readonly leaseToken: string; readonly closing: Promise<void> } | undefined;
       return Object.freeze({
         held,
         record,
@@ -5658,18 +5676,42 @@ export function createDockerContainerCoreOwner(
           });
           return closing;
         },
-        recordDeleteClose(execution: V2Execution, signal: AbortSignal) {
-          if (accepted && accepted.operationId !== execution.operationId) return fail();
-          accepted ??= {
-            operationId: execution.operationId,
-            closing: (async () => {
-              // An idle write can hand off only if SQL certainly wrote zero rows.
-              // A lost write or connector result never starts a second submission.
-              if (idle && (await idle) === "saved") return;
-              await recordApplicationSuccessorClose(reservation, held, { execution, signal });
-            })(),
-          };
-          return accepted.closing;
+        async recordDeleteClose(execution: V2Execution, signal: AbortSignal) {
+          if (acceptedOperationId !== undefined && acceptedOperationId !== execution.operationId)
+            return fail();
+          if (signal.aborted) return fail();
+          acceptedOperationId = execution.operationId;
+          const previous = accepted;
+          if (previous) {
+            try {
+              return await waitForSuccessorClose(previous.closing, signal);
+            } catch (error) {
+              if (
+                signal.aborted ||
+                accepted === previous ||
+                previous.leaseToken === execution.leaseToken
+              )
+                throw error;
+            }
+          }
+          if (!accepted) {
+            const write = { submitted: false };
+            const closing = (async () => {
+              // Only a definitively unwritten idle close may hand off.
+              if (idle && (await waitForSuccessorClose(idle, signal)) === "saved") return;
+              const outcome = await recordApplicationSuccessorClose(reservation, held, {
+                execution,
+                signal,
+                write,
+              });
+              if (outcome !== "saved") return fail();
+            })().catch((error: unknown) => {
+              if (!write.submitted && accepted?.closing === closing) accepted = undefined;
+              throw error;
+            });
+            accepted = { leaseToken: execution.leaseToken, closing };
+          }
+          return waitForSuccessorClose(accepted.closing, signal);
         },
       });
     },
