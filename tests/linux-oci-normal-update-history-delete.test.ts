@@ -1,6 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { CONTAINER_CONTRACT as C, V2_CONTAINER_F2_FORM } from "../src/container-contract.ts";
-import { isJsonObject } from "../src/json.ts";
+import { V2_CONTAINER_F2_FORM } from "../src/container-contract.ts";
 import {
   linuxOciGenerationTopology,
   linuxOciPeerNetworksDisjoint,
@@ -14,41 +13,19 @@ import {
 } from "./helpers/container-http-transport-fixture.ts";
 import { qualifiedNormalDeleteFixture } from "./helpers/linux-oci-normal-delete-fixture.ts";
 import {
+  normalUpdateAlternateTopology as alternate,
+  type NormalUpdateFixture as Fixture,
+  specOf,
+  runNormalUpdateStep as step,
+  acceptNormalUpdate as update,
+} from "./helpers/linux-oci-normal-update-fixture.ts";
+import {
   acceptedHttpSelection,
   acceptedRawHttp,
 } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 
 // Original normal creator/Engine, real crypto and atomic memorySQLite. Native
 // processes/HTTP syscalls alone are intercepted. All assertions escape Engine.
-const alternate = () => ({
-  ...acceptedHttpSelection().hostTopology,
-  peerIpv4Host: "10.240.0.4",
-  peerIpv4Guest: "10.240.0.5",
-  peerIpv6Host: "fd60:1234::4",
-  peerIpv6Guest: "fd60:1234::5",
-});
-type Fixture = Awaited<ReturnType<typeof qualifiedNormalDeleteFixture>>["f"];
-async function specOf(f: Fixture, uid: string) {
-  const row = (await f.sql.query("SELECT spec_json FROM tf_v2_resources WHERE uid=?", [uid]))[0];
-  if (typeof row?.spec_json !== "string") throw Error("NONSECRET accepted spec missing");
-  const spec: unknown = JSON.parse(row.spec_json);
-  if (!isJsonObject(spec)) throw Error("NONSECRET accepted spec invalid");
-  return spec;
-}
-async function update(f: Fixture, uid: string, generation = 1) {
-  return f.engine.acceptUpdate({
-    principal: "synthetic-oci-parent",
-    key: crypto.randomUUID(),
-    uid,
-    expectedGeneration: generation,
-    spec: { ...(await specOf(f, uid)), [C.fields.workloadRevision]: "2".repeat(64) },
-    privateInputs: { SECRET: "NONSECRET-generation-two-value" },
-  });
-}
-async function step(f: Fixture) {
-  f.advanceNormalClock(61_000);
-  return f.engine.runNext();
-}
 async function oldIo(f: Fixture) {
   const io = ownedRawHttp();
   const response = f.composition.fetchServingHttp(
@@ -373,9 +350,3 @@ test("normal-update-history lease lost during original coordinate read refuses n
     await f.cleanup();
   }
 });
-
-export {
-  alternate as normalUpdateAlternateTopology,
-  step as runNormalUpdateStep,
-  update as acceptNormalUpdate,
-};

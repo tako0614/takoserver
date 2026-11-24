@@ -5,13 +5,13 @@ import { V2_CONTAINER_OWNER_HISTORICAL_DELETE_EXPAND } from "../src/takoform-v2/
 import { ownedRawHttp, rawTick } from "./helpers/container-http-transport-fixture.ts";
 import { qualifiedNormalDeleteFixture } from "./helpers/linux-oci-normal-delete-fixture.ts";
 import {
+  normalUpdateAlternateTopology,
+  runNormalUpdateStep,
+} from "./helpers/linux-oci-normal-update-fixture.ts";
+import {
   acceptedHttpSelection,
   acceptedRawHttp,
 } from "./helpers/linux-oci-owned-bundle-fixture.ts";
-import {
-  normalUpdateAlternateTopology,
-  runNormalUpdateStep,
-} from "./linux-oci-normal-update-history-delete.test.ts";
 
 type Fixture = Awaited<ReturnType<typeof qualifiedNormalDeleteFixture>>["f"];
 async function update(f: Fixture, uid: string, generation: number) {
