@@ -479,6 +479,24 @@ function capturedAllocationData(allocation: OriginalOciAllocation) {
     receiptBytes: allocation.receiptBytes,
   });
 }
+/** Negative fence for dispatch already authorized by Core's accepted SQL. */
+export function assertOriginalLinuxOciDispatchCustody(
+  original: object,
+  core: DockerContainerCoreOwner,
+  signal: AbortSignal,
+): void {
+  const custody = originalOciCustodies.get(original);
+  if (
+    !custody ||
+    custody.core !== core ||
+    custody.isClosed() ||
+    custody.signal.aborted ||
+    !(signal instanceof AbortSignal) ||
+    signal.aborted
+  )
+    fail("parent_custody");
+}
+
 function originalPeerCustody(
   original: object,
   core: DockerContainerCoreOwner,
@@ -1806,6 +1824,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     return fail("host_topology_requires_egress");
   const { ociParentControl: parentMode, qualifiedPhysicalDigest } = options;
   const runtimeApplicationOwner = parentMode === "sealed-peer-runtime-application-owner@1";
+  const originalNativeCustody = Object.freeze({});
   const core = createDockerContainerCoreOwner(
     runtimeApplicationOwner
       ? {
@@ -1814,6 +1833,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           qualifiedPhysicalDigest: qualifiedPhysicalDigest ?? fail("parent_selection"),
         }
       : options,
+    originalNativeCustody,
   );
   if (!options.configuredInputs) return fail("configured_inputs");
   const configured = createDockerContainerConfiguredInputs({
@@ -1869,7 +1889,6 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const httpRuntimes = new Map<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>();
   const successorHttp = new Map<DockerContainerCreateRecord, OriginalOciSuccessorHttp>();
   const heldLiveInits: OriginalOciCustody["heldLiveInits"] = new Set();
-  const originalNativeCustody = Object.freeze({});
   const nativeLifetime = new AbortController();
   originalOciCustodies.set(originalNativeCustody, {
     core,
@@ -2866,7 +2885,12 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       // Do not nest a second active execution around original creator methods.
       // Each stage enters its own original scope and rereads actual acceptance.
       const accepted = await core.withExecution(execution, () =>
-        core.readAcceptedExecution(execution),
+        core.readAcceptedExecution(
+          execution,
+          execution.action === "delete"
+            ? { custody: originalNativeCustody, signal: cancel.signal }
+            : undefined,
+        ),
       );
       local();
       if (parentMode === "sealed-original@1" && accepted.retained.length) {

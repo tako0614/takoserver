@@ -61,6 +61,7 @@ import {
 import {
   advanceOriginalLinuxOciOwnedDisposal,
   assertCurrentOriginalLinuxOciLiveInitCustody,
+  assertOriginalLinuxOciDispatchCustody,
   createOriginalLinuxOciSealedApplicationCloseResume,
   disposeOriginalLinuxOciAllocation,
   type LinuxOciHeldLiveInit,
@@ -224,7 +225,10 @@ export interface DockerContainerCoreOwner {
     policy: DockerContainerRuntimePolicy,
     requiredSecretNames: readonly string[],
   ): ReturnType<typeof createDockerContainerCreateCustody>;
-  readAcceptedExecution(original: V2Execution): Promise<DockerContainerAcceptedExecution>;
+  readAcceptedExecution(
+    original: V2Execution,
+    deleteDispatch?: { readonly custody: object; readonly signal: AbortSignal },
+  ): Promise<DockerContainerAcceptedExecution>;
   /** Claim once under the ORIGINAL accepted execution, then refuse a singleton
    * topology when any other same-target claim lacks proven released coordinates.
    * This is a negative collision fence, never an allocation/native permission. */
@@ -752,6 +756,7 @@ function peerArtifact(scope: unknown, record: DockerContainerCreateRecord) {
 /** Must be installed into actual Core through AppPorts.v2ContainerHostAcceptance. */
 export function createDockerContainerCoreOwner(
   options: DockerContainerCoreOwnerOptions,
+  originalOciCustody?: object,
 ): DockerContainerCoreOwner {
   const { sql, clock, installationId, backendId, targetKey } = options;
   const parentMode = options.ociParentControl;
@@ -829,12 +834,16 @@ export function createDockerContainerCoreOwner(
     // Keep its original SQL admission result without retaining its payload or
     // letting that late capture cancel the current DELETE lease.
     if (closedContextAdmission.has(context.resourceUid)) return;
-    for (const lease of leases)
-      if (
-        lease.record.intent.resourceUid === context.resourceUid &&
-        !(context.action === "update" && retainedServing(lease, lease.proof))
-      )
-        lease.controller.abort();
+    // The original OCI dispatch verifies a committed DELETE before cancelling
+    // old management. Preparing a candidate has no OCI retirement effect.
+    if (originalOciCustody === undefined || context.action !== "delete") {
+      for (const lease of leases)
+        if (
+          lease.record.intent.resourceUid === context.resourceUid &&
+          !(context.action === "update" && retainedServing(lease, lease.proof))
+        )
+          lease.controller.abort();
+    }
     contexts.set(context.operationId, context);
   };
   const acceptance: V2HostAcceptance = Object.freeze<V2HostAcceptance>({
@@ -5608,7 +5617,7 @@ export function createDockerContainerCoreOwner(
       executionScope(execution);
       return observation;
     },
-    async readAcceptedExecution(execution: V2Execution): Promise<DockerContainerAcceptedExecution> {
+    async readAcceptedExecution(execution, deleteDispatch) {
       await assertExecution(execution);
       const deleting = execution.action === "delete";
       const rows = await sql.query(
@@ -5789,6 +5798,26 @@ export function createDockerContainerCoreOwner(
       const spec = publicSpec(current(first, "accepted_spec_json"));
       const names = validateDockerContainerSpec(spec).requiredSensitiveVars;
       await assertExecution(execution);
+      if (deleteDispatch !== undefined) {
+        if (
+          !deleting ||
+          originalOciCustody === undefined ||
+          deleteDispatch.custody !== originalOciCustody
+        )
+          return fail();
+        assertOriginalLinuxOciDispatchCustody(originalOciCustody, result, deleteDispatch.signal);
+        for (const lease of leases) {
+          if (
+            lease.record.intent.resourceUid === execution.resourceUid &&
+            lease.record.intent.incarnationId === first.i_incarnation_id &&
+            !(
+              lease.phase === "remove" &&
+              lease.proof.i_retire_operation_id === execution.operationId
+            )
+          )
+            lease.controller.abort();
+        }
+      }
       return Object.freeze({
         installationId,
         operationId: execution.operationId,

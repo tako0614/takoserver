@@ -1,5 +1,10 @@
 import { expect, spyOn, test } from "bun:test";
 import { isJsonObject } from "../src/json.ts";
+import * as coreOwner from "../src/providers/docker-container-core-owner.ts";
+import type {
+  DockerContainerCreateHeldAuthority,
+  DockerContainerCreateRecord,
+} from "../src/providers/docker-container-create-custody.ts";
 import * as originalBundle from "../src/providers/linux-oci-owned-bundle.ts";
 import * as containerOwnerSchema from "../src/takoform-v2/container-owner-schema.ts";
 import {
@@ -80,6 +85,109 @@ async function through(f: Fixture, predicate: () => Promise<boolean>) {
   }
   throw Error("NONSECRET retirement boundary not reached");
 }
+
+test("normal-delete-consumer revokes management only on accepted original dispatch", async () => {
+  const createCore = coreOwner.createDockerContainerCoreOwner;
+  let core: ReturnType<typeof createCore> | undefined;
+  const rejected = new Error("NONSECRET modeled DELETE acceptance batch refusal");
+  let refuseBatch = false;
+  let prepared = false;
+  let restoreBatch = () => {};
+  const inspect = spyOn(coreOwner, "createDockerContainerCoreOwner").mockImplementation(
+    (...args) => {
+      // Install the dormant fault before the original Engine captures its batch.
+      const { sql } = args[0];
+      const batch = sql.batch.bind(sql);
+      const spy = spyOn(sql, "batch").mockImplementation(async (statements) => {
+        if (
+          refuseBatch &&
+          statements.at(-1)?.sql.includes("INSERT OR ABORT INTO main.tf_v2_container_acceptances")
+        ) {
+          prepared = true;
+          throw rejected;
+        }
+        return batch(statements);
+      });
+      restoreBatch = () => spy.mockRestore();
+      return (core = createCore(...args));
+    },
+  );
+  const started = await live()
+    .catch((error: unknown) => {
+      restoreBatch();
+      throw error;
+    })
+    .finally(() => inspect.mockRestore());
+  const { f, accepted } = started;
+  const release = Promise.withResolvers<void>();
+  let management: ReturnType<typeof observeRawPromise<void>> | undefined;
+  try {
+    if (!core) throw new Error("missing original OCI Core");
+    const rows = await f.sql.query(
+      "SELECT v.intent_json,q.claim_id,q.native_id FROM tf_v2_container_revisions v " +
+        "JOIN tf_v2_container_create_claims q ON q.resource_uid=v.resource_uid AND q.generation=v.generation " +
+        "WHERE v.resource_uid=? AND v.retention='serving' AND q.state='bound'",
+      [accepted.resourceUid],
+    );
+    const row = rows[0];
+    if (
+      rows.length !== 1 ||
+      typeof row?.intent_json !== "string" ||
+      typeof row.claim_id !== "string" ||
+      typeof row.native_id !== "string"
+    )
+      throw new Error("missing original serving claim");
+    const record: DockerContainerCreateRecord = {
+      claimId: row.claim_id,
+      nativeId: row.native_id,
+      intent: JSON.parse(row.intent_json),
+      state: "bound",
+    };
+    const original = Promise.withResolvers<DockerContainerCreateHeldAuthority>();
+    const managementRun = core.owner.withAuthority(record, "observe", async (authority) => {
+      original.resolve(authority);
+      await release.promise;
+    });
+    management = observeRawPromise(managementRun);
+    const held = await Promise.race([
+      original.promise,
+      managementRun.then(() => {
+        throw new Error("missing original management scope");
+      }),
+    ]);
+    refuseBatch = true;
+    await expect(deleting(f, accepted.resourceUid)).rejects.toThrow(rejected);
+    expect(prepared).toBe(true);
+    expect(held.revocation.aborted).toBe(false);
+    expect(await held.stillCurrent()).toBe(true);
+    refuseBatch = false;
+
+    const deletion = await deleting(f, accepted.resourceUid);
+    expect(held.revocation.aborted).toBe(false);
+    let result = await step(f);
+    expect(held.revocation.aborted).toBe(true);
+    if (result?.status !== "succeeded") {
+      result = await through(
+        f,
+        async () =>
+          (await f.sql.query("SELECT status FROM tf_v2_operations WHERE id=?", [deletion.id]))[0]
+            ?.status === "succeeded",
+      );
+    }
+    expect(result).toMatchObject({ id: deletion.id, status: "succeeded", effect: "complete" });
+    release.resolve();
+    expect(await management.value).toHaveProperty("error");
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    restoreBatch();
+    release.resolve();
+    try {
+      await management?.value;
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
 
 for (const loss of ["native-CAS", "payload-batch"] as const) {
   test(`normal-delete-consumer ${loss} lost ACK resumes same-operation finalization without a second native read/effect`, async () => {
