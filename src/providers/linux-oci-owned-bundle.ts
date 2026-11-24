@@ -648,8 +648,7 @@ export async function openOriginalLinuxOciHeldLiveInit(
   const transportSignal = new AbortController().signal;
   const revocation = new AbortController();
   let attempted = false;
-  let checking = false;
-  let nativeRead: Promise<void> | undefined;
+  let checking: Promise<void> | undefined;
   let joining: Promise<void> | undefined;
   let rawRevocation: AbortSignal | undefined;
   const opening = Promise.resolve().then(() => {
@@ -662,7 +661,7 @@ export async function openOriginalLinuxOciHeldLiveInit(
       if (!joining) {
         joining = Promise.resolve()
           .then(async () => {
-            await nativeRead?.catch(() => undefined);
+            await checking?.catch(() => undefined);
             const held = await opening.catch((error: unknown) => {
               // An attempted opener rejection cannot prove no child was allocated.
               if (attempted) throw error;
@@ -700,25 +699,26 @@ export async function openOriginalLinuxOciHeldLiveInit(
         checking
       )
         return fail("revoked");
-      checking = true;
-      try {
+      const running = Promise.resolve().then(async () => {
         if (held.identity.nativeId !== record.nativeId) return fail("parent_custody");
         await current(actualSignal);
         if (revocation.signal.aborted) return fail("revoked");
-        nativeRead = held.assertCurrent(transportSignal);
-        try {
-          await nativeRead;
-        } finally {
-          nativeRead = undefined;
-        }
+        await held.assertCurrent(transportSignal);
         if (revocation.signal.aborted) return fail("revoked");
         await current(actualSignal);
         if (revocation.signal.aborted) return fail("revoked");
+      });
+      // Track the complete owned read, including the final authoritative check.
+      checking = running;
+      try {
+        await running;
+        assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
+        if (actualSignal.aborted || revocation.signal.aborted) return fail("revoked");
       } catch (error) {
         await source.close().catch(() => undefined);
         throw error;
       } finally {
-        checking = false;
+        checking = undefined;
       }
     };
     await check(signal);

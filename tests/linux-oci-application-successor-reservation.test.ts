@@ -399,6 +399,108 @@ for (const variant of ["current", "cross-namespace", "post-read stale", "caller 
   }, 20_000);
 }
 
+test("creator close joins the final held init read before native close", async () => {
+  await withOriginal(async ({ f, fresh, selector, signal, raw, original, expand }) => {
+    await expand();
+    const rawHeld = heldLiveInitPeer(original.claimId, "5");
+    raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+    raw.mockReturnValueOnce(rawHeld.child);
+    const held = await fresh.openCurrentHeldLiveInit(selector, signal);
+    const finalFence = Promise.withResolvers<void>();
+    const releaseFence = Promise.withResolvers<void>();
+    const query = f.sql.query.bind(f.sql);
+    let fences = 0;
+    const spy = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+      if (
+        statement.startsWith("SELECT epoch,owner_token,predecessor_close_document") &&
+        ++fences === 2
+      ) {
+        finalFence.resolve();
+        await releaseFence.promise;
+      }
+      return query(statement, params);
+    });
+    try {
+      const reading = held.assertCurrent(signal);
+      const finished = reading.then(
+        () => "resolved",
+        () => "refused",
+      );
+      expect(await Promise.race([finalFence.promise.then(() => "fenced"), finished])).toBe(
+        "fenced",
+      );
+      const closure = fresh.close();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(rawHeld.operations).toEqual(["open", "read", "read"]);
+      releaseFence.resolve();
+      expect(await finished).toBe("refused");
+      await closure;
+      expect(rawHeld.operations).toEqual(["open", "read", "read", "close"]);
+    } finally {
+      releaseFence.resolve();
+      spy.mockRestore();
+      await fresh.close().catch(() => undefined);
+      rawHeld.dispose();
+    }
+  });
+}, 20_000);
+
+for (const revokedBy of ["read cancellation", "creator close"] as const) {
+  test(`held init refuses ${revokedBy} after its final inner check`, async () => {
+    await withOriginal(async ({ f, fresh, selector, signal, raw, original, expand }) => {
+      await expand();
+      const rawHeld = heldLiveInitPeer(original.claimId, "5");
+      raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+      raw.mockReturnValueOnce(rawHeld.child);
+      const held = await fresh.openCurrentHeldLiveInit(selector, signal);
+      const caller = new AbortController();
+      const aborted = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+      if (!aborted) throw Error("AbortSignal getter is unavailable");
+      const query = f.sql.query.bind(f.sql);
+      let fences = 0;
+      let queued = false;
+      let closing: Promise<void> | undefined;
+      const spy = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+        const rows = await query(statement, params);
+        if (statement.startsWith("SELECT epoch,owner_token,predecessor_close_document")) fences++;
+        return rows;
+      });
+      Object.defineProperty(held.revocation, "aborted", {
+        configurable: true,
+        get() {
+          const value = aborted.call(this);
+          if (fences === 2 && !queued) {
+            queued = true;
+            // Queue real revocation after the inner check has read this value,
+            // ahead of the outer continuation that returns the read result.
+            queueMicrotask(() => {
+              if (revokedBy === "read cancellation") caller.abort();
+              else closing = fresh.close();
+            });
+          }
+          return value;
+        },
+      });
+      try {
+        const outcome = await held.assertCurrent(caller.signal).then(
+          () => "resolved",
+          () => "refused",
+        );
+        expect(queued).toBe(true);
+        expect(outcome).toBe("refused");
+        expect(fences).toBe(2);
+        await closing;
+        expect(rawHeld.operations).toEqual(["open", "read", "read", "close"]);
+      } finally {
+        Reflect.deleteProperty(held.revocation, "aborted");
+        spy.mockRestore();
+        await fresh.close().catch(() => undefined);
+        rawHeld.dispose();
+      }
+    });
+  }, 20_000);
+}
+
 for (const terminal of [
   "acknowledged",
   "unknown",
