@@ -2497,12 +2497,71 @@ type HeldLiveInitIdentity = Readonly<{
   barrier: "unproven";
 }>;
 
+export type LinuxOciHeldTopologyFile = Readonly<{
+  device: string;
+  inode: string;
+  size: string;
+  uid: "0";
+  mode: "33152";
+  nlink: "1";
+  mtimeNs: string;
+  ctimeNs: string;
+}>;
+
 const heldLiveInitRead = '{"kind":"linux-oci-parent-held-live-init-read@1"}';
+const heldAdmissionRead = '{"kind":"linux-oci-parent-held-admission-read@1"}';
 const heldLiveInitClose = '{"kind":"linux-oci-parent-held-live-init-close@1"}';
 const heldLiveInitCurrent =
   '{"kind":"linux-oci-parent-held-live-init-current@1","barrier":"unproven"}';
 const heldLiveInitClosed =
   '{"kind":"linux-oci-parent-held-live-init-closed@1","barrier":"unproven"}';
+
+function heldAdmissionTopology(
+  body: string,
+  identity: HeldLiveInitIdentity,
+  generation: number,
+): LinuxOciHeldTopologyFile {
+  const kind = "linux-oci-parent-held-admission-current@1";
+  const value = parseStrictJson(encoder.encode(body), 512);
+  if (
+    !record(value) ||
+    value.kind !== kind ||
+    value.nativeId !== identity.nativeId ||
+    value.generation !== String(generation) ||
+    value.namespaceDevice !== identity.namespaceDevice ||
+    value.namespaceInode !== identity.namespaceInode ||
+    value.barrier !== "unproven" ||
+    !record(value.topology)
+  )
+    throw failure("parent_peer_retained");
+  const { device, inode, size, uid, mode, nlink, mtimeNs, ctimeNs } = value.topology;
+  if (
+    !positiveU64String(device) ||
+    !positiveU64String(inode) ||
+    !positiveU64String(size) ||
+    BigInt(size) > 32768n ||
+    uid !== "0" ||
+    mode !== "33152" ||
+    nlink !== "1" ||
+    (mtimeNs !== "0" && !positiveU64String(mtimeNs)) ||
+    (ctimeNs !== "0" && !positiveU64String(ctimeNs))
+  )
+    throw failure("parent_peer_retained");
+  const topology = Object.freeze({ device, inode, size, uid, mode, nlink, mtimeNs, ctimeNs });
+  if (
+    JSON.stringify({
+      kind,
+      nativeId: identity.nativeId,
+      generation: value.generation,
+      namespaceDevice: identity.namespaceDevice,
+      namespaceInode: identity.namespaceInode,
+      topology,
+      barrier: "unproven",
+    }) !== body
+  )
+    throw failure("parent_peer_retained");
+  return topology;
+}
 
 /** Private transport after the caller authenticates its original binding.
  * The identity alone is observational. Only this owned connector can recheck
@@ -2533,7 +2592,7 @@ export function prepareAuthenticatedLinuxOciHeldLiveInitReader(
 }
 
 async function openOriginalHeldLiveInit(state: OriginalPeerReaderState, signal: AbortSignal) {
-  type Operation = "open" | "read" | "close";
+  type Operation = "open" | "read" | "admission" | "close";
   type Pending = {
     readonly operation: Operation;
     readonly frame: Buffer;
@@ -2755,6 +2814,23 @@ async function openOriginalHeldLiveInit(state: OriginalPeerReaderState, signal: 
           throw unavailable();
         await exchange("read", command(heldLiveInitRead), actualSignal);
         if (revocation.signal.aborted || actualSignal.aborted) throw unavailable();
+      },
+      async readAdmittedTopology(actualSignal: AbortSignal): Promise<LinuxOciHeldTopologyFile> {
+        if (
+          !(actualSignal instanceof AbortSignal) ||
+          revocation.signal.aborted ||
+          actualSignal.aborted
+        )
+          throw unavailable();
+        const body = await exchange("admission", command(heldAdmissionRead), actualSignal);
+        try {
+          const topology = heldAdmissionTopology(body, identity, state.generation);
+          if (revocation.signal.aborted || actualSignal.aborted) throw unavailable();
+          return topology;
+        } catch {
+          stop();
+          throw unavailable();
+        }
       },
       close(): Promise<void> {
         if (!closing) {

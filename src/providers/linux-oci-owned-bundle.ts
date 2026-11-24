@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { type BigIntStats, constants, lstatSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, parse } from "node:path";
 import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "../container-contract.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
@@ -53,6 +54,7 @@ import {
   type LinuxOciApplicationOwnerExit,
   type LinuxOciCreateStoppedRequest,
   type LinuxOciDisposedHelperObservation,
+  type LinuxOciHeldTopologyFile,
   type LinuxOciInitReapedObservation,
   type LinuxOciNamespaceLifetimeObservation,
   type LinuxOciOriginalLiveInit,
@@ -616,9 +618,82 @@ export async function readOriginalLinuxOciLiveInit(
   return fact;
 }
 
-export type LinuxOciHeldLiveInit = Awaited<
-  ReturnType<ReturnType<typeof prepareAuthenticatedLinuxOciHeldLiveInitReader>>
->;
+export type LinuxOciHeldLiveInit = Omit<
+  Awaited<ReturnType<ReturnType<typeof prepareAuthenticatedLinuxOciHeldLiveInitReader>>>,
+  "readAdmittedTopology"
+> & {
+  readOriginalTopology(signal: AbortSignal): Promise<{
+    readonly claimId: string;
+    readonly generation: number;
+    readonly namespaceDevice: string;
+    readonly namespaceInode: string;
+    readonly topology: Readonly<LinuxOciHostTopology>;
+  }>;
+};
+
+function assertHeldTopologyFile(identity: LinuxOciHeldTopologyFile, stat: BigIntStats) {
+  if (
+    !stat.isFile() ||
+    String(stat.dev) !== identity.device ||
+    String(stat.ino) !== identity.inode ||
+    String(stat.size) !== identity.size ||
+    String(stat.uid) !== identity.uid ||
+    String(stat.mode) !== identity.mode ||
+    String(stat.nlink) !== identity.nlink ||
+    String(stat.mtimeNs) !== identity.mtimeNs ||
+    String(stat.ctimeNs) !== identity.ctimeNs
+  )
+    return fail("http_custody");
+}
+
+async function readOriginalHeldTopology(
+  custody: OriginalOciCustody,
+  record: DockerContainerCreateRecord,
+  allocation: OriginalOciAllocation,
+  observe: () => Promise<LinuxOciHeldTopologyFile>,
+  assertCurrent: () => Promise<unknown>,
+) {
+  const { topology } = allocation;
+  if (!topology || !custody.hostTopology) return fail("http_custody");
+  const selected = linuxOciGenerationTopology(
+    { primary: custody.hostTopology, alternate: custody.alternateHostTopology },
+    record.intent.policy.generation,
+  );
+  if (canonicalJson(topology) !== canonicalJson(selected)) return fail("http_custody");
+  // Keep the CREATE serializer's original receipt bytes. The bound claim
+  // authenticated them in readOriginalPeerAllocation.
+  const expected = Buffer.from(
+    '{"kind":"linux-oci-owned-topology@1","artifact":' +
+      allocation.receiptBytes +
+      ',"topology":' +
+      JSON.stringify(topology) +
+      "}",
+  );
+  if (expected.length > 32768) return fail("http_custody");
+  const path = join(allocation.root.path, LINUX_OCI_HOST_TOPOLOGY_FILE);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let identity: LinuxOciHeldTopologyFile;
+  try {
+    const original = await file.stat({ bigint: true });
+    if (!original.isFile() || original.size !== BigInt(expected.length))
+      return fail("http_custody");
+    const bytes = Buffer.alloc(expected.length + 1);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    if (bytesRead !== expected.length || !bytes.subarray(0, bytesRead).equals(expected))
+      return fail("http_custody");
+    identity = await observe();
+    assertHeldTopologyFile(identity, original);
+    await assertCurrent();
+    assertHeldTopologyFile(identity, await file.stat({ bigint: true }));
+  } finally {
+    // The creator joins this operation before closing the Native connector
+    // or disposing the allocation. Keep the FD until both fences complete.
+    await file.close();
+  }
+  // The SQL scope or key may change while the descriptor is being released.
+  await assertCurrent();
+  return { path, identity, topology };
+}
 
 /** Private bridge from the owning, authenticated Core to the exact original
  * allocation and held native reader. The readback never supplies a route. */
@@ -636,10 +711,17 @@ export async function openOriginalLinuxOciHeldLiveInit(
   const current = async (actualSignal: AbortSignal) => {
     assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
     if (!(actualSignal instanceof AbortSignal) || actualSignal.aborted) return fail("revoked");
-    await readOriginalPeerAllocation(custody, record, artifact, binding, "present");
+    const allocation = await readOriginalPeerAllocation(
+      custody,
+      record,
+      artifact,
+      binding,
+      "present",
+    );
     await assertCurrent(actualSignal);
     assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
     if (actualSignal.aborted) return fail("revoked");
+    return allocation;
   };
   await current(signal);
   const open = prepareAuthenticatedLinuxOciHeldLiveInitReader(binary, binding, custody.signal);
@@ -648,7 +730,7 @@ export async function openOriginalLinuxOciHeldLiveInit(
   const transportSignal = new AbortController().signal;
   const revocation = new AbortController();
   let attempted = false;
-  let checking: Promise<void> | undefined;
+  let checking: Promise<unknown> | undefined;
   let joining: Promise<void> | undefined;
   let rawRevocation: AbortSignal | undefined;
   const opening = Promise.resolve().then(() => {
@@ -691,7 +773,15 @@ export async function openOriginalLinuxOciHeldLiveInit(
     rawRevocation = held.revocation;
     rawRevocation.addEventListener("abort", revoke, { once: true });
     if (rawRevocation.aborted) revoke();
-    const check = async (actualSignal: AbortSignal) => {
+    const assertLocal = (actualSignal: AbortSignal) => {
+      assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
+      if (actualSignal.aborted || revocation.signal.aborted) return fail("revoked");
+    };
+    const check = async <T, R>(
+      actualSignal: AbortSignal,
+      observe: (allocation: OriginalOciAllocation) => Promise<T>,
+      finish: (value: T) => R,
+    ) => {
       if (
         !(actualSignal instanceof AbortSignal) ||
         actualSignal.aborted ||
@@ -701,19 +791,16 @@ export async function openOriginalLinuxOciHeldLiveInit(
         return fail("revoked");
       const running = Promise.resolve().then(async () => {
         if (held.identity.nativeId !== record.nativeId) return fail("parent_custody");
-        await current(actualSignal);
-        if (revocation.signal.aborted) return fail("revoked");
-        await held.assertCurrent(transportSignal);
-        if (revocation.signal.aborted) return fail("revoked");
-        await current(actualSignal);
-        if (revocation.signal.aborted) return fail("revoked");
+        const allocation = await current(actualSignal);
+        assertLocal(actualSignal);
+        return observe(allocation);
       });
       // Track the complete owned read, including the final authoritative check.
       checking = running;
       try {
-        await running;
-        assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
-        if (actualSignal.aborted || revocation.signal.aborted) return fail("revoked");
+        const value = await running;
+        assertLocal(actualSignal);
+        return finish(value);
       } catch (error) {
         await source.close().catch(() => undefined);
         throw error;
@@ -721,11 +808,53 @@ export async function openOriginalLinuxOciHeldLiveInit(
         checking = undefined;
       }
     };
-    await check(signal);
+    const assertHeldCurrent = (actualSignal: AbortSignal) =>
+      check(
+        actualSignal,
+        async () => {
+          await held.assertCurrent(transportSignal);
+          assertLocal(actualSignal);
+          await current(actualSignal);
+          assertLocal(actualSignal);
+        },
+        () => undefined,
+      );
+    await assertHeldCurrent(signal);
     return Object.freeze({
       identity: held.identity,
       revocation: revocation.signal,
-      assertCurrent: check,
+      assertCurrent: assertHeldCurrent,
+      readOriginalTopology(actualSignal: AbortSignal) {
+        return check(
+          actualSignal,
+          (allocation) =>
+            readOriginalHeldTopology(
+              custody,
+              record,
+              allocation,
+              () => {
+                assertLocal(actualSignal);
+                return held.readAdmittedTopology(transportSignal);
+              },
+              () => {
+                assertLocal(actualSignal);
+                return current(actualSignal);
+              },
+            ),
+          ({ path, identity, topology }) => {
+            // Refuse replacement during asynchronous FD closure without
+            // another await between this check and the private read result.
+            assertHeldTopologyFile(identity, lstatSync(path, { bigint: true }));
+            return Object.freeze({
+              claimId: record.claimId,
+              generation: record.intent.policy.generation,
+              namespaceDevice: held.identity.namespaceDevice,
+              namespaceInode: held.identity.namespaceInode,
+              topology,
+            });
+          },
+        );
+      },
       close: source.close,
     });
   } catch (error) {

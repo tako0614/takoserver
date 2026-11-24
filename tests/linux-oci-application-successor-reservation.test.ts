@@ -1,6 +1,11 @@
 import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
+import * as fs from "node:fs";
+import * as files from "node:fs/promises";
+import { lstat, readFile, rename, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { LINUX_OCI_HOST_TOPOLOGY_FILE } from "../src/providers/linux-oci-host-topology.ts";
 import * as bundle from "../src/providers/linux-oci-owned-bundle.ts";
 import {
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
@@ -9,7 +14,7 @@ import {
   V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
 import { ownedRawHttp } from "./helpers/container-http-transport-fixture.ts";
-import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
+import { acceptedRawHttp, syntheticTopology } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 const reservations = "tf_v2_container_application_successors";
@@ -50,6 +55,7 @@ function heldLiveInitPeer(
   namespaceInode: string,
   beforeRead?: () => Promise<void>,
   acknowledgeClose = true,
+  admitted?: () => string | undefined,
 ) {
   const stdin = new PassThrough();
   const stdout = new PassThrough();
@@ -60,8 +66,8 @@ function heldLiveInitPeer(
     stderr: { value: stderr },
   });
   const operations: string[] = [];
-  const send = (value: object) => {
-    const body = Buffer.from(JSON.stringify(value));
+  const send = (value: object | string) => {
+    const body = Buffer.from(typeof value === "string" ? value : JSON.stringify(value));
     const size = Buffer.alloc(4);
     size.writeUInt32BE(body.length);
     stdout.write(Buffer.concat([size, body]));
@@ -92,6 +98,18 @@ function heldLiveInitPeer(
       );
       return;
     }
+    if (command === '{"kind":"linux-oci-parent-held-admission-read@1"}') {
+      operations.push("admission");
+      const body = admitted?.();
+      if (body !== undefined) send(body);
+      else {
+        stdout.emit("end");
+        stderr.emit("end");
+        child.emit("exit", 77, null);
+        child.emit("close", 77, null);
+      }
+      return;
+    }
     expect(command).toBe('{"kind":"linux-oci-parent-held-live-init-close@1"}');
     operations.push("close");
     if (acknowledgeClose)
@@ -109,6 +127,68 @@ function heldLiveInitPeer(
       stdout.destroy();
       stderr.destroy();
     },
+  };
+}
+
+async function topologyReply(path: string, nativeId: string, generation: number) {
+  const stat = await lstat(path, { bigint: true });
+  return {
+    kind: "linux-oci-parent-held-admission-current@1",
+    nativeId,
+    generation: String(generation),
+    namespaceDevice: "4",
+    namespaceInode: "5",
+    topology: {
+      device: String(stat.dev),
+      inode: String(stat.ino),
+      size: String(stat.size),
+      uid: "0",
+      mode: String(stat.mode),
+      nlink: String(stat.nlink),
+      mtimeNs: String(stat.mtimeNs),
+      ctimeNs: String(stat.ctimeNs),
+    },
+    barrier: "unproven",
+  };
+}
+
+function modelNativeTopologyOwner(path: string, beforeClose?: () => Promise<void>) {
+  const needsRootOwner = process.getuid?.() !== 0;
+  if (!needsRootOwner && !beforeClose) return () => undefined;
+  // The held H command runs as root. All other fixture stat fields come
+  // from the real descriptor and pathname, even on a non-root test runner.
+  const rootOwner = <T extends { uid: number | bigint }>(stat: T) => {
+    Object.defineProperty(stat, "uid", { value: typeof stat.uid === "bigint" ? 0n : 0 });
+    return stat;
+  };
+  const open = files.open;
+  const opened = spyOn(files, "open").mockImplementation(async (...args) => {
+    const file = await open(...args);
+    if (args[0] === path) {
+      if (needsRootOwner) {
+        const stat = file.stat;
+        file.stat = ((...args) => Reflect.apply(stat, file, args).then(rootOwner)) as typeof stat;
+      }
+      if (beforeClose) {
+        const close = file.close;
+        file.close = async () => {
+          await beforeClose();
+          await close.call(file);
+        };
+      }
+    }
+    return file;
+  });
+  const stat = fs.lstatSync;
+  const named =
+    needsRootOwner &&
+    spyOn(fs, "lstatSync").mockImplementation(((...args) => {
+      const result = Reflect.apply(stat, fs, args);
+      return args[0] === path ? rootOwner(result) : result;
+    }) as typeof stat);
+  return () => {
+    if (named) named.mockRestore();
+    opened.mockRestore();
   };
 }
 
@@ -396,6 +476,187 @@ for (const variant of ["current", "cross-namespace", "post-read stale", "caller 
         rawHeld.dispose();
       }
     });
+  }, 20_000);
+}
+
+for (const interruption of ["before read", "during final SQL", "creator close"] as const) {
+  test(`held admission reads only original topology and refuses ${interruption}`, async () => {
+    await withOriginal(async ({ f, fresh, selector, signal, raw, original, expand }) => {
+      await expand();
+      const path = join(original.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE);
+      const savedPath = `${path}.original`;
+      const originalBytes = await readFile(path);
+      const reply = JSON.stringify(
+        await topologyReply(path, original.claimId, original.generation),
+      );
+      const restore = modelNativeTopologyOwner(path);
+      const peer = heldLiveInitPeer(original.claimId, "5", undefined, true, () => reply);
+      raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+      raw.mockReturnValueOnce(peer.child);
+      const releaseFence = Promise.withResolvers<void>();
+      const finalFence = Promise.withResolvers<void>();
+      let replaced = false;
+      let restoreQuery: (() => void) | undefined;
+      try {
+        const held = await fresh.openCurrentHeldLiveInit(selector, signal);
+        const observation = await held.readOriginalTopology(signal);
+        expect(observation).toEqual({
+          claimId: original.claimId,
+          generation: original.generation,
+          namespaceDevice: "4",
+          namespaceInode: "5",
+          topology: syntheticTopology(),
+        });
+        expect(Object.isFrozen(observation.topology)).toBe(true);
+        const io = ownedRawHttp();
+        try {
+          await expect(
+            fresh.openServingHttp(
+              selector,
+              new Request("http://ignored.invalid/"),
+              () => undefined,
+            ),
+          ).rejects.toThrow("http_custody");
+          expect(io.counts().calls).toBe(0);
+        } finally {
+          io.restore();
+        }
+        const replace = async () => {
+          await rename(path, savedPath);
+          replaced = true;
+          await writeFile(path, originalBytes, { flag: "wx", mode: 0o600 });
+        };
+        if (interruption !== "before read") {
+          const query = f.sql.query.bind(f.sql);
+          let fences = 0;
+          const spy = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+            if (
+              statement.startsWith("SELECT epoch,owner_token,predecessor_close_document") &&
+              ++fences === 2
+            ) {
+              finalFence.resolve();
+              await releaseFence.promise;
+            }
+            return query(statement, params);
+          });
+          restoreQuery = () => spy.mockRestore();
+        } else await replace();
+        const reading = held.readOriginalTopology(signal);
+        const finished = reading.then(
+          () => "resolved",
+          () => "refused",
+        );
+        let closing: Promise<void> | undefined;
+        if (interruption !== "before read") {
+          expect(await Promise.race([finalFence.promise.then(() => "fenced"), finished])).toBe(
+            "fenced",
+          );
+          if (interruption === "creator close") {
+            closing = fresh.close();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(peer.operations).toEqual(["open", "read", "admission", "admission"]);
+          } else await replace();
+          releaseFence.resolve();
+        }
+        expect(await finished).toBe("refused");
+        await closing;
+        await held.close();
+        expect(peer.operations).toEqual(["open", "read", "admission", "admission", "close"]);
+      } finally {
+        releaseFence.resolve();
+        restoreQuery?.();
+        if (replaced) await rename(savedPath, path);
+        restore();
+        await fresh.close().catch(() => undefined);
+        peer.dispose();
+      }
+    });
+  }, 20_000);
+}
+
+test("held admission refuses a serving row revoked during topology FD close", async () => {
+  await withOriginal(async ({ f, fresh, selector, signal, raw, original, expand }) => {
+    await expand();
+    const path = join(original.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE);
+    const reply = JSON.stringify(await topologyReply(path, original.claimId, original.generation));
+    const peer = heldLiveInitPeer(original.claimId, "5", undefined, true, () => reply);
+    raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+    raw.mockReturnValueOnce(peer.child);
+    const held = await fresh.openCurrentHeldLiveInit(selector, signal);
+    const closeStarted = Promise.withResolvers<void>();
+    const releaseClose = Promise.withResolvers<void>();
+    const restore = modelNativeTopologyOwner(path, async () => {
+      closeStarted.resolve();
+      await releaseClose.promise;
+    });
+    const query = f.sql.query.bind(f.sql);
+    let fences = 0;
+    const spy = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+      const rows = await query(statement, params);
+      if (statement.startsWith("SELECT epoch,owner_token,predecessor_close_document")) fences++;
+      return rows;
+    });
+    try {
+      const finished = held.readOriginalTopology(signal).then(
+        () => "resolved",
+        () => "refused",
+      );
+      expect(await Promise.race([closeStarted.promise.then(() => "closing"), finished])).toBe(
+        "closing",
+      );
+      expect(fences).toBe(2);
+      expect(
+        (
+          await f.sql.run(
+            "UPDATE tf_v2_resources SET observed_json=json_set(observed_json,'$.ready',json('false')) WHERE uid=?",
+            [selector.resourceUid],
+          )
+        ).changes,
+      ).toBe(1);
+      expect(signal.aborted).toBe(false);
+      expect(held.revocation.aborted).toBe(false);
+      releaseClose.resolve();
+      expect(await finished).toBe("refused");
+      expect(fences).toBe(3);
+      expect(peer.operations).toEqual(["open", "read", "admission", "close"]);
+    } finally {
+      releaseClose.resolve();
+      spy.mockRestore();
+      restore();
+      await fresh.close().catch(() => undefined);
+      peer.dispose();
+    }
+  });
+}, 20_000);
+
+for (const fault of ["namespace", "decimal", "duplicate field", "native refusal"] as const) {
+  test(`held admission keeps original transport unknown after ${fault}`, async () => {
+    await withOriginal(async ({ fresh, selector, signal, raw, original, expand }) => {
+      await expand();
+      const path = join(original.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE);
+      const reply = await topologyReply(path, original.claimId, original.generation);
+      if (fault === "namespace") reply.namespaceInode = "6";
+      if (fault === "decimal") reply.topology.inode = `0${reply.topology.inode}`;
+      const body = JSON.stringify(reply);
+      const adverse =
+        fault === "duplicate field"
+          ? body.replace('"uid":"0"', '"uid":"0","uid":"0"')
+          : fault === "native refusal"
+            ? undefined
+            : body;
+      const peer = heldLiveInitPeer(original.claimId, "5", undefined, true, () => adverse);
+      raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+      raw.mockReturnValueOnce(peer.child);
+      try {
+        const held = await fresh.openCurrentHeldLiveInit(selector, signal);
+        await expect(held.readOriginalTopology(signal)).rejects.toThrow("parent_peer_retained");
+        expect(held.revocation.aborted).toBe(true);
+        await expect(fresh.close()).rejects.toThrow("parent_peer_retained");
+        expect(peer.operations).toEqual(["open", "read", "admission"]);
+      } finally {
+        peer.dispose();
+      }
+    }, true);
   }, 20_000);
 }
 
