@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -739,6 +739,10 @@ async function runSelfhostBunHost(
     await assertSelfhostLinuxContainerNodeSchema(sql, preflightLinuxContainerSelection);
   } catch (error) {
     controlDatabase.close();
+    writeSync(
+      process.stderr.fd,
+      "self-host tracked OCI shutdown evidence schema is missing or incompatible\n",
+    );
     throw error;
   }
   // The sole migration writer has already committed the checked realm claim
