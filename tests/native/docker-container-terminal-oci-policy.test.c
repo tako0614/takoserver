@@ -850,6 +850,10 @@ static void policy_child_case(void){
  eg.ranges=eg.entered=0;
  if(!setjmp(child_exit))oci_policy_child(policy_subject,2,450,453);
  CHECK(lock_taken && eg.ranges==3 && eg.entered && eg.close_calls[4]>=2);
+ struct oci_admission_owner admission={.original=&o};
+ eg.ranges=eg.entered=0;
+ if(!setjmp(child_exit))oci_admission_child(&admission,2,450,453);
+ CHECK(lock_taken && eg.ranges==3 && eg.entered && eg.close_calls[4]>=3);
  pol.child=0;
  eg.child_mode=0;
  CHECK(oci_uplink_unlock(subject)==0);

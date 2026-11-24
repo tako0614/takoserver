@@ -672,6 +672,9 @@ static int oci_policy_join(struct oci_policy_owner *p,unsigned int stage,int tim
   p->ok[stage]=info.si_code==CLD_EXITED && !info.si_status;
   return 0;
 }
+/* Callers using oci_policy_readback need stable protocol numbers. */
+static char *const oci_policy_numeric_ruleset[]={"nft","-j","-p","list","ruleset",NULL};
+
 static _Noreturn void oci_policy_child(struct oci_policy_owner *p,unsigned int stage,int input,int output){
   struct tns_oci_owner *o=p->original;
   int executable=fcntl(o->egress_binary,F_DUPFD_CLOEXEC,10),network=fcntl(o->network,F_DUPFD_CLOEXEC,10),incoming=fcntl(input,F_DUPFD_CLOEXEC,10),outgoing=fcntl(output,F_DUPFD_CLOEXEC,10);
@@ -688,9 +691,8 @@ static _Noreturn void oci_policy_child(struct oci_policy_owner *p,unsigned int s
   char *const check[]={"nft","--check","-f","-",NULL},*const apply[]={"nft","-f","-",NULL};
   /* Use stable protocol numbers for the compiled TCP (6) / UDP (17) sets. */
   char *const readback[]={"nft","-j","-p","list","table","inet",OCI_POLICY_TABLE,NULL};
-  char *const ruleset[]={"nft","-j","-p","list","ruleset",NULL};
   char *const environment[]={"PATH=/usr/sbin:/usr/bin:/sbin:/bin",NULL};
-  char *const *argv=stage==0?check:stage==1?apply:stage==2?(o->admission_ruleset_reads?ruleset:readback):NULL;
+  char *const *argv=stage==0?check:stage==1?apply:stage==2?(o->admission_ruleset_reads?oci_policy_numeric_ruleset:readback):NULL;
   if(!argv)_exit(125);
   umask(077);
   syscall(SYS_execveat,3,"",argv,environment,AT_EMPTY_PATH);

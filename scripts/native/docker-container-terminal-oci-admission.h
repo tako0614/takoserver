@@ -71,9 +71,8 @@ static _Noreturn void oci_admission_child(struct oci_admission_owner *a,unsigned
   for(int fd=0;fd<3;fd++) {int flags=fcntl(fd,F_GETFL);if(flags<0 || fcntl(fd,F_SETFL,flags&~O_NONBLOCK)<0 || fcntl(fd,F_SETFD,0)<0)_exit(125);}
   char *const before[]={"nft","-j","list","table","inet",OCI_EGRESS_TABLE,NULL};
   char *const apply[]={"nft","-f","-",NULL};
-  char *const after[]={"nft","-j","list","ruleset",NULL};
   char *const environment[]={"PATH=/usr/sbin:/usr/bin:/sbin:/bin",NULL};
-  char *const *argv=stage==0?before:stage==1?apply:stage==2?after:NULL;
+  char *const *argv=stage==0?before:stage==1?apply:stage==2?oci_policy_numeric_ruleset:NULL;
   if(!argv)_exit(125);
   umask(077);syscall(SYS_execveat,3,"",argv,environment,AT_EMPTY_PATH);_exit(125);
 }
