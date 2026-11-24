@@ -1,11 +1,15 @@
 import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as files from "node:fs/promises";
 import * as net from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import type { JsonObject, Sql } from "../src/ports.ts";
+import { createLinuxOciContainerBindingSource } from "../src/providers/linux-oci-container-binding-broker.ts";
 import { LINUX_OCI_HOST_TOPOLOGY_FILE } from "../src/providers/linux-oci-host-topology.ts";
+import type { createLinuxOciOwnedBundle } from "../src/providers/linux-oci-owned-bundle.ts";
 import {
   v2ConfiguredUpdateDiscardTransition,
   v2FinalDeleteConfiguredUpdateDiscardTransition,
@@ -17,6 +21,24 @@ import {
   V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
+import {
+  fixedReferencesForContainerConsumerWorkerVersion,
+  prepareContainerConsumerWorkerVersionReferences,
+} from "../src/takoform-v2/forms/container-consumer-references.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/container-consumer-specs.ts";
+import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
+import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  parseForwardWorkerVersionSpec,
+} from "../src/takoform-v2/forms/worker-specs.ts";
+import { V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_SQL } from "../src/takoform-v2/operation-generation-index.ts";
+import type { V2Form } from "../src/takoform-v2/types.ts";
+import { createContainerConsumerWorkerDeploymentForm } from "../src/takoform-v2/worker-deployment-backend.ts";
+import { createV2ForwardContainerWorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
 import {
   observeRawPromise,
   ownedRawHttp,
@@ -417,6 +439,160 @@ function modelRootTopology(path: string) {
   };
 }
 
+/** Commit the Worker graph in the actual Container SQL before the UPDATE.
+ * The Worker native publication is modeled. Both graph readers and the
+ * Container's actual application owner evaluate currentness independently. */
+async function workerBindingPublication(
+  sql: Sql,
+  original: ReturnType<typeof createLinuxOciOwnedBundle>,
+  target: { targetUid: string; principal: string; space: string; targetKey: string },
+) {
+  const { targetUid, principal, space, targetKey } = target;
+  await sql.run(V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_SQL);
+  const contents = new TextEncoder().encode(
+    "export default {fetch(request,env){return env.APP.fetch(request)}};",
+  );
+  const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+  const moduleUrl = "https://nonsecret.invalid/fixture/index.js";
+  const manifestUrl = "https://nonsecret.invalid/fixture/manifest.json";
+  const manifest = new TextEncoder().encode(
+    JSON.stringify({
+      entrypoint: "index.js",
+      files: [
+        {
+          path: "index.js",
+          url: moduleUrl,
+          sha256: digest(contents),
+          mediaType: "application/javascript+module",
+        },
+      ],
+    }),
+  );
+  const bundle = createWorkerBundleHost({
+    sql,
+    targetKey,
+    source: {
+      async read({ url }) {
+        if (url === moduleUrl) return contents;
+        if (url === manifestUrl) return manifest;
+        throw new Error("unexpected fixture artifact");
+      },
+    },
+  });
+  const metadata = (id: string, observed: JsonObject): V2Form => ({
+    validateCreate() {},
+    validateUpdate() {},
+    backend: {
+      id,
+      targetKey,
+      async execute() {
+        return { kind: "complete", observed, output: {} };
+      },
+      async reconcile() {
+        return { kind: "unknown" };
+      },
+    },
+  });
+  const workerBackendId = "synthetic-cutover-worker-version";
+  const deploymentForm = createContainerConsumerWorkerDeploymentForm({ targetKey });
+  const versions: { resourceUid: string; weight: number }[] = [];
+  const engine = createTakoformV2Engine({
+    sql,
+    authorize: async () => true,
+    replayWindowSeconds: 3600,
+    forms: {
+      [MODULE_WORKER_FORM_URL]: metadata("synthetic-cutover-worker", { ready: true }),
+      [WORKER_BUNDLE_FORM_URL]: bundle.form,
+      [CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL]: {
+        ...metadata(workerBackendId, { ready: true, resolvedBindings: true, bundleVerified: true }),
+        validateCreate: parseForwardWorkerVersionSpec,
+        references: (spec) =>
+          fixedReferencesForContainerConsumerWorkerVersion(parseForwardWorkerVersionSpec(spec)),
+        prepareAdmission: prepareContainerConsumerWorkerVersionReferences,
+      },
+      [CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL]: {
+        ...deploymentForm,
+        backend: {
+          ...deploymentForm.backend,
+          async execute() {
+            return {
+              kind: "complete",
+              observed: { ready: true, active: true, selectedVersions: versions },
+              output: {},
+            };
+          },
+        },
+      },
+    },
+  });
+  async function create(form: string, name: string, spec: JsonObject) {
+    const op = await engine.acceptCreate({
+      principal,
+      key: crypto.randomUUID(),
+      input: { form, name, space, spec },
+    });
+    expect(await engine.runNext()).toMatchObject({
+      id: op.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    return op;
+  }
+  const worker = await create(MODULE_WORKER_FORM_URL, "cutover-worker", {});
+  const artifact = await create(WORKER_BUNDLE_FORM_URL, "cutover-bundle", {
+    artifact: { url: manifestUrl, sha256: digest(manifest) },
+  });
+  const version = await create(CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL, "cutover-version", {
+    worker: { resourceUid: worker.resourceUid },
+    bundle: { resourceUid: artifact.resourceUid },
+    handlers: ["fetch"],
+    containerBindings: [{ name: "APP", resource: { resourceUid: targetUid } }],
+  });
+  versions.push({ resourceUid: version.resourceUid, weight: 10_000 });
+  const deployment = await create(
+    CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+    "cutover-deployment",
+    {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10_000 }],
+    },
+  );
+  const source = createLinuxOciContainerBindingSource({
+    sql,
+    targetKey,
+    workerBackendId,
+    containerBackendId: "synthetic-oci-backend",
+    original,
+  });
+  const publication = createV2ForwardContainerWorkerPublicationState(
+    { sql, bundleCustody: bundle.custody },
+    source.readCurrentServingTarget,
+  );
+  const read = () =>
+    source.read({
+      principal,
+      space,
+      workerVersionUid: version.resourceUid,
+      workerVersionGeneration: 1,
+      operationId: version.id,
+      bindingName: "APP",
+      targetUid,
+    });
+  const resolve = () =>
+    publication.resolveCurrentServing({
+      workerUid: worker.resourceUid,
+      targetKey,
+      sourceOperationId: deployment.id,
+      expectedIdentity: {
+        generation: `takoserver-v2-operation:${deployment.id}`,
+        workerResourceUid: worker.resourceUid,
+        hostnames: [],
+        versions: [{ workerVersionUid: version.resourceUid, weight: 10_000 }],
+      },
+    });
+  return { source, read, resolve };
+}
+
 async function verifySuccessorHttpClose(
   outcome:
     | "joined"
@@ -427,6 +603,7 @@ async function verifySuccessorHttpClose(
     | "pending-update"
     | "update-cutover"
     | "update-delete"
+    | "update-worker-binding"
     | "delete"
     | "delete-late"
     | "delete-restart"
@@ -434,7 +611,8 @@ async function verifySuccessorHttpClose(
 ) {
   const deleting = outcome.startsWith("delete");
   const deleteAfterUpdate = outcome === "update-delete";
-  const cutover = outcome === "update-cutover" || deleteAfterUpdate;
+  const workerBinding = outcome === "update-worker-binding";
+  const cutover = outcome === "update-cutover" || deleteAfterUpdate || workerBinding;
   const updating = outcome === "pending-update" || cutover;
   const f = await originalPeerDeleteFixture({
     normal: true,
@@ -613,6 +791,17 @@ async function verifySuccessorHttpClose(
           "SELECT desired_generation,serving_generation,runtime_epoch FROM tf_v2_container_instances WHERE resource_uid=?",
           [selector.resourceUid],
         );
+      const worker = workerBinding
+        ? await workerBindingPublication(f.sql, creator, targetScope)
+        : undefined;
+      async function openBinding(generation: number, path: string) {
+        const request = new Request(`http://caller.invalid/${path}`);
+        if (!worker) return creator.openServingHttp({ ...selector, generation }, request, () => {});
+        const current = await worker.read();
+        expect(current?.nativeServing?.generation).toBe(generation);
+        if (!current) throw new Error("missing original Worker binding snapshot");
+        return worker.source.open(current, request, () => {});
+      }
       let now = Date.now();
       let advance:
         | (() => ReturnType<ReturnType<typeof createTakoformV2Engine>["runNext"]>)
@@ -661,6 +850,9 @@ async function verifySuccessorHttpClose(
           revisionOperationId: accepted.id,
         });
       }
+      let oldWorker = await worker?.resolve();
+      if (worker && oldWorker?.kind !== "ready")
+        throw new Error("original Worker did not stay serving");
 
       io.restore();
       const again = ownedRawHttp();
@@ -668,11 +860,7 @@ async function verifySuccessorHttpClose(
         await expect(
           creator.fetchServingHttp(selector, new Request("http://caller.invalid/legacy")),
         ).rejects.toThrow("http_custody");
-        const second = await creator.openServingHttp(
-          selector,
-          new Request("http://caller.invalid/again"),
-          () => {},
-        );
+        const second = await openBinding(1, "again");
         for (let i = 0; i < 250 && !again.counts().calls; i++) await rawTick();
         expect(again.counts().calls).toBe(1);
         expect(String(again.targets[0])).toBe("http://10.240.0.3:8080/again");
@@ -697,6 +885,16 @@ async function verifySuccessorHttpClose(
             expect(await creator.observeCurrentServingTarget(targetScope)).toMatchObject({
               generation: 1,
             });
+            if (worker && oldWorker?.kind === "ready") {
+              // Dispatch changes the exact Worker graph snapshot even while
+              // the original Container generation is still serving.
+              expect(await oldWorker.stillCurrent()).toBe(false);
+              oldWorker = await worker.resolve();
+              if (oldWorker.kind !== "ready")
+                throw new Error("Worker unavailable after unhealthy replacement");
+              expect(await oldWorker.stillCurrent()).toBe(true);
+              expect((await worker.read())?.nativeServing?.generation).toBe(1);
+            }
             expect(again.counts().requestDestroy).toBe(0);
             expect(oldStops()).toBe(0);
 
@@ -708,6 +906,15 @@ async function verifySuccessorHttpClose(
               incarnationId: selector.incarnationId,
               revisionOperationId: updateId,
             });
+            if (oldWorker?.kind === "ready") {
+              expect(await oldWorker.stillCurrent()).toBe(false);
+              expect((await worker?.resolve())?.kind).toBe("ready");
+              expect(
+                await f.sql.query("SELECT observed_generation FROM tf_v2_resources WHERE uid=?", [
+                  selector.resourceUid,
+                ]),
+              ).toEqual([{ observed_generation: 1 }]);
+            }
             expect(oldStops()).toBe(0);
           } finally {
             nextHealth.restore();
@@ -722,11 +929,7 @@ async function verifySuccessorHttpClose(
 
           const newIo = ownedRawHttp();
           try {
-            const newCall = await creator.openServingHttp(
-              { ...selector, generation: 2 },
-              new Request("http://caller.invalid/new"),
-              () => {},
-            );
+            const newCall = await openBinding(2, "new");
             for (let i = 0; i < 250 && !newIo.counts().calls; i++) await rawTick();
             expect(newIo.counts().calls).toBe(1);
             expect(String(newIo.targets[0])).toBe("http://10.240.0.5:8080/new");
@@ -1201,6 +1404,7 @@ test.each([
   "pending-update",
   "update-cutover",
   "update-delete",
+  "update-worker-binding",
   "delete",
   "delete-late",
   "delete-restart",
