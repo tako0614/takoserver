@@ -2459,11 +2459,12 @@ test("normal OCI backend completes genuine accepted CREATE only after original S
   }
 });
 
-test("normal OCI backend reconciles the original running child after retained refusal and rejects a fresh foreign creator without IO", async () => {
+test("normal OCI backend reports the original executable manifest after index-pinned CREATE reconciliation", async () => {
   const f = await fixture(false, {
       ...acceptedHttpSelection(),
       normalBackend: true,
       nativeObservationRefusalAt: 6,
+      imageIndex: true,
     }),
     raw = acceptedRawHttp();
   raw.onEnd(() => {
@@ -2483,6 +2484,13 @@ test("normal OCI backend reconciles the original running child after retained re
     expect(
       await f.sql.query("SELECT serving_generation,runtime_epoch FROM tf_v2_container_instances"),
     ).toEqual([{ serving_generation: 1, runtime_epoch: 1 }]);
+    expect(f.sourceDigest).not.toBe(f.acceptedDigest);
+    expect(f.recordedCreate()).toMatchObject({
+      sourceDigest: f.sourceDigest,
+      manifestDigest: f.acceptedDigest,
+    });
+    const artifactCounts = f.counts();
+    expect(artifactCounts.reads).toBe(3);
     const before = f.nativeCounts();
     reconstructed = f.reconstructNormal();
     f.advanceNormalClock(61_000);
@@ -2492,6 +2500,7 @@ test("normal OCI backend reconciles the original running child after retained re
       effect: "unknown",
     });
     expect(f.nativeCounts()).toEqual(before);
+    expect(f.counts()).toEqual(artifactCounts);
     expect(raw.calls).toHaveLength(1);
     // A new genuine engine lease over the ORIGINAL private controller can
     // observe and finish without another CREATE, START or publication epoch.
@@ -2501,6 +2510,16 @@ test("normal OCI backend reconciles the original running child after retained re
       status: "succeeded",
       effect: "complete",
     });
+    const resources = await f.sql.query("SELECT observed_json FROM tf_v2_resources");
+    const saved = resources[0]?.observed_json;
+    if (typeof saved !== "string") throw new Error("original observed row absent");
+    const fields = CONTAINER_CONTRACT.fields;
+    expect(JSON.parse(saved)).toEqual({
+      [fields.ready]: true,
+      [fields.servingGeneration]: 1,
+      [fields.imageDigest]: f.acceptedDigest,
+    });
+    expect(f.counts()).toEqual(artifactCounts);
     expect(f.nativeCounts().processes).toBe(1);
     expect(
       f.nativeCounts().requests.filter((kind) => kind === "linux-oci-create-stopped@1"),

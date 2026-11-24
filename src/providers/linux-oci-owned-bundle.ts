@@ -102,7 +102,7 @@ type OriginalOciCustody = {
   readonly namespaceReleases: Set<string>;
   readonly disposedHelpers: WeakSet<LinuxOciPhysicalSession>;
   readonly helperJoins: Map<string, LinuxOciDisposedHelperObservation>;
-  readonly allocations: Map<string, OriginalOciAllocation>;
+  readonly allocations: ReadonlyMap<string, OriginalOciAllocation>;
   readonly disposalSteps: Map<
     string,
     "begin" | "read" | "delete" | "join-delete" | "dispose" | "continue-dispose" | "join-helper"
@@ -332,6 +332,9 @@ type OriginalOciAllocation = {
   readonly receiptBytes: string;
   cleanup: "untouched" | "authenticated" | "prepared" | "unknown" | "removed";
 };
+type CreatedOciAllocation = OriginalOciAllocation & {
+  readonly manifestDigest: string;
+};
 
 async function originalFileIdentity(path: string, directory: boolean) {
   const stat = await lstat(path, { bigint: true });
@@ -382,7 +385,7 @@ async function captureOriginalAllocation(
       serializeLinuxOciHostTopology(bundle.receipt, bundle.record, topology)
   )
     return fail("allocation_identity");
-  const allocation: OriginalOciAllocation = {
+  const allocation: CreatedOciAllocation = {
     ...(topology === undefined ? {} : { topology }),
     intent: canonicalJson(bundle.record.intent),
     parents: Object.freeze(parents),
@@ -390,6 +393,7 @@ async function captureOriginalAllocation(
     rootfs,
     receipt,
     receiptBytes,
+    manifestDigest: bundle.receipt.manifestDigest,
     cleanup: "untouched",
   };
   return allocation;
@@ -1476,7 +1480,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   if (parentMode !== undefined && (!options.configuredInputs || physicalBinary === undefined))
     return fail("parent_selection");
   const disposedHelpers = new WeakSet<LinuxOciPhysicalSession>();
-  const allocations = new Map<string, OriginalOciAllocation>();
+  const allocations = new Map<string, CreatedOciAllocation>();
   const sql = options.sql;
   core.acceptance.assertSql(sql);
   // A failed join retains this exact request. A fresh call cannot replace it
@@ -2563,6 +2567,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         const serving = fresh.retained.find(
           ({ record }) => record.intent.policy.generation === fresh.generation,
         );
+        const allocation = serving && allocations.get(serving.record.claimId);
         if (
           fresh.action === "delete" ||
           fresh.servingConfirmedAtMs === null ||
@@ -2572,6 +2577,9 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           serving.record.nativeId === null ||
           serving.record.intent.incarnationId !== fresh.incarnationId ||
           serving.record.intent.revision !== fresh.revision ||
+          !allocation ||
+          allocation.cleanup !== "untouched" ||
+          allocation.intent !== canonicalJson(serving.record.intent) ||
           !nativeSessions.has(serving.record.claimId) ||
           nativeBindings.get(serving.record.claimId) !== serving.record.nativeId ||
           typeof fresh.spec.image !== "string"
@@ -2586,7 +2594,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           observed: {
             [fields.ready]: true,
             [fields.servingGeneration]: fresh.generation,
-            [fields.imageDigest]: fresh.spec.image.slice(fresh.spec.image.lastIndexOf("@") + 1),
+            [fields.imageDigest]: allocation.manifestDigest,
           },
           output: {},
         };
@@ -2735,7 +2743,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           generation: receipt.generation,
           revision: receipt.revision,
           sourceDigest: receipt.sourceDigest,
-          manifestDigest: receipt.manifestDigest,
+          manifestDigest: allocation.manifestDigest,
           configDigest: receipt.configDigest,
           archiveDigest: receipt.archiveDigest,
           args: bundle.argv,

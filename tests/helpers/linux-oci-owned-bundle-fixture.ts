@@ -160,6 +160,7 @@ async function fixture(
     readonly outboundInternet?: boolean;
     readonly viaHostCreator?: boolean;
     readonly normalBackend?: boolean;
+    readonly imageIndex?: boolean;
     readonly configuredKey?: "sql" | "selection" | "owner";
   } = {},
 ) {
@@ -239,10 +240,26 @@ async function fixture(
       annotations: { synthetic: "other-pin" },
     }),
   );
+  const index = new TextEncoder().encode(
+    JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.index.v1+json",
+      manifests: [
+        {
+          mediaType: "application/vnd.oci.image.manifest.v1+json",
+          digest: digest(manifest),
+          size: manifest.length,
+          platform: { os: "linux", architecture: "amd64" },
+        },
+      ],
+    }),
+  );
+  const sourceDigest = digest(adversarial.imageIndex ? index : manifest);
   const source = new Map([
     [digest(manifest), manifest],
     [digest(alternativeManifest), alternativeManifest],
     [digest(config), config],
+    [digest(index), index],
   ]);
   let reads = 0,
     unpacks = 0,
@@ -1272,7 +1289,7 @@ async function fixture(
         );
         expect(receipt).toBe(JSON.stringify(bundle.receipt));
         artifactDigests.push(bundle.receipt.sourceDigest);
-        expect(bundle.receipt.sourceDigest).toBe(digest(manifest));
+        expect(bundle.receipt.sourceDigest).toBe(sourceDigest);
         expect(bundle.receipt.configDigest).toBe(digest(config));
         expect(
           await readFile(join(bundle.allocationRoot, "rootfs", "synthetic-file"), "utf8"),
@@ -1488,6 +1505,7 @@ async function fixture(
     },
     artifactDigests,
     acceptedDigest: digest(manifest),
+    sourceDigest,
     configuredReads: () => configuredReads,
     beforeLoan(callback: typeof beforeLoan) {
       beforeLoan = callback;
@@ -1508,7 +1526,7 @@ async function fixture(
           space: "synthetic-space",
           name: "synthetic-oci",
           spec: {
-            [fields.image]: `registry.example/app@${digest(manifest)}`,
+            [fields.image]: `registry.example/app@${sourceDigest}`,
             [fields.httpPort]: 8080,
             [fields.healthPath]: "/health",
             [fields.workloadRevision]: "1".repeat(64),
