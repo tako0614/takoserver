@@ -20,7 +20,7 @@ const successors = "tf_v2_container_application_successors";
 const predecessors = "tf_v2_container_shutdown_io_closes";
 const fenceDelete = "container_owner_application_successor_delete";
 
-function deleteEngine(
+function selectedEngine(
   fixture: Awaited<ReturnType<typeof originalPeerDeleteFixture>>,
   ociParentControl: "sealed-original@1" | "sealed-peer-runtime-application-owner@1",
 ) {
@@ -158,7 +158,7 @@ function withPrecheckedSchema(statements: readonly SqlStatement[], admission: Sq
     schemaBindings === 0 ||
     !schema.includes("container_owner_shutdown_io_values")
   )
-    throw Error("unexpected ordinary DELETE schema guard");
+    throw Error("unexpected ordinary acceptance schema guard");
   let changed = 0;
   const stale = statements.map((statement) => {
     const index = statement.sql.indexOf(schema);
@@ -167,7 +167,7 @@ function withPrecheckedSchema(statements: readonly SqlStatement[], admission: Sq
     const bindingsBefore = before.match(/\?/gu)?.length ?? 0;
     const params = statement.params;
     if (!params || !statement.sql.startsWith(ownerScope, index + schema.length))
-      throw Error("unexpected ordinary DELETE scope");
+      throw Error("unexpected ordinary acceptance scope");
     changed++;
     return {
       sql: `${before}1${statement.sql.slice(index + schema.length)}`,
@@ -178,7 +178,7 @@ function withPrecheckedSchema(statements: readonly SqlStatement[], admission: Sq
     };
   });
   if (changed !== 2 || stale.at(-1) !== statements.at(-1))
-    throw Error("fixture must preserve the original DELETE terminal");
+    throw Error("fixture must preserve the original acceptance terminal");
   return stale;
 }
 
@@ -304,7 +304,7 @@ test("a committed successor defeats a prepared stale DELETE and remains held aft
     expect((await recordClose(close)).changes).toBe(1);
     await expect(recordClose(close)).rejects.toMatchObject({ code: "constraint" });
     await expect(
-      deleteEngine(f, "sealed-original@1").acceptDelete({
+      selectedEngine(f, "sealed-original@1").acceptDelete({
         principal: "synthetic-oci-parent",
         key: crypto.randomUUID(),
         uid: coordinates[0],
@@ -362,7 +362,7 @@ test("selected OCI DELETE atomically binds the latest application owner without 
     await expand();
     const token = "d".repeat(64);
     expect((await reserve(contender, coordinates, predecessor, 1, token)).changes).toBe(1);
-    const engine = deleteEngine(f, "sealed-peer-runtime-application-owner@1");
+    const engine = selectedEngine(f, "sealed-peer-runtime-application-owner@1");
     const accepted = await engine.acceptDelete({
       principal: "synthetic-oci-parent",
       key: crypto.randomUUID(),
@@ -382,6 +382,77 @@ test("selected OCI DELETE atomically binds the latest application owner without 
         [coordinates[0]],
       ),
     ).toEqual([{ retire_operation_id: accepted.id, serving_generation: null }]);
+    expect(await contender.query(`SELECT close_document FROM ${successors}`)).toEqual([
+      { close_document: null },
+    ]);
+  });
+}, 20_000);
+
+test("selected OCI UPDATE binds the current application owner and retains serving until cutover", async () => {
+  await withOriginal(async (f, contender, coordinates, predecessor, expand) => {
+    const [uid, generation] = coordinates;
+    const token = "e".repeat(64);
+    const [resource] = await contender.query("SELECT spec_json FROM tf_v2_resources WHERE uid=?", [
+      uid,
+    ]);
+    if (typeof resource?.spec_json !== "string") throw Error("original Container spec missing");
+    const request = {
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid,
+      expectedGeneration: generation,
+      spec: { ...JSON.parse(resource.spec_json), workloadRevision: "2".repeat(64) },
+    };
+    const instance = () =>
+      contender.query(
+        "SELECT desired_generation, serving_generation, runtime_epoch FROM tf_v2_container_instances WHERE resource_uid=?",
+        [uid],
+      );
+    const before = await instance();
+    const updates = () =>
+      contender.query("SELECT count(*) AS updates FROM tf_v2_operations WHERE action='update'");
+    const rawBatch = f.sql.batch.bind(f.sql);
+    const batch = spyOn(f.sql, "batch").mockImplementation(async (statements) => {
+      const admission = statements.find(({ sql }) =>
+        sql.startsWith("SELECT 1 AS permitted WHERE ("),
+      );
+      if (!admission) throw Error("expected an ordinary prepared UPDATE batch");
+      expect(await contender.query(admission.sql, admission.params)).toEqual([{ permitted: 1 }]);
+      await expand();
+      expect((await reserve(contender, coordinates, predecessor, 1, token)).changes).toBe(1);
+      const refused = await rawBatch(statements);
+      expect(refused[statements.indexOf(admission)]?.rows).toEqual([]);
+      expect(await instance()).toEqual(before);
+      expect(await updates()).toEqual([{ updates: 0 }]);
+      return rawBatch(withPrecheckedSchema(statements, admission));
+    });
+    try {
+      const stale = selectedEngine(f, "sealed-peer-runtime-application-owner@1");
+      await expect(stale.acceptUpdate(request)).rejects.toThrow(
+        "container_owner_application_successor_update",
+      );
+    } finally {
+      batch.mockRestore();
+    }
+    expect(await instance()).toEqual(before);
+    expect(await updates()).toEqual([{ updates: 0 }]);
+    await expect(selectedEngine(f, "sealed-original@1").acceptUpdate(request)).rejects.toThrow();
+    expect(await instance()).toEqual(before);
+    const engine = selectedEngine(f, "sealed-peer-runtime-application-owner@1");
+    const accepted = await engine.acceptUpdate(request);
+    expect(accepted).toMatchObject({
+      status: "queued",
+      action: "update",
+      generation: generation + 1,
+    });
+    expect(await engine.acceptUpdate(request)).toMatchObject({ id: accepted.id });
+    expect(
+      await contender.query(
+        "SELECT application_successor_owner_token FROM tf_v2_container_acceptances WHERE operation_id=?",
+        [accepted.id],
+      ),
+    ).toEqual([{ application_successor_owner_token: token }]);
+    expect(await instance()).toEqual([{ ...before[0], desired_generation: generation + 1 }]);
     expect(await contender.query(`SELECT close_document FROM ${successors}`)).toEqual([
       { close_document: null },
     ]);

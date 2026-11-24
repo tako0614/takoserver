@@ -566,6 +566,7 @@ interface ApplicationSuccessorIssuance {
   readonly predecessorFence: SqlStatement;
   readonly liveSql: string;
   readonly liveParams: readonly SqlParam[];
+  readonly retainedServingFence: SqlStatement;
   readonly assertKeys: () => void;
 }
 class LinuxOciApplicationSuccessorReservation {
@@ -728,6 +729,46 @@ function fence(proof: Proof): { sql: string; params: SqlParam[] } {
       fields.map(({ column }) => column + " IS ?").join(" AND ") +
       ")",
     params: fields.map(({ key }) => proof[key]!),
+  };
+}
+const servingUpdateMutableColumns = new Set([
+  "i.desired_generation",
+  "i.management_epoch",
+  "r.generation",
+  "r.phase",
+  "r.spec_json",
+  "r.last_operation",
+]);
+const servingUpdateFields = fields.filter(
+  ({ column }) =>
+    !column.startsWith("la.") &&
+    !column.startsWith("lo.") &&
+    !servingUpdateMutableColumns.has(column),
+);
+function retainedApplicationServingFence(proof: Proof, ownerToken: string) {
+  // The original revision and START remain the serving generation. Only
+  // the management-side snapshot moves before this accepted UPDATE publishes.
+  return {
+    sql: `EXISTS (SELECT 1${from} WHERE ${servingUpdateFields.map(({ column }) => `${column} IS ?`).join(" AND ")}
+        AND i.management_epoch>? AND q.application_io_cleanup=?
+        AND la.application_successor_owner_token=?
+        AND r.phase='pending' AND r.busy_operation=la.operation_id
+        AND r.generation=i.desired_generation AND la.generation=r.generation AND la.generation>v.generation
+        AND la.action='update' AND la.resource_uid=i.resource_uid
+        AND la.installation_id=i.installation_id AND la.incarnation_id=i.incarnation_id
+        AND la.principal=i.principal AND la.space=i.space AND la.name=i.name AND la.form_url=i.form_url
+        AND la.backend_id=i.backend_id AND la.target_key=i.target_key AND la.accepted_spec_json=r.spec_json
+        AND lo.action=la.action AND lo.resource_uid=la.resource_uid AND lo.generation=la.generation
+        AND lo.status IN ('queued','running','reconciling','waiting_input')
+        AND EXISTS (SELECT 1 FROM main.tf_v2_container_revisions next
+          WHERE next.resource_uid=i.resource_uid AND next.operation_id=la.operation_id
+            AND next.generation=la.generation AND next.revision=la.revision AND next.retention='accepted'))`,
+    params: [
+      ...servingUpdateFields.map(({ key }) => proof[key] ?? null),
+      proof.i_management_epoch ?? null,
+      V2_CONTAINER_APPLICATION_IO_RESERVED,
+      ownerToken,
+    ],
   };
 }
 
@@ -4269,8 +4310,7 @@ export function createDockerContainerCoreOwner(
     );
     const raw = rows[0]?.native_control;
     if (rows.length !== 1 || typeof raw !== "string") return fail();
-    const snapshot = fence(loaded.proof);
-    const guard = {
+    const currentGuard = (snapshot: ReturnType<typeof fence>) => ({
       sql:
         snapshot.sql +
         ` AND EXISTS (SELECT 1 FROM ${claims} WHERE ${allocationPredicate} AND native_control=?)` +
@@ -4283,7 +4323,8 @@ export function createDockerContainerCoreOwner(
         ...(selectorFence?.params ?? []),
         ...(successor ? applicationSuccessorStore.params : []),
       ],
-    };
+    });
+    const guard = currentGuard(fence(loaded.proof));
     const currentRunning = async () =>
       !signal.aborted && (await boundInitPhase(loaded, guard)) === "running" && !signal.aborted;
     const { artifact, binding, originalControlKeyId, key } = await openOriginalParentControl(
@@ -4356,6 +4397,8 @@ export function createDockerContainerCoreOwner(
       coordinates,
       raw,
       guard,
+      retainedServingGuard: (ownerToken: string) =>
+        currentGuard(retainedApplicationServingFence(loaded.proof, ownerToken)),
       acceptedSpecJson: loaded.proof.a_accepted_spec_json,
       assertLocal,
       assertControlKey,
@@ -4507,6 +4550,7 @@ export function createDockerContainerCoreOwner(
     selector: { readonly resourceUid: string; readonly incarnationId: string },
     originalCustody: object,
     signal: AbortSignal,
+    serving?: "retained-serving",
   ): Promise<void> {
     if (!runtimeApplicationOwner || !(signal instanceof AbortSignal)) return fail();
     const { resourceUid, incarnationId } = captureCurrentOciSelector(selector);
@@ -4526,11 +4570,13 @@ export function createDockerContainerCoreOwner(
       issued.assertKeys();
     };
     assertLocal();
+    const retained = serving === "retained-serving" ? issued.retainedServingFence : undefined;
+    const live = retained ? `(${issued.liveSql} OR (${retained.sql}))` : issued.liveSql;
     const confirmed = await sql.query(
       "SELECT epoch,owner_token,predecessor_close_document,close_document FROM main.tf_v2_container_application_successors " +
         "WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=? AND owner_token=? AND " +
         "NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors newer WHERE newer.resource_uid=? AND newer.generation=? AND newer.epoch>?) AND " +
-        issued.liveSql,
+        live,
       [
         resourceUid,
         intent.policy.generation,
@@ -4542,6 +4588,7 @@ export function createDockerContainerCoreOwner(
         intent.policy.generation,
         issued.epoch,
         ...issued.liveParams,
+        ...(retained?.params ?? []),
       ],
     );
     const row = confirmed[0];
@@ -4581,6 +4628,7 @@ export function createDockerContainerCoreOwner(
       "application-successor",
     );
     let held: LinuxOciHeldLiveInit | undefined;
+    let opened = false;
     try {
       held = await current.openHeld(
         (actualSignal) =>
@@ -4589,6 +4637,7 @@ export function createDockerContainerCoreOwner(
             identity,
             originalCustody,
             actualSignal,
+            opened && expectedGeneration !== undefined ? "retained-serving" : undefined,
           ),
         expectedGeneration === undefined ? undefined : "application",
       );
@@ -4599,6 +4648,9 @@ export function createDockerContainerCoreOwner(
         held.identity.namespaceInode !== issued.observation.namespaceInode
       )
         return fail();
+      // A connector opens against the strict acknowledged reservation. Its
+      // later reads keep this original serving epoch during UPDATE acceptance.
+      opened = true;
       return { held, reservation, record: issued.record, httpPort: issued.httpPort };
     } catch (error) {
       // The creator retains an unacknowledged close independently of handoff.
@@ -5784,11 +5836,14 @@ export function createDockerContainerCoreOwner(
         // statement comparing the authenticated predecessor bytes.
         const running =
           "EXISTS (SELECT 1 FROM main.tf_v2_container_start_attempts WHERE resource_uid=? AND generation=? AND create_claim_id=? AND native_id=? AND attempt=1 AND state='running' AND confirmed_running_at_ms IS NOT NULL AND confirmed_exited_at_ms IS NULL)";
-        const live = current.guard.sql + " AND " + running + " AND " + predecessor.sql;
-        const liveParams = [...current.guard.params, ...coordinates, ...predecessor.params];
+        const runningAndPredecessor = " AND " + running + " AND " + predecessor.sql;
+        const runningAndPredecessorParams = [...coordinates, ...predecessor.params];
+        const live = current.guard.sql + runningAndPredecessor;
+        const liveParams = [...current.guard.params, ...runningAndPredecessorParams];
         const ownerToken = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
           byte.toString(16).padStart(2, "0"),
         ).join("");
+        const retained = current.retainedServingGuard(ownerToken);
         current.assertLocal();
         predecessor.assertCurrent();
         const [resourceUid, generation] = coordinates;
@@ -5831,6 +5886,10 @@ export function createDockerContainerCoreOwner(
           }),
           liveSql: live,
           liveParams: Object.freeze(liveParams),
+          retainedServingFence: Object.freeze({
+            sql: retained.sql + runningAndPredecessor,
+            params: Object.freeze([...retained.params, ...runningAndPredecessorParams]),
+          }),
           assertKeys() {
             assertControlKey();
             predecessor.assertCurrent();

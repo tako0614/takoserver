@@ -22,6 +22,7 @@ import {
   ownedRawHttp,
   rawTick,
 } from "./helpers/container-http-transport-fixture.ts";
+import { specOf } from "./helpers/linux-oci-normal-update-fixture.ts";
 import {
   acceptedHttpSelection,
   acceptedRawHttp,
@@ -420,12 +421,14 @@ async function verifySuccessorHttpClose(
     | "unknown"
     | "ack-lost"
     | "binding"
+    | "pending-update"
     | "delete"
     | "delete-late"
     | "delete-restart"
     | "delete-unknown",
 ) {
   const deleting = outcome.startsWith("delete");
+  const updating = outcome === "pending-update";
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
@@ -446,7 +449,7 @@ async function verifySuccessorHttpClose(
     await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })));
     await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
     await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
-    if (deleting) {
+    if (deleting || updating) {
       await f.sql.batch(v2ConfiguredUpdateDiscardTransition());
       await f.sql.batch(v2FinalDeleteConfiguredUpdateDiscardTransition());
     }
@@ -551,7 +554,7 @@ async function verifySuccessorHttpClose(
     }
 
     queueOriginalPeers();
-    if (outcome === "binding") {
+    if (outcome === "binding" || updating) {
       const cancel = new AbortController();
       const canceled = creator.openServingHttp(
         selector,
@@ -589,6 +592,40 @@ async function verifySuccessorHttpClose(
       const originalRows = await reservations();
       expect(originalRows).toMatchObject([{ epoch: 1, close_document: null }]);
       expect(raw.mock.calls).toHaveLength(existingCalls + 2);
+      if (updating) {
+        const instance = () =>
+          f.sql.query(
+            "SELECT desired_generation,serving_generation,runtime_epoch FROM tf_v2_container_instances WHERE resource_uid=?",
+            [selector.resourceUid],
+          );
+        const [before] = await instance();
+        const engine = createTakoformV2Engine(
+          {
+            sql: f.sql,
+            authorize: async () => true,
+            replayWindowSeconds: 3600,
+            forms: { [creator.formUrl]: creator.retainedForm },
+          },
+          creator.acceptance,
+        );
+        const update = await engine.acceptUpdate({
+          principal: "synthetic-oci-parent",
+          uid: selector.resourceUid,
+          key: crypto.randomUUID(),
+          expectedGeneration: selector.generation,
+          spec: {
+            ...(await specOf(f, selector.resourceUid)),
+            workloadRevision: "2".repeat(64),
+          },
+        });
+        expect(await instance()).toEqual([{ ...before, desired_generation: 2 }]);
+        expect(
+          await f.sql.query(
+            "SELECT application_successor_owner_token FROM tf_v2_container_acceptances WHERE operation_id=?",
+            [update.id],
+          ),
+        ).toEqual([{ application_successor_owner_token: originalRows[0]?.owner_token }]);
+      }
 
       io.restore();
       const again = ownedRawHttp();
@@ -614,9 +651,14 @@ async function verifySuccessorHttpClose(
         expect(await reservations()).toEqual(originalRows);
         expect(raw.mock.calls).toHaveLength(existingCalls + 2);
         creatorCloseChecked = true;
-        await creator.close();
+        if (updating) {
+          await expect(creator.close()).rejects.toThrow();
+          expect(await reservations()).toEqual(originalRows);
+        } else {
+          await creator.close();
+          expect(typeof (await reservations())[0]?.close_document).toBe("string");
+        }
         expect(heldCloses).toBe(1);
-        expect(typeof (await reservations())[0]?.close_document).toBe("string");
         expect(f.network).not.toHaveBeenCalled();
         return;
       } finally {
@@ -982,6 +1024,7 @@ test.each([
   "unknown",
   "ack-lost",
   "binding",
+  "pending-update",
   "delete",
   "delete-late",
   "delete-restart",

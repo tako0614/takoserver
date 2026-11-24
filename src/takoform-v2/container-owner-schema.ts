@@ -1109,10 +1109,15 @@ export async function inspectV2ContainerOwnerShutdownIoSchema(sql: Sql): Promise
 }
 
 const applicationSuccessorOwnerToken = "application_successor_owner_token";
+const applicationSuccessorTable = `${PREFIX}application_successors`;
+const selectedServingApplicationOwner = `SELECT successor.owner_token
+  FROM main.${applicationSuccessorTable} successor
+  JOIN main.${I} instance ON instance.resource_uid = successor.resource_uid
+  WHERE successor.resource_uid = ? AND successor.generation = instance.serving_generation
+  ORDER BY successor.epoch DESC LIMIT 1`;
 
 function buildApplicationSuccessorSchema() {
-  const applicationSuccessorTable = `${PREFIX}application_successors`;
-  const successorDeleteColumn = `${applicationSuccessorOwnerToken} TEXT CHECK (${applicationSuccessorOwnerToken} IS NULL OR (form_url = ${literal(F2_FORM)} AND action = 'delete' AND ${hex(applicationSuccessorOwnerToken)}))`;
+  const successorOwnerColumn = `${applicationSuccessorOwnerToken} TEXT CHECK (${applicationSuccessorOwnerToken} IS NULL OR (form_url = ${literal(F2_FORM)} AND action IN ('update', 'delete') AND ${hex(applicationSuccessorOwnerToken)}))`;
   const currentApplicationSuccessorClaim = `EXISTS (
   SELECT 1 FROM ${Q} claim
   JOIN ${I} instance ON instance.resource_uid = claim.resource_uid
@@ -1253,10 +1258,10 @@ function buildApplicationSuccessorSchema() {
       refuse("0"),
     ),
     trigger(
-      "application_successor_fence_delete",
+      "application_successor_fence_management",
       A,
       "BEFORE INSERT",
-      `  SELECT CASE WHEN NEW.action = 'delete' AND NOT (
+      `  SELECT CASE WHEN NEW.action IN ('update', 'delete') AND NOT (
     (NEW.${applicationSuccessorOwnerToken} IS NULL AND NOT EXISTS (
       SELECT 1 FROM ${applicationSuccessorTable} WHERE resource_uid = NEW.resource_uid))
     OR EXISTS (
@@ -1276,7 +1281,8 @@ function buildApplicationSuccessorSchema() {
         AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable} outstanding
           WHERE outstanding.resource_uid = successor.resource_uid
             AND outstanding.generation <> successor.generation AND outstanding.close_document IS NULL)
-    )) THEN RAISE(ABORT, 'container_owner_application_successor_delete') END;`,
+    )) THEN CASE WHEN NEW.action = 'delete' THEN RAISE(ABORT, 'container_owner_application_successor_delete')
+      ELSE RAISE(ABORT, 'container_owner_application_successor_update') END END;`,
     ),
     trigger(
       "application_successor_acceptance_retain",
@@ -1294,7 +1300,7 @@ function buildApplicationSuccessorSchema() {
             item.table,
             item.sql.replace(
               ",\n  UNIQUE (resource_uid, generation)",
-              ", " + successorDeleteColumn + ",\n  UNIQUE (resource_uid, generation)",
+              `, ${successorOwnerColumn},\n  UNIQUE (resource_uid, generation)`,
             ),
           )
         : item,
@@ -1333,7 +1339,7 @@ function buildApplicationSuccessorSchema() {
           sql: `INSERT INTO temp.${applicationSuccessorTransition} VALUES (CASE WHEN ${shutdownIoReady} THEN 1 END)`,
           params: shutdownIoReadyParams,
         },
-        { sql: `ALTER TABLE ${A} ADD COLUMN ${successorDeleteColumn}` },
+        { sql: `ALTER TABLE ${A} ADD COLUMN ${successorOwnerColumn}` },
         ...applicationSuccessorObjects.map(({ sql }) => ({ sql })),
         {
           sql: `UPDATE temp.${applicationSuccessorTransition} SET ok = CASE WHEN ${applicationSuccessorReady} THEN 1 END`,
@@ -1347,9 +1353,8 @@ function buildApplicationSuccessorSchema() {
 
 /** Optional SQLite candidate. The row records a one-use reservation before I/O
  * and retains one terminal envelope per epoch. Only the owning runtime can
- * authenticate either close envelope. The existing acceptance guards still
- * require their exact schemas. A future consumer must coordinate both DELETE
- * and UPDATE with successor custody before accepting either action. */
+ * authenticate either close envelope. Selected DELETE and UPDATE atomically
+ * bind the serving owner in their existing acceptance transaction. */
 export const V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND =
   /* @__PURE__ */ buildApplicationSuccessorSchema();
 
@@ -1422,8 +1427,7 @@ export function createV2ContainerHostAcceptance(options: {
       throw new TypeError("invalid Container Host construction");
   }
   const f2: Pick<V2HostAcceptance, "prepare" | "prepareDelete" | "assertSql"> = Object.freeze({
-    prepare(context: V2HostAcceptanceContext) {
-      if (context.form !== F2_FORM) return undefined;
+    async prepare(context: V2HostAcceptanceContext) {
       // Copy synchronously before yielding. Redeem still binds the ORIGINAL context
       // identity, while every fixed statement parameter is this captured snapshot.
       if (
@@ -1544,12 +1548,21 @@ export function createV2ContainerHostAcceptance(options: {
             c.generation,
           ]
         : [];
-      const successorCreate =
-        allowsApplicationSuccessor && c.action === "create"
-          ? V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready
-          : undefined;
+      const selectedSuccessor =
+        allowsApplicationSuccessor &&
+        c.action === "update" &&
+        (await inspectV2ContainerOwnerApplicationSuccessorSchema(sql));
+      const successor = V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready;
+      const readiness = selectedSuccessor
+        ? successor
+        : allowsApplicationSuccessor && c.action === "create"
+          ? {
+              sql: `(${selectedReady} OR ${successor.sql})`,
+              params: [...selectedReadyParams, ...successor.params],
+            }
+          : { sql: selectedReady, params: selectedReadyParams };
       const guard: SqlStatement = {
-        sql: `${successorCreate ? `(${selectedReady} OR ${successorCreate.sql})` : selectedReady} AND (${
+        sql: `${readiness.sql} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
@@ -1557,8 +1570,7 @@ export function createV2ContainerHostAcceptance(options: {
             AND desired_generation = ? AND retired_at_ms IS NULL)`
         })${retainedMaterialGuard}`,
         params: [
-          ...selectedReadyParams,
-          ...(successorCreate?.params ?? []),
+          ...readiness.params,
           ...(c.action === "create"
             ? [c.resourceUid]
             : [
@@ -1582,9 +1594,9 @@ export function createV2ContainerHostAcceptance(options: {
         sql: `INSERT INTO main.${A} (operation_id, resource_uid, installation_id, incarnation_id,
           principal, space, name, form_url, backend_id, target_key, action, generation, backend_key,
           replay_key, fingerprint, accepted_spec_json, accepted_output_json, references_json,
-          configured_private_inputs_json, accepted_at, retain_until, revision)
+          configured_private_inputs_json, accepted_at, retain_until, revision${selectedSuccessor ? `, ${applicationSuccessorOwnerToken}` : ""})
           SELECT ?, ?, ?, ${c.action === "create" ? "?" : `(SELECT incarnation_id FROM main.${I} WHERE resource_uid = ?)`},
-            ?, ?, ?, ?, ?, ?, ?, ?, op.backend_key, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, op.backend_key, ?, ?, ?, ?, ?, ?, ?, ?, ?${selectedSuccessor ? `, (${selectedServingApplicationOwner})` : ""}
           FROM main.tf_v2_operations op WHERE op.id = ?`,
         params: [
           c.operationId,
@@ -1608,10 +1620,11 @@ export function createV2ContainerHostAcceptance(options: {
           c.at,
           c.retainUntil,
           `${c.generation}-${workload}`,
+          ...(selectedSuccessor ? [c.resourceUid] : []),
           c.operationId,
         ],
       };
-      return Promise.resolve(prepareV2HostAcceptance(sql, context, guard, terminal));
+      return prepareV2HostAcceptance(sql, context, guard, terminal);
     },
     prepareDelete(context: V2HostDeleteAcceptanceContext) {
       if (context.form !== F2_FORM) return undefined;
@@ -1699,13 +1712,7 @@ export function createV2ContainerHostAcceptance(options: {
           configured_private_inputs_json, accepted_at, retain_until, revision${successor ? `, ${applicationSuccessorOwnerToken}` : ""})
           VALUES ( ?, ?, ?, ${`(SELECT incarnation_id FROM main.${I} WHERE resource_uid = ?)`},
             ?, ?, ?, ?, ?, ?, ?, ?, (SELECT op.backend_key FROM main.tf_v2_operations op WHERE op.id = ?), ?, ?, ?, ?, ?, NULL, ?, ?, ?${
-              successor
-                ? `,
-            (SELECT successor.owner_token FROM main.${PREFIX}application_successors successor
-             JOIN main.${I} instance ON instance.resource_uid = successor.resource_uid
-             WHERE successor.resource_uid = ? AND successor.generation = instance.serving_generation
-             ORDER BY successor.epoch DESC LIMIT 1)`
-                : ""
+              successor ? `, (${selectedServingApplicationOwner})` : ""
             }
           )`,
           params: [
@@ -1969,7 +1976,8 @@ export function createV2ContainerHostAcceptance(options: {
     initialOutput: legacy.initialOutput?.bind(legacy),
     prepare(context: V2HostAcceptanceContext) {
       if (context.form === C.formUrl) return legacy.prepare(context);
-      return f2.prepare(context);
+      if (context.form === F2_FORM) return f2.prepare(context);
+      return undefined;
     },
     prepareDelete(context: V2HostDeleteAcceptanceContext) {
       if (context.form === C.formUrl) return legacy.prepareDelete!(context);
