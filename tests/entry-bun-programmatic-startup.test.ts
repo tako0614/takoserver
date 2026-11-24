@@ -95,6 +95,45 @@ test("explicit selection without seal keys rejects before state and consumes the
   expect(result.stderr).toBe("");
 });
 
+test("Bun rejects a foreign OCI target before opening local state", async () => {
+  const scratch = await mkdtemp(join(tmpdir(), "selfhost-oci-target-"));
+  const dataRoot = join(scratch, "data");
+  const entryUrl = new URL("../src/entry-bun.ts", import.meta.url).href;
+  try {
+    const result = await runIsolated(`
+      import { existsSync } from "node:fs";
+      import { startSelfhostBunHost } from ${JSON.stringify(entryUrl)};
+      process.env.TAKOSERVER_DATA_ROOT = ${JSON.stringify(dataRoot)};
+      process.env.TAKOSERVER_PUBLIC_ORIGIN = "https://operator.invalid";
+      process.env.TAKOSERVER_TAKOFORM_V2_CONFIG = JSON.stringify({
+        documentation: "https://docs.example.invalid/takoform-v2",
+        authenticationDocumentation: "https://docs.example.invalid/takoform-v2/authentication",
+      });
+      process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY = "A".repeat(43);
+      process.env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING = JSON.stringify({
+        current: { id: "startup-fixture", key: Buffer.alloc(32, 7).toString("base64url") },
+      });
+      try {
+        await startSelfhostBunHost({ linuxContainerSelection: { kind: "oci", selection: {
+          targetKey: "different-worker-target", configuredInputs: { maxSecretBytes: 4096 },
+          physicalBinary: "/unused", egressLimits: {}, hostTopology: {},
+        } } });
+        throw new Error("unexpected-success");
+      } catch (cause) {
+        if (existsSync(process.env.TAKOSERVER_DATA_ROOT)) throw new Error("preflight opened state");
+        console.log(cause.message);
+      }
+    `);
+    expect(result).toEqual({
+      exitCode: 0,
+      stdout: "Linux OCI Container selection requires targetKey selfhost-v2-worker-primary\n",
+      stderr: "",
+    });
+  } finally {
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
 for (const { name, options, error } of [
   {
     name: "without a Linux selection",

@@ -605,6 +605,12 @@ async function runSelfhostBunHost(
     if (!preflightLinuxContainerSelection) {
       throw new TypeError("Linux Container operator selection is unavailable");
     }
+    if (
+      preflightLinuxContainerSelection.kind === "oci" &&
+      preflightLinuxContainerSelection.selection.targetKey !== v2WorkerTargetKey
+    ) {
+      throw new TypeError(`Linux OCI Container selection requires targetKey ${v2WorkerTargetKey}`);
+    }
   }
   const currentCandidates = selectPublicHostFormSource(
     process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE,
