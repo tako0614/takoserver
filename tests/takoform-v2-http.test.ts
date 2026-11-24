@@ -42,9 +42,8 @@ function fixtureBackend() {
   return { backend, calls };
 }
 
-function setup() {
+function setup({ backend, calls } = fixtureBackend()) {
   const database = migrateSqliteDatabase();
-  const { backend, calls } = fixtureBackend();
   let fixtureNow = Date.now();
   const fixtureForm: V2Form = {
     validateCreate(spec) {
@@ -363,6 +362,104 @@ test("public v2 routes drive the durable engine without GET-triggered execution"
         })
       ).action,
     ).toBe("delete");
+  } finally {
+    database.close();
+  }
+});
+
+test("v2 DELETE stays readable until the original operation completes", async () => {
+  const calls: string[] = [];
+  let checkpointConfirmed = false;
+  const backend: V2Backend = {
+    id: "fixture-only-backend",
+    targetKey: "fixture-only-target",
+    async execute(input) {
+      calls.push(`execute:${input.action}`);
+      return input.action === "delete"
+        ? { kind: "unknown" }
+        : { kind: "complete", observed: {}, output: {} };
+    },
+    async reconcile(input) {
+      calls.push(`reconcile:${input.action}`);
+      if (checkpointConfirmed) return { kind: "complete", observed: {}, output: {} };
+      checkpointConfirmed = true;
+      return { kind: "continue" };
+    },
+  };
+  const { database, engine, router, advanceClock } = setup({ backend, calls });
+  try {
+    const created = await response(
+      router,
+      call("/resources", {
+        method: "POST",
+        headers: { "idempotency-key": KEY_A },
+        body: JSON.stringify({
+          form: FIXTURE_FORM,
+          space: "fixture-space",
+          name: "delete-readback",
+          spec: { value: "one" },
+        }),
+      }),
+    );
+    expect(created.status).toBe(202);
+    const { resourceUid } = await created.json();
+    expect(await engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+
+    const resourcePath = `/resources/${resourceUid}`;
+    const deleted = await response(
+      router,
+      call(resourcePath, {
+        method: "DELETE",
+        headers: { "idempotency-key": KEY_D, "takoform-expected-generation": "1" },
+      }),
+    );
+    expect(deleted.status).toBe(202);
+    const removal = await deleted.json();
+    expect(removal).toMatchObject({ action: "delete", generation: 2, status: "queued" });
+    const operationPath = `/operations/${removal.id}`;
+
+    const pending = {
+      id: removal.id,
+      resourceUid,
+      action: "delete",
+      generation: 2,
+      status: "reconciling",
+      effect: "unknown",
+    };
+    for (const expectedError of ["outcome_unconfirmed", undefined]) {
+      expect(await engine.runNext()).toMatchObject(pending);
+      const operation = await response(router, call(operationPath));
+      expect(operation.status).toBe(200);
+      const readback = await operation.json();
+      expect(readback).toMatchObject(pending);
+      expect(readback.error?.code).toBe(expectedError);
+
+      const resource = await response(router, call(resourcePath));
+      expect(resource.status).toBe(200);
+      expect(await resource.json()).toMatchObject({
+        uid: resourceUid,
+        phase: "deleting",
+        generation: 2,
+        observedGeneration: 1,
+        lastOperation: removal.id,
+      });
+      advanceClock();
+    }
+
+    const completed = { ...pending, status: "succeeded", effect: "complete" };
+    expect(await engine.runNext()).toMatchObject(completed);
+    const gone = await response(router, call(resourcePath));
+    expect(gone.status).toBe(410);
+    expect(await gone.json()).toMatchObject({ code: "gone" });
+    const terminal = await response(router, call(operationPath));
+    expect(terminal.status).toBe(200);
+    expect(await terminal.json()).toMatchObject(completed);
+    expect(calls).toEqual([
+      "execute:create",
+      "execute:delete",
+      "reconcile:delete",
+      "reconcile:delete",
+    ]);
   } finally {
     database.close();
   }
