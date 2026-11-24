@@ -792,6 +792,21 @@ static void policy_codec_cases(void){struct tns_oci_owner o;struct tns_owner b;p
  CHECK(oci_policy_inventory(policy_subject)==0 && policy_subject->denied_count>=2 && oci_policy_compile(policy_subject)==0);CHECK(strstr(policy_subject->script,"ct direction original accept") && strstr(policy_subject->script,"ct direction reply counter name host_replies jump budgeted") && strstr(policy_subject->script,"ct count over 65535") && !strstr(policy_subject->script,"ct mark") && !strstr(policy_subject->script,"health"));policy_raw_readback();CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)==0 && policy_subject->observed_packets[0]==7 && policy_subject->observed_bytes[0]==11 && policy_subject->observed_quota==13);
  for(unsigned int i=0;i<6;i++){policy_raw_readback();if(i==0)policy_change(pol.readback,&pol.readback_size,"\"sport\"}},\"right\":8080","\"sport\"}},\"right\":8081");if(i==1)policy_change(pol.readback,&pol.readback_size,"10.0.0.0","11.0.0.0");if(i==2)policy_change(pol.readback,&pol.readback_size,"\"inv\":true","\"inv\":false");if(i==3)policy_change(pol.readback,&pol.readback_size,"\"packets\":7,","");if(i==4)policy_change(pol.readback,&pol.readback_size,"\"table\":{","\"table\":{\"grant\":true,");if(i==5)policy_change(pol.readback,&pol.readback_size,"\"bytes\":11","\"bytes\":18446744073709551616");CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)<0);}
  policy_raw_readback();policy_change(pol.readback,&pol.readback_size,"\"set\":[\"new\",\"established\"]","\"set\":[\"established\",\"new\"]");CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)==0);policy_change(pol.readback,&pol.readback_size,"\"set\":[\"established\",\"new\"]","\"set\":[\"new\",\"new\"]");CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)<0);
+ /* Real `nft -j` can use == for the compiler's ct state set matches.
+  * The same observation must still reject different states or operators. */
+ const char *new_states="\"op\":\"in\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":{\"set\":[\"new\",\"established\"]}";
+ const char *new_states_nft="\"op\":\"==\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":{\"set\":[\"established\",\"new\"]}";
+ const char *related_states="\"op\":\"in\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":{\"set\":[\"established\",\"related\"]}";
+ const char *related_states_nft="\"op\":\"==\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":{\"set\":[\"established\",\"related\"]}";
+ policy_raw_readback();
+ for(unsigned int i=0;i<2;i++)policy_change(pol.readback,&pol.readback_size,new_states,new_states_nft);
+ policy_change(pol.readback,&pol.readback_size,related_states,related_states_nft);
+ CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)==0);
+ policy_change(pol.readback,&pol.readback_size,"\"established\",\"related\"","\"established\",\"invalid\"");
+ CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)<0);
+ policy_raw_readback();
+ policy_change(pol.readback,&pol.readback_size,"\"op\":\"in\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":\"established\"", "\"op\":\"==\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":\"established\"");
+ CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)<0);
  /* Compiler-data branch only: this is not another dispatched owner/policy. */policy_subject->limits.internet=0;CHECK(oci_policy_compile(policy_subject)==0 && strstr(policy_subject->script,"counter name outbound_denied drop"));policy_discard(&o);
 }
 static void policy_source_cases(void){struct tns_oci_owner o;struct tns_owner b;policy_prepare(&o,&b);pol.active=1;pol.partial=1;CHECK(oci_policy_install(policy_subject)==0 && policy_subject->verified && pol.spawns==3 && !lock_taken);for(unsigned int i=0;i<3;i++)CHECK(pol.joins[i]==1 && !pol.signals[i]);for(unsigned int i=0;i<2;i++)CHECK(pol.neighbors[i][0]==1 && pol.neighbors[i][1]==1);CHECK(pol.sent_size[0]==policy_subject->script_size && pol.sent_size[1]==policy_subject->script_size && !memcmp(pol.sent[0],policy_subject->script,pol.sent_size[0]));CHECK(oci_policy_install(policy_subject)<0 && pol.spawns==3);pol.active=0;CHECK(oci_policy_close(&o.policy)==0 && !o.policy);policy_subject=NULL;CHECK(oci_uplink_cleanup(&o.uplink)==0);

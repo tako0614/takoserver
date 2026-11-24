@@ -412,6 +412,19 @@ return 0;
 }
 static int oci_policy_string_is(const struct oci_policy_tree *t,unsigned int i,const char *s){return i && t->nodes[i].kind==OP_STRING && t->nodes[i].text_size==strlen(s) && !memcmp(t->strings+t->nodes[i].text,s,strlen(s));
 }
+/* nft can serialize a compiled `ct state { ... }` match with `==`.
+ * Recognize only the operator spelling on that match. The caller still
+ * compares the entire left operand and exact set members below. */
+static int oci_policy_ct_state_set(const struct oci_policy_tree *t,unsigned int match){
+  if(!oci_policy_key(t,match,"match"))return 0;
+  unsigned int left=oci_policy_get(t,match,"left"),right=oci_policy_get(t,match,"right");
+  unsigned int ct=oci_policy_get(t,left,"ct"),set=oci_policy_get(t,right,"set");
+  if(!ct || !set || t->nodes[left].first!=ct || t->nodes[ct].next ||
+     t->nodes[right].first!=set || t->nodes[set].next || t->nodes[set].kind!=OP_ARRAY)return 0;
+  unsigned int key=oci_policy_get(t,ct,"key"),member=t->nodes[set].first;
+  return key && t->nodes[ct].first==key && !t->nodes[key].next &&
+    oci_policy_string_is(t,key,"state") && member && t->nodes[member].next;
+}
 static int oci_policy_equal(const struct oci_policy_tree *a,unsigned int ai,const struct oci_policy_tree *b,unsigned int bi){
   const struct oci_policy_node *x=&a->nodes[ai],*y=&b->nodes[bi];
   if(x->kind!=y->kind)return 0;
@@ -422,7 +435,10 @@ static int oci_policy_equal(const struct oci_policy_tree *a,unsigned int ai,cons
   unsigned int found=0;
   for(unsigned int j=y->first;j;j=b->nodes[j].next)if(a->nodes[i].key_size==b->nodes[j].key_size && !memcmp(a->strings+a->nodes[i].key,b->strings+b->nodes[j].key,a->nodes[i].key_size)){found=j;
   break;
-  }if(!found || !oci_policy_equal(a,i,b,found))return 0;
+  }if(!found)return 0;
+  if(oci_policy_key(b,found,"op") && oci_policy_string_is(b,found,"in") &&
+     oci_policy_string_is(a,i,"==") && oci_policy_ct_state_set(b,bi))continue;
+  if(!oci_policy_equal(a,i,b,found))return 0;
   }for(unsigned int j=y->first;j;j=b->nodes[j].next)count_b++;
   return count_a==count_b;
   }
