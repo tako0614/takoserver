@@ -2694,12 +2694,26 @@ test("shutdown I/O exact optional schema binds and retains only an original clai
     ]) {
       for (const statement of expand.statements) db.exec(statement);
     }
+    const before = db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all();
+    await expect(sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements)).rejects.toThrow();
+    expect(db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all()).toEqual(before);
+    db.exec("PRAGMA ignore_check_constraints=ON");
+    try {
+      await expect(sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements)).rejects.toThrow();
+      expect(db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all()).toEqual(before);
+    } finally {
+      db.exec("PRAGMA ignore_check_constraints=OFF");
+    }
+
     await sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
     expect(await inspectV2ContainerOwnerFinalDeleteSchema(sql)).toBe(true);
     expect(await inspectV2ContainerOwnerShutdownIoSchema(sql)).toBe(false);
     await sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
     expect(await inspectV2ContainerOwnerFinalDeleteSchema(sql)).toBe(false);
     expect(await inspectV2ContainerOwnerShutdownIoSchema(sql)).toBe(true);
+    const installed = db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all();
+    await expect(sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements)).rejects.toThrow();
+    expect(db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all()).toEqual(installed);
     for (const layer of ["control", "allocation", "application-io", "final-delete"] as const) {
       expect(await inspectV2ContainerOwnerSelectedSchema(sql, layer)).toBe(true);
     }

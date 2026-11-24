@@ -1075,9 +1075,25 @@ const shutdownIoReady =
     `${tableNames}, ${literal(shutdownIoTable)}`,
   ) +
   ")";
+const shutdownIoTransition = "__tako_container_shutdown_io_transition";
 const shutdownIoStatements: readonly SqlStatement[] = Object.freeze(
-  shutdownIoObjects.map((item) => Object.freeze({ sql: item.sql })),
+  [
+    {
+      sql: `CREATE TABLE temp.${shutdownIoTransition} (ok INTEGER NOT NULL)`,
+    },
+    {
+      sql: `INSERT INTO temp.${shutdownIoTransition} VALUES (CASE WHEN ${finalDeleteReady} THEN 1 END)`,
+      params: finalDeleteReadyParams,
+    },
+    ...shutdownIoObjects.map(({ sql }) => ({ sql })),
+    {
+      sql: `UPDATE temp.${shutdownIoTransition} SET ok = CASE WHEN ${shutdownIoReady} THEN 1 END`,
+      params: shutdownIoReadyParams,
+    },
+    { sql: `DROP TABLE temp.${shutdownIoTransition}` },
+  ].map((statement) => Object.freeze(statement)),
 );
+/** The owning SQLite executor must apply this exact optional transition in one batch. */
 export const V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND = Object.freeze({
   from: V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
   objects: shutdownIoSelectedObjects,
