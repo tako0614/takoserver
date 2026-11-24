@@ -7,6 +7,7 @@ import { PassThrough } from "node:stream";
 import {
   createLinuxOciParentBootstrap,
   prepareAuthenticatedLinuxOciApplicationOwnerReader,
+  prepareAuthenticatedLinuxOciHeldLiveInitReader,
   prepareAuthenticatedLinuxOciLiveInitReader,
 } from "../src/providers/linux-oci-physical-session.ts";
 
@@ -645,35 +646,39 @@ test("runtime application profile seals both original identities and reads the o
   }
 });
 
+function runtimeApplicationBinding(binary: string) {
+  const { dev, ino, uid, mode } = lstatSync(binary);
+  return {
+    kind: "linux-oci-original-peer-control@1",
+    purpose: RUNTIME_APPLICATION_PURPOSE,
+    claimId: CLAIM,
+    generation: 1,
+    listenerCookie: COOKIE.toString(),
+    capability: Buffer.from(fixtureCapability()).toString("base64url"),
+    createDigest: HELPER_DIGEST,
+    executable: { path: binary, dev, ino, uid, mode },
+    peer: {
+      kind: "linux-oci-parent-peer@1",
+      device: "77",
+      inode: PEER_INODE.toString(),
+      bootId: PEER_BOOT,
+    },
+    applicationOwner: {
+      kind: "linux-oci-application-owner@1",
+      device: "77",
+      inode: APPLICATION_INODE.toString(),
+      bootId: PEER_BOOT,
+    },
+    allocation: { fixture: true },
+    retirementProducer: { revision: "NCLOSE01", digest: HELPER_DIGEST },
+  };
+}
+
 test("original runtime P live-init read accepts only the same claim and closed observational reply", async () => {
   const f = fixture();
   const lifetime = new AbortController();
   try {
-    const { dev, ino, uid, mode } = lstatSync(f.binary);
-    const binding = {
-      kind: "linux-oci-original-peer-control@1",
-      purpose: RUNTIME_APPLICATION_PURPOSE,
-      claimId: CLAIM,
-      generation: 1,
-      listenerCookie: COOKIE.toString(),
-      capability: Buffer.from(fixtureCapability()).toString("base64url"),
-      createDigest: HELPER_DIGEST,
-      executable: { path: f.binary, dev, ino, uid, mode },
-      peer: {
-        kind: "linux-oci-parent-peer@1",
-        device: "77",
-        inode: PEER_INODE.toString(),
-        bootId: PEER_BOOT,
-      },
-      applicationOwner: {
-        kind: "linux-oci-application-owner@1",
-        device: "77",
-        inode: APPLICATION_INODE.toString(),
-        bootId: PEER_BOOT,
-      },
-      allocation: { fixture: true },
-      retirementProducer: { revision: "NCLOSE01", digest: HELPER_DIGEST },
-    };
+    const binding = runtimeApplicationBinding(f.binary);
     const reply = {
       kind: "linux-oci-parent-live-init@1",
       nativeId: CLAIM,
@@ -734,6 +739,186 @@ test("original runtime P live-init read accepts only the same claim and closed o
     expect(f.raw).toHaveBeenCalledTimes(cases.length);
   } finally {
     lifetime.abort();
+    f.cleanup();
+  }
+});
+
+const heldInit = {
+  kind: "linux-oci-parent-held-live-init@1",
+  nativeId: CLAIM,
+  namespaceDevice: "77",
+  namespaceInode: "18446744073709551615",
+  barrier: "unproven",
+} as const;
+const heldCurrent = {
+  kind: "linux-oci-parent-held-live-init-current@1",
+  barrier: "unproven",
+};
+const heldClosed = {
+  kind: "linux-oci-parent-held-live-init-closed@1",
+  barrier: "unproven",
+};
+
+test("held live init serializes currentness and joins exact close on its own connector", async () => {
+  const f = fixture();
+  const child = connectorStreams();
+  const owner = new AbortController();
+  try {
+    f.raw.mockReturnValueOnce(child.child);
+    const binding = runtimeApplicationBinding(f.binary);
+    const open = prepareAuthenticatedLinuxOciHeldLiveInitReader(f.binary, binding, owner.signal);
+    const pending = open(owner.signal);
+    await wrote();
+    expect(f.raw).toHaveBeenCalledWith(f.binary, ["--parent-peer-hold-live-init"], {
+      env: {},
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const expected = Buffer.alloc(176);
+    expected.writeUInt32BE(172);
+    expected.write("TKOPEER2", 4);
+    expected.write(CLAIM, 12);
+    expected.writeBigUInt64BE(1n, 76);
+    expected.writeBigUInt64BE(COOKIE, 84);
+    expected.set(fixtureCapability(), 92);
+    expected.writeBigUInt64BE(77n, 124);
+    expected.writeBigUInt64BE(PEER_INODE, 132);
+    expected.write(PEER_BOOT, 140);
+    expect(child.writes).toEqual([expected]);
+    for (const byte of jsonFrame(heldInit)) child.stdout.write(Buffer.from([byte]));
+    const held = await pending;
+    expect(held.identity).toEqual(heldInit);
+    expect(held.revocation.aborted).toBe(false);
+    expect(Object.isFrozen(held)).toBe(true);
+    expect(Object.isFrozen(held.identity)).toBe(true);
+    await expect(open(signal())).rejects.toThrow("parent_peer_retained");
+    const current = held.assertCurrent(owner.signal);
+    await expect(held.assertCurrent(signal())).rejects.toThrow("parent_peer_retained");
+    expect(child.writes).toHaveLength(2);
+    expect(child.writes[1]).toEqual(jsonFrame({ kind: "linux-oci-parent-held-live-init-read@1" }));
+    child.stdout.write(jsonFrame(heldCurrent));
+    await current;
+    const again = held.assertCurrent(signal());
+    child.stdout.write(jsonFrame(heldCurrent));
+    await again;
+    expect(child.writes).toHaveLength(3);
+    const closing = held.close();
+    expect(held.close()).toBe(closing);
+    expect(held.revocation.aborted).toBe(true);
+    await expect(held.assertCurrent(signal())).rejects.toThrow("parent_peer_retained");
+    await wrote();
+    expect(child.writes[3]).toEqual(jsonFrame({ kind: "linux-oci-parent-held-live-init-close@1" }));
+    expect(child.stdin.writableEnded).toBe(false);
+    let settled = false;
+    void closing.then(
+      () => {
+        settled = true;
+      },
+      () => undefined,
+    );
+    child.stdout.write(jsonFrame(heldClosed));
+    await wrote();
+    expect(child.stdin.writableEnded).toBe(true);
+    expect(settled).toBe(false);
+    child.stderr.emit("end");
+    child.child.emit("exit", 0, null);
+    child.stdout.emit("end");
+    await wrote();
+    expect(settled).toBe(false);
+    child.child.emit("close", 0, null);
+    await closing;
+    expect(child.writes).toHaveLength(4);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+    expect(child.counts()).toEqual({ kills: 0, unrefs: 0 });
+  } finally {
+    owner.abort();
+    child.close();
+    f.cleanup();
+  }
+});
+
+test("held live init refuses bad frames, closure without ACK and loss on the same owner lifetime", async () => {
+  const f = fixture();
+  const binding = runtimeApplicationBinding(f.binary);
+  try {
+    for (const fault of [
+      "foreign init",
+      "trailing reply",
+      "wrong current",
+      "lost close ACK",
+      "owner abort",
+      "request abort",
+      "native exit",
+      "lost pipe",
+    ] as const) {
+      const child = connectorStreams();
+      const owner = new AbortController();
+      try {
+        f.raw.mockReturnValueOnce(child.child);
+        const open = prepareAuthenticatedLinuxOciHeldLiveInitReader(
+          f.binary,
+          binding,
+          owner.signal,
+        );
+        const pending = open(owner.signal);
+        await wrote();
+        if (fault === "foreign init" || fault === "trailing reply") {
+          const first = jsonFrame(
+            fault === "foreign init" ? { ...heldInit, nativeId: "b".repeat(64) } : heldInit,
+          );
+          child.stdout.write(
+            fault === "trailing reply" ? Buffer.concat([first, jsonFrame(heldCurrent)]) : first,
+          );
+          await expect(pending).rejects.toThrow("parent_peer_retained");
+          expect(child.writes).toHaveLength(1);
+        } else {
+          child.stdout.write(jsonFrame(heldInit));
+          const held = await pending;
+          if (fault === "lost close ACK") {
+            const closing = held.close();
+            await wrote();
+            child.stdout.emit("end");
+            child.stderr.emit("end");
+            child.child.emit("exit", 0, null);
+            child.child.emit("close", 0, null);
+            await expect(closing).rejects.toThrow("parent_peer_retained");
+          } else if (fault === "native exit") {
+            child.child.emit("exit", 77, null);
+          } else if (fault === "lost pipe") {
+            child.stdin.emit("close");
+          } else if (fault === "request abort") {
+            const request = new AbortController();
+            const current = held.assertCurrent(request.signal);
+            request.abort();
+            await expect(current).rejects.toThrow("parent_peer_retained");
+            expect(owner.signal.aborted).toBe(false);
+          } else {
+            const current = held.assertCurrent(owner.signal);
+            child.stdout.write(jsonFrame(fault === "wrong current" ? heldClosed : heldCurrent));
+            if (fault === "wrong current") {
+              await expect(current).rejects.toThrow("parent_peer_retained");
+            } else {
+              await current;
+              owner.abort();
+            }
+          }
+          expect(held.revocation.aborted).toBe(true);
+          await expect(held.assertCurrent(signal())).rejects.toThrow("parent_peer_retained");
+          await expect(held.close()).rejects.toThrow("parent_peer_retained");
+          expect(child.writes).toHaveLength(
+            fault === "native exit" || fault === "lost pipe" ? 1 : 2,
+          );
+        }
+        expect(child.stdin.writableEnded).toBe(true);
+        await expect(open(signal())).rejects.toThrow("parent_peer_retained");
+        expect(child.counts()).toEqual({ kills: 0, unrefs: 0 });
+      } finally {
+        owner.abort();
+        child.close();
+      }
+    }
+    expect(f.raw).toHaveBeenCalledTimes(8);
+  } finally {
     f.cleanup();
   }
 });

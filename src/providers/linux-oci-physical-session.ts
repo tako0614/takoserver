@@ -2489,6 +2489,290 @@ export function prepareAuthenticatedLinuxOciLiveInitReader(
   };
 }
 
+type HeldLiveInitIdentity = Readonly<{
+  kind: "linux-oci-parent-held-live-init@1";
+  nativeId: string;
+  namespaceDevice: string;
+  namespaceInode: string;
+  barrier: "unproven";
+}>;
+
+const heldLiveInitRead = '{"kind":"linux-oci-parent-held-live-init-read@1"}';
+const heldLiveInitClose = '{"kind":"linux-oci-parent-held-live-init-close@1"}';
+const heldLiveInitCurrent =
+  '{"kind":"linux-oci-parent-held-live-init-current@1","barrier":"unproven"}';
+const heldLiveInitClosed =
+  '{"kind":"linux-oci-parent-held-live-init-closed@1","barrier":"unproven"}';
+
+/** Private transport after the caller authenticates its original binding.
+ * The identity alone is observational. Only this owned connector can recheck
+ * its held init; neither a DTO nor another connector can continue it. */
+export function prepareAuthenticatedLinuxOciHeldLiveInitReader(
+  binary: string,
+  value: unknown,
+  lifetime: AbortSignal,
+) {
+  if (
+    !(lifetime instanceof AbortSignal) ||
+    !record(value) ||
+    Object.getOwnPropertyDescriptor(value, "purpose")?.value !==
+      RUNTIME_APPLICATION_RECONSTRUCTION_PURPOSE
+  )
+    throw failure("parent_binding");
+  const state = authenticatedPeerState(binary, value, lifetime);
+  let attempted = false;
+  return async (signal: AbortSignal) => {
+    if (attempted) throw failure("parent_peer_retained");
+    attempted = true;
+    try {
+      return await openOriginalHeldLiveInit(state, signal);
+    } finally {
+      state.capability.fill(0);
+    }
+  };
+}
+
+async function openOriginalHeldLiveInit(state: OriginalPeerReaderState, signal: AbortSignal) {
+  type Operation = "open" | "read" | "close";
+  type Pending = {
+    readonly operation: Operation;
+    readonly frame: Buffer;
+    readonly signal: AbortSignal;
+    readonly timer: ReturnType<typeof setTimeout>;
+    readonly resolve: (body: string) => void;
+    readonly reject: (reason: Error) => void;
+    written: boolean;
+    reply?: string;
+  };
+  const unavailable = () => failure("parent_peer_retained");
+  const lifetime = state.lifetime;
+  if (!(signal instanceof AbortSignal) || signal.aborted || lifetime?.aborted) throw unavailable();
+  state.assertBinary();
+  const child = spawn(state.binary, ["--parent-peer-hold-live-init"], {
+    env: Object.create(null),
+    shell: false,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const revocation = new AbortController();
+  let pending: Pending | undefined;
+  let buffer = Buffer.alloc(0);
+  let stopped = false,
+    inputEnded = false,
+    stdoutEnded = false,
+    stderrEnded = false;
+  let exited = false,
+    childClosed = false;
+  let closing: Promise<void> | undefined;
+  const detach = (request: Pending) => {
+    clearTimeout(request.timer);
+    if (request.signal !== signal && request.signal !== lifetime)
+      request.signal.removeEventListener("abort", stop);
+    request.frame.fill(0);
+    pending = undefined;
+  };
+  const endInput = () => {
+    if (!inputEnded) {
+      inputEnded = true;
+      child.stdin.end();
+    }
+  };
+  const finish = () => {
+    stopped = true;
+    signal.removeEventListener("abort", stop);
+    lifetime?.removeEventListener("abort", stop);
+    revocation.abort();
+  };
+  const stop = () => {
+    if (stopped) return;
+    finish();
+    if (pending) {
+      const request = pending;
+      detach(request);
+      request.reject(unavailable());
+    }
+    buffer = Buffer.alloc(0);
+    try {
+      endInput(); // Only this private connector, never the original owner process.
+    } catch {
+      /* Connection remains revoked and its cleanup is unconfirmed. */
+    }
+  };
+  const check = () => {
+    const request = pending;
+    if (!request || !request.written || request.reply === undefined || stopped) return;
+    try {
+      if (request.signal.aborted || signal.aborted || lifetime?.aborted) throw unavailable();
+      state.assertBinary();
+      if (request.operation === "close") {
+        endInput(); // The exact close ACK is required before releasing stdin.
+        if (!(stdoutEnded && stderrEnded && exited && childClosed)) return;
+        finish();
+      }
+      detach(request);
+      request.resolve(request.reply);
+    } catch {
+      stop();
+    }
+  };
+  child.stdout.on("data", (chunk: Buffer) => {
+    if (stopped) return;
+    try {
+      if (
+        !pending ||
+        pending.reply !== undefined ||
+        !Buffer.isBuffer(chunk) ||
+        chunk.length > 516 - buffer.length
+      )
+        throw unavailable();
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length < 4) return;
+      const size = buffer.readUInt32BE(0);
+      if (!size || size >= 512 || buffer.length > size + 4) throw unavailable();
+      if (buffer.length !== size + 4) return;
+      const reply = decoder.decode(buffer.subarray(4));
+      if (
+        (pending.operation === "read" && reply !== heldLiveInitCurrent) ||
+        (pending.operation === "close" && reply !== heldLiveInitClosed)
+      )
+        throw unavailable();
+      pending.reply = reply;
+      buffer = Buffer.alloc(0);
+      check();
+    } catch {
+      stop();
+    }
+  });
+  child.stdout.on("end", () => {
+    stdoutEnded = true;
+    if (pending?.operation !== "close" || pending.reply === undefined) stop();
+    else check();
+  });
+  child.stderr.on("data", stop);
+  child.stderr.on("end", () => {
+    stderrEnded = true;
+    if (pending?.operation !== "close") stop();
+    else check();
+  });
+  child.on("exit", (code, exitSignal) => {
+    exited = true;
+    if (pending?.operation !== "close" || code !== 0 || exitSignal !== null) stop();
+    else check();
+  });
+  child.on("close", (code, exitSignal) => {
+    childClosed = true;
+    if (pending?.operation !== "close" || !exited || code !== 0 || exitSignal !== null) stop();
+    else check();
+  });
+  child.on("error", stop);
+  child.stdin.on("error", stop);
+  child.stdout.on("error", stop);
+  child.stderr.on("error", stop);
+  child.stdin.on("close", () => {
+    if (pending?.operation !== "close") stop();
+  });
+  child.stdout.on("close", () => {
+    if (!stdoutEnded) stop();
+  });
+  child.stderr.on("close", () => {
+    if (!stderrEnded) stop();
+  });
+  signal.addEventListener("abort", stop, { once: true });
+  if (lifetime !== signal) lifetime?.addEventListener("abort", stop, { once: true });
+
+  function exchange(operation: Operation, frame: Buffer, requestSignal: AbortSignal) {
+    return new Promise<string>((resolve, reject) => {
+      if (stopped || pending || requestSignal.aborted || signal.aborted || lifetime?.aborted) {
+        frame.fill(0);
+        reject(unavailable());
+        return;
+      }
+      const request = {
+        operation,
+        frame,
+        signal: requestSignal,
+        resolve,
+        reject,
+        timer: setTimeout(stop, operation === "open" ? 10_000 : 4_000),
+        written: false,
+      };
+      pending = request;
+      // The owner/connector abort listeners remain attached between commands.
+      if (requestSignal !== signal && requestSignal !== lifetime)
+        requestSignal.addEventListener("abort", stop, { once: true });
+      try {
+        state.assertBinary();
+        child.stdin.write(frame, (error) => {
+          frame.fill(0);
+          if (error) stop();
+          else {
+            request.written = true;
+            check();
+          }
+        });
+      } catch {
+        stop();
+      }
+    });
+  }
+  const command = (body: string) => {
+    const result = Buffer.alloc(4 + body.length);
+    result.writeUInt32BE(body.length);
+    result.write(body, 4, "ascii");
+    return result;
+  };
+  try {
+    const reply = await exchange("open", originalPeerConnectorFrame(state), signal);
+    const observed = parseStrictJson(encoder.encode(reply), 512);
+    if (
+      stopped ||
+      signal.aborted ||
+      lifetime?.aborted ||
+      !record(observed) ||
+      observed.kind !== "linux-oci-parent-held-live-init@1" ||
+      observed.nativeId !== state.claim ||
+      !positiveU64String(observed.namespaceDevice) ||
+      !positiveU64String(observed.namespaceInode) ||
+      observed.barrier !== "unproven"
+    )
+      throw unavailable();
+    const identity: HeldLiveInitIdentity = Object.freeze({
+      kind: "linux-oci-parent-held-live-init@1",
+      nativeId: state.claim,
+      namespaceDevice: observed.namespaceDevice,
+      namespaceInode: observed.namespaceInode,
+      barrier: "unproven",
+    });
+    if (JSON.stringify(identity) !== reply) throw unavailable();
+    return Object.freeze({
+      identity,
+      revocation: revocation.signal,
+      async assertCurrent(actualSignal: AbortSignal): Promise<void> {
+        if (
+          !(actualSignal instanceof AbortSignal) ||
+          revocation.signal.aborted ||
+          actualSignal.aborted
+        )
+          throw unavailable();
+        await exchange("read", command(heldLiveInitRead), actualSignal);
+        if (revocation.signal.aborted || actualSignal.aborted) throw unavailable();
+      },
+      close(): Promise<void> {
+        if (!closing) {
+          closing = Promise.resolve().then(async () => {
+            if (pending) stop(); // No close command may follow an unresolved read.
+            await exchange("close", command(heldLiveInitClose), signal);
+          });
+          revocation.abort();
+        }
+        return closing;
+      },
+    });
+  } catch {
+    stop();
+    throw unavailable();
+  }
+}
+
 function originalPeerConnectorFrame(state: OriginalPeerReaderState) {
   const frame = Buffer.alloc(176),
     peer = state.peer;
