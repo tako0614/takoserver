@@ -408,7 +408,7 @@ function modelRootTopology(path: string) {
   };
 }
 
-async function verifySuccessorHttpClose(outcome: "joined" | "unknown") {
+async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unknown" | "ack-lost") {
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
@@ -473,7 +473,7 @@ async function verifySuccessorHttpClose(outcome: "joined" | "unknown") {
     const existingCalls = raw.mock.calls.length;
     const reservations = () =>
       f.sql.query(
-        "SELECT generation,epoch,close_document FROM tf_v2_container_application_successors",
+        "SELECT generation,epoch,owner_token,close_document,json_extract(predecessor_close_document,'$.scope.controlDigest') AS control_digest FROM tf_v2_container_application_successors",
       );
     await expect(
       creator.openCurrentSuccessorServingHttp(
@@ -537,7 +537,32 @@ async function verifySuccessorHttpClose(outcome: "joined" | "unknown") {
     await rawTick();
     expect(settled.state()).toBe("pending");
 
-    if (outcome === "joined") {
+    let closeWrites = 0;
+    let submittedClose: string | undefined;
+    const run = f.sql.run.bind(f.sql);
+    const write = spyOn(f.sql, "run").mockImplementation(async (statement, params) => {
+      if (
+        !statement.startsWith(
+          "UPDATE main.tf_v2_container_application_successors SET close_document=",
+        )
+      )
+        return run(statement, params);
+      closeWrites++;
+      const document = params?.[0];
+      if (typeof document !== "string") throw new Error("missing submitted close document");
+      submittedClose = document;
+      const result = await run(statement, params);
+      if (outcome === "ack-lost" && result.changes === 1)
+        throw new Error("NONSECRET simulated lost acknowledgement after commit");
+      return result;
+    });
+    const cleanup = cleanupIo;
+    cleanupIo = () => {
+      write.mockRestore();
+      cleanup();
+    };
+
+    if (outcome === "withdrawn") {
       // Serving readiness was withdrawn while the original exchange still
       // owns its raw handles. This refusal starts the H1 drain.
       await f.sql.run(
@@ -548,17 +573,22 @@ async function verifySuccessorHttpClose(outcome: "joined" | "unknown") {
       await expect(refusal.response).rejects.toThrow();
       await refusal.settlement;
       expect(io.counts().requestDestroy).toBe(1);
-
-      const closing = observeRawPromise(connection.close());
+    }
+    if (outcome !== "unknown") {
+      const close = creator.close();
+      creatorCloseChecked = true;
+      const closing = observeRawPromise(close);
       await rawTick();
       expect(closing.state()).toBe("pending");
       expect(heldCloses).toBe(0);
+      expect(closeWrites).toBe(0);
       io.closeResponse();
       await rawTick();
       expect(closing.state()).toBe("pending");
       io.closeRequest();
       expect(await settled.value).toHaveProperty("result");
-      expect(await closing.value).toHaveProperty("result");
+      if (outcome === "withdrawn") expect(await closing.value).toHaveProperty("error");
+      else expect(await closing.value).toHaveProperty("result");
       expect(heldCloses).toBe(1);
     } else {
       const failure = new Error("NONSECRET uncertain raw request shutdown");
@@ -580,13 +610,33 @@ async function verifySuccessorHttpClose(outcome: "joined" | "unknown") {
         requestDestroy.mockRestore();
       }
     }
-    expect(await reservations()).toEqual([
-      {
-        generation: original.generation,
-        epoch: 1,
-        close_document: null,
-      },
-    ]);
+    const rows = await reservations();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ generation: original.generation, epoch: 1 });
+    if (outcome === "joined" || outcome === "ack-lost") {
+      const document = rows[0]?.close_document;
+      if (typeof document !== "string") throw new Error("missing owned successor close document");
+      expect(submittedClose).toBe(document);
+      expect(closeWrites).toBe(1);
+      expect(JSON.parse(document)).toMatchObject({
+        kind: "linux-oci-sealed-host-application-successor-close@1",
+        scope: {
+          purpose: "takoserver.linux-oci-host-application-successor-close@1",
+          resourceUid: selector.resourceUid,
+          incarnationId: selector.incarnationId,
+          installationId: original.installationId,
+          generation: original.generation,
+          claimId: original.claimId,
+          nativeId: original.claimId,
+          epoch: 1,
+          ownerToken: rows[0]?.owner_token,
+          controlDigest: rows[0]?.control_digest,
+        },
+      });
+    } else {
+      expect(rows[0]?.close_document).toBeNull();
+      if (outcome === "unknown") expect(closeWrites).toBe(0);
+    }
 
     await expect(creator.openCurrentSuccessorServingHttp(selector, signal)).rejects.toThrow();
     expect(raw.mock.calls).toHaveLength(existingCalls + 2);
@@ -603,7 +653,7 @@ async function verifySuccessorHttpClose(outcome: "joined" | "unknown") {
   }
 }
 
-test.each(["joined", "unknown"] as const)(
+test.each(["joined", "withdrawn", "unknown", "ack-lost"] as const)(
   "OCI HTTP successor closes its held connector only after confirmed I/O (%s)",
   verifySuccessorHttpClose,
   20_000,

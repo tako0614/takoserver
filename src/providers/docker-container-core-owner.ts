@@ -71,6 +71,7 @@ import {
   openOriginalLinuxOciHeldLiveInit,
   originalLinuxOciHttpRetirementSource,
   originalLinuxOciParentControlSource,
+  originalLinuxOciSuccessorHttpRetirementSource,
   prepareOriginalLinuxOciAllocationDisposal,
   prepareOriginalLinuxOciApplicationOwnerRead,
   prepareOriginalLinuxOciPeerInit,
@@ -304,6 +305,7 @@ export interface DockerContainerCoreOwner {
     readonly record: DockerContainerCreateRecord;
     readonly held: LinuxOciHeldLiveInit;
     readonly httpPort: number;
+    recordClose(): Promise<void>;
   }>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
@@ -548,8 +550,10 @@ interface ApplicationSuccessorIssuance {
   readonly record: DockerContainerCreateRecord;
   readonly observation: LinuxOciOriginalLiveInit;
   readonly httpPort: number | undefined;
+  readonly epoch: 1;
   readonly ownerToken: string;
   readonly predecessor: string;
+  readonly controlDigest: string;
   readonly liveSql: string;
   readonly liveParams: readonly SqlParam[];
   readonly assertKeys: () => void;
@@ -2766,9 +2770,13 @@ export function createDockerContainerCoreOwner(
   }
   const applicationCloseKind = "linux-oci-sealed-application-io-close@1";
   const shutdownIoCloseKind = "linux-oci-sealed-host-shutdown-io-close@1";
+  const successorCloseKind = "linux-oci-sealed-host-application-successor-close@1";
   const reconcilerLeaseSql =
     " AND EXISTS (SELECT 1 FROM tf_v2_operations WHERE id=? AND resource_uid=? AND lease_token=? AND lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000 AND status='reconciling' AND effect='unknown' AND dispatch_possible=1)";
-  type ApplicationCloseKind = typeof applicationCloseKind | typeof shutdownIoCloseKind;
+  type ApplicationCloseKind =
+    | typeof applicationCloseKind
+    | typeof shutdownIoCloseKind
+    | typeof successorCloseKind;
   async function shutdownIoScope(input: DockerContainerCreateRecord, raw: string) {
     return {
       purpose: "takoserver.linux-oci-host-shutdown-io-close@1",
@@ -4447,7 +4455,7 @@ export function createDockerContainerCoreOwner(
         held.identity.namespaceInode !== issued.observation.namespaceInode
       )
         return fail();
-      return { held, record: issued.record, httpPort: issued.httpPort };
+      return { held, reservation, record: issued.record, httpPort: issued.httpPort };
     } catch (error) {
       // The creator retains an unacknowledged close independently of handoff.
       await held?.close().catch(() => undefined);
@@ -4455,6 +4463,103 @@ export function createDockerContainerCoreOwner(
     } finally {
       current.finish();
     }
+  }
+  async function recordApplicationSuccessorClose(
+    reservation: LinuxOciApplicationSuccessorReservation,
+    held: LinuxOciHeldLiveInit,
+  ) {
+    const issued = LinuxOciApplicationSuccessorReservation.issuance(reservation);
+    const { originalCustody, record, epoch, ownerToken, predecessor } = issued;
+    const joined = originalLinuxOciSuccessorHttpRetirementSource(
+      originalCustody,
+      result,
+      record,
+      held,
+    );
+    const assertLocal = () => {
+      if (
+        issued.core !== result ||
+        issued.sql !== sql ||
+        originalLinuxOciSuccessorHttpRetirementSource(originalCustody, result, record, held) !==
+          joined
+      )
+        return fail();
+      issued.assertKeys();
+    };
+    assertLocal();
+    await joined();
+    assertLocal();
+
+    const { intent, claimId, nativeId } = record;
+    const { resourceUid, incarnationId } = intent;
+    const generation = intent.policy.generation;
+    const scope = Object.freeze({
+      purpose: "takoserver.linux-oci-host-application-successor-close@1",
+      resourceUid,
+      incarnationId,
+      installationId,
+      generation,
+      claimId,
+      nativeId,
+      controlDigest: issued.controlDigest,
+      epoch,
+      ownerToken,
+    });
+    const selected = await sealApplicationCloseFact(scope, successorCloseKind);
+    const keyCurrent = await readApplicationCloseFact(selected.document, scope, successorCloseKind);
+    const current =
+      "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=? AND owner_token=? AND predecessor_close_document=?" +
+      " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors newer WHERE newer.resource_uid=? AND newer.generation=? AND newer.epoch>?)" +
+      " AND EXISTS (SELECT 1 FROM main.tf_v2_container_shutdown_io_closes original WHERE original.resource_uid=? AND original.generation=? AND original.claim_id=? AND original.native_id=? AND original.close_document=?)" +
+      " AND EXISTS (SELECT 1 FROM main.tf_v2_resources resource WHERE resource.uid=? AND resource.phase='idle' AND resource.busy_operation IS NULL)" +
+      " AND " +
+      issued.liveSql;
+    const params = [
+      resourceUid,
+      generation,
+      claimId,
+      nativeId,
+      epoch,
+      ownerToken,
+      predecessor,
+      resourceUid,
+      generation,
+      epoch,
+      resourceUid,
+      generation,
+      claimId,
+      nativeId,
+      predecessor,
+      resourceUid,
+      ...issued.liveParams,
+    ];
+    assertLocal();
+    selected.assertCurrent();
+    keyCurrent();
+    // A thrown write can have committed. One exact readback resolves this
+    // operation's already sealed bytes. It never issues another write.
+    let writeError: unknown;
+    const saved = await sql
+      .run(
+        "UPDATE main.tf_v2_container_application_successors SET close_document=? WHERE close_document IS NULL AND " +
+          current,
+        [selected.document, ...params],
+      )
+      .catch((error: unknown) => {
+        writeError = error;
+      });
+    if (saved && saved.changes !== 1) return fail();
+    const confirmed = await sql.query(
+      "SELECT close_document FROM main.tf_v2_container_application_successors WHERE " + current,
+      params,
+    );
+    if (confirmed.length !== 1 || confirmed[0]?.close_document !== selected.document) {
+      if (writeError !== undefined) throw writeError;
+      return fail();
+    }
+    assertLocal();
+    selected.assertCurrent();
+    keyCurrent();
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
@@ -5217,7 +5322,7 @@ export function createDockerContainerCoreOwner(
     },
     async openCurrentApplicationSuccessorHttp(selector, generation, originalCustody, signal) {
       if (!Number.isSafeInteger(generation) || generation < 1) return fail();
-      const { held, record, httpPort } = await openApplicationSuccessor(
+      const { held, reservation, record, httpPort } = await openApplicationSuccessor(
         selector,
         originalCustody,
         signal,
@@ -5227,7 +5332,16 @@ export function createDockerContainerCoreOwner(
         await held.close();
         return fail();
       }
-      return Object.freeze({ held, record, httpPort });
+      let saved: Promise<void> | undefined;
+      return Object.freeze({
+        held,
+        record,
+        httpPort,
+        recordClose() {
+          saved ??= recordApplicationSuccessorClose(reservation, held);
+          return saved;
+        },
+      });
     },
     async reserveOriginalApplicationSuccessor(
       selector,
@@ -5277,9 +5391,10 @@ export function createDockerContainerCoreOwner(
         );
         const predecessor = previous[0]?.close_document;
         if (previous.length !== 1 || typeof predecessor !== "string") return fail();
+        const originalCloseScope = await shutdownIoScope(captured, raw);
         const predecessorCurrent = await readApplicationCloseFact(
           predecessor,
-          await shutdownIoScope(captured, raw),
+          originalCloseScope,
           shutdownIoCloseKind,
         );
         predecessorCurrent();
@@ -5318,8 +5433,10 @@ export function createDockerContainerCoreOwner(
           record: captured,
           observation,
           httpPort,
+          epoch: 1,
           ownerToken,
           predecessor,
+          controlDigest: originalCloseScope.controlDigest,
           liveSql: live,
           liveParams: Object.freeze(liveParams),
           assertKeys() {

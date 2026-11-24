@@ -88,6 +88,8 @@ type OriginalOciHttpRoute = {
 };
 
 type OriginalOciSuccessorHttp = {
+  readonly held: LinuxOciHeldLiveInit;
+  joined(): Promise<void>;
   read(signal: AbortSignal): Promise<OriginalOciHttpRoute>;
   close(): Promise<void>;
 };
@@ -215,6 +217,22 @@ export function originalLinuxOciHttpRetirementSource(
   if (!captured || !runtime || canonicalJson(captured) !== canonicalJson(record))
     return fail("http_custody");
   return runtime;
+}
+
+/** Close proof is available only from this creator's exact HTTP and held
+ * connector join. It remains owned while creator shutdown fences admission. */
+export function originalLinuxOciSuccessorHttpRetirementSource(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  held: LinuxOciHeldLiveInit,
+) {
+  const custody = originalOciCustodies.get(original);
+  if (!custody || custody.core !== core || !custody.runtime3 || custody.signal.aborted)
+    return fail("http_custody");
+  const source = custody.successorHttp.get(record);
+  if (source?.held !== held) return fail("http_custody");
+  return source.joined;
 }
 
 const observeOriginalOciStarted = LinuxOciPhysicalSession.prototype.observeStarted;
@@ -3146,12 +3164,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       signal.addEventListener("abort", abort, { once: true });
       const timer = setTimeout(abort, timeout);
       const running = (async () => {
-        const { held, record, httpPort } = await core.openCurrentApplicationSuccessorHttp(
-          identity,
-          generation,
-          originalNativeCustody,
-          cancel.signal,
-        );
+        const { held, record, httpPort, recordClose } =
+          await core.openCurrentApplicationSuccessorHttp(
+            identity,
+            generation,
+            originalNativeCustody,
+            cancel.signal,
+          );
         try {
           // The held read checks the original accepted topology and latest open
           // reservation. Its successful read alone never registers a runtime.
@@ -3159,6 +3178,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           if (closed || cancel.signal.aborted || held.revocation.aborted) return fail("revoked");
           const runtime = createLinuxOciContainerHttpRuntime(originalNativeCustody, core, record);
           let reading = Promise.resolve();
+          let transportJoin: Promise<void> | undefined;
           let joining: Promise<void> | undefined;
           const assertLocal = (actualSignal: AbortSignal) => {
             if (
@@ -3172,6 +3192,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               return fail("revoked");
           };
           const source: OriginalOciSuccessorHttp = {
+            held,
+            joined() {
+              return transportJoin ?? fail("http_custody");
+            },
             read(actualSignal) {
               const check = reading.then(async () => {
                 assertLocal(actualSignal);
@@ -3194,9 +3218,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               joining ??= Promise.resolve().then(async () => {
                 // A rejected transport join leaves the held connector and the
                 // open reservation in custody. Only a known join may close it.
-                await runtime.close();
-                await reading;
-                await held.close();
+                transportJoin = (async () => {
+                  await runtime.close();
+                  await reading;
+                  await held.close();
+                })();
+                await transportJoin;
+                await recordClose();
               });
               return joining;
             },
