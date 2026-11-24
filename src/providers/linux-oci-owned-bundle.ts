@@ -81,6 +81,17 @@ type OriginalPeerRead = {
   /** Actual management producer, absent for a one-use readonly reader. */
   readonly management?: ReturnType<typeof prepareAuthenticatedLinuxOciPeerInit>;
 };
+type OriginalOciHttpRoute = {
+  readonly nativeId: string;
+  readonly endpoint: string;
+  assertLocal(): void;
+};
+
+type OriginalOciSuccessorHttp = {
+  read(signal: AbortSignal): Promise<OriginalOciHttpRoute>;
+  close(): Promise<void>;
+};
+
 type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
   readonly runtime3: boolean;
@@ -91,6 +102,7 @@ type OriginalOciCustody = {
   readonly alternateHostTopology: LinuxOciHostTopology | undefined;
   readonly httpRecords: ReadonlyMap<string, DockerContainerCreateRecord>;
   readonly httpRuntimes: ReadonlyMap<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>;
+  readonly successorHttp: ReadonlyMap<DockerContainerCreateRecord, OriginalOciSuccessorHttp>;
   readonly heldLiveInits: Set<{ close(): Promise<void> }>;
   readonly peerReads: Map<string, OriginalPeerRead>;
   readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
@@ -135,7 +147,7 @@ const originalParentRequests = new WeakMap<object, LinuxOciCreateStoppedRequest>
 /** Internal source lookup only. Endpoint data cannot register an owner: every
  * read requires the original creator key, same Core, bound original record and
  * still-held original session. Core separately samples accepted serving SQL. */
-export function originalLinuxOciHttpEndpoint(
+function originalLinuxOciHttpEndpoint(
   original: object,
   core: DockerContainerCoreOwner,
   record: DockerContainerCreateRecord,
@@ -161,6 +173,29 @@ export function originalLinuxOciHttpEndpoint(
   if (!captured && custody.alternateHostTopology !== undefined) return fail("http_custody");
   return `http://${(captured ?? custody.hostTopology).peerIpv4Guest}:${httpPort}/`;
 }
+/** The same creator revalidates either its original session or its private
+ * successor source. Neither a record nor endpoint data can register either. */
+export async function readOriginalLinuxOciHttpRoute(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  signal: AbortSignal,
+): Promise<OriginalOciHttpRoute> {
+  const custody = originalOciCustodies.get(original);
+  const successor = custody?.core === core && custody.successorHttp.get(record);
+  if (successor) return successor.read(signal);
+  const actual = await core.observeServingOciHttp(record, original, signal);
+  const endpoint = () =>
+    originalLinuxOciHttpEndpoint(original, core, record, actual.httpPort, signal);
+  return {
+    nativeId: actual.native.nativeId,
+    endpoint: endpoint(),
+    assertLocal() {
+      endpoint();
+    },
+  };
+}
+
 /** Internal source lookup only. This is the already-owned application runtime,
  * never a replacement created from a claim or a positive retirement witness. */
 export function originalLinuxOciHttpRetirementSource(
@@ -1804,6 +1839,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const httpProbes = new Map<string, ReturnType<typeof createLinuxOciHttpHealthProbe>>();
   const httpRecords = new Map<string, DockerContainerCreateRecord>();
   const httpRuntimes = new Map<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>();
+  const successorHttp = new Map<DockerContainerCreateRecord, OriginalOciSuccessorHttp>();
   const heldLiveInits: OriginalOciCustody["heldLiveInits"] = new Set();
   const originalNativeCustody = Object.freeze({});
   const nativeLifetime = new AbortController();
@@ -1817,6 +1853,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     alternateHostTopology: topologies?.alternate,
     httpRecords,
     httpRuntimes,
+    successorHttp,
     heldLiveInits,
     peerReads: new Map(),
     sessions: nativeSessions,
@@ -3076,6 +3113,111 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         if (!retained) signal.removeEventListener("abort", abort);
       }
     },
+    /** Private connection for a caller whose binding owner authorizes each
+     * invocation. Its lifetime belongs to this creator, not a request. */
+    async openCurrentSuccessorServingHttp(
+      selector: {
+        readonly resourceUid: string;
+        readonly incarnationId: string;
+        readonly generation: number;
+      },
+      signal: AbortSignal,
+    ) {
+      if (closed || !runtimeApplicationOwner || !physicalBinary) return fail("parent_custody");
+      if (!(signal instanceof AbortSignal) || signal.aborted) return fail("revoked");
+      const identity = Object.freeze({
+        resourceUid: selector.resourceUid,
+        incarnationId: selector.incarnationId,
+      });
+      const generation = selector.generation;
+      const cancel = new AbortController();
+      const abort = () => cancel.abort();
+      cancellation.add(cancel);
+      signal.addEventListener("abort", abort, { once: true });
+      const timer = setTimeout(abort, timeout);
+      const running = (async () => {
+        const { held, record, httpPort } = await core.openCurrentApplicationSuccessorHttp(
+          identity,
+          generation,
+          originalNativeCustody,
+          cancel.signal,
+        );
+        try {
+          // The held read checks the original accepted topology and latest open
+          // reservation. Its successful read alone never registers a runtime.
+          await held.readOriginalTopology(cancel.signal);
+          if (closed || cancel.signal.aborted || held.revocation.aborted) return fail("revoked");
+          const runtime = createLinuxOciContainerHttpRuntime(originalNativeCustody, core, record);
+          let reading = Promise.resolve();
+          let joining: Promise<void> | undefined;
+          const assertLocal = (actualSignal: AbortSignal) => {
+            if (
+              closed ||
+              joining ||
+              cancel.signal.aborted ||
+              held.revocation.aborted ||
+              actualSignal.aborted ||
+              successorHttp.get(record) !== source
+            )
+              return fail("revoked");
+          };
+          const source: OriginalOciSuccessorHttp = {
+            read(actualSignal) {
+              const check = reading.then(async () => {
+                assertLocal(actualSignal);
+                // A caller cancellation cannot revoke the shared connector.
+                const { topology } = await held.readOriginalTopology(cancel.signal);
+                assertLocal(actualSignal);
+                return {
+                  nativeId: held.identity.nativeId,
+                  endpoint: `http://${topology.peerIpv4Guest}:${httpPort}/`,
+                  assertLocal: () => assertLocal(actualSignal),
+                };
+              });
+              reading = check.then(
+                () => undefined,
+                () => undefined,
+              );
+              return check;
+            },
+            close() {
+              joining ??= Promise.resolve().then(async () => {
+                const [io] = await Promise.allSettled([runtime.close()]);
+                await reading;
+                const [connector] = await Promise.allSettled([held.close()]);
+                if (io.status === "rejected") throw io.reason;
+                if (connector.status === "rejected") throw connector.reason;
+              });
+              return joining;
+            },
+          };
+          successorHttp.set(record, source);
+          held.revocation.addEventListener(
+            "abort",
+            () => {
+              void source.close().catch(() => undefined);
+            },
+            { once: true },
+          );
+          return Object.freeze({
+            open: runtime.open,
+            close: source.close,
+          });
+        } catch (error) {
+          await held.close().catch(() => undefined);
+          throw error;
+        }
+      })();
+      scopes.add(running);
+      try {
+        return await running;
+      } finally {
+        clearTimeout(timer);
+        cancellation.delete(cancel);
+        signal.removeEventListener("abort", abort);
+        scopes.delete(running);
+      }
+    },
     /** Internal application transport. Identity is a selector to revalidate,
      * never caller authorization; a real binding composition must authorize it. */
     fetchServingHttp(
@@ -3573,11 +3715,18 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         for (const cancel of cancellation) cancel.abort();
       }
       if (!nativeClosing) {
+        const successorJoins = Promise.allSettled(
+          [...successorHttp.values()].map((source) => source.close()),
+        );
         const attempt = (async () => {
           if (runtimeApplicationOwner) {
             // Complete already-owned scopes without revoking the original
             // runtime identity needed to record the shutdown fact.
             await Promise.allSettled([...scopes]);
+            const successorFailure = (await successorJoins).find(
+              (result) => result.status === "rejected",
+            );
+            if (successorFailure) throw successorFailure.reason;
             if (heldLiveInits.size) {
               const held = await Promise.allSettled(
                 [...heldLiveInits].map((source) => source.close()),

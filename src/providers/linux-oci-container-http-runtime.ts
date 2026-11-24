@@ -6,7 +6,7 @@ import {
   createHttpRevisionServing,
   type HttpRevisionServingSnapshot,
 } from "./http-revision-serving.ts";
-import { originalLinuxOciHttpEndpoint } from "./linux-oci-owned-bundle.ts";
+import { readOriginalLinuxOciHttpRoute } from "./linux-oci-owned-bundle.ts";
 
 /** Constructed only by the original OCI creator. The opaque key is checked by
  * the original source on EVERY invoke; record/endpoint/observations alone do
@@ -52,11 +52,10 @@ export function createLinuxOciContainerHttpRuntime(
   };
   const observe = async () => {
     current();
-    const actual = await core.observeServingOciHttp(record, original, lifetime.signal);
+    const route = await readOriginalLinuxOciHttpRoute(original, core, record, lifetime.signal);
     current();
-    // The endpoint is derived from the original private topology, not caller URL.
-    originalLinuxOciHttpEndpoint(original, core, record, actual.httpPort, lifetime.signal);
-    return { state: "ready", nativeId: actual.native.nativeId };
+    route.assertLocal();
+    return { state: "ready", nativeId: route.nativeId };
   };
   const coordinator = createHttpRevisionServing({
     automaticTimers: false,
@@ -76,31 +75,23 @@ export function createLinuxOciContainerHttpRuntime(
       reconcile: observe, // reads only; this adapter cannot CREATE/START/retry
       async invoke(_revision, request, options) {
         current();
-        const actual = await core.observeServingOciHttp(record, original, options.signal);
+        const route = await readOriginalLinuxOciHttpRoute(original, core, record, options.signal);
         current();
-        if (options.signal.aborted || actual.native.nativeId !== options.nativeId)
+        if (options.signal.aborted || route.nativeId !== options.nativeId)
           throw new Error("linux_oci_http_revoked");
-        const endpoint = originalLinuxOciHttpEndpoint(
-          original,
-          core,
-          record,
-          actual.httpPort,
-          options.signal,
-        );
         return forwardContainerHttp(
           request,
-          endpoint,
+          route.endpoint,
           (outgoing) => {
+            // The original caller fence supplies no grant. It may revoke the
+            // invocation, so recheck the owned route after running this fence.
+            const originalCall = openCalls.get(request);
+            originalCall?.refuseIfRevoked();
             current();
+            route.assertLocal();
             if (options.signal.aborted) throw new Error("linux_oci_http_revoked");
             const invocation = createContainerHttpInvocation();
-            const originalCall = openCalls.get(request);
-            if (originalCall) {
-              // A throw-only fence from the ORIGINAL native caller closure.
-              // It supplies no grant and its return value is never consulted.
-              originalCall.refuseIfRevoked();
-              originalCall.actual = invocation;
-            }
+            if (originalCall) originalCall.actual = invocation;
             originalIO.add(invocation); // BEFORE the actual raw constructor
             void invocation.settlement.then(
               () => {

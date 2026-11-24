@@ -276,6 +276,7 @@ export interface DockerContainerCoreOwner {
     selector: { readonly resourceUid: string; readonly incarnationId: string },
     originalCustody: object,
     signal: AbortSignal,
+    expectedGeneration?: number,
   ): Promise<LinuxOciApplicationSuccessorReservation>;
   /** Negative storage/owner check only. A separate held native source must
    * authorize application I/O. The current reservation alone supplies none. */
@@ -292,6 +293,18 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciHeldLiveInit>;
+  /** Private creator intake. The held connector still has to prove topology
+   * and currentness before the creator can construct an application runtime. */
+  openCurrentApplicationSuccessorHttp(
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    generation: number,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<{
+    readonly record: DockerContainerCreateRecord;
+    readonly held: LinuxOciHeldLiveInit;
+    readonly httpPort: number;
+  }>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
    * removal; the binding owner must authorize each application invocation. */
@@ -534,6 +547,7 @@ interface ApplicationSuccessorIssuance {
   readonly signal: AbortSignal;
   readonly record: DockerContainerCreateRecord;
   readonly observation: LinuxOciOriginalLiveInit;
+  readonly httpPort: number | undefined;
   readonly ownerToken: string;
   readonly predecessor: string;
   readonly liveSql: string;
@@ -4267,6 +4281,7 @@ export function createDockerContainerCoreOwner(
       coordinates,
       raw,
       guard,
+      acceptedSpecJson: loaded.proof.a_accepted_spec_json,
       assertLocal,
       assertControlKey,
       observe,
@@ -4383,6 +4398,57 @@ export function createDockerContainerCoreOwner(
     )
       return fail();
     assertLocal();
+  }
+  async function openApplicationSuccessor(
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    originalCustody: object,
+    signal: AbortSignal,
+    expectedGeneration?: number,
+  ) {
+    const identity = captureCurrentOciSelector(selector);
+    // Only this mint's acknowledged reservation can proceed to the one held
+    // connector. A prior reservation row never reconstructs this authority.
+    const reservation = await result.reserveOriginalApplicationSuccessor(
+      identity,
+      originalCustody,
+      signal,
+      expectedGeneration,
+    );
+    const issued = LinuxOciApplicationSuccessorReservation.issuance(reservation);
+    const { selected, guard } = await selectCurrentOciInit(identity, signal);
+    sameRecord(issued.record, selected);
+    const current = await prepareCurrentOciInit(
+      selected,
+      originalCustody,
+      signal,
+      guard,
+      "application-successor",
+    );
+    let held: LinuxOciHeldLiveInit | undefined;
+    try {
+      held = await current.openHeld((actualSignal) =>
+        assertOriginalApplicationSuccessorReservation(
+          reservation,
+          identity,
+          originalCustody,
+          actualSignal,
+        ),
+      );
+      current.assertLocal();
+      if (
+        held.revocation.aborted ||
+        held.identity.namespaceDevice !== issued.observation.namespaceDevice ||
+        held.identity.namespaceInode !== issued.observation.namespaceInode
+      )
+        return fail();
+      return { held, record: issued.record, httpPort: issued.httpPort };
+    } catch (error) {
+      // The creator retains an unacknowledged close independently of handoff.
+      await held?.close().catch(() => undefined);
+      throw error;
+    } finally {
+      current.finish();
+    }
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
@@ -5140,51 +5206,29 @@ export function createDockerContainerCoreOwner(
     },
     assertOriginalApplicationSuccessorReservation,
     async openCurrentApplicationSuccessorLiveInit(selector, originalCustody, signal) {
-      const identity = captureCurrentOciSelector(selector);
-      // Only this mint's acknowledged reservation can proceed to the one held
-      // connector. A prior reservation row never reconstructs this authority.
-      const reservation = await result.reserveOriginalApplicationSuccessor(
-        identity,
-        originalCustody,
-        signal,
-      );
-      const issued = LinuxOciApplicationSuccessorReservation.issuance(reservation);
-      const { selected, guard } = await selectCurrentOciInit(identity, signal);
-      sameRecord(issued.record, selected);
-      const current = await prepareCurrentOciInit(
-        selected,
-        originalCustody,
-        signal,
-        guard,
-        "application-successor",
-      );
-      let held: LinuxOciHeldLiveInit | undefined;
-      try {
-        held = await current.openHeld((actualSignal) =>
-          assertOriginalApplicationSuccessorReservation(
-            reservation,
-            identity,
-            originalCustody,
-            actualSignal,
-          ),
-        );
-        current.assertLocal();
-        if (
-          held.revocation.aborted ||
-          held.identity.namespaceDevice !== issued.observation.namespaceDevice ||
-          held.identity.namespaceInode !== issued.observation.namespaceInode
-        )
-          return fail();
-        return held;
-      } catch (error) {
-        // The creator retains an unacknowledged close independently of handoff.
-        await held?.close().catch(() => undefined);
-        throw error;
-      } finally {
-        current.finish();
-      }
+      const { held } = await openApplicationSuccessor(selector, originalCustody, signal);
+      return held;
     },
-    async reserveOriginalApplicationSuccessor(selector, originalCustody, signal) {
+    async openCurrentApplicationSuccessorHttp(selector, generation, originalCustody, signal) {
+      if (!Number.isSafeInteger(generation) || generation < 1) return fail();
+      const { held, record, httpPort } = await openApplicationSuccessor(
+        selector,
+        originalCustody,
+        signal,
+        generation,
+      );
+      if (httpPort === undefined) {
+        await held.close();
+        return fail();
+      }
+      return Object.freeze({ held, record, httpPort });
+    },
+    async reserveOriginalApplicationSuccessor(
+      selector,
+      originalCustody,
+      signal,
+      expectedGeneration,
+    ) {
       if (!runtimeApplicationOwner || !(signal instanceof AbortSignal)) return fail();
       const identity = captureCurrentOciSelector(selector);
       assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
@@ -5194,6 +5238,11 @@ export function createDockerContainerCoreOwner(
       );
       if (schema.length !== 1 || schema[0]?.ready !== 1) return fail();
       const { selected, guard } = await selectCurrentOciInit(identity, signal);
+      if (
+        expectedGeneration !== undefined &&
+        selected.intent.policy.generation !== expectedGeneration
+      )
+        return fail();
       const current = await prepareCurrentOciInit(
         selected,
         originalCustody,
@@ -5202,7 +5251,14 @@ export function createDockerContainerCoreOwner(
         "application-successor",
       );
       try {
-        const { captured, coordinates, raw, assertControlKey } = current;
+        const { captured, coordinates, raw, acceptedSpecJson, assertControlKey } = current;
+        let httpPort: number | undefined;
+        if (expectedGeneration !== undefined) {
+          const port = publicSpec(acceptedSpecJson)[C.fields.httpPort];
+          if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535)
+            return fail();
+          httpPort = port;
+        }
         const scope = "resource_uid=? AND generation=? AND claim_id=? AND native_id=?";
         const unclaimed =
           " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=?)";
@@ -5255,6 +5311,7 @@ export function createDockerContainerCoreOwner(
           signal,
           record: captured,
           observation,
+          httpPort,
           ownerToken,
           predecessor,
           liveSql: live,

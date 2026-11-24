@@ -1,5 +1,17 @@
 import { expect, spyOn, test } from "bun:test";
+import * as childProcess from "node:child_process";
+import * as fs from "node:fs";
+import * as files from "node:fs/promises";
 import * as net from "node:net";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
+import { LINUX_OCI_HOST_TOPOLOGY_FILE } from "../src/providers/linux-oci-host-topology.ts";
+import {
+  V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND,
+  V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
+  V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
+} from "../src/takoform-v2/container-owner-schema.ts";
 import {
   observeRawPromise,
   ownedRawHttp,
@@ -10,6 +22,7 @@ import {
   acceptedRawHttp,
   originalOwnedOciFixture,
 } from "./helpers/linux-oci-owned-bundle-fixture.ts";
+import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // Original signed Core/acceptance/Engine/creator, memorySQLite and intercepted
 // P/H/HTTP streams only. Imported prior cases are filtered, never invoked.
@@ -344,3 +357,215 @@ test("OCI HTTP unknown upload cancellation retains original handle without STOP/
     await x.cleanup();
   }
 });
+
+function successorPeer(replies: (command: string) => readonly [body: object, final: boolean]) {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.defineProperties(new childProcess.ChildProcess(), {
+    stdin: { value: stdin },
+    stdout: { value: stdout },
+    stderr: { value: stderr },
+  });
+  stdin.on("data", (bytes: Buffer) => {
+    const [reply, final] = replies(bytes.subarray(4).toString());
+    const body = Buffer.from(JSON.stringify({ ...reply, barrier: "unproven" }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(body.length);
+    stdout.write(Buffer.concat([length, body]));
+    if (final) {
+      stdout.emit("end");
+      stderr.emit("end");
+      child.emit("exit", 0, null);
+      child.emit("close", 0, null);
+    }
+  });
+  return child;
+}
+
+function modelRootTopology(path: string) {
+  if (process.getuid?.() === 0) return () => undefined;
+  // Native root ownership is the only inferred stat field in this portable fixture.
+  const root = (stat: fs.BigIntStats) => Object.assign(stat, { uid: 0n });
+  const open = files.open;
+  const opened = spyOn(files, "open").mockImplementation(async (...args) => {
+    const file = await open(...args);
+    if (args[0] === path) {
+      const stat = file.stat.bind(file);
+      file.stat = ((...opts: Parameters<typeof file.stat>) =>
+        stat(...opts).then((actual) => root(actual as fs.BigIntStats))) as typeof file.stat;
+    }
+    return file;
+  });
+  const lstat = fs.lstatSync;
+  const named = spyOn(fs, "lstatSync").mockImplementation(((...args) => {
+    const stat = Reflect.apply(lstat, fs, args);
+    return args[0] === path ? root(stat) : stat;
+  }) as typeof lstat);
+  return () => {
+    opened.mockRestore();
+    named.mockRestore();
+  };
+}
+
+test("OCI HTTP successor owns the accepted endpoint and joins its raw I/O before held close", async () => {
+  const f = await originalPeerDeleteFixture({
+    normal: true,
+    configuredPeer: true,
+    qualifiedProducer: true,
+    runtimeApplicationOwner: true,
+    allocationSchema: true,
+  });
+  let fresh: ReturnType<typeof f.reconstructParent> | undefined;
+  const health = acceptedRawHttp();
+  health.onEnd(() => {
+    health.reply();
+    health.join();
+  });
+  let cleanupIo = () => {};
+  try {
+    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })));
+    await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+    await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({
+      id: accepted.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    await f.composition.close();
+    health.restore();
+    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
+
+    const original = f.recordedCreate();
+    const selector = {
+      resourceUid: accepted.resourceUid,
+      incarnationId: original.incarnationId,
+      generation: original.generation,
+    };
+    const signal = new AbortController().signal;
+    const creator = f.reconstructParent();
+    fresh = creator;
+    const path = join(original.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE);
+    const identity = { nativeId: original.claimId, namespaceDevice: "4", namespaceInode: "5" };
+    const stat = await files.lstat(path, { bigint: true });
+    const topology = {
+      device: String(stat.dev),
+      inode: String(stat.ino),
+      size: String(stat.size),
+      uid: "0",
+      mode: String(stat.mode),
+      nlink: String(stat.nlink),
+      mtimeNs: String(stat.mtimeNs),
+      ctimeNs: String(stat.ctimeNs),
+    };
+    const restoreRoot = modelRootTopology(path);
+    const raw = spyOn(childProcess, "spawn");
+    const io = ownedRawHttp();
+    cleanupIo = () => {
+      io.closeResponse();
+      io.closeRequest();
+      io.restore();
+      restoreRoot();
+      raw.mockRestore();
+    };
+    const existingCalls = raw.mock.calls.length;
+    const reservations = () =>
+      f.sql.query(
+        "SELECT generation,epoch,close_document FROM tf_v2_container_application_successors",
+      );
+    await expect(
+      creator.openCurrentSuccessorServingHttp(
+        { ...selector, generation: selector.generation + 1 },
+        signal,
+      ),
+    ).rejects.toThrow();
+    expect(await reservations()).toEqual([]);
+    expect(raw.mock.calls).toHaveLength(existingCalls);
+    await expect(
+      creator.openServingHttp(selector, new Request("http://caller.invalid/"), () => {}),
+    ).rejects.toThrow("http_custody");
+    expect(io.counts().calls).toBe(0);
+
+    let heldCloses = 0;
+    const live = successorPeer(() => [{ kind: "linux-oci-parent-live-init@1", ...identity }, true]);
+    let opened = false;
+    const held = successorPeer((command) => {
+      if (!opened) {
+        opened = true;
+        expect(command.startsWith("TKOPEER2")).toBe(true);
+        return [{ kind: "linux-oci-parent-held-live-init@1", ...identity }, false];
+      }
+      switch (JSON.parse(command).kind) {
+        case "linux-oci-parent-held-live-init-read@1":
+          return [{ kind: "linux-oci-parent-held-live-init-current@1" }, false];
+        case "linux-oci-parent-held-admission-read@1":
+          return [
+            {
+              kind: "linux-oci-parent-held-admission-current@1",
+              nativeId: identity.nativeId,
+              generation: String(original.generation),
+              namespaceDevice: identity.namespaceDevice,
+              namespaceInode: identity.namespaceInode,
+              topology,
+            },
+            false,
+          ];
+        case "linux-oci-parent-held-live-init-close@1":
+          heldCloses++;
+          return [{ kind: "linux-oci-parent-held-live-init-closed@1" }, true];
+        default:
+          throw new Error("unexpected held command");
+      }
+    });
+
+    raw.mockReturnValueOnce(live).mockReturnValueOnce(held);
+    const connection = await creator.openCurrentSuccessorServingHttp(selector, signal);
+    const originalCall = connection.open(
+      new Request("https://caller.invalid/actual?x=1"),
+      () => {},
+    );
+    const settled = observeRawPromise(originalCall.settlement);
+    for (let i = 0; i < 250 && !io.counts().calls; i++) await rawTick();
+    expect(io.counts().calls).toBe(1);
+    expect(String(io.targets[0])).toBe("http://10.240.0.3:8080/actual?x=1");
+    io.head();
+    const response = await originalCall.response;
+    io.incoming.end("NONSECRET successor response");
+    expect(await response.text()).toBe("NONSECRET successor response");
+    await rawTick();
+    expect(settled.state()).toBe("pending");
+
+    const closing = observeRawPromise(connection.close());
+    await rawTick();
+    expect(closing.state()).toBe("pending");
+    expect(heldCloses).toBe(0);
+    io.closeResponse();
+    await rawTick();
+    expect(closing.state()).toBe("pending");
+    io.closeRequest();
+    expect(await settled.value).toHaveProperty("result");
+    expect(await closing.value).toHaveProperty("result");
+    expect(heldCloses).toBe(1);
+    expect(await reservations()).toEqual([
+      {
+        generation: original.generation,
+        epoch: 1,
+        close_document: null,
+      },
+    ]);
+
+    await expect(creator.openCurrentSuccessorServingHttp(selector, signal)).rejects.toThrow();
+    expect(raw.mock.calls).toHaveLength(existingCalls + 2);
+    expect(io.counts().calls).toBe(1);
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    cleanupIo();
+    health.restore();
+    try {
+      await fresh?.close();
+    } finally {
+      await f.cleanup();
+    }
+  }
+}, 20_000);
