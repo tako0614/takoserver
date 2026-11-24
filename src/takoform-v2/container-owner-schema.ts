@@ -1108,6 +1108,169 @@ export async function inspectV2ContainerOwnerShutdownIoSchema(sql: Sql): Promise
   }
 }
 
+const applicationSuccessorTable = `${PREFIX}application_successors`;
+const currentApplicationSuccessorClaim = `EXISTS (
+  SELECT 1 FROM ${Q} claim
+  JOIN ${I} instance ON instance.resource_uid = claim.resource_uid
+  JOIN ${R} revision ON revision.resource_uid = claim.resource_uid AND revision.generation = claim.generation
+  JOIN ${S} started ON started.resource_uid = claim.resource_uid AND started.generation = claim.generation
+  JOIN main.tf_v2_resources resource ON resource.uid = claim.resource_uid
+  JOIN main.tf_v2_operations operation ON operation.id = revision.operation_id
+  WHERE claim.resource_uid = NEW.resource_uid AND claim.generation = NEW.generation
+    AND claim.claim_id = NEW.claim_id AND claim.native_id = NEW.native_id
+    AND claim.installation_id = instance.installation_id AND claim.state = 'bound'
+    AND claim.allocation_cleanup = 'untouched'
+    AND claim.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+    AND json_extract(claim.native_control, '$.kind') = 'linux-oci-sealed-control@1'
+    AND json_extract(claim.native_control, '$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1'
+    AND instance.form_url = ${literal(F2_FORM)} AND instance.desired_generation = claim.generation
+    AND instance.serving_generation = claim.generation AND instance.retire_operation_id IS NULL
+    AND instance.retired_at_ms IS NULL AND revision.retention = 'serving'
+    AND started.attempt = 1 AND started.create_claim_id = claim.claim_id AND started.native_id = claim.native_id
+    AND started.state = 'running' AND started.confirmed_running_at_ms IS NOT NULL
+    AND resource.principal = instance.principal AND resource.space = instance.space AND resource.name = instance.name
+    AND resource.form_url = instance.form_url AND resource.backend_id = instance.backend_id
+    AND resource.target_key = instance.target_key AND resource.generation = claim.generation
+    AND resource.observed_generation = claim.generation AND resource.last_operation = operation.id
+    AND resource.phase = 'idle' AND resource.deleted_at IS NULL AND resource.busy_operation IS NULL
+    AND json_type(resource.observed_json, '$.ready') = 'true'
+    AND json_extract(resource.observed_json, '$.servingGeneration') = claim.generation
+    AND operation.resource_uid = resource.uid AND operation.generation = claim.generation
+    AND operation.status = 'succeeded' AND operation.effect = 'complete')`;
+const applicationSuccessorClaim = `resource_uid = NEW.resource_uid AND generation = NEW.generation
+      AND claim_id = NEW.claim_id AND native_id = NEW.native_id`;
+const applicationSuccessorClose = `CASE WHEN json_valid(NEW.close_document) THEN
+    json_type(NEW.close_document) = 'object'
+    AND (SELECT count(*) FROM json_each(NEW.close_document)) = 5
+    AND json_extract(NEW.close_document, '$.kind') = 'linux-oci-sealed-host-application-successor-close@1'
+    AND ${text("json_extract(NEW.close_document, '$.keyId')")}
+    AND ${text("json_extract(NEW.close_document, '$.nonce')")}
+    AND json_type(NEW.close_document, '$.ciphertext') = 'text'
+    AND length(json_extract(NEW.close_document, '$.ciphertext')) > 0
+    AND json_type(NEW.close_document, '$.scope') = 'object'
+    AND (SELECT count(*) FROM json_each(NEW.close_document, '$.scope')) = 10
+    AND json_extract(NEW.close_document, '$.scope.purpose') = 'takoserver.linux-oci-host-application-successor-close@1'
+    AND json_type(NEW.close_document, '$.scope.resourceUid') = 'text'
+    AND json_extract(NEW.close_document, '$.scope.resourceUid') IS NEW.resource_uid
+    AND json_type(NEW.close_document, '$.scope.generation') = 'integer'
+    AND json_extract(NEW.close_document, '$.scope.generation') IS NEW.generation
+    AND json_extract(NEW.close_document, '$.scope.claimId') IS NEW.claim_id
+    AND json_extract(NEW.close_document, '$.scope.nativeId') IS NEW.native_id
+    AND json_type(NEW.close_document, '$.scope.epoch') = 'integer'
+    AND json_extract(NEW.close_document, '$.scope.epoch') IS NEW.epoch
+    AND json_extract(NEW.close_document, '$.scope.ownerToken') IS NEW.owner_token
+    AND json_extract(NEW.close_document, '$.scope.installationId') IS json_extract(NEW.predecessor_close_document, '$.scope.installationId')
+    AND json_extract(NEW.close_document, '$.scope.incarnationId') IS json_extract(NEW.predecessor_close_document, '$.scope.incarnationId')
+    AND json_extract(NEW.close_document, '$.scope.controlDigest') IS json_extract(NEW.predecessor_close_document, '$.scope.controlDigest')
+  ELSE 0 END`;
+const applicationSuccessorObjects = Object.freeze([
+  object(
+    "table",
+    applicationSuccessorTable,
+    applicationSuccessorTable,
+    `CREATE TABLE ${applicationSuccessorTable} (
+  resource_uid TEXT NOT NULL CHECK (${text("resource_uid")}),
+  generation INTEGER NOT NULL CHECK (${integer("generation", 1)}),
+  claim_id TEXT NOT NULL CHECK (${hex("claim_id")}),
+  native_id TEXT NOT NULL CHECK (${hex("native_id")}),
+  epoch INTEGER NOT NULL CHECK (${integer("epoch", 1)}),
+  owner_token TEXT NOT NULL UNIQUE CHECK (${hex("owner_token")}),
+  predecessor_close_document TEXT NOT NULL CHECK (typeof(predecessor_close_document) = 'text' AND length(predecessor_close_document) BETWEEN 1 AND 65536 AND json_valid(predecessor_close_document)),
+  close_document TEXT CHECK (close_document IS NULL OR (typeof(close_document) = 'text' AND length(close_document) BETWEEN 1 AND 65536 AND json_valid(close_document))),
+  PRIMARY KEY (resource_uid, generation, epoch),
+  FOREIGN KEY (resource_uid, generation) REFERENCES ${Q}(resource_uid, generation)
+)`,
+  ),
+  trigger(
+    "application_successor_reserve",
+    applicationSuccessorTable,
+    "BEFORE INSERT",
+    refuse(`NEW.close_document IS NULL AND ${currentApplicationSuccessorClaim}
+    AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable}
+      WHERE owner_token = NEW.owner_token OR (resource_uid = NEW.resource_uid AND generation = NEW.generation AND epoch >= NEW.epoch))
+    AND ((NEW.epoch = 1 AND EXISTS (SELECT 1 FROM ${shutdownIoTable}
+        WHERE ${applicationSuccessorClaim} AND close_document = NEW.predecessor_close_document))
+      OR (NEW.epoch > 1 AND EXISTS (SELECT 1 FROM ${applicationSuccessorTable}
+        WHERE ${applicationSuccessorClaim} AND epoch = NEW.epoch - 1 AND close_document = NEW.predecessor_close_document)))`),
+  ),
+  trigger(
+    "application_successor_record_close",
+    applicationSuccessorTable,
+    "BEFORE UPDATE",
+    refuse(`${same(["resource_uid", "generation", "claim_id", "native_id", "epoch", "owner_token", "predecessor_close_document"])}
+    AND OLD.close_document IS NULL AND ${applicationSuccessorClose}
+    AND ${currentApplicationSuccessorClaim}`),
+  ),
+  trigger("application_successor_retain", applicationSuccessorTable, "BEFORE DELETE", refuse("0")),
+  trigger(
+    "application_successor_fence_delete",
+    A,
+    "BEFORE INSERT",
+    `  SELECT CASE WHEN NEW.action = 'delete' AND EXISTS (SELECT 1 FROM ${applicationSuccessorTable}
+    WHERE resource_uid = NEW.resource_uid) THEN RAISE(ABORT, 'container_owner_application_successor_delete') END;`,
+  ),
+]);
+const applicationSuccessorSelectedObjects = Object.freeze([
+  ...shutdownIoSelectedObjects,
+  ...applicationSuccessorObjects,
+]);
+const applicationSuccessorRows = Object.freeze(
+  applicationSuccessorSelectedObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const applicationSuccessorReadyParams = Object.freeze([JSON.stringify(applicationSuccessorRows)]);
+const applicationSuccessorReady =
+  "(WITH container_owner_application_successor_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, row, column) =>
+      `json_extract((SELECT document FROM container_owner_application_successor_values), '$[${row}][${column}]')`,
+    applicationSuccessorRows,
+    applicationSuccessorSelectedObjects.map((item) => literal(item.name)).join(", "),
+    `${tableNames}, ${literal(shutdownIoTable)}, ${literal(applicationSuccessorTable)}`,
+  ) +
+  ")";
+const applicationSuccessorTransition = "__tako_container_application_successor_transition";
+
+/** Optional SQLite candidate. The row records a one-use reservation before I/O
+ * and retains one terminal envelope per epoch. Only the owning runtime can
+ * authenticate either close envelope. The existing acceptance guards still
+ * require their exact schemas. A future consumer must coordinate both DELETE
+ * and UPDATE with successor custody before accepting either action. */
+export const V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
+  objects: applicationSuccessorSelectedObjects,
+  statements: Object.freeze(
+    [
+      { sql: `CREATE TABLE temp.${applicationSuccessorTransition} (ok INTEGER NOT NULL)` },
+      {
+        sql: `INSERT INTO temp.${applicationSuccessorTransition} VALUES (CASE WHEN ${shutdownIoReady} THEN 1 END)`,
+        params: shutdownIoReadyParams,
+      },
+      ...applicationSuccessorObjects.map(({ sql }) => ({ sql })),
+      {
+        sql: `UPDATE temp.${applicationSuccessorTransition} SET ok = CASE WHEN ${applicationSuccessorReady} THEN 1 END`,
+        params: applicationSuccessorReadyParams,
+      },
+      { sql: `DROP TABLE temp.${applicationSuccessorTransition}` },
+    ].map((statement) => Object.freeze(statement)),
+  ) as readonly SqlStatement[],
+});
+
+export async function inspectV2ContainerOwnerApplicationSuccessorSchema(
+  sql: Sql,
+): Promise<boolean> {
+  try {
+    const rows = await sql.query(
+      `SELECT ${applicationSuccessorReady} AS ready`,
+      applicationSuccessorReadyParams,
+    );
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+
 /** Existing standalone inspectors retain their exact predecessor shapes. */
 export async function inspectV2ContainerOwnerSelectedSchema(
   sql: Sql,
