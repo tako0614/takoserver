@@ -75,6 +75,11 @@ int tns_oci_observe_started(struct tns_oci_owner *owner,
 /* Read the original held init and allocation without changing the owner's
  * phase on refusal. This fact does not check policy or authorize serving. */
 int tns_oci_read_live_init(struct tns_oci_owner *owner, struct tns_oci_started *started);
+/* Private kernel/identity prerequisite for a future full admission refresh.
+ * Checks the original live init, immutable inputs and current uncut kernel
+ * admission. The installed ruleset and live uplink require their own fresh
+ * read before any physical admission fact can be sent. */
+int tns_oci_check_original_kernel_admission(struct tns_oci_owner *owner);
 /* Duplicate exactly the held original init after the same nonmutating read.
  * The private native caller owns the CLOEXEC duplicate on success. */
 int tns_oci_duplicate_live_init(struct tns_oci_owner *owner,

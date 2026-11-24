@@ -819,6 +819,30 @@ fail:
 #include "docker-container-terminal-oci-policy.h"
 #include "docker-container-terminal-oci-admission.h"
 
+int tns_oci_check_original_kernel_admission(struct tns_oci_owner *o) {
+  if (!o || !o->policy || o->policy->original != o || !o->policy->selected ||
+      !o->policy->verified || o->policy->close_unknown || o->policy->runtime ||
+      !o->uplink || o->policy->uplink != o->uplink || o->uplink->original != o ||
+      !o->uplink->file_selected || !o->uplink->configured || !o->uplink->pair_known ||
+      o->uplink->broken || o->uplink->close_unknown || o->uplink->cleaning ||
+      o->uplink->lock_held || !o->egress_selected || !o->egress_guard_verified ||
+      o->egress_close_unknown || !o->admission_attempt || !o->admission ||
+      !o->admission->open_acknowledged || o->admission->close_unknown) {
+    errno = EUCLEAN;
+    return -1;
+  }
+  struct tns_oci_started started;
+  struct tns_identity birth;
+  if (tns_oci_read_live_init(o, &started) < 0 ||
+      tns_owner_read_admitted_identity(o->birth, &birth) < 0 ||
+      oci_admission_observable(o) < 0) return -1;
+  if (started.namespace_device != birth.device || started.namespace_inode != birth.inode ||
+      !tns_identity_equal(&o->uplink->identity, &birth)) { errno = ESTALE; return -1; }
+  if (tns_oci_read_live_init(o, &started) < 0 || oci_admission_observable(o) < 0 ||
+      oci_private_init_current(o) < 0) return -1;
+  return oci_not_canceled();
+}
+
 static int oci_create_profile(const struct tns_oci_options *options,
                                 struct tns_oci_owner **slot,
                                 enum oci_retirement_profile profile) {
