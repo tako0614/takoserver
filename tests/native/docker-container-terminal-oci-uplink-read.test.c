@@ -167,6 +167,65 @@ static void original_untouched(const struct tns_oci_owner *o, const struct tns_o
   CHECK(b->phase == TNS_HELD && !b->cut_attempted && !o->invalid && !o->policy->runtime && !ad.cuts);
 }
 
+static void read_topology_prepare(struct tns_oci_owner *o, struct tns_owner *b) {
+  read_prepare(o, b);
+  struct oci_uplink_owner *u = o->uplink;
+  u->create_sent = u->create_known = u->link_path_captured = u->driver_captured = 1;
+  u->host_index = 50;
+  u->guest_index = 51;
+  u->loopback_index = 1;
+  memcpy(u->host_mac, (const unsigned char[]){2,1,2,3,4,5}, 6);
+  memcpy(u->guest_mac, (const unsigned char[]){2,1,2,3,4,6}, 6);
+  u->driver_facts.driver.cmd = ETHTOOL_GDRVINFO;
+  strcpy(u->driver_facts.driver.driver, "raw-original-driver");
+  strcpy(u->driver_facts.driver.version, "6.12");
+  u->driver_facts.features.cmd = ETHTOOL_GFEATURES;
+  u->driver_facts.features.size = 2;
+  u->driver_facts.features.blocks[0].available = u->driver_facts.features.blocks[0].requested =
+    u->driver_facts.features.blocks[0].active = 1;
+  up.created = up.bounded_read_fixture = 1;
+  for (size_t side = 0; side < 2; ++side) {
+    up.up[side] = up.routes[side] = 1;
+    for (size_t family = 0; family < 2; ++family) up.assigned[side][family] = pol.neighbors[side][family] = 1;
+  }
+  CHECK(oci_policy_network(o->policy, AF_INET, u->expected.local4, 32) == 0);
+  CHECK(oci_policy_network(o->policy, AF_INET6, u->expected.local6, 128) == 0);
+  CHECK(oci_policy_network(o->policy, AF_INET, u->expected.host4, 32) == 0);
+  CHECK(oci_policy_network(o->policy, AF_INET6, u->expected.host6, 128) == 0);
+}
+
+static void read_topology_cases(void) {
+  for (unsigned int fault = 0; fault < 6; ++fault) {
+    struct tns_oci_owner o;
+    struct tns_owner b;
+    struct oci_uplink_read r = {0};
+    struct stat observed, empty;
+    memset(&observed, 0xa5, sizeof(observed));
+    memset(&empty, 0xa5, sizeof(empty));
+    read_topology_prepare(&o, &b);
+    CHECK(oci_uplink_read_open(&o, &r, 3000) == 0);
+    struct oci_uplink_request forbidden = {0};
+    CHECK(oci_uplink_mutate(r.scratch, 0, &forbidden) < 0 && !up.mutations);
+    CHECK(oci_uplink_lock(r.scratch) < 0 && oci_uplink_unlock(r.scratch) < 0);
+    if (fault == 1) pol.fault = 2; /* Non-permanent original peer. */
+    if (fault == 2) up.routes[1] = 0;
+    if (fault == 3) up.up[1] = 0;
+    if (fault == 4) up.file[0] ^= 1;
+    if (fault == 5) o.policy->denied[0].address[0] ^= 1;
+    int result = oci_policy_read_topology_current(&o, &r, &observed);
+    if (!fault) {
+      CHECK(result == 0 && oci_egress_same_stat(&observed, &o.uplink->file_identity));
+      CHECK(observed.st_nlink == 1 && observed.st_uid == 0 && (observed.st_mode & 07777) == 0600);
+      CHECK(r.scratch->sequence > 10 && !r.scratch->broken);
+    } else {
+      CHECK(result < 0 && !memcmp(&observed, &empty, sizeof(observed)));
+    }
+    CHECK(o.policy->denied_count == 4 && r.scratch && oci_uplink_read_close(&r) == 0);
+    original_untouched(&o, &b);
+    admission_discard(&o);
+  }
+}
+
 static void read_cases(void) {
   struct tns_oci_owner o;
   struct tns_owner b;
@@ -229,6 +288,7 @@ static void read_cases(void) {
 
 int main(void) {
   read_cases();
+  read_topology_cases();
   printf("isolated native uplink read model: %lu checks\n", checks);
   return 0;
 }

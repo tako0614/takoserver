@@ -251,7 +251,8 @@ static int oci_policy_neighbor_read(struct oci_policy_owner *p,int guest,int fam
   struct msghdr message={.msg_name=&kernel,.msg_namelen=sizeof(kernel),.msg_iov=&iov,.msg_iovlen=1};
   int64_t now=oci_now();
   if(now<0)return -1;
-  int64_t deadline=now+2500;
+  int64_t deadline=u->read_scope ? u->read_scope->deadline : now+2500;
+  if(u->read_scope && (oci_egress_left(deadline)<0 || oci_not_canceled()<0))return -1;
   if(sendmsg(fd,&message,MSG_NOSIGNAL)!=(ssize_t)sizeof(request))goto fail;
   unsigned int found=0,done=0,records=0;
   size_t total=0;
@@ -822,6 +823,31 @@ static int oci_policy_runtime_facts(struct oci_policy_owner *p) {
     if (oci_policy_neighbor_read(p,side,AF_INET) < 0 ||
         oci_policy_neighbor_read(p,side,AF_INET6) < 0) return -1;
   return oci_policy_original(p);
+}
+
+/* Use the already-installed original baseline with the independently bound
+ * GET transport. Inventory comparisons have their own writable copy. */
+static inline int oci_policy_read_topology_current(struct tns_oci_owner *o,
+                                                   struct oci_uplink_read *r,
+                                                   struct stat *topology_identity) {
+  if (!o || !r || !r->ready || !r->scratch || r->scratch->original != o ||
+      !topology_identity || oci_uplink_read_current(r) < 0) return -1;
+  const struct oci_uplink_owner *u = r->original;
+  const struct oci_policy_owner *original = o->policy;
+  if (!u->create_sent || !u->create_known || !u->link_path_captured || !u->driver_captured ||
+      !u->host_index || !u->guest_index || !u->loopback_index || !original->denied_count) {
+    errno = EUCLEAN;
+    return -1;
+  }
+  struct oci_policy_owner *readback = malloc(sizeof(*readback));
+  if (!readback) return -1;
+  *readback = *original;
+  readback->uplink = r->scratch;
+  readback->runtime = NULL;
+  int result = oci_policy_runtime_facts(readback);
+  if (!result) result = oci_uplink_read_topology_identity(r, topology_identity);
+  free(readback);
+  return result;
 }
 static int oci_policy_runtime_read(struct oci_policy_owner *p,int64_t deadline,
                                    char *output,size_t *used) {

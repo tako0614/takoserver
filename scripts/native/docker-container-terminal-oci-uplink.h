@@ -56,8 +56,10 @@ struct oci_uplink_link_path {
   unsigned char kind[UINT16_MAX - sizeof(struct rtattr)];
 };
 struct oci_host_path_owner;
+struct oci_uplink_read;
 struct oci_uplink_owner {
   struct oci_host_path_owner *host_path;
+  struct oci_uplink_read *read_scope;
   struct tns_oci_owner *original;
   struct oci_uplink_topology expected;
   struct tns_identity identity, creator;
@@ -80,6 +82,14 @@ struct oci_uplink_owner {
   unsigned int create_sent, create_known, pair_known, configured, delete_sent, delete_known;
   unsigned int phase, cleaning;
   unsigned int attempt, child_joined, child_ok, kill_attempt, broken, close_unknown;
+};
+
+/* One private observation on this H's still-held original. Every transport,
+ * timeout, sequence and cleanup latch belongs to this temporary lease. */
+struct oci_uplink_read {
+  struct oci_uplink_owner *original, *scratch;
+  int64_t deadline;
+  int attempted, ready, failed, waited, close_unknown;
 };
 
 /* Definitions follow in the original policy implementation. */
@@ -228,7 +238,13 @@ static int oci_uplink_host_current(struct oci_uplink_owner *u);
 static int oci_uplink_file_current(struct oci_uplink_owner *u);
 static int oci_uplink_cleanup_current(struct oci_uplink_owner *u);
 static int oci_uplink_lock_current(struct oci_uplink_owner *u);
+static inline int oci_uplink_read_current(const struct oci_uplink_read *r);
+static inline int oci_uplink_read_topology_identity(const struct oci_uplink_read *r,
+                                                   struct stat *identity);
+static inline int oci_uplink_read_dump_scoped(struct oci_uplink_read *r, int guest, uint16_t type,
+                                             struct oci_uplink_dump *out);
 static int oci_uplink_original(struct oci_uplink_owner *u) {
+  if (u && u->read_scope) return oci_uplink_read_current(u->read_scope);
   if (u && u->cleaning) return oci_uplink_cleanup_current(u);
   if (!u || !u->original || u->controller != getpid() || u->broken || u->close_unknown ||
       !u->original->egress_selected || !u->original->egress_guard_verified ||
@@ -355,7 +371,7 @@ static int oci_uplink_guest_receive(struct oci_uplink_owner *u, int64_t deadline
 }
 
 static int oci_uplink_guest_channel(struct tns_oci_owner *o, struct oci_uplink_owner *u) {
-  if (!o || !u || tns_oci_once(&u->attempt) < 0) { errno = EALREADY; return -1; }
+  if (!o || !u || u->read_scope || tns_oci_once(&u->attempt) < 0) { errno = EALREADY; return -1; }
   u->original = o; u->controller = getpid(); u->identity = o->identity;
   u->guest = u->host = u->channel = u->child_pidfd = u->netfd = u->lock_root = u->lock = -1;
   struct tns_lifetime life;
@@ -436,6 +452,7 @@ static int oci_uplink_dump_query(struct oci_uplink_owner *u, int guest, uint16_t
 static int oci_uplink_dump_side(struct oci_uplink_owner *u, int guest, uint16_t type,
                                 struct oci_uplink_dump *out) {
   if (!out) return -1;
+  if (u->read_scope) return oci_uplink_read_dump_scoped(u->read_scope, guest, type, out);
   int64_t now = oci_now();
   if (now < 0) return -1;
   int64_t deadline = now + 2500;
@@ -497,6 +514,7 @@ static int oci_uplink_select(struct tns_oci_owner *o, struct oci_uplink_owner **
   return oci_not_canceled();
 }
 static int oci_uplink_host_current(struct oci_uplink_owner *u) {
+  if (u->read_scope) return oci_uplink_read_current(u->read_scope);
   struct tns_identity before, held, after; struct stat st; struct statfs fs;
   if (tns_owner_observe_creator(u->original->birth, &before) < 0 ||
       !tns_identity_equal(&before, &u->creator) || fstat(u->netfd, &st) < 0 || fstatfs(u->netfd, &fs) < 0 ||
@@ -601,6 +619,7 @@ static int oci_uplink_lock_current(struct oci_uplink_owner *u) {
   return 0;
 }
 static int oci_uplink_lock(struct oci_uplink_owner *u) {
+  if (u->read_scope) { errno = EPERM; return -1; }
   if (u->lock_held) return oci_uplink_lock_current(u);
   if (oci_uplink_original(u) < 0) return -1;
   if (u->lock < 0) {
@@ -615,6 +634,7 @@ static int oci_uplink_lock(struct oci_uplink_owner *u) {
   return oci_uplink_lock_current(u);
 }
 static int oci_uplink_unlock(struct oci_uplink_owner *u) {
+  if (u->read_scope) { errno = EPERM; return -1; }
   if (!u->lock_held) return 0;
   if (oci_uplink_lock_current(u) < 0) return -1;
   struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET};
@@ -875,6 +895,7 @@ static int oci_uplink_ack(const void *bytes, size_t size, const struct nlmsghdr 
   return 0;
 }
 static int oci_uplink_mutate(struct oci_uplink_owner *u, int guest, struct oci_uplink_request *r) {
+  if (u->read_scope) { errno = EPERM; return -1; }
   if (!u->lock_held || oci_uplink_original(u) < 0 || u->sequence == UINT32_MAX) return -1;
   int fd = guest ? u->guest : u->host; uint32_t port = guest ? u->guest_port : u->host_port;
   if (fd < 0 || !port) { errno = EBADF; return -1; }
@@ -1056,6 +1077,7 @@ done:
 }
 static int oci_uplink_install(struct tns_oci_owner *o, struct oci_uplink_owner *u) {
   if (!u) return 0;
+  if (u->read_scope) { errno = EPERM; return -1; }
   if (tns_oci_once(&u->phase) < 0) { errno = EALREADY; return -1; }
   if (oci_uplink_guest_channel(o, u) < 0 || oci_uplink_host_channel(u) < 0 || oci_uplink_lock(u) < 0 || oci_uplink_new_pair(u) < 0) goto fail;
   /* Bind the actual Host forwarding edge before either new endpoint is UP. */
@@ -1109,6 +1131,7 @@ done:
 static int oci_uplink_cleanup(struct oci_uplink_owner **slot) {
   if (!slot || !*slot) return 0;
   struct oci_uplink_owner *u = *slot; int saved = 0;
+  if (u->read_scope) { errno = EPERM; return -1; }
   if (u->controller != getpid()) { errno = EPERM; return -1; }
   if (u->child && !u->child_joined) {
     if (!u->kill_attempt) {

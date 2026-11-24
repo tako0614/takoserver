@@ -1,14 +1,6 @@
 #ifndef DOCKER_CONTAINER_TERMINAL_OCI_UPLINK_READ_H
 #define DOCKER_CONTAINER_TERMINAL_OCI_UPLINK_READ_H
 
-/* One private observation on this H's still-held original. Every transport,
- * timeout, sequence and cleanup latch belongs to this temporary lease. */
-struct oci_uplink_read {
-  struct oci_uplink_owner *original, *scratch;
-  int64_t deadline;
-  int attempted, ready, failed, waited, close_unknown;
-};
-
 static inline int oci_uplink_read_namespace(int fd, const struct tns_identity *identity) {
   struct stat st;
   struct statfs fs;
@@ -39,7 +31,8 @@ static inline int oci_uplink_read_creator_current(const struct tns_identity *cre
 
 static inline int oci_uplink_read_current(const struct oci_uplink_read *r) {
   struct oci_uplink_owner *s = r->scratch, *u = r->original;
-  if (!s || s->original->retirement_profile != OCI_RETIREMENT_RUNTIME_FIRST ||
+  if (!s || r->failed || s->broken || s->read_scope != r ||
+      s->original->retirement_profile != OCI_RETIREMENT_RUNTIME_FIRST ||
       s->original->uplink != u || u->controller != s->controller ||
       u->controller != getpid() || u->cookie != s->cookie || u->host_cookie != s->host_cookie ||
       !tns_identity_equal(&u->creator, &s->creator) || !tns_identity_equal(&u->identity, &s->identity)) {
@@ -51,7 +44,28 @@ static inline int oci_uplink_read_current(const struct oci_uplink_read *r) {
       oci_uplink_read_namespace(s->netfd, &s->creator) < 0 ||
       oci_uplink_read_creator_current(&s->creator) < 0 ||
       oci_uplink_read_namespace(s->original->network, &s->identity) < 0) return -1;
+  uint32_t host_port, guest_port;
+  if (oci_uplink_socket_identity(s->host, s->host_cookie, &host_port) < 0 || host_port != s->host_port ||
+      oci_uplink_socket_identity(s->guest, s->cookie, &guest_port) < 0 || guest_port != s->guest_port) return -1;
   return oci_egress_left(r->deadline) < 0 ? -1 : oci_not_canceled();
+}
+
+/* Keep the CREATE topology in original custody. The admitted proof may export
+ * a final fstat identity only from this same retained, exact named FD. */
+static inline int oci_uplink_read_topology_identity(const struct oci_uplink_read *r,
+                                                   struct stat *identity) {
+  struct oci_uplink_owner *u = r->original;
+  struct stat actual;
+  if (!identity || !r->ready || oci_uplink_read_current(r) < 0 || !u->file_selected ||
+      oci_uplink_file_current(u) < 0 || fstat(u->file, &actual) < 0) return -1;
+  if (!S_ISREG(actual.st_mode) || actual.st_uid || (actual.st_mode & 07777) != 0600 ||
+      actual.st_nlink != 1 || !oci_egress_same_stat(&actual, &u->file_identity)) {
+    errno = ESTALE;
+    return -1;
+  }
+  if (oci_uplink_read_current(r) < 0) return -1;
+  *identity = actual;
+  return 0;
 }
 
 static inline int oci_uplink_read_wait(struct oci_uplink_read *r, int timeout) {
@@ -155,12 +169,31 @@ static inline int oci_uplink_read_open(struct tns_oci_owner *o, struct oci_uplin
   r->scratch = s;
   r->deadline = deadline;
   s->original = o;
+  s->read_scope = r;
   s->identity = u->identity;
   s->creator = u->creator;
   s->cookie = u->cookie;
   s->host_cookie = u->host_cookie;
   s->controller = getpid();
-  s->netfd = s->child_pidfd = s->channel = s->guest = s->host = s->lock = -1;
+  s->netfd = s->child_pidfd = s->channel = s->guest = s->host = s->lock = s->lock_root = s->file = -1;
+  /* Immutable CREATE observations qualify the shared validators. Only this
+   * lease receives their independent observations and failure latches. */
+  s->expected = u->expected;
+  s->driver_facts = u->driver_facts;
+  s->driver_captured = u->driver_captured;
+  s->link_path = u->link_path;
+  s->link_path_captured = u->link_path_captured;
+  s->create_sent = u->create_sent;
+  s->create_known = u->create_known;
+  s->pair_known = u->pair_known;
+  s->configured = u->configured;
+  s->host_index = u->host_index;
+  s->guest_index = u->guest_index;
+  s->loopback_index = u->loopback_index;
+  memcpy(s->host_mac, u->host_mac, sizeof(s->host_mac));
+  memcpy(s->guest_mac, u->guest_mac, sizeof(s->guest_mac));
+  memcpy(s->host_name, u->host_name, sizeof(s->host_name));
+  memcpy(s->guest_name, u->guest_name, sizeof(s->guest_name));
   s->netfd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
   if (s->netfd < 0 || oci_uplink_read_namespace(s->netfd, &s->creator) < 0 ||
       oci_uplink_open_route(&s->host) < 0 ||
@@ -203,8 +236,8 @@ static inline int oci_uplink_read_dump_one(struct oci_uplink_read *r, int guest,
 
 /* Returns only actual bounded GET bytes validated by the existing parser.
  * Full policy evidence needs both namespaces' live policy and a final join. */
-static inline int oci_uplink_read_dump(struct oci_uplink_read *r, int guest, uint16_t type,
-                                      struct oci_uplink_dump *out) {
+static inline int oci_uplink_read_dump_scoped(struct oci_uplink_read *r, int guest, uint16_t type,
+                                             struct oci_uplink_dump *out) {
   if (!r || !out || !r->ready || r->failed || (guest != 0 && guest != 1)) { errno = EINVAL; return -1; }
   memset(out, 0, sizeof(*out));
   if (oci_uplink_read_current(r) < 0 || oci_uplink_read_dump_one(r, guest, type, 0, out) < 0) goto fail;
@@ -214,13 +247,21 @@ static inline int oci_uplink_read_dump(struct oci_uplink_read *r, int guest, uin
     if (records != out->records) { errno = ESTALE; goto fail; }
   }
   return 0;
-fail: {
-  int saved = errno ? errno : EPROTO;
+fail:
   r->failed = 1;
   out->failed = 1;
-  (void)oci_uplink_read_close(r);
-  errno = saved;
+  if (!errno) errno = EPROTO;
   return -1;
 }
+
+static inline int oci_uplink_read_dump(struct oci_uplink_read *r, int guest, uint16_t type,
+                                      struct oci_uplink_dump *out) {
+  int result = oci_uplink_read_dump_scoped(r, guest, type, out);
+  if (result < 0 && r && r->failed) {
+    int saved = errno;
+    (void)oci_uplink_read_close(r);
+    errno = saved;
+  }
+  return result;
 }
 #endif

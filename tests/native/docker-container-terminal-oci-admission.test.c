@@ -71,7 +71,7 @@ static struct {
  char file[32769]; size_t file_size;
  int active, child, wrong_host, no_file, malformed, bad_ack, drop_ack, read_fault, close_fault, nack_at, bad_lock, unlock_fault, conflict, cookie_fault;
  unsigned int mutations, creates, deletes, closes[600], joins, signals, sockets, dumps, steps;
- int created, removed, assigned[2][2], up[2], routes[2];
+ int created, removed, assigned[2][2], up[2], routes[2], bounded_read_fixture;
  struct nlmsghdr request; unsigned char request_bytes[4096];
  /* Separate raw Host-command descriptors; reset by original prepare memset. */
  unsigned int host_pipes, host_spawns, host_joins[6], host_eof[6], host_signals[6];
@@ -698,10 +698,13 @@ static ssize_t up_recvmsg(int fd,struct msghdr *m,int flags){CHECK(m->msg_iovlen
  if((up.request.nlmsg_flags&NLM_F_DUMP)!=NLM_F_DUMP){struct nlmsghdr h={.nlmsg_len=NLMSG_LENGTH(sizeof(struct nlmsgerr)),.nlmsg_type=NLMSG_ERROR,.nlmsg_flags=NLM_F_CAPPED,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port};struct nlmsgerr e={.error=(up.bad_ack || (up.nack_at && up.mutations==(unsigned int)up.nack_at))?-EPERM:0,.msg=up.request};memcpy(out,&h,sizeof(h));memcpy(out+NLMSG_HDRLEN,&e,sizeof(e));return (ssize_t)h.nlmsg_len;}
  size_t at=0;struct oci_uplink_request r;if(up.request.nlmsg_type==RTM_GETLINK){if(fd==407){raw_link(&r,"eth0",2,IFF_UP,subject->expected.mac,0);((struct ifinfomsg*)r.body)->ifi_type=ARPHRD_ETHER;at=raw_append(out,at,&r,port);}else{raw_link(&r,"lo",1,IFF_LOOPBACK,NULL,0);at=raw_append(out,at,&r,port);}if(up.created && !up.removed){raw_link(&r,fd==405?subject->guest_name:subject->host_name,fd==405?51:50,up.up[fd==405]?IFF_UP:0,fd==405?subject->guest_mac:subject->host_mac,fd==405?50:51);at=raw_append(out,at,&r,port);}}
  else if(up.request.nlmsg_type==RTM_GETADDR)at=raw_addresses(out,fd==405,port);
- else if(up.request.nlmsg_type==RTM_GETROUTE)at=raw_routes(out,fd==405,port);
+ else if(up.request.nlmsg_type==RTM_GETROUTE){struct rtmsg route;memcpy(&route,up.request_bytes+NLMSG_HDRLEN,sizeof(route));if(!up.bounded_read_fixture || !(route.rtm_flags&RTM_F_CLONED))at=raw_routes(out,fd==405,port);}
  else if(up.request.nlmsg_type==RTM_GETNEIGH){struct ndmsg request;memcpy(&request,up.request_bytes+NLMSG_HDRLEN,sizeof(request));int guest=fd==405,v6=request.ndm_family==AF_INET6;CHECK((request.ndm_family==AF_INET || v6) && !request.ndm_ifindex && !request.ndm_state && !request.ndm_flags && !request.ndm_type && pol.neighbors[guest][v6]==1);struct ndmsg a={.ndm_family=request.ndm_family,.ndm_ifindex=guest?51:50,.ndm_state=NUD_PERMANENT,.ndm_type=RTN_UNICAST};oci_uplink_request(&r,RTM_NEWNEIGH,0,&a,sizeof(a));const void *ip=v6?(const void*)(guest?subject->expected.host6:subject->expected.guest6):(const void*)(guest?subject->expected.host4:subject->expected.guest4);CHECK(oci_uplink_attr(&r,NDA_DST,ip,v6?16u:4u)==0 && oci_uplink_attr(&r,NDA_LLADDR,guest?subject->host_mac:subject->guest_mac,6)==0);if(pol.fault==2)((struct ndmsg*)r.body)->ndm_state=NUD_STALE;at=raw_append(out,at,&r,port);}
  else {CHECK(up.request.nlmsg_type==RTM_GETRULE);at=raw_rules(out,port);}
- struct {struct nlmsghdr h;int result;} done={.h={.nlmsg_len=NLMSG_LENGTH(sizeof(int)),.nlmsg_type=NLMSG_DONE,.nlmsg_flags=NLM_F_MULTI,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port}};if(up.read_fault)done.h.nlmsg_flags|=NLM_F_DUMP_INTR;memcpy(out+at,&done,sizeof(done));return (ssize_t)(at+sizeof(done));
+ struct {struct nlmsghdr h;int result;} done={.h={.nlmsg_len=NLMSG_LENGTH(sizeof(int)),.nlmsg_type=NLMSG_DONE,.nlmsg_flags=NLM_F_MULTI,.nlmsg_seq=up.request.nlmsg_seq,.nlmsg_pid=port}};
+ if(up.bounded_read_fixture && up.request.nlmsg_type==RTM_GETROUTE){struct rtmsg route;memcpy(&route,up.request_bytes+NLMSG_HDRLEN,sizeof(route));if(route.rtm_flags&RTM_F_CLONED)done.h.nlmsg_flags|=NLM_F_DUMP_FILTERED;}
+ if(up.read_fault)done.h.nlmsg_flags|=NLM_F_DUMP_INTR;
+ memcpy(out+at,&done,sizeof(done));return (ssize_t)(at+sizeof(done));
 }
 static void prepare(struct tns_oci_owner *o,struct tns_owner *b){memset(&up,0,sizeof(up));lock_busy=lock_taken=0;initialize_egress(o,b);CHECK(oci_egress_select(o,9)==0 && oci_egress_guard_install(o)==0);o->command_pid=0;up.active=1;
  int n=snprintf(up.file,sizeof(up.file),"{\"kind\":\"linux-oci-owned-topology@1\",\"artifact\":%s,\"topology\":{\"interfaceName\":\"eth0\",\"interfaceIndex\":2,\"interfaceMac\":\"02:11:22:33:44:55\",\"ipv4Address\":\"192.0.2.2/24\",\"ipv4Gateway\":\"192.0.2.1\",\"ipv6Address\":\"2001:db8::2/64\",\"ipv6Gateway\":\"2001:db8::1\",\"peerIpv4Host\":\"10.77.0.2\",\"peerIpv4Guest\":\"10.77.0.3\",\"peerIpv6Host\":\"fd77::2\",\"peerIpv6Guest\":\"fd77::3\"}}",eg.artifact);CHECK(n>0 && (size_t)n<sizeof(up.file));up.file_size=(size_t)n;
