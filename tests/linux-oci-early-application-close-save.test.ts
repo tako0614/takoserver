@@ -13,6 +13,7 @@ import {
   V2_CONTAINER_APPLICATION_IO_RESERVED,
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
   V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
+  V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
 import {
   observeRawPromise,
@@ -193,33 +194,50 @@ for (const fault of trackedCloseCases) {
   );
 }
 
-async function trackedPreStopClose(fault: (typeof trackedCloseCases)[number]) {
+async function trackedOwnerForClose(
+  options: { incompleteStart?: boolean; shutdownSchema?: boolean } = {},
+) {
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
     qualifiedProducer: true,
     runtimeApplicationOwner: true,
     allocationSchema: true,
-    ...(fault === "incomplete START" ? { managementFault: "incomplete" as const } : {}),
+    ...(options.incompleteStart ? { managementFault: "incomplete" as const } : {}),
   });
   const health = acceptedRawHttp();
   health.onEnd(() => {
     health.reply();
     health.join();
   });
-  const count = (kind: string) => f.nativeCounts().requests.filter((k) => k === kind).length;
-  const stop = "linux-oci-stop-init@1";
-  let fresh: ReturnType<typeof f.reconstructNormal> | undefined;
   try {
     await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })));
     await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+    if (options.shutdownSchema) await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
     await f.sql.batch(v2ConfiguredUpdateDiscardTransition());
     await f.sql.batch(v2FinalDeleteConfiguredUpdateDiscardTransition());
     const accepted = await f.create();
     expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
-    expect(count("linux-oci-parent-bootstrap@6")).toBe(1);
+    expect(
+      f.nativeCounts().requests.filter((kind) => kind === "linux-oci-parent-bootstrap@6"),
+    ).toHaveLength(1);
+    return { f, accepted };
+  } catch (error) {
+    await f.cleanup();
+    throw error;
+  } finally {
     health.restore();
+  }
+}
 
+async function trackedPreStopClose(fault: (typeof trackedCloseCases)[number]) {
+  const { f, accepted } = await trackedOwnerForClose({
+    incompleteStart: fault === "incomplete START",
+  });
+  const count = (kind: string) => f.nativeCounts().requests.filter((k) => k === kind).length;
+  const stop = "linux-oci-stop-init@1";
+  let fresh: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
     // Join the actual serving exchange before DELETE so the original
     // application's close can fulfill before any native stop is needed.
     const io = ownedRawHttp();
@@ -349,7 +367,146 @@ async function trackedPreStopClose(fault: (typeof trackedCloseCases)[number]) {
       expect(count(kind)).toBe(1);
     expect(f.network).not.toHaveBeenCalled();
   } finally {
-    health.restore();
+    await fresh?.close().catch(() => undefined);
+    await f.cleanup();
+  }
+}
+
+for (const write of ["saved", "refused"] as const) {
+  test(
+    `early-application-close-save tracked shutdown only enables a fresh DELETE with a ${write} witness`,
+    () => trackedShutdownClose(write === "refused"),
+    20000,
+  );
+}
+
+async function trackedShutdownClose(refuseWrite: boolean) {
+  const { f, accepted } = await trackedOwnerForClose({ shutdownSchema: true });
+  const io = ownedRawHttp();
+  const shutdownWitness = () => f.sql.query("SELECT * FROM tf_v2_container_shutdown_io_closes");
+  let closing: ReturnType<typeof observeRawPromise<void>> | undefined;
+  let fresh: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
+    const response = f.composition.fetchServingHttp(
+      f.recordedCreate(),
+      new Request("http://ignored.invalid/NONSECRET-shutdown-response"),
+    );
+    await waitFor(() => io.counts().calls === 1);
+    io.head();
+    expect((await response).status).toBe(200);
+    const native = f.nativeCounts();
+    const exits = f.nativeExits();
+    const actualRun = f.sql.run.bind(f.sql);
+    let writes = 0;
+    const writing = spyOn(f.sql, "run").mockImplementation((statement, params) => {
+      if (statement.startsWith("INSERT INTO tf_v2_container_shutdown_io_closes")) {
+        writes++;
+        if (refuseWrite) throw Error("NONSECRET shutdown close write refused");
+      }
+      return actualRun(statement, params);
+    });
+    try {
+      closing = observeRawPromise(f.composition.close());
+      await waitFor(() => io.counts().requestDestroy === 1);
+      expect(closing.state()).toBe("pending");
+      expect(await shutdownWitness()).toHaveLength(0);
+      io.closeResponse();
+      await rawTick();
+      expect(closing.state()).toBe("pending");
+      expect(await shutdownWitness()).toHaveLength(0);
+      io.closeRequest();
+      const shutdown = await closing.value;
+      if (refuseWrite) {
+        expect(shutdown).toHaveProperty("error");
+      } else {
+        if ("error" in shutdown) throw shutdown.error;
+        await f.composition.close();
+      }
+      expect(writes).toBe(1);
+    } finally {
+      writing.mockRestore();
+    }
+    const witnesses = await shutdownWitness();
+    expect(witnesses).toHaveLength(refuseWrite ? 0 : 1);
+    if (!refuseWrite) {
+      const { claimId, incarnationId, installationId } = f.recordedCreate();
+      const witness = witnesses[0];
+      expect(witness).toMatchObject({
+        resource_uid: accepted.resourceUid,
+        generation: 1,
+        claim_id: claimId,
+        native_id: claimId,
+      });
+      if (typeof witness?.close_document !== "string")
+        throw Error("NONSECRET shutdown close fact missing");
+      expect(JSON.parse(witness.close_document)).toMatchObject({
+        kind: "linux-oci-sealed-host-shutdown-io-close@1",
+        scope: {
+          purpose: "takoserver.linux-oci-host-shutdown-io-close@1",
+          resourceUid: accepted.resourceUid,
+          generation: 1,
+          claimId,
+          installationId,
+          incarnationId,
+        },
+      });
+    }
+    expect(await f.sql.query("SELECT id FROM tf_v2_operations WHERE action='delete'")).toEqual([]);
+    await untouched(f);
+    expect(f.nativeCounts()).toEqual(native);
+    expect(f.nativeExits()).toBe(exits);
+    if (refuseWrite) f.applicationOwnerState(true);
+
+    fresh = f.reconstructNormal();
+    const removal = await fresh.engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    f.advanceNormalClock(61_000);
+    let state = await fresh.engine.runNext();
+    expect(state).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+    if (refuseWrite) {
+      expect(f.nativeCounts()).toEqual({
+        processes: native.processes + 1,
+        requests: [...native.requests, "linux-oci-parent-read-application-owner@1"],
+      });
+      await untouched(f);
+    } else {
+      const count = (kind: string) => f.nativeCounts().requests.filter((k) => k === kind).length;
+      const stop = "linux-oci-stop-init@1";
+      expect(count(stop)).toBe(1);
+      for (let phase = 0; phase < 20 && state?.status !== "succeeded"; phase++) {
+        f.advanceNormalClock(61_000);
+        state = await fresh.engine.runNext();
+      }
+      expect(state).toMatchObject({ id: removal.id, status: "succeeded", effect: "complete" });
+      expect(
+        await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
+      ).toEqual([{ state: "removed", allocation_cleanup: "closed" }]);
+      const document = await closeDocument(f);
+      if (typeof document !== "string") throw Error("NONSECRET same-DELETE close fact missing");
+      expect(JSON.parse(document)).toMatchObject({
+        kind: "linux-oci-sealed-application-io-close@1",
+        scope: { operation: { operationId: removal.id, action: "delete", generation: 2 } },
+      });
+      for (const kind of [
+        "linux-oci-parent-bootstrap@6",
+        "linux-oci-create-stopped@1",
+        "linux-oci-start@1",
+        stop,
+        "linux-oci-read-tracked-join@1",
+      ])
+        expect(count(kind)).toBe(1);
+    }
+    expect(await shutdownWitness()).toEqual(witnesses);
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    io.closeResponse();
+    io.closeRequest();
+    await closing?.value;
+    io.restore();
     await fresh?.close().catch(() => undefined);
     await f.cleanup();
   }

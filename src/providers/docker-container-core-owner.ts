@@ -11,6 +11,7 @@ import {
   createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerHistoricalDeleteSchema,
   inspectV2ContainerOwnerSelectedSchema,
+  inspectV2ContainerOwnerShutdownIoSchema,
   serializeV2ContainerConfiguredPrivateInputs,
   V2_CONTAINER_APPLICATION_IO_RESERVED,
   V2_CONTAINER_CONTROL_RESERVED,
@@ -177,6 +178,11 @@ export interface DockerContainerCoreOwner {
   readonly acceptance: V2HostAcceptance;
   readonly owner: DockerPhysicalCoreOwnerPort;
   saveAcceptedParentControl(
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<void>;
+  saveOriginalShutdownIoClose(
     record: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
@@ -2623,7 +2629,66 @@ export function createDockerContainerCoreOwner(
       operation,
     });
   }
-  async function readApplicationCloseFact(document: unknown, ioScope: unknown) {
+  const applicationCloseKind = "linux-oci-sealed-application-io-close@1";
+  const shutdownIoCloseKind = "linux-oci-sealed-host-shutdown-io-close@1";
+  const reconcilerLeaseSql =
+    " AND EXISTS (SELECT 1 FROM tf_v2_operations WHERE id=? AND resource_uid=? AND lease_token=? AND lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000 AND status='reconciling' AND effect='unknown' AND dispatch_possible=1)";
+  type ApplicationCloseKind = typeof applicationCloseKind | typeof shutdownIoCloseKind;
+  async function shutdownIoScope(input: DockerContainerCreateRecord, raw: string) {
+    return {
+      purpose: "takoserver.linux-oci-host-shutdown-io-close@1",
+      resourceUid: input.intent.resourceUid,
+      incarnationId: input.intent.incarnationId,
+      installationId,
+      generation: input.intent.policy.generation,
+      claimId: input.claimId,
+      nativeId: input.nativeId,
+      controlDigest: await canonicalDigest(raw),
+    };
+  }
+  async function sealApplicationCloseFact(ioScope: unknown, kind: ApplicationCloseKind) {
+    const selection = controlKeyring?.current;
+    if (!selection || !controlDecryptionKey) return fail();
+    const { id: keyId, key } = selection;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(keyId) || !isContainerSecretKey(key))
+      return fail();
+    const assertCurrent = () => {
+      if (controlDecryptionKey(keyId) !== key) return fail();
+    };
+    assertCurrent();
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const closed = new TextEncoder().encode(
+      '{"kind":"linux-oci-original-application-io-closed@1"}',
+    );
+    try {
+      const ciphertext = new Uint8Array(
+        await encryptContainerSecretBytes(
+          key,
+          nonce,
+          closed,
+          new TextEncoder().encode(canonicalJson(ioScope)),
+        ),
+      );
+      assertCurrent();
+      return {
+        document: canonicalJson({
+          kind,
+          scope: ioScope,
+          keyId,
+          nonce: encodeContainerSecretBytes(nonce),
+          ciphertext: encodeContainerSecretBytes(ciphertext),
+        }),
+        assertCurrent,
+      };
+    } finally {
+      closed.fill(0);
+    }
+  }
+  async function readApplicationCloseFact(
+    document: unknown,
+    ioScope: unknown,
+    kind: ApplicationCloseKind = applicationCloseKind,
+  ) {
     if (
       !controlDecryptionKey ||
       typeof document !== "string" ||
@@ -2635,7 +2700,7 @@ export function createDockerContainerCoreOwner(
     const sealed = parseStrictJson(new TextEncoder().encode(document), 65536);
     if (
       !own(sealed, ["kind", "scope", "keyId", "nonce", "ciphertext"]) ||
-      sealed.kind !== "linux-oci-sealed-application-io-close@1" ||
+      sealed.kind !== kind ||
       canonicalJson(sealed) !== document ||
       canonicalJson(sealed.scope) !== canonicalJson(ioScope) ||
       typeof sealed.keyId !== "string" ||
@@ -3144,7 +3209,79 @@ export function createDockerContainerCoreOwner(
         );
         if (closed.length !== 1) return fail();
         if (management === "application-recovery" || management === true) {
-          const document = closed[0]?.application_io_cleanup;
+          let document = closed[0]?.application_io_cleanup;
+          if (
+            management === "application-recovery" &&
+            runtimeApplicationOwner &&
+            execution.action === "delete" &&
+            document === V2_CONTAINER_APPLICATION_IO_RESERVED &&
+            closed[0]?.allocation_cleanup === "untouched" &&
+            (await inspectV2ContainerOwnerShutdownIoSchema(sql))
+          ) {
+            const coordinates = [
+              input.intent.resourceUid,
+              input.intent.policy.generation,
+              input.claimId,
+              input.nativeId,
+            ];
+            const shutdown = await sql.query(
+              "SELECT close_document FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=?",
+              coordinates,
+            );
+            if (shutdown.length > 1) return fail();
+            if (shutdown.length === 1) {
+              const receipt = shutdown[0]?.close_document;
+              if (typeof receipt !== "string") return fail();
+              const shutdownCurrent = await readApplicationCloseFact(
+                receipt,
+                await shutdownIoScope(input, raw),
+                shutdownIoCloseKind,
+              );
+              // Carry the genuine original terminal fact into this operation's
+              // existing one-use close slot. No mutation of the prior receipt
+              // and no native request until the same DELETE verifies its seal.
+              const selected = await sealApplicationCloseFact(
+                await applicationCloseScope(scope, loaded.proof, execution, input, raw),
+                applicationCloseKind,
+              );
+              await assertExecution(execution);
+              if (
+                !(await current(lease)) ||
+                signal.aborted ||
+                !lease.active ||
+                lease.controller.signal.aborted ||
+                !leases.has(lease) ||
+                controlDecryptionKey(originalControlKeyId) !== key
+              )
+                return fail();
+              executionScope(execution);
+              shutdownCurrent();
+              selected.assertCurrent();
+              const guard = fence(loaded.proof);
+              const saved = await sql.run(
+                "UPDATE tf_v2_container_create_claims SET application_io_cleanup=? WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched' AND native_control=? AND application_io_cleanup=? AND " +
+                  guard.sql +
+                  reconcilerLeaseSql +
+                  " AND EXISTS (SELECT 1 FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND close_document=?)",
+                [
+                  selected.document,
+                  ...coordinates,
+                  raw,
+                  V2_CONTAINER_APPLICATION_IO_RESERVED,
+                  ...guard.params,
+                  execution.operationId,
+                  execution.resourceUid,
+                  execution.leaseToken,
+                  ...coordinates,
+                  receipt,
+                ],
+              );
+              if (saved.changes !== 1) return fail();
+              shutdownCurrent();
+              selected.assertCurrent();
+              document = selected.document;
+            }
+          }
           if (document === null || document === V2_CONTAINER_APPLICATION_IO_RESERVED) {
             if (management === "application-recovery") missingApplicationDocument = document;
           } else if (trackedPeer && closed[0]?.allocation_cleanup === "untouched") {
@@ -3410,9 +3547,7 @@ export function createDockerContainerCoreOwner(
               ? originalLinuxOciHttpRetirementSource(originalCustody, result, input, signal)
               : undefined;
             let applicationFactCurrent: (() => void) | undefined;
-            const applicationLeaseSql = applicationSchema
-              ? " AND EXISTS (SELECT 1 FROM tf_v2_operations WHERE id=? AND resource_uid=? AND lease_token=? AND lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000 AND status='reconciling' AND effect='unknown' AND dispatch_possible=1)"
-              : "";
+            const applicationLeaseSql = applicationSchema ? reconcilerLeaseSql : "";
             const applicationLeaseParams = applicationSchema
               ? [execution.operationId, execution.resourceUid, execution.leaseToken]
               : [];
@@ -3475,7 +3610,6 @@ export function createDockerContainerCoreOwner(
                   input,
                   raw,
                 );
-                const aad = new TextEncoder().encode(canonicalJson(ioScope));
                 let document = await currentApplication();
                 if (document === V2_CONTAINER_APPLICATION_IO_RESERVED) {
                   // An absent/fresh runtime never initializes a missing fact.
@@ -3483,41 +3617,15 @@ export function createDockerContainerCoreOwner(
                   localIo();
                   await application.close(); // exact original irreversible cached Promise
                   await currentApplication(V2_CONTAINER_APPLICATION_IO_RESERVED);
-                  const currentKey = controlKeyring.current,
-                    keyId = currentKey.id,
-                    actualKey = currentKey.key;
-                  if (
-                    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(keyId) ||
-                    !isContainerSecretKey(actualKey) ||
-                    controlDecryptionKey(keyId) !== actualKey
-                  )
-                    return fail();
-                  const nonce = crypto.getRandomValues(new Uint8Array(12));
-                  const closed = new TextEncoder().encode(
-                    '{"kind":"linux-oci-original-application-io-closed@1"}',
-                  );
-                  let ciphertext: Uint8Array<ArrayBuffer>;
-                  try {
-                    ciphertext = new Uint8Array(
-                      await encryptContainerSecretBytes(actualKey, nonce, closed, aad),
-                    );
-                  } finally {
-                    closed.fill(0);
-                  }
+                  const selected = await sealApplicationCloseFact(ioScope, applicationCloseKind);
                   await currentApplication(V2_CONTAINER_APPLICATION_IO_RESERVED);
-                  if (controlDecryptionKey(keyId) !== actualKey) return fail();
-                  const sealedDocument = canonicalJson({
-                    kind: "linux-oci-sealed-application-io-close@1",
-                    scope: ioScope,
-                    keyId,
-                    nonce: encodeContainerSecretBytes(nonce),
-                    ciphertext: encodeContainerSecretBytes(ciphertext),
-                  });
+                  selected.assertCurrent();
+                  const sealedDocument = selected.document;
                   document = sealedDocument;
                   const beforeSave = await boundStartRecord(input);
                   if (!usable(beforeSave.proof, "remove") || !(await current(lease))) return fail();
                   const saveGuard = fence(beforeSave.proof);
-                  if (controlDecryptionKey(keyId) !== actualKey) return fail();
+                  selected.assertCurrent();
                   localIo(); // no await between the original local fence and CAS
                   const saved = await sql.run(
                     "UPDATE tf_v2_container_create_claims SET application_io_cleanup=? WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=? AND application_io_cleanup=? AND " +
@@ -3909,6 +4017,87 @@ export function createDockerContainerCoreOwner(
     }
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
+    async saveOriginalShutdownIoClose(input, originalCustody, signal) {
+      if (!runtimeApplicationOwner || signal.aborted) return fail();
+      const application = originalLinuxOciHttpRetirementSource(
+        originalCustody,
+        result,
+        input,
+        signal,
+      );
+      if (!application) return fail();
+      const appCurrent = () => {
+        if (
+          signal.aborted ||
+          originalLinuxOciHttpRetirementSource(originalCustody, result, input, signal) !==
+            application
+        )
+          return fail();
+      };
+      await application.close();
+      appCurrent();
+      const loaded = await boundStartRecord(input);
+      if (
+        !usable(loaded.proof, "observe") ||
+        loaded.proof.i_serving_generation !== input.intent.policy.generation ||
+        (await boundInitPhase(loaded)) !== "running" ||
+        !(await inspectV2ContainerOwnerShutdownIoSchema(sql))
+      )
+        return fail();
+      const coordinates = [
+        input.intent.resourceUid,
+        input.intent.policy.generation,
+        input.claimId,
+        input.nativeId,
+      ];
+      const control = await sql.query(
+        "SELECT native_control FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched'",
+        coordinates,
+      );
+      const raw = control[0]?.native_control;
+      if (
+        control.length !== 1 ||
+        typeof raw !== "string" ||
+        raw.length > 65536 ||
+        raw === V2_CONTAINER_CONTROL_RESERVED
+      )
+        return fail();
+      const scope = await shutdownIoScope(input, raw);
+      const previous = await sql.query(
+        "SELECT close_document FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=?",
+        coordinates,
+      );
+      if (previous.length > 1) return fail();
+      if (previous.length === 1) {
+        const currentReceipt = await readApplicationCloseFact(
+          previous[0]?.close_document,
+          scope,
+          shutdownIoCloseKind,
+        );
+        await assertSnapshot(loaded.proof);
+        appCurrent();
+        currentReceipt();
+        return;
+      }
+      const selected = await sealApplicationCloseFact(scope, shutdownIoCloseKind);
+      const guard = fence(loaded.proof);
+      appCurrent();
+      selected.assertCurrent();
+      const saved = await sql.run(
+        "INSERT INTO tf_v2_container_shutdown_io_closes (resource_uid,generation,claim_id,native_id,close_document) SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched' AND native_control=?) AND " +
+          guard.sql,
+        [...coordinates, selected.document, ...coordinates, raw, ...guard.params],
+      );
+      if (saved.changes !== 1) return fail();
+      const confirmed = await sql.query(
+        "SELECT close_document FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=?",
+        coordinates,
+      );
+      if (confirmed.length !== 1 || confirmed[0]?.close_document !== selected.document)
+        return fail();
+      appCurrent();
+      selected.assertCurrent();
+    },
     async saveAcceptedParentControl(input, originalCustody, signal) {
       if (
         parentMode === undefined ||

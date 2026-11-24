@@ -531,13 +531,14 @@ const readyPredicate = (
   encodeValue: (value: string, rowIndex: number, columnIndex: number) => string,
   selectedRows = expectedRows,
   selectedNames = names,
+  selectedTableNames = tableNames,
 ): string => `(
   ${selectedRows.map((row, rowIndex) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`).join("\n  AND ")}
   AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE sql IS NOT NULL
-    AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${tableNames})) AND name NOT IN (${selectedNames}))
+    AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${selectedTableNames})) AND name NOT IN (${selectedNames}))
   AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata')  AND source.sql IS NOT NULL AND instr(upper(source.sql), 'REFERENCES') = 0 THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
-     WHERE  source.type = 'table' AND lower(fk."table") IN (${tableNames}) AND source.name NOT IN (${tableNames})) END)
-  AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" IN (${tableNames}))
+     WHERE  source.type = 'table' AND lower(fk."table") IN (${selectedTableNames}) AND source.name NOT IN (${selectedTableNames})) END)
+  AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" IN (${selectedTableNames}))
 )`;
 export const V2_CONTAINER_OWNER_READY = readyPredicate(literal);
 const runtimeReadyParams = Object.freeze([JSON.stringify(expectedRows)]);
@@ -996,7 +997,102 @@ export async function inspectV2ContainerOwnerHistoricalDeleteSchema(sql: Sql): P
     return false;
   }
 }
-/** Exact negative readiness only; optional successor does not alter old readers. */
+
+/** Optional add-on to the exact final-DELETE shape. This table retains the
+ * original creator's shutdown fact before any subsequent DELETE is accepted.
+ * The owning runtime still authenticates the envelope and native control digest. */
+const shutdownIoTable = `${PREFIX}shutdown_io_closes`;
+const shutdownIoObjects = Object.freeze([
+  object(
+    "table",
+    shutdownIoTable,
+    shutdownIoTable,
+    `CREATE TABLE ${shutdownIoTable} (
+  resource_uid TEXT NOT NULL CHECK (${text("resource_uid")}),
+  generation INTEGER NOT NULL CHECK (${integer("generation", 1)}),
+  claim_id TEXT NOT NULL CHECK (${hex("claim_id")}),
+  native_id TEXT NOT NULL CHECK (${hex("native_id")}),
+  close_document TEXT NOT NULL CHECK (typeof(close_document) = 'text' AND length(close_document) BETWEEN 1 AND 65536 AND json_valid(close_document)),
+  PRIMARY KEY (resource_uid, generation),
+  FOREIGN KEY (resource_uid, generation) REFERENCES ${Q}(resource_uid, generation)
+)`,
+  ),
+  trigger(
+    "shutdown_io_close_insert",
+    shutdownIoTable,
+    "BEFORE INSERT",
+    refuse(`CASE WHEN json_valid(NEW.close_document) THEN
+      json_type(NEW.close_document) = 'object'
+      AND (SELECT count(*) FROM json_each(NEW.close_document)) = 5
+      AND json_extract(NEW.close_document, '$.kind') = 'linux-oci-sealed-host-shutdown-io-close@1'
+      AND ${text("json_extract(NEW.close_document, '$.keyId')")}
+      AND ${text("json_extract(NEW.close_document, '$.nonce')")}
+      AND json_type(NEW.close_document, '$.ciphertext') = 'text'
+      AND length(json_extract(NEW.close_document, '$.ciphertext')) > 0
+      AND json_type(NEW.close_document, '$.scope') = 'object'
+      AND (SELECT count(*) FROM json_each(NEW.close_document, '$.scope')) = 8
+      AND json_extract(NEW.close_document, '$.scope.purpose') = 'takoserver.linux-oci-host-shutdown-io-close@1'
+      AND json_type(NEW.close_document, '$.scope.resourceUid') = 'text'
+      AND json_extract(NEW.close_document, '$.scope.resourceUid') = NEW.resource_uid
+      AND json_type(NEW.close_document, '$.scope.generation') = 'integer'
+      AND json_extract(NEW.close_document, '$.scope.generation') = NEW.generation
+      AND json_type(NEW.close_document, '$.scope.claimId') = 'text'
+      AND json_extract(NEW.close_document, '$.scope.claimId') = NEW.claim_id
+      AND json_type(NEW.close_document, '$.scope.nativeId') = 'text'
+      AND json_extract(NEW.close_document, '$.scope.nativeId') = NEW.native_id
+      AND json_type(NEW.close_document, '$.scope.installationId') = 'text'
+      AND json_type(NEW.close_document, '$.scope.incarnationId') = 'text'
+      AND substr(json_extract(NEW.close_document, '$.scope.controlDigest'), 1, 7) = 'sha256:'
+      AND ${hex("substr(json_extract(NEW.close_document, '$.scope.controlDigest'), 8)")}
+      AND EXISTS (SELECT 1 FROM ${Q} claim
+        JOIN ${I} instance ON instance.resource_uid = claim.resource_uid AND instance.installation_id = claim.installation_id
+        WHERE claim.resource_uid = NEW.resource_uid AND claim.generation = NEW.generation
+          AND claim.claim_id = NEW.claim_id AND claim.native_id = NEW.native_id AND claim.state = 'bound'
+          AND json_extract(claim.native_control, '$.kind') = 'linux-oci-sealed-control@1'
+          AND instance.retire_operation_id IS NULL AND instance.retired_at_ms IS NULL
+          AND claim.installation_id = json_extract(NEW.close_document, '$.scope.installationId')
+          AND instance.incarnation_id = json_extract(NEW.close_document, '$.scope.incarnationId'))
+      AND NOT EXISTS (SELECT 1 FROM ${shutdownIoTable} WHERE resource_uid = NEW.resource_uid AND generation = NEW.generation)
+      ELSE 0 END`),
+  ),
+  trigger("shutdown_io_close_immutable", shutdownIoTable, "BEFORE UPDATE", refuse("0")),
+  trigger("shutdown_io_close_retain", shutdownIoTable, "BEFORE DELETE", refuse("0")),
+]);
+const shutdownIoSelectedObjects = Object.freeze([...finalDeleteObjects, ...shutdownIoObjects]);
+const shutdownIoRows = Object.freeze(
+  shutdownIoSelectedObjects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const shutdownIoReadyParams = Object.freeze([JSON.stringify(shutdownIoRows)]);
+const shutdownIoReady =
+  "(WITH container_owner_shutdown_io_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, row, column) =>
+      `json_extract((SELECT document FROM container_owner_shutdown_io_values), '$[${row}][${column}]')`,
+    shutdownIoRows,
+    shutdownIoSelectedObjects.map((item) => literal(item.name)).join(", "),
+    `${tableNames}, ${literal(shutdownIoTable)}`,
+  ) +
+  ")";
+const shutdownIoStatements: readonly SqlStatement[] = Object.freeze(
+  shutdownIoObjects.map((item) => Object.freeze({ sql: item.sql })),
+);
+export const V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND = Object.freeze({
+  from: V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
+  objects: shutdownIoSelectedObjects,
+  statements: shutdownIoStatements,
+});
+export async function inspectV2ContainerOwnerShutdownIoSchema(sql: Sql): Promise<boolean> {
+  try {
+    const rows = await sql.query(`SELECT ${shutdownIoReady} AS ready`, shutdownIoReadyParams);
+    return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
+  } catch {
+    return false;
+  }
+}
+
+/** Existing standalone inspectors retain their exact predecessor shapes. */
 export async function inspectV2ContainerOwnerSelectedSchema(
   sql: Sql,
   layer: "control" | "allocation" | "application-io" | "final-delete",
@@ -1010,20 +1106,20 @@ export async function inspectV2ContainerOwnerSelectedSchema(
           ? ([selectedApplicationIoReady, selectedApplicationIoReadyParams] as const)
           : ([finalDeleteReady, finalDeleteReadyParams] as const);
   try {
-    const rows = await sql.query(`SELECT (${original[0]} OR ${historicalDeleteReady}) AS ready`, [
-      ...original[1],
-      ...historicalDeleteParams,
-    ]);
+    const rows = await sql.query(
+      `SELECT (${original[0]} OR ${historicalDeleteReady} OR ${shutdownIoReady}) AS ready`,
+      [...original[1], ...historicalDeleteParams, ...shutdownIoReadyParams],
+    );
     return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
   } catch {
     return false;
   }
 }
-const historicalSelectedControlReady =
-  "(" + selectedControlReady + " OR " + historicalDeleteReady + ")";
+const historicalSelectedControlReady = `(${selectedControlReady} OR ${historicalDeleteReady} OR ${shutdownIoReady})`;
 const historicalSelectedControlParams = Object.freeze([
   ...selectedControlReadyParams,
   ...historicalDeleteParams,
+  ...shutdownIoReadyParams,
 ]);
 
 /** Internal construction only. No request DTO, SQL claim or callback mints native authority. */

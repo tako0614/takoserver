@@ -5,6 +5,7 @@ import { dirname, isAbsolute, join, parse } from "node:path";
 import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "../container-contract.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
 import { parseStrictJson } from "../strict-json.ts";
+import { inspectV2ContainerOwnerShutdownIoSchema } from "../takoform-v2/container-owner-schema.ts";
 import type { V2BackendResult, V2Execution, V2Form } from "../takoform-v2/types.ts";
 import {
   createDockerContainerConfiguredInputs,
@@ -3157,11 +3158,66 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       const invocationJoins = Promise.allSettled(
         [...httpRuntimes.values()].map((runtime) => runtime.close()),
       );
-      const joined = artifact.close();
-      if (physicalBinary === undefined) return joined;
+      if (physicalBinary === undefined) return artifact.close();
+      if (runtimeApplicationOwner) {
+        closed = true;
+        for (const cancel of cancellation) cancel.abort();
+      }
       if (!nativeClosing) {
         const attempt = (async () => {
-          const original = await Promise.allSettled([joined]);
+          if (runtimeApplicationOwner) {
+            // Complete already-owned scopes without revoking the original
+            // runtime identity needed to record the shutdown fact.
+            await Promise.allSettled([...scopes]);
+            if (parents.size || nativeSessions.size) {
+              const custody = originalOciCustodies.get(originalNativeCustody);
+              if (!custody || !(await inspectV2ContainerOwnerShutdownIoSchema(sql)))
+                return fail("parent_control_retained");
+              const claims = new Set([...parents.keys(), ...nativeSessions.keys()]);
+              const outcomes = await Promise.allSettled(
+                [...claims].map(async (claimId) => {
+                  const record = httpRecords.get(claimId);
+                  const session = nativeSessions.get(claimId);
+                  const runtime = httpRuntimes.get(claimId);
+                  if (!record || !session || !runtime || !parents.has(claimId))
+                    return fail("parent_control_retained");
+                  const rows = await sql.query(
+                    "SELECT state,allocation_cleanup,removed_at_ms FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=?",
+                    [
+                      record.intent.resourceUid,
+                      record.intent.policy.generation,
+                      record.claimId,
+                      record.nativeId,
+                    ],
+                  );
+                  if (rows.length !== 1) return fail("parent_control_retained");
+                  const current = rows[0];
+                  if (
+                    current?.state === "removed" &&
+                    current.allocation_cleanup === "closed" &&
+                    Number.isSafeInteger(current.removed_at_ms)
+                  )
+                    return; // Existing terminal custody belongs to this exact claim.
+                  if (current?.state !== "bound" || custody.peerReads.has(claimId))
+                    return fail("parent_control_retained");
+                  await httpProbes.get(claimId)?.close();
+                  await runtime.close();
+                  // Publish the readback only after the original P stdin has
+                  // finished. A successor still waits for normal Host exit.
+                  await detachOriginalLinuxOciRuntimePeer(session, nativeLifetime.signal);
+                  await core.saveOriginalShutdownIoClose(
+                    record,
+                    originalNativeCustody,
+                    nativeLifetime.signal,
+                  );
+                }),
+              );
+              const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+              if (rejected) throw rejected.reason;
+              return artifact.close();
+            }
+          }
+          const original = await Promise.allSettled([artifact.close()]);
           // A constructor can reenter close through its raw spawn boundary.
           // Collect only AFTER original scopes join, never an initial empty map.
           const physical = await Promise.allSettled(
