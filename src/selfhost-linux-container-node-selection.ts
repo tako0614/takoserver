@@ -1,8 +1,10 @@
+import type { Sql } from "./ports.ts";
 import { containerRecord, isContainerSecretKey } from "./providers/container-secret-codec.ts";
 import type { RuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 import type { SelfhostLinuxDockerCoreSelection } from "./selfhost-linux-docker-core.ts";
 import type { SelfhostLinuxDockerNodeSelectionSource } from "./selfhost-linux-docker-node-selection.ts";
 import type { SelfhostLinuxOciCoreSelection } from "./selfhost-linux-oci-core.ts";
+import { inspectV2ContainerOwnerShutdownIoSchema } from "./takoform-v2/container-owner-schema.ts";
 
 type RequiredOciNodeConfiguration = Required<
   Pick<SelfhostLinuxOciCoreSelection, "physicalBinary" | "egressLimits" | "hostTopology">
@@ -31,6 +33,18 @@ export type SelfhostLinuxContainerNodeSelection =
       readonly kind: "oci";
       readonly selection: SelfhostLinuxOciCoreSelection & RequiredOciNodeConfiguration;
     };
+
+export async function assertSelfhostLinuxContainerNodeSchema(
+  sql: Sql,
+  selected: SelfhostLinuxContainerNodeSelection | undefined,
+): Promise<void> {
+  if (
+    selected?.kind === "oci" &&
+    selected.selection.ociParentControl === "sealed-peer-runtime-application-owner@1" &&
+    !(await inspectV2ContainerOwnerShutdownIoSchema(sql))
+  )
+    throw new Error("selfhost_linux_oci_shutdown_io_schema_required");
+}
 
 /** Required Node configuration only. The original creator still snapshots and
  * validates these data; their presence is no realized network/admission proof. */

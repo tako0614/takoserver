@@ -114,6 +114,7 @@ import {
 } from "./selfhost-health-signals.ts";
 import { createSelfhostLinuxContainerNodeComposition } from "./selfhost-linux-container-node-composition.ts";
 import {
+  assertSelfhostLinuxContainerNodeSchema,
   createSelfhostLinuxContainerNodeSelection,
   type SelfhostLinuxContainerNodeSelectionSource,
 } from "./selfhost-linux-container-node-selection.ts";
@@ -732,6 +733,14 @@ async function runSelfhostBunHost(
     );
   }
   const sql = createSqliteSql(controlDatabase);
+  try {
+    // Explicit tracked OCI must be able to save its original shutdown proof
+    // before the Node entry starts the runtime or admits a CREATE.
+    await assertSelfhostLinuxContainerNodeSchema(sql, preflightLinuxContainerSelection);
+  } catch (error) {
+    controlDatabase.close();
+    throw error;
+  }
   // The sole migration writer has already committed the checked realm claim
   // atomically with any forward schema change; this is read-only verification.
   await assertStripeModeRealm(sql, stripeMode);

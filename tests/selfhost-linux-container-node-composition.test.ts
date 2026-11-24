@@ -10,6 +10,7 @@ import type { Sql } from "../src/ports.ts";
 import { parseRuntimeInputKeyAuthority } from "../src/runtime-input-seal-keyring.ts";
 import { createSelfhostLinuxContainerNodeComposition } from "../src/selfhost-linux-container-node-composition.ts";
 import {
+  assertSelfhostLinuxContainerNodeSchema,
   createSelfhostLinuxContainerNodeSelection,
   type SelfhostLinuxOciNodeSelectionSource,
 } from "../src/selfhost-linux-container-node-selection.ts";
@@ -20,6 +21,13 @@ import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import type { V2OperatorFormSelectionFactory } from "../src/takoform-v2/application.ts";
 import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
+import {
+  V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+  V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  V2_CONTAINER_OWNER_CONTROL_EXPAND,
+  V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
+  V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
+} from "../src/takoform-v2/container-owner-schema.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2Action } from "../src/takoform-v2/types.ts";
 
@@ -443,3 +451,65 @@ test("OCI Node refuses missing topology limits or physical target before Sql and
 
 // Closed constructor/model source for the dedicated OCI binding cases only.
 export { fixture as originalOciNodeBindingFixture };
+
+test("OCI Node shutdown schema preflight requires the exact expanded witness schema", async () => {
+  const f = await fixture();
+  try {
+    const selected = createSelfhostLinuxContainerNodeSelection({
+      selection: {
+        kind: "oci",
+        selection: {
+          ...f.source,
+          ociParentControl: "sealed-peer-runtime-application-owner@1",
+          qualifiedPhysicalDigest: `sha256:${"1".repeat(64)}`,
+        },
+      },
+      sealKeys: f.authority.sealKeys,
+    });
+    if (selected?.kind !== "oci") throw new Error("tracked OCI selection absent");
+    const assertReady = () => assertSelfhostLinuxContainerNodeSchema(f.sql, selected);
+    const required = "selfhost_linux_oci_shutdown_io_schema_required";
+    await expect(assertReady()).rejects.toThrow(required);
+    for (const expand of [
+      V2_CONTAINER_OWNER_CONTROL_EXPAND,
+      V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+      V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+    ])
+      await f.sql.batch(expand.statements.map((sql) => ({ sql })));
+    await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+    await expect(assertReady()).rejects.toThrow(required);
+    await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+    await assertReady();
+    await f.sql.batch([
+      { sql: "DROP TRIGGER tf_v2_container_shutdown_io_close_immutable" },
+      {
+        sql: "CREATE TRIGGER tf_v2_container_shutdown_io_close_immutable BEFORE UPDATE ON tf_v2_container_shutdown_io_closes BEGIN SELECT 1; END",
+      },
+    ]);
+    await expect(assertReady()).rejects.toThrow(required);
+  } finally {
+    await f.close();
+  }
+});
+
+test("OCI Node shutdown schema preflight skips disabled and legacy selections", async () => {
+  const f = await fixture();
+  const query = spyOn(f.sql, "query");
+  try {
+    const legacy = createSelfhostLinuxContainerNodeSelection({
+      selection: {
+        kind: "oci",
+        selection: { ...f.source, ociParentControl: "sealed-peer-application-owner@1" },
+      },
+      sealKeys: f.authority.sealKeys,
+    });
+    if (legacy?.kind !== "oci") throw new Error("legacy OCI selection absent");
+    await assertSelfhostLinuxContainerNodeSchema(f.sql, undefined);
+    await assertSelfhostLinuxContainerNodeSchema(f.sql, f.selection);
+    await assertSelfhostLinuxContainerNodeSchema(f.sql, legacy);
+    expect(query).not.toHaveBeenCalled();
+  } finally {
+    query.mockRestore();
+    await f.close();
+  }
+});
