@@ -26,6 +26,7 @@ import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configur
 import {
   V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND,
   V2_CONTAINER_OWNER_CONTROL_EXPAND,
   V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
   V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
@@ -454,7 +455,7 @@ test("OCI Node refuses missing topology limits or physical target before Sql and
 // Closed constructor/model source for the dedicated OCI binding cases only.
 export { fixture as originalOciNodeBindingFixture };
 
-test("OCI Node shutdown schema preflight requires the exact expanded witness schema", async () => {
+test("OCI Node shutdown schema preflight accepts exact H0 and H1 witness schemas", async () => {
   const f = await fixture();
   try {
     const selected = createSelfhostLinuxContainerNodeSelection({
@@ -482,10 +483,27 @@ test("OCI Node shutdown schema preflight requires the exact expanded witness sch
     await expect(assertReady()).rejects.toThrow(required);
     await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
     await assertReady();
+    const [shutdownTrigger] = await f.sql.query(
+      "SELECT sql FROM main.sqlite_schema WHERE name='tf_v2_container_shutdown_io_close_immutable' AND type='trigger'",
+    );
+    if (typeof shutdownTrigger?.sql !== "string") throw new Error("H0 close trigger absent");
     await f.sql.batch([
       { sql: "DROP TRIGGER tf_v2_container_shutdown_io_close_immutable" },
       {
         sql: "CREATE TRIGGER tf_v2_container_shutdown_io_close_immutable BEFORE UPDATE ON tf_v2_container_shutdown_io_closes BEGIN SELECT 1; END",
+      },
+    ]);
+    await expect(assertReady()).rejects.toThrow(required);
+    await f.sql.batch([
+      { sql: "DROP TRIGGER tf_v2_container_shutdown_io_close_immutable" },
+      { sql: shutdownTrigger.sql },
+    ]);
+    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
+    await assertReady();
+    await f.sql.batch([
+      { sql: "DROP TRIGGER tf_v2_container_application_successor_record_close" },
+      {
+        sql: "CREATE TRIGGER tf_v2_container_application_successor_record_close BEFORE UPDATE ON tf_v2_container_application_successors BEGIN SELECT 1; END",
       },
     ]);
     await expect(assertReady()).rejects.toThrow(required);

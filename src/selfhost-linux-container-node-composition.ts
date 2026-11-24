@@ -14,7 +14,10 @@ import {
 import { createSelfhostLinuxDockerContainerBackend } from "./selfhost-linux-docker-container-backend.ts";
 import { createSelfhostLinuxOciContainerBackend } from "./selfhost-linux-oci-container-backend.ts";
 import type { V2OperatorFormSelectionFactory } from "./takoform-v2/application.ts";
-import { inspectV2ContainerOwnerShutdownIoSchema } from "./takoform-v2/container-owner-schema.ts";
+import {
+  inspectV2ContainerOwnerApplicationSuccessorSchema,
+  inspectV2ContainerOwnerShutdownIoSchema,
+} from "./takoform-v2/container-owner-schema.ts";
 import { isV2FormUrl } from "./takoform-v2/identity.ts";
 import {
   type V2PrivateInputCustody,
@@ -36,7 +39,8 @@ export async function assertSelfhostLinuxContainerNodeSchema(
   if (
     selected?.kind === "oci" &&
     selected.selection.ociParentControl === "sealed-peer-runtime-application-owner@1" &&
-    !(await inspectV2ContainerOwnerShutdownIoSchema(sql))
+    !(await inspectV2ContainerOwnerShutdownIoSchema(sql)) &&
+    !(await inspectV2ContainerOwnerApplicationSuccessorSchema(sql))
   )
     throw new Error("selfhost_linux_oci_shutdown_io_schema_required");
 }

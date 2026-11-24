@@ -969,7 +969,10 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     source: "src/selfhost-linux-container-node-composition.ts",
     target: "src/takoform-v2/container-owner-schema.ts",
     typeOnly: false,
-    names: ["inspectV2ContainerOwnerShutdownIoSchema"],
+    names: [
+      "inspectV2ContainerOwnerApplicationSuccessorSchema",
+      "inspectV2ContainerOwnerShutdownIoSchema",
+    ],
   },
   {
     // The tracked owner checks the close slot before detaching its original parent.
