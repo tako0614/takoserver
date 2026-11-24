@@ -594,16 +594,19 @@ static int ocipp_allowed(struct ocipp_owner *o, enum tns_ocip_kind kind) {
   return 0; /* Routing only. The original H still enforces every producer phase. */
 }
 
-static int ocipp_live_init_current(struct ocipp_owner *o) {
-  return !ocipp_interrupted && ocipp_binding_current(o) == 0 && o->frontend >= 0 &&
-    o->host_lost && o->frontend_live_init &&
-    ocipp_authentication_remaining(o) &&
-    o->application_attempt && o->runtime_first == 1 && o->live_init[0] >= 0 &&
+static int ocipp_live_init_phase(struct ocipp_owner *o) {
+  return o->application_attempt && o->runtime_first == 1 && o->live_init[0] >= 0 &&
     o->attempted && o->child > 0 && o->pidfd >= 0 && !o->joined && !o->wait_unknown &&
     !o->close_unknown && !o->identity_unknown && !o->reply_unknown && !o->management_unknown &&
     !o->eof[0] && !o->pipe_unknown[0] && !o->eof[1] && !o->pipe_unknown[1] &&
     !o->pending && !o->awaiting && !o->input_paused && o->request_kind != TNS_OCIP_CANCEL &&
     o->effects == ((1u << TNS_OCIP_CREATE) | (1u << TNS_OCIP_START));
+}
+
+static int ocipp_live_init_current(struct ocipp_owner *o) {
+  return !ocipp_interrupted && ocipp_binding_current(o) == 0 && o->frontend >= 0 &&
+    o->host_lost && o->frontend_live_init && ocipp_authentication_remaining(o) &&
+    ocipp_live_init_phase(o);
 }
 
 static int ocipp_live_init_management(struct ocipp_owner *o) {
@@ -647,6 +650,145 @@ abandoned:
   o->live_init[0] = -1;
   (void)close(fd);
   return ocipp_management_text(o, refused);
+}
+
+/* Every complete SCM_RIGHTS entry is owned by this process before validation.
+ * Parse only the bounded returned control bytes and close all rejected rights,
+ * including the entries delivered before MSG_CTRUNC. */
+static int ocipp_receive_live_init_descriptor(int fd, const char claim[65],
+                                               struct tns_oci_live_init_descriptor *out) {
+  unsigned char body[104];
+  union {
+    struct cmsghdr align;
+    unsigned char bytes[CMSG_SPACE(4 * sizeof(int))];
+  } control = {0};
+  struct iovec data = {.iov_base = body, .iov_len = sizeof(body)};
+  struct msghdr message = {.msg_iov = &data, .msg_iovlen = 1,
+    .msg_control = control.bytes, .msg_controllen = sizeof(control.bytes)};
+  ssize_t size = recvmsg(fd, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
+  if (size < 0) return -1;
+  size_t received = message.msg_controllen;
+  int valid = received <= sizeof(control.bytes) &&
+    !(message.msg_flags & ~(MSG_CMSG_CLOEXEC | MSG_EOR));
+  if (received > sizeof(control.bytes)) received = sizeof(control.bytes);
+
+  int pidfd = -1;
+  size_t entries = 0, rights = 0, at = 0;
+  while (at < received) {
+    struct cmsghdr header;
+    size_t remaining = received - at;
+    if (remaining < sizeof(header)) { valid = 0; break; }
+    memcpy(&header, control.bytes + at, sizeof(header));
+    if (header.cmsg_len < CMSG_LEN(0) || header.cmsg_len > remaining) { valid = 0; break; }
+    size_t payload = header.cmsg_len - CMSG_LEN(0);
+    if (header.cmsg_level == SOL_SOCKET && header.cmsg_type == SCM_RIGHTS) {
+      for (size_t offset = 0; offset + sizeof(int) <= payload; offset += sizeof(int)) {
+        int right;
+        memcpy(&right, control.bytes + at + CMSG_LEN(0) + offset, sizeof(right));
+        ++rights;
+        if (right < 0) valid = 0;
+        else if (pidfd < 0) pidfd = right;
+        else (void)close(right);
+      }
+      if (payload != sizeof(int)) valid = 0;
+    } else valid = 0;
+    ++entries;
+    size_t step = CMSG_ALIGN(header.cmsg_len);
+    if (step > remaining) { valid = 0; break; }
+    at += step;
+  }
+  if (valid && !received && size == 8 && !memcmp(body, "TKOLIVN2", 8)) return 1;
+  if (!valid || entries != 1 || rights != 1 || pidfd < 0 ||
+      received != CMSG_SPACE(sizeof(int)) || size != (ssize_t)sizeof(body) ||
+      memcmp(body, "TKOLIVR2", 8) || memcmp(body + 8, claim, 64) ||
+      !ocipp_u64(body + 72) || !ocipp_u64(body + 80)) {
+    if (pidfd >= 0) (void)close(pidfd);
+    errno = EPROTO;
+    return -1;
+  }
+  struct tns_oci_live_init_descriptor observed = {
+    .started = {.namespace_device = ocipp_u64(body + 72), .namespace_inode = ocipp_u64(body + 80)},
+    .pidfd_device = ocipp_u64(body + 88), .pidfd_inode = ocipp_u64(body + 96), .pidfd = pidfd
+  };
+  memcpy(observed.started.native_id, claim, 65);
+  *out = observed;
+  return 0;
+}
+
+struct ocipp_live_init_descriptor_request {
+  char claim[65];
+  uint64_t generation;
+  int requester; /* Separate authenticated request socket, not a management frontend. */
+  int64_t deadline;
+};
+static int ocipp_live_init_descriptor_time(const struct ocipp_live_init_descriptor_request *r) {
+  int64_t now = ocip_now();
+  if (now < 0 || now >= r->deadline || r->deadline - now > OCIPP_AUTH_TIMEOUT) return 0;
+  int remaining = (int)(r->deadline - now);
+  return remaining < OCIP_LIVE_INIT_TIMEOUT ? remaining : OCIP_LIVE_INIT_TIMEOUT;
+}
+
+static int ocipp_live_init_descriptor_current(struct ocipp_owner *o,
+    const struct ocipp_live_init_descriptor_request *r, int channel, int helper) {
+  return !ocipp_interrupted && ocipp_binding_current(o) == 0 && o->host_lost &&
+    o->frontend < 0 && r->requester > 2 && r->requester != o->listener &&
+    r->requester != o->candidate && r->requester != channel && r->requester != helper &&
+    o->generation == r->generation && !memcmp(o->claim, r->claim, 65) &&
+    o->live_init[0] == channel && o->pidfd == helper && ocipp_live_init_phase(o) &&
+    ocipp_live_init_descriptor_time(r);
+}
+
+/* Native P only, following a separately authenticated scoped request.
+ * No selector calls this yet. Success owns one duplicate in the caller;
+ * neither management fd ownership nor mutation state participates in this IO. */
+static inline int ocipp_hold_live_init_descriptor(struct ocipp_owner *o,
+    const struct ocipp_live_init_descriptor_request *r, struct tns_oci_live_init_descriptor *out) {
+  if (!o || !r || !out) { errno = EINVAL; return -1; }
+  int channel = o->live_init[0], helper = o->pidfd;
+  if (!ocipp_live_init_descriptor_current(o, r, channel, helper)) return -1;
+  uint64_t h_device, h_inode;
+  if (ocipp_pidfs(helper, &h_device, &h_inode) < 0) return -1;
+  struct pollfd events[] = {
+    {.fd = channel, .events = POLLIN},
+    {.fd = r->requester, .events = POLLIN | POLLRDHUP},
+    {.fd = helper, .events = POLLIN},
+    {.fd = -1, .events = POLLIN}
+  };
+  struct tns_oci_live_init_descriptor observed = {.pidfd = -1};
+  if (poll(events, 3, 0) != 0) {
+    if (events[0].revents) goto abandoned;
+    return -1;
+  }
+  if (ocipp_interrupted || !ocipp_live_init_descriptor_time(r)) return -1;
+  const char request[] = "TKOLIVE2";
+  if (send(channel, request, sizeof(request) - 1, MSG_DONTWAIT | MSG_NOSIGNAL) !=
+      (ssize_t)(sizeof(request) - 1)) goto abandoned;
+  int wait = ocipp_live_init_descriptor_time(r);
+  if (!wait || poll(events, 3, wait) != 1 || events[0].revents != POLLIN ||
+      events[1].revents || events[2].revents ||
+      !ocipp_live_init_descriptor_current(o, r, channel, helper)) goto abandoned;
+  int status = ocipp_receive_live_init_descriptor(channel, r->claim, &observed);
+  if (status < 0) goto abandoned;
+  uint64_t device, inode;
+  if (ocipp_pidfs(helper, &device, &inode) < 0 || device != h_device || inode != h_inode)
+    goto abandoned;
+  if (status == 0 && (ocipp_pidfs(observed.pidfd, &device, &inode) < 0 ||
+      device != observed.pidfd_device || inode != observed.pidfd_inode)) goto abandoned;
+  if (!ocipp_live_init_descriptor_current(o, r, channel, helper)) goto abandoned;
+  /* Sample the received init with the original H and requester after the
+   * final binding check. Its holder must keep using this same pidfd. */
+  events[3].fd = observed.pidfd;
+  if (poll(events, status == 0 ? 4 : 3, 0) != 0 ||
+      ocipp_interrupted || !ocipp_live_init_descriptor_time(r)) goto abandoned;
+  if (status > 0) { errno = ESTALE; return -1; }
+  *out = observed;
+  return 0;
+abandoned:
+  if (observed.pidfd >= 0) (void)close(observed.pidfd);
+  /* A partial or lost auxiliary exchange cannot supply a later reply. */
+  o->live_init[0] = -1;
+  (void)close(channel);
+  return -1;
 }
 
 static int ocipp_queue(struct ocipp_owner *o, const unsigned char *body, uint32_t size) {

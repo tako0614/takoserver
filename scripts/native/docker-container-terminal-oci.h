@@ -49,6 +49,11 @@ struct tns_oci_started {
   uint64_t namespace_device;
   uint64_t namespace_inode;
 };
+struct tns_oci_live_init_descriptor {
+  struct tns_oci_started started;
+  uint64_t pidfd_device, pidfd_inode;
+  int pidfd;
+};
 
 /* One-use, including unknown failure. Rootfs/runtime verification precedes the
  * internally owned fresh namespace and exact runc CREATE. */
@@ -70,6 +75,10 @@ int tns_oci_observe_started(struct tns_oci_owner *owner,
 /* Read the original held init and allocation without changing the owner's
  * phase on refusal. This fact does not check policy or authorize serving. */
 int tns_oci_read_live_init(struct tns_oci_owner *owner, struct tns_oci_started *started);
+/* Duplicate exactly the held original init after the same nonmutating read.
+ * The private native caller owns the CLOEXEC duplicate on success. */
+int tns_oci_duplicate_live_init(struct tns_oci_owner *owner,
+                               struct tns_oci_live_init_descriptor *descriptor);
 /* Dedicated single-thread subreaper, default SIGCHLD and exclusive exact-child
  * reaping are required before CREATE; the library never changes caller state.
  * STOP consumes one original-init SIGKILL attempt. JOIN can only join/reap that

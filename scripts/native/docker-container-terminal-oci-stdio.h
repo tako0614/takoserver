@@ -2,9 +2,59 @@
 #define DOCKER_CONTAINER_TERMINAL_OCI_STDIO_H
 
 #include "docker-container-terminal-oci.h"
+#include <errno.h>
 #include <limits.h>
+#include <signal.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
+static inline void ocipp_put64(unsigned char *p, uint64_t value) {
+  for (unsigned int i = 0; i < 8; ++i) { p[7 - i] = (unsigned char)value; value >>= 8; }
+}
+
+/* Only H on its private P/H packet socket sends this descriptor. It never
+ * enters parent mutation stdout or any application-facing protocol. */
+static inline int tns_ocip_send_live_init_descriptor(
+    int fd, const struct tns_oci_live_init_descriptor *descriptor) {
+  if (!descriptor) { errno = EINVAL; return -1; }
+  const struct tns_oci_started *started = &descriptor->started;
+  if (descriptor->pidfd < 0 || !descriptor->pidfd_inode || started->native_id[64] ||
+      tns_oci_claim(started->native_id) < 0 || !started->namespace_device ||
+      !started->namespace_inode) { errno = EPROTO; return -1; }
+  unsigned char reply[104];
+  memcpy(reply, "TKOLIVR2", 8);
+  memcpy(reply + 8, started->native_id, 64);
+  ocipp_put64(reply + 72, started->namespace_device);
+  ocipp_put64(reply + 80, started->namespace_inode);
+  ocipp_put64(reply + 88, descriptor->pidfd_device);
+  ocipp_put64(reply + 96, descriptor->pidfd_inode);
+
+  union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(int))]; } ancillary = {0};
+  struct iovec iov = {.iov_base = reply, .iov_len = sizeof(reply)};
+  struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1,
+    .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes)};
+  struct cmsghdr *rights = CMSG_FIRSTHDR(&message);
+  rights->cmsg_level = SOL_SOCKET;
+  rights->cmsg_type = SCM_RIGHTS;
+  rights->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(rights), &descriptor->pidfd, sizeof(descriptor->pidfd));
+  return sendmsg(fd, &message, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)sizeof(reply) ? 0 : -1;
+}
+
+static inline int tns_ocip_reply_live_init_descriptor(
+    int fd, struct tns_oci_owner *owner, int unavailable, const volatile sig_atomic_t *interrupted) {
+  struct tns_oci_live_init_descriptor descriptor;
+  if (unavailable || *interrupted || !owner ||
+      tns_oci_duplicate_live_init(owner, &descriptor) < 0) {
+    const char refused[] = "TKOLIVN2";
+    return send(fd, refused, sizeof(refused) - 1, MSG_DONTWAIT | MSG_NOSIGNAL) ==
+      (ssize_t)(sizeof(refused) - 1) ? 0 : -1;
+  }
+  int result = *interrupted ? -1 : tns_ocip_send_live_init_descriptor(fd, &descriptor);
+  return close(descriptor.pidfd) < 0 ? -1 : result;
+}
 
 /* Only actual fstat metadata reaches this policy in the native main. */
 static inline int tns_ocip_private_fifo(mode_t mode, uid_t owner) {

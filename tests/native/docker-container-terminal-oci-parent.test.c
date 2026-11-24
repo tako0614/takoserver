@@ -25,6 +25,16 @@ enum live_fault {
   LIVE_OK, LIVE_SEALED, LIVE_STALE, LIVE_FOREIGN, LIVE_SHORT, LIVE_TIMEOUT,
   LIVE_CLIENT_LOST, LIVE_H_EXITED, LIVE_CANCELED, LIVE_TRAILING, LIVE_BAD_REQUEST
 };
+enum descriptor_receive_fault {
+  DESCRIPTOR_RECEIVE_OK, DESCRIPTOR_REFUSED, DESCRIPTOR_MISSING, DESCRIPTOR_EXTRA,
+  DESCRIPTOR_CONTROL_TRUNCATED, DESCRIPTOR_DATA_TRUNCATED, DESCRIPTOR_SHORT,
+  DESCRIPTOR_FOREIGN_CLAIM, DESCRIPTOR_FOREIGN_PIDFS, DESCRIPTOR_WRONG_DEVICE,
+  DESCRIPTOR_EXITED, DESCRIPTOR_H_EXITED, DESCRIPTOR_CLIENT_LOST, DESCRIPTOR_STALE_GENERATION,
+  DESCRIPTOR_EXPIRED_BEFORE_SEND, DESCRIPTOR_EXPIRED_AFTER_READ, DESCRIPTOR_CANCELED,
+  DESCRIPTOR_TRAILING, DESCRIPTOR_EXITED_AT_FINAL_POLL,
+};
+enum { DESCRIPTOR_INIT = 94, DESCRIPTOR_REQUESTER = 97 };
+static const uint64_t descriptor_inode = UINT64_C(0x100000345);
 static struct {
   int wrong_controller, not_root, tamper, close_fault, wait_kind, host_eof, host_epipe;
   int child, wrong_parent, read_error[2], eof[2], writes_again, write_toggle;
@@ -63,6 +73,11 @@ static struct {
   int live_connector, live_legacy, live_polls, live_peer_mismatch;
   unsigned char live_request[8], live_reply[88];
   size_t live_reply_size;
+  int descriptor_mode;
+  enum descriptor_receive_fault descriptor_fault;
+  unsigned int descriptor_writes, descriptor_reads, descriptor_polls;
+  unsigned int descriptor_init_checks;
+  int64_t descriptor_deadline;
 } pm;
 static jmp_buf parent_jump;
 static int parent_exit_code;
@@ -91,6 +106,7 @@ static int parent_socket(int family, int type, int protocol);
 static int parent_socketpair(int family, int type, int protocol, int ends[2]);
 static ssize_t parent_send(int fd, const void *bytes, size_t size, int flags);
 static ssize_t parent_recv(int fd, void *bytes, size_t size, int flags);
+static ssize_t parent_recvmsg(int fd, struct msghdr *message, int flags);
 static int parent_live_observe(struct tns_oci_owner *owner, struct tns_oci_started *started);
 static int parent_bind(int fd, const struct sockaddr *address, socklen_t size);
 static int parent_listen(int fd, int backlog);
@@ -126,6 +142,7 @@ static _Noreturn void parent_exit(int status);
 #define socketpair parent_socketpair
 #define send parent_send
 #define recv parent_recv
+#define recvmsg parent_recvmsg
 #define tns_oci_read_live_init parent_live_observe
 #define bind parent_bind
 #define listen parent_listen
@@ -147,6 +164,7 @@ static _Noreturn void parent_exit(int status);
 #undef bind
 #undef tns_oci_read_live_init
 #undef recv
+#undef recvmsg
 #undef send
 #undef socketpair
 #undef socket
@@ -179,6 +197,11 @@ static int parent_open(const char *name, int flags, ...) {
   CHECK(!strcmp(name, "/proc/self/exe") && flags == (O_PATH | O_CLOEXEC)); return 60;
 }
 static int parent_fstat(int fd, struct stat *out) {
+  if (pm.descriptor_mode && (fd == 80 || fd == DESCRIPTOR_INIT)) {
+    *out = (struct stat){.st_dev = fd == 80 ? 42 : 45,
+      .st_ino = (ino_t)(fd == 80 ? UINT64_C(0x100000111) : descriptor_inode)};
+    return 0;
+  }
   if(fd==4){CHECK(pm.child);*out=(struct stat){.st_mode=S_IFSOCK|0600};return 0;}
   if(fd==93){CHECK(pm.application_profile);*out=(struct stat){.st_dev=42,.st_ino=pm.application_inode+(pm.application_stat_changed?1u:0u)};return 0;}
   if(fd==61 || fd==92){*out=(struct stat){.st_dev=42,.st_ino=fd==61?pm.self_inode:pm.peer_inode,.st_mode=0700};return 0;}
@@ -188,6 +211,12 @@ static int parent_fstat(int fd, struct stat *out) {
     .st_uid=0,.st_gid=0,.st_nlink=1,.st_size=12345}; return 0;
 }
 static int parent_fstatfs(int fd,struct statfs *out){
+  if (pm.descriptor_mode && (fd == 80 || fd == DESCRIPTOR_INIT)) {
+    memset(out,0,sizeof(*out));
+    out->f_type=(long)(fd==DESCRIPTOR_INIT && pm.descriptor_fault==DESCRIPTOR_FOREIGN_PIDFS ?
+      ANON_INODE_FS_MAGIC : PID_FS_MAGIC);
+    return 0;
+  }
   CHECK(fd==61 || fd==62 || fd==92 || (fd==93 && pm.application_profile));memset(out,0,sizeof(*out));
   out->f_type=fd==62?PROC_SUPER_MAGIC:pm.old_pidfs?ANON_INODE_FS_MAGIC:PID_FS_MAGIC;return 0;
 }
@@ -301,6 +330,11 @@ static int parent_live_observe(struct tns_oci_owner *owner, struct tns_oci_start
 }
 static ssize_t parent_send(int fd, const void *bytes, size_t size, int flags) {
   CHECK(flags==(MSG_DONTWAIT|MSG_NOSIGNAL));
+  if (pm.descriptor_mode) {
+    CHECK(fd == 76 && size == 8 && !memcmp(bytes, "TKOLIVE2", size));
+    CHECK(++pm.descriptor_writes == 1);
+    return (ssize_t)size;
+  }
   if(fd==4) {
     CHECK(size==8 || size==sizeof(pm.live_reply));
     memcpy(pm.live_reply,bytes,size);pm.live_reply_size=size;
@@ -310,7 +344,7 @@ static ssize_t parent_send(int fd, const void *bytes, size_t size, int flags) {
   }
   CHECK(fd==76 && size==8 && !memcmp(bytes,"TKOLIVE1",8));
   memcpy(pm.live_request,bytes,size);
-  if(pm.live_fault==LIVE_BAD_REQUEST)pm.live_request[7]='2';
+  if(pm.live_fault==LIVE_BAD_REQUEST)pm.live_request[7]='x';
   pm.live_writes++;
   CHECK(ocip_live_init_read(4,&live_owner,pm.live_fault==LIVE_SEALED)==
         (pm.live_fault==LIVE_BAD_REQUEST ? -1 : 0));
@@ -325,6 +359,41 @@ static ssize_t parent_recv(int fd, void *bytes, size_t size, int flags) {
   CHECK(fd==76 && size==sizeof(pm.live_reply) && pm.live_reply_size);
   size=pm.live_reply_size;memcpy(bytes,pm.live_reply,size);
   pm.live_reply_size=0;pm.live_receives++;return (ssize_t)size;
+}
+static ssize_t parent_recvmsg(int fd, struct msghdr *message, int flags) {
+  CHECK(pm.descriptor_mode && fd == 76 && flags == (MSG_DONTWAIT | MSG_CMSG_CLOEXEC));
+  CHECK(pm.descriptor_writes == 1 && ++pm.descriptor_reads == 1);
+  CHECK(message->msg_iovlen == 1 && message->msg_iov[0].iov_len == 104);
+  unsigned char *body = message->msg_iov[0].iov_base;
+  enum descriptor_receive_fault fault = pm.descriptor_fault;
+  if (fault == DESCRIPTOR_REFUSED) {
+    memcpy(body, "TKOLIVN2", 8);
+    message->msg_controllen = 0;
+    return 8;
+  }
+  memcpy(body, "TKOLIVR2", 8);
+  memcpy(body + 8, CLAIM, 64);
+  if (fault == DESCRIPTOR_FOREIGN_CLAIM) body[8] = 'b';
+  ocipp_put64(body + 72, 4);ocipp_put64(body + 80, 55);
+  ocipp_put64(body + 88, fault == DESCRIPTOR_WRONG_DEVICE ? 46 : 45);
+  ocipp_put64(body + 96, descriptor_inode);
+  static const int delivered[] = {DESCRIPTOR_INIT, 95, 96, 98};
+  size_t rights = fault == DESCRIPTOR_CONTROL_TRUNCATED ? 4u :
+    fault == DESCRIPTOR_EXTRA ? 2u : fault == DESCRIPTOR_MISSING ? 0u : 1u;
+  if (rights) {
+    CHECK(CMSG_SPACE(rights * sizeof(int)) <= message->msg_controllen);
+    message->msg_controllen = CMSG_SPACE(rights * sizeof(int));
+    struct cmsghdr *header = CMSG_FIRSTHDR(message);
+    CHECK(header);
+    header->cmsg_len = CMSG_LEN(rights * sizeof(int));
+    header->cmsg_level = SOL_SOCKET;header->cmsg_type = SCM_RIGHTS;
+    memcpy(CMSG_DATA(header), delivered, rights * sizeof(int));
+  } else message->msg_controllen = 0;
+  if (fault == DESCRIPTOR_CONTROL_TRUNCATED) message->msg_flags |= MSG_CTRUNC;
+  if (fault == DESCRIPTOR_DATA_TRUNCATED) message->msg_flags |= MSG_TRUNC;
+  if (fault == DESCRIPTOR_EXPIRED_AFTER_READ) pm.clock = pm.descriptor_deadline;
+  if (fault == DESCRIPTOR_CANCELED) ocipp_interrupted = 1;
+  return fault == DESCRIPTOR_SHORT ? 103 : 104;
 }
 static int parent_bind(int fd,const struct sockaddr *address,socklen_t size){
   CHECK(fd==90 && size<=sizeof(pm.address));const struct sockaddr_un *a=(const struct sockaddr_un*)address;
@@ -406,6 +475,34 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
   CHECK(pm.delivered_size+size<=sizeof(pm.delivered));memcpy(pm.delivered+pm.delivered_size,bytes,size);pm.delivered_size+=size;return (ssize_t)size;
 }
 static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
+  if (pm.descriptor_mode && (count == 3 || count == 4)) {
+    CHECK(fds[0].fd == 76 && fds[0].events == POLLIN &&
+          fds[1].fd == DESCRIPTOR_REQUESTER && fds[1].events == (POLLIN | POLLRDHUP) &&
+          fds[2].fd == 80 && fds[2].events == POLLIN);
+    for (nfds_t i = 0; i < count; ++i) fds[i].revents = 0;
+    unsigned int attempt = ++pm.descriptor_polls;
+    if (count == 4) {
+      CHECK(attempt == 3 && timeout == 0 && pm.descriptor_reads == 1 &&
+            pm.descriptor_init_checks == 1 &&
+            fds[3].fd == DESCRIPTOR_INIT && fds[3].events == POLLIN);
+      if (pm.descriptor_fault == DESCRIPTOR_EXITED_AT_FINAL_POLL) {
+        fds[3].revents = POLLIN; return 1;
+      }
+    }
+    if (!timeout) {
+      if (attempt == 1 && pm.descriptor_fault == DESCRIPTOR_EXPIRED_BEFORE_SEND)
+        pm.clock = pm.descriptor_deadline;
+      if (pm.descriptor_fault == DESCRIPTOR_TRAILING && pm.descriptor_reads) {
+        fds[0].revents = POLLIN; return 1;
+      }
+      return 0;
+    }
+    CHECK(attempt == 2 && timeout > 0 && timeout <= OCIP_LIVE_INIT_TIMEOUT);
+    if (pm.descriptor_fault == DESCRIPTOR_CLIENT_LOST) fds[1].revents = POLLRDHUP;
+    else if (pm.descriptor_fault == DESCRIPTOR_H_EXITED) fds[2].revents = POLLIN;
+    else fds[0].revents = POLLIN;
+    return 1;
+  }
   if(count==3) {
     CHECK(fds[0].fd==76 && fds[0].events==POLLIN &&
           fds[1].fd==91 && fds[1].events==(POLLIN|POLLRDHUP) &&
@@ -426,6 +523,12 @@ static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
     fds[0].revents=POLLIN;return 1;
   }
   if(count==1){
+    if (pm.descriptor_mode && (fds[0].fd == 80 || fds[0].fd == DESCRIPTOR_INIT)) {
+      CHECK(timeout == 0 && fds[0].events == POLLIN);
+      if (fds[0].fd == DESCRIPTOR_INIT) pm.descriptor_init_checks++;
+      int exited = fds[0].fd == DESCRIPTOR_INIT && pm.descriptor_fault == DESCRIPTOR_EXITED;
+      fds[0].revents = exited ? POLLIN : 0;return exited;
+    }
     if(fds[0].fd==93){CHECK(pm.application_profile && timeout==0 && fds[0].events==POLLIN);pm.application_polls++;fds[0].revents=0;
       if(pm.application_poll_error){errno=EIO;return -1;}
       if(pm.application_dead){fds[0].revents=(short)(POLLIN|(pm.application_hup?POLLHUP:0));return 1;}return 0;}
@@ -1044,6 +1147,67 @@ static void live_init_frontend_deadline(void) {
     dispose_fixture(&o);
   }
 }
+static void live_init_descriptor_receive(void) {
+  const struct tns_oci_live_init_descriptor empty = {.pidfd = -1};
+  for (enum descriptor_receive_fault fault = DESCRIPTOR_RECEIVE_OK;
+       fault <= DESCRIPTOR_EXITED_AT_FINAL_POLL; ++fault) {
+    struct ocipp_owner o, before;
+    prepare_live_parent(&o);
+    memcpy(&before, &o, sizeof(before));
+    unsigned int writes = pm.writes, waits = pm.waits;
+    pm.descriptor_mode = 1;
+    pm.descriptor_fault = fault;
+    pm.descriptor_deadline = pm.clock + 4000;
+    struct ocipp_live_init_descriptor_request request = {
+      .generation = o.generation + (unsigned int)(fault == DESCRIPTOR_STALE_GENERATION),
+      .requester = DESCRIPTOR_REQUESTER,
+      .deadline = pm.descriptor_deadline
+    };
+    memcpy(request.claim, o.claim, sizeof(request.claim));
+    struct tns_oci_live_init_descriptor descriptor;
+    memcpy(&descriptor, &empty, sizeof(descriptor));
+    int result = ocipp_hold_live_init_descriptor(&o, &request, &descriptor);
+    int positive = fault == DESCRIPTOR_RECEIVE_OK;
+    int sent = fault != DESCRIPTOR_STALE_GENERATION && fault != DESCRIPTOR_EXPIRED_BEFORE_SEND;
+    int received = sent && fault != DESCRIPTOR_CLIENT_LOST && fault != DESCRIPTOR_H_EXITED;
+    int lost_channel = sent && !positive && fault != DESCRIPTOR_REFUSED;
+    CHECK(result == (positive ? 0 : -1));
+    CHECK(pm.descriptor_writes == (unsigned int)sent && pm.descriptor_reads == (unsigned int)received);
+    CHECK(o.live_init[0] == (lost_channel ? -1 : 76) && pm.closes[76] == (unsigned int)lost_channel);
+    before.live_init[0] = o.live_init[0];
+    CHECK(!memcmp(&o, &before, sizeof(o)) && pm.writes == writes && pm.waits == waits &&
+          !pm.closes[DESCRIPTOR_REQUESTER] && !pm.closes[80] && !pm.closes[71]);
+    if (positive) {
+      CHECK(!strcmp(descriptor.started.native_id, CLAIM) && descriptor.pidfd == DESCRIPTOR_INIT);
+      CHECK(descriptor.started.namespace_device == 4 && descriptor.started.namespace_inode == 55);
+      CHECK(descriptor.pidfd_device == 45 && descriptor.pidfd_inode == descriptor_inode);
+      CHECK(!pm.closes[DESCRIPTOR_INIT]);
+      CHECK(parent_close(descriptor.pidfd) == 0);
+    } else {
+      CHECK(!memcmp(&descriptor, &empty, sizeof(descriptor)));
+      int delivered = received && fault != DESCRIPTOR_REFUSED && fault != DESCRIPTOR_MISSING;
+      CHECK(pm.closes[DESCRIPTOR_INIT] == (unsigned int)delivered);
+    }
+    CHECK(pm.closes[95] == (unsigned int)(fault == DESCRIPTOR_EXTRA ||
+          fault == DESCRIPTOR_CONTROL_TRUNCATED));
+    CHECK(pm.closes[96] == (unsigned int)(fault == DESCRIPTOR_CONTROL_TRUNCATED) &&
+          pm.closes[98] == (unsigned int)(fault == DESCRIPTOR_CONTROL_TRUNCATED));
+    pm.descriptor_mode = 0;
+    if (fault == DESCRIPTOR_REFUSED) {
+      authenticate_frontend_for(&o, 0, 1);
+      CHECK(frontend_command(&o, live_command) == 0 && pm.live_writes == 1);
+      CHECK(memmem(pm.frontend_sent, pm.frontend_sent_size, live_positive, sizeof(live_positive) - 1));
+      ocipp_host_lost(&o);
+    }
+    if (fault != DESCRIPTOR_CANCELED) {
+      authenticate_frontend(&o, 0);
+      CHECK(frontend_command(&o, live_outcome) == 0 && !o.replay_required);
+      CHECK(frontend_command(&o, live_stop) == 0 && o.pending && ocipp_flush_input(&o) == 0);
+      CHECK(pm.writes == writes + 1 && o.request_kind == TNS_OCIP_STOP_INIT);
+    }
+    dispose_fixture(&o);
+  }
+}
 static void peer_server_replies(struct ocipp_owner *o,int pending) {
   CHECK(ocipp_first_create(o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
   CHECK(ocipp_spawn(o)==0 && ocipp_flush_input(o)==0);pm.wait_kind=1;CHECK(ocipp_wait(o)==0);
@@ -1277,6 +1441,10 @@ static void peer_instance_only(void) {
   pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"peer-live-init-descriptor")) {
+    live_init_descriptor_receive();
+    printf("P held-init descriptor receive boundaries: %lu checks\n",checks);return 0;
+  }
   if(argc==2 && !strcmp(argv[1],"peer-live-init")) {
     live_init_readonly();live_init_auth_and_loss();live_init_frontend_deadline();
     printf("peer live-init read-only boundaries: %lu checks\n",checks);return 0;
