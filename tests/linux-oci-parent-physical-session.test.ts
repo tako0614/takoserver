@@ -1,12 +1,13 @@
 import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import {
   createLinuxOciParentBootstrap,
   prepareAuthenticatedLinuxOciApplicationOwnerReader,
+  prepareAuthenticatedLinuxOciLiveInitReader,
 } from "../src/providers/linux-oci-physical-session.ts";
 
 // Explicit NONSECRET fixture bytes only. All spawn/streams are raw doubles;
@@ -640,6 +641,99 @@ test("runtime application profile seals both original identities and reads the o
   } finally {
     lifetime.abort();
     reader.close();
+    f.cleanup();
+  }
+});
+
+test("original runtime P live-init read accepts only the same claim and closed observational reply", async () => {
+  const f = fixture();
+  const lifetime = new AbortController();
+  try {
+    const { dev, ino, uid, mode } = lstatSync(f.binary);
+    const binding = {
+      kind: "linux-oci-original-peer-control@1",
+      purpose: RUNTIME_APPLICATION_PURPOSE,
+      claimId: CLAIM,
+      generation: 1,
+      listenerCookie: COOKIE.toString(),
+      capability: Buffer.from(fixtureCapability()).toString("base64url"),
+      createDigest: HELPER_DIGEST,
+      executable: { path: f.binary, dev, ino, uid, mode },
+      peer: {
+        kind: "linux-oci-parent-peer@1",
+        device: "77",
+        inode: PEER_INODE.toString(),
+        bootId: PEER_BOOT,
+      },
+      applicationOwner: {
+        kind: "linux-oci-application-owner@1",
+        device: "77",
+        inode: APPLICATION_INODE.toString(),
+        bootId: PEER_BOOT,
+      },
+      allocation: { fixture: true },
+      retirementProducer: { revision: "NCLOSE01", digest: HELPER_DIGEST },
+    };
+    const reply = {
+      kind: "linux-oci-parent-live-init@1",
+      nativeId: CLAIM,
+      namespaceDevice: "77",
+      namespaceInode: "18446744073709551615",
+      barrier: "unproven",
+    } as const;
+    expect(() =>
+      prepareAuthenticatedLinuxOciLiveInitReader(
+        f.binary,
+        { ...binding, purpose: "takoserver.linux-oci-peer-application-owner-reconstruction@1" },
+        lifetime.signal,
+      ),
+    ).toThrow("parent_binding");
+    expect(f.raw).not.toHaveBeenCalled();
+    const cases = [
+      { body: reply, code: 0 },
+      { body: { ...reply, nativeId: "b".repeat(64) }, code: 0 },
+      { body: { ...reply, namespaceInode: "18446744073709551616" }, code: 0 },
+      { body: { ...reply, namespaceDevice: "077" }, code: 0 },
+      { body: { ...reply, barrier: "complete" }, code: 0 },
+      { body: { ...reply, readiness: true }, code: 0 },
+      { body: reply, code: 1 },
+      { body: reply, code: 0, abort: true },
+    ];
+    for (const [index, variant] of cases.entries()) {
+      const reader = connectorStreams();
+      const attempt = new AbortController();
+      try {
+        f.raw.mockReturnValueOnce(reader.child);
+        const read = prepareAuthenticatedLinuxOciLiveInitReader(f.binary, binding, lifetime.signal);
+        const pending = read(attempt.signal);
+        await wrote();
+        expect(f.raw.mock.calls.at(-1)?.[1]).toEqual(["--parent-peer-read-live-init"]);
+        expect(reader.writes).toHaveLength(1);
+        expect(reader.writes[0]?.subarray(4, 12).toString()).toBe("TKOPEER2");
+        expect(reader.writes[0]?.subarray(12, 76).toString()).toBe(CLAIM);
+        expect(reader.writes[0]?.readBigUInt64BE(132)).toBe(PEER_INODE);
+        reader.stdout.write(jsonFrame(variant.body));
+        if (variant.abort) attempt.abort();
+        reader.stdout.emit("end");
+        reader.stderr.emit("end");
+        reader.child.emit("exit", variant.code, null);
+        reader.child.emit("close", variant.code, null);
+        if (index === 0) {
+          const observed = await pending;
+          expect(observed).toEqual(reply);
+          expect(Object.isFrozen(observed)).toBe(true);
+        } else {
+          await expect(pending).rejects.toThrow("parent_peer_retained");
+        }
+        await expect(read(signal())).rejects.toThrow("parent_peer_retained");
+      } finally {
+        attempt.abort();
+        reader.close();
+      }
+    }
+    expect(f.raw).toHaveBeenCalledTimes(cases.length);
+  } finally {
+    lifetime.abort();
     f.cleanup();
   }
 });

@@ -55,6 +55,7 @@ import {
   type LinuxOciDisposedHelperObservation,
   type LinuxOciInitReapedObservation,
   type LinuxOciNamespaceLifetimeObservation,
+  type LinuxOciOriginalLiveInit,
   LinuxOciParentBootstrap,
   type LinuxOciParentHResult,
   type LinuxOciPeerInitProgress,
@@ -62,6 +63,7 @@ import {
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
   prepareAuthenticatedLinuxOciApplicationOwnerReader,
+  prepareAuthenticatedLinuxOciLiveInitReader,
   prepareAuthenticatedLinuxOciPeerInit,
   prepareAuthenticatedLinuxOciPeerReader,
 } from "./linux-oci-physical-session.ts";
@@ -79,6 +81,7 @@ type OriginalPeerRead = {
 type OriginalOciCustody = {
   readonly core: DockerContainerCoreOwner;
   readonly runtime3: boolean;
+  readonly isClosed: () => boolean;
   readonly artifactRoot: string;
   readonly physicalBinary: string | undefined;
   readonly hostTopology: LinuxOciHostTopology | undefined;
@@ -419,17 +422,10 @@ function capturedAllocationData(allocation: OriginalOciAllocation) {
     receiptBytes: allocation.receiptBytes,
   });
 }
-/** Called only after owning Core AEAD authentication, with the real creator
- * custody key. Data cannot register an allocation, session or replacement P. */
-async function authenticatedOriginalPeerSource(
+function originalPeerCustody(
   original: object,
   core: DockerContainerCoreOwner,
-  record: DockerContainerCreateRecord,
-  artifact: unknown,
-  binding: unknown,
   signal: AbortSignal,
-  previous?: OriginalPeerRead,
-  allocationState: "present" | "closed" = "present",
 ) {
   const custody = originalOciCustodies.get(original);
   if (
@@ -437,10 +433,19 @@ async function authenticatedOriginalPeerSource(
     custody.core !== core ||
     !custody.physicalBinary ||
     custody.signal.aborted ||
-    signal.aborted ||
-    custody.peerReads.get(record.claimId) !== previous
+    signal.aborted
   )
     return fail("parent_custody");
+  return { custody, binary: custody.physicalBinary };
+}
+
+async function readOriginalPeerAllocation(
+  custody: OriginalOciCustody,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  allocationState: "present" | "closed",
+) {
   const exact = (v: unknown, keys: readonly string[]): v is Record<string, unknown> =>
     isJsonObject(v) &&
     Object.keys(v).length === keys.length &&
@@ -539,14 +544,66 @@ async function authenticatedOriginalPeerSource(
       return fail("allocation_identity");
     await assertOriginalFile(captured.receipt, false);
   }
+  return captured;
+}
+
+/** Called only after owning Core AEAD authentication, with the real creator
+ * custody key. Data cannot register an allocation, session or replacement P. */
+async function authenticatedOriginalPeerSource(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+  previous?: OriginalPeerRead,
+  allocationState: "present" | "closed" = "present",
+) {
+  const { custody, binary } = originalPeerCustody(original, core, signal);
+  if (custody.peerReads.get(record.claimId) !== previous) return fail("parent_custody");
+  const allocation = await readOriginalPeerAllocation(
+    custody,
+    record,
+    artifact,
+    binding,
+    allocationState,
+  );
   if (
     custody.signal.aborted ||
     signal.aborted ||
     custody.peerReads.get(record.claimId) !== previous
   )
     return fail("parent_custody");
-  return { custody, binary: custody.physicalBinary, allocation: captured };
+  return { custody, binary, allocation };
 }
+
+/** Fixed observation after Core authenticates its current same-Sql record.
+ * The opened binding is consumed here, outside all caller-provided callbacks. */
+export async function readOriginalLinuxOciLiveInit(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+  assertCurrent: () => Promise<void>,
+): Promise<LinuxOciOriginalLiveInit> {
+  const { custody, binary } = originalPeerCustody(original, core, signal);
+  const assertOpen = () => {
+    if (custody.isClosed() || custody.signal.aborted || signal.aborted) fail("parent_custody");
+  };
+  if (!custody.runtime3 || record.state !== "bound" || record.nativeId !== record.claimId)
+    return fail("parent_custody");
+  assertOpen();
+  await readOriginalPeerAllocation(custody, record, artifact, binding, "present");
+  await assertCurrent();
+  assertOpen();
+  const read = prepareAuthenticatedLinuxOciLiveInitReader(binary, binding, custody.signal);
+  const fact = await read(signal);
+  assertOpen();
+  return fact;
+}
+
 export function prepareOriginalLinuxOciPeerRead(
   original: object,
   core: DockerContainerCoreOwner,
@@ -1493,6 +1550,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   originalOciCustodies.set(originalNativeCustody, {
     core,
     runtime3: trackedPeer,
+    isClosed: () => closed,
     artifactRoot,
     physicalBinary,
     hostTopology,
@@ -2683,6 +2741,32 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     })();
   }
   const creator = Object.freeze({
+    /** Private observation of a current same-Sql original. The result does
+     * not register a replacement session or enable the application transport. */
+    async readCurrentLiveInit(
+      record: DockerContainerCreateRecord,
+      signal: AbortSignal,
+    ): Promise<LinuxOciOriginalLiveInit> {
+      if (closed || !runtimeApplicationOwner || !physicalBinary) return fail("parent_custody");
+      if (!(signal instanceof AbortSignal) || signal.aborted) return fail("revoked");
+      const cancel = new AbortController();
+      const abort = () => cancel.abort();
+      cancellation.add(cancel);
+      signal.addEventListener("abort", abort, { once: true });
+      const timer = setTimeout(abort, timeout);
+      const running = core.readCurrentOciInit(record, originalNativeCustody, cancel.signal);
+      scopes.add(running);
+      try {
+        const fact = await running;
+        if (closed || cancel.signal.aborted) return fail("revoked");
+        return fact;
+      } finally {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", abort);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+      }
+    },
     /** Internal application transport. Identity is a selector to revalidate,
      * never caller authorization; a real binding composition must authorize it. */
     fetchServingHttp(

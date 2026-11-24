@@ -72,6 +72,7 @@ import {
   prepareOriginalLinuxOciPeerInit,
   prepareOriginalLinuxOciPeerRead,
   readOriginalLinuxOciControlArtifact,
+  readOriginalLinuxOciLiveInit,
   releaseOriginalLinuxOciOwnedNamespace,
   sealOriginalLinuxOciParentControl,
   stopOriginalLinuxOciOwnedInit,
@@ -82,6 +83,7 @@ import type {
   LinuxOciDisposedHelperObservation,
   LinuxOciInitReapedObservation,
   LinuxOciNamespaceLifetimeObservation,
+  LinuxOciOriginalLiveInit,
   LinuxOciParentHResult,
   LinuxOciPeerInitProgress,
   LinuxOciRetirementObservation,
@@ -251,6 +253,13 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<void>;
+  /** Internal keyed read of the original running init through its fixed peer
+   * connector. Sealed control bytes stay in owning Core and creator code. */
+  readCurrentOciInit(
+    record: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciOriginalLiveInit>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
    * removal; the binding owner must authorize each application invocation. */
@@ -1307,18 +1316,18 @@ export function createDockerContainerCoreOwner(
     )
       fail();
   }
+  function freezeJson(value: unknown): void {
+    if (value && typeof value === "object") {
+      for (const child of Object.values(value)) freezeJson(child);
+      Object.freeze(value);
+    }
+  }
   function publicSpec(raw: unknown): JsonObject {
     if (typeof raw !== "string") return fail();
     const parsed = parseStrictJson(new TextEncoder().encode(raw), 1048576);
     if (!isJsonObject(parsed)) return fail();
     validateDockerContainerSpec(parsed);
-    const freeze = (value: unknown): void => {
-      if (value && typeof value === "object") {
-        for (const child of Object.values(value)) freeze(child);
-        Object.freeze(value);
-      }
-    };
-    freeze(parsed);
+    freezeJson(parsed);
     return parsed;
   }
   async function assertSnapshot(proof: Proof): Promise<void> {
@@ -1579,10 +1588,11 @@ export function createDockerContainerCoreOwner(
     if (saved.state !== "bound" || saved.nativeId !== input.nativeId) return fail();
     return { ...loaded, record: saved };
   }
-  async function boundInitPhase(loaded: BoundStart) {
+  async function boundInitPhase(loaded: BoundStart, guard?: ReturnType<typeof fence>) {
     const rows = await sql.query(
-      "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?",
-      [loaded.intent.resourceUid, loaded.intent.policy.generation],
+      "SELECT attempt,create_claim_id,native_id,state,claimed_at_ms,confirmed_running_at_ms,confirmed_exited_at_ms FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=?" +
+        (guard === undefined ? "" : " AND " + guard.sql),
+      [loaded.intent.resourceUid, loaded.intent.policy.generation, ...(guard?.params ?? [])],
     );
     if (rows.length === 0) return "unclaimed";
     const row = rows[0];
@@ -1611,6 +1621,32 @@ export function createDockerContainerCoreOwner(
     )
       return "exited";
     return fail();
+  }
+  async function loadServingOci(input: DockerContainerCreateRecord, signal: AbortSignal) {
+    if (
+      !own(input, ["claimId", "intent", "nativeId", "state"]) ||
+      !hex(input.claimId) ||
+      !hex(input.nativeId) ||
+      input.state !== "bound" ||
+      !(signal instanceof AbortSignal) ||
+      signal.aborted
+    )
+      return fail();
+    const captured = Object.freeze({
+      claimId: input.claimId,
+      intent: intentSnapshot(input.intent),
+      nativeId: input.nativeId,
+      state: "bound" as const,
+    });
+    const loaded = await boundStartRecord(captured);
+    if (
+      !usable(loaded.proof, "reconcile") ||
+      loaded.proof.i_serving_generation !== captured.intent.policy.generation ||
+      loaded.proof.v_retention !== "serving" ||
+      loaded.proof.i_retired_at_ms !== null
+    )
+      return fail();
+    return { captured, loaded };
   }
   async function startState(loaded: BoundStart) {
     const rows = await sql.query(
@@ -2893,6 +2929,99 @@ export function createDockerContainerCoreOwner(
     await refresh();
     return { local, refresh, snapshot };
   }
+  async function openOriginalParentControl(
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    proof: Proof,
+    raw: string,
+    signal: AbortSignal,
+    stillCurrent: () => Promise<boolean>,
+  ) {
+    if (
+      !controlDecryptionKey ||
+      signal.aborted ||
+      raw.length > 65536 ||
+      raw === V2_CONTAINER_CONTROL_RESERVED
+    )
+      return fail();
+    const envelope = parseStrictJson(new TextEncoder().encode(raw), 65536);
+    if (
+      !own(envelope, ["kind", "scope", "keyId", "nonce", "ciphertext"]) ||
+      envelope.kind !== "linux-oci-sealed-control@1" ||
+      !text(envelope.keyId) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(envelope.keyId) ||
+      typeof envelope.nonce !== "string" ||
+      typeof envelope.ciphertext !== "string" ||
+      canonicalJson(envelope) !== raw
+    )
+      return fail();
+    const artifact = peerMode
+      ? peerArtifact(envelope.scope, input)
+      : await readOriginalLinuxOciControlArtifact(originalCustody, result, input, signal);
+    // a/o describe the ORIGINAL accepted CREATE/UPDATE for this generation.
+    // la/lo describe today's operation, which may be DELETE; never substitute it.
+    const scope = Object.freeze({
+      purpose: peerMode ? peerPurpose : "takoserver.linux-oci-parent-control@1",
+      claimId: input.claimId,
+      installationId,
+      resourceUid: input.intent.resourceUid,
+      incarnationId: input.intent.incarnationId,
+      generation: input.intent.policy.generation,
+      revision: input.intent.revision,
+      operationId: proof.a_operation_id,
+      principal: proof.i_principal,
+      space: proof.i_space,
+      form: proof.i_form_url,
+      backendId,
+      targetKey,
+      action: proof.a_action,
+      acceptedFingerprint: proof.a_fingerprint,
+      policyDigest: input.intent.policy.policyDigest,
+      artifact,
+    });
+    if (
+      canonicalJson(envelope.scope) !== canonicalJson(scope) ||
+      !(await stillCurrent()) ||
+      signal.aborted
+    )
+      return fail();
+    const originalControlKeyId = envelope.keyId,
+      key = controlDecryptionKey(originalControlKeyId),
+      nonce = decodeContainerSecretBytes(envelope.nonce),
+      ciphertext = decodeContainerSecretBytes(envelope.ciphertext);
+    if (
+      !isContainerSecretKey(key) ||
+      nonce.length !== 12 ||
+      ciphertext.length < 16 ||
+      ciphertext.length > 65536
+    )
+      return fail();
+    let plaintext: Uint8Array<ArrayBuffer> | undefined;
+    try {
+      plaintext = await decryptContainerSecretBytes(
+        key,
+        nonce,
+        ciphertext,
+        new TextEncoder().encode(canonicalJson(scope)),
+      );
+      const binding = parseStrictJson(plaintext, 65536);
+      if (peerMode && (!isJsonObject(binding) || binding.purpose !== peerReconstructionPurpose))
+        return fail();
+      const finalProducer =
+        trackedPeer &&
+        qualifiedPhysicalDigest !== undefined &&
+        isJsonObject(binding) &&
+        own(binding.retirementProducer, ["revision", "digest"]) &&
+        binding.retirementProducer.revision === "NCLOSE01" &&
+        binding.retirementProducer.digest === qualifiedPhysicalDigest;
+      if (runtimeApplicationOwner && !finalProducer) return fail();
+      if (JSON.stringify(binding) !== new TextDecoder("utf-8", { fatal: true }).decode(plaintext))
+        return fail();
+      return { artifact, scope, binding, originalControlKeyId, key, finalProducer };
+    } finally {
+      plaintext?.fill(0);
+    }
+  }
   async function acceptedParentControl(
     execution: V2Execution,
     input: DockerContainerCreateRecord,
@@ -2972,86 +3101,10 @@ export function createDockerContainerCoreOwner(
       [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
     );
     const raw = rows[0]?.native_control;
-    if (
-      rows.length !== 1 ||
-      typeof raw !== "string" ||
-      raw.length > 65536 ||
-      raw === V2_CONTAINER_CONTROL_RESERVED
-    )
-      return fail();
-    const envelope = parseStrictJson(new TextEncoder().encode(raw), 65536);
-    if (
-      !own(envelope, ["kind", "scope", "keyId", "nonce", "ciphertext"]) ||
-      envelope.kind !== "linux-oci-sealed-control@1" ||
-      !text(envelope.keyId) ||
-      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(envelope.keyId) ||
-      typeof envelope.nonce !== "string" ||
-      typeof envelope.ciphertext !== "string" ||
-      canonicalJson(envelope) !== raw
-    )
-      return fail();
-    const artifact = peerMode
-      ? peerArtifact(envelope.scope, input)
-      : await readOriginalLinuxOciControlArtifact(originalCustody, result, input, signal);
-    // a/o describe the ORIGINAL accepted CREATE/UPDATE for this generation.
-    // la/lo describe today's operation, which may be DELETE; never substitute it.
-    const scope = Object.freeze({
-      purpose: peerMode ? peerPurpose : "takoserver.linux-oci-parent-control@1",
-      claimId: input.claimId,
-      installationId,
-      resourceUid: input.intent.resourceUid,
-      incarnationId: input.intent.incarnationId,
-      generation: input.intent.policy.generation,
-      revision: input.intent.revision,
-      operationId: loaded.proof.a_operation_id,
-      principal: loaded.proof.i_principal,
-      space: loaded.proof.i_space,
-      form: loaded.proof.i_form_url,
-      backendId,
-      targetKey,
-      action: loaded.proof.a_action,
-      acceptedFingerprint: loaded.proof.a_fingerprint,
-      policyDigest: input.intent.policy.policyDigest,
-      artifact,
-    });
-    if (
-      canonicalJson(envelope.scope) !== canonicalJson(scope) ||
-      !(await current(lease)) ||
-      signal.aborted
-    )
-      return fail();
-    const originalControlKeyId = envelope.keyId,
-      key = controlDecryptionKey(originalControlKeyId),
-      nonce = decodeContainerSecretBytes(envelope.nonce),
-      ciphertext = decodeContainerSecretBytes(envelope.ciphertext);
-    if (
-      !isContainerSecretKey(key) ||
-      nonce.length !== 12 ||
-      ciphertext.length < 16 ||
-      ciphertext.length > 65536
-    )
-      return fail();
-    let plaintext: Uint8Array<ArrayBuffer> | undefined;
-    try {
-      plaintext = await decryptContainerSecretBytes(
-        key,
-        nonce,
-        ciphertext,
-        new TextEncoder().encode(canonicalJson(scope)),
-      );
-      const binding = parseStrictJson(plaintext, 65536);
-      if (peerMode && (!isJsonObject(binding) || binding.purpose !== peerReconstructionPurpose))
-        return fail();
-      const finalProducer =
-        trackedPeer &&
-        qualifiedPhysicalDigest !== undefined &&
-        isJsonObject(binding) &&
-        own(binding.retirementProducer, ["revision", "digest"]) &&
-        binding.retirementProducer.revision === "NCLOSE01" &&
-        binding.retirementProducer.digest === qualifiedPhysicalDigest;
-      if (runtimeApplicationOwner && !finalProducer) return fail();
-      if (JSON.stringify(binding) !== new TextDecoder("utf-8", { fatal: true }).decode(plaintext))
-        return fail();
+    if (rows.length !== 1 || typeof raw !== "string") return fail();
+    return openOriginalParentControl(input, originalCustody, loaded.proof, raw, signal, () =>
+      current(lease),
+    ).then(async ({ artifact, scope, binding, originalControlKeyId, key, finalProducer }) => {
       await assertSnapshot(loaded.proof);
       await assertExecution(execution);
       if (!(await current(lease)) || signal.aborted) return fail();
@@ -3289,7 +3342,6 @@ export function createDockerContainerCoreOwner(
             // after fresh same-operation, key, lease, row, and AEAD checks.
             // P still independently refuses an attached frontend or foreign
             // process and reports its exact native stage before any command.
-            const controlKeyId = envelope.keyId;
             let factCurrent: (() => void) | undefined;
             const guard = async () => {
               await assertSnapshot(loaded.proof);
@@ -3320,7 +3372,7 @@ export function createDockerContainerCoreOwner(
                 row[0]?.application_io_cleanup !== document
               )
                 return fail();
-              if (!controlDecryptionKey || controlDecryptionKey(controlKeyId) !== key)
+              if (!controlDecryptionKey || controlDecryptionKey(originalControlKeyId) !== key)
                 return fail();
               factCurrent();
               if (
@@ -3365,7 +3417,6 @@ export function createDockerContainerCoreOwner(
           const document = closed[0]?.application_io_cleanup;
           const ioScope = await applicationCloseScope(scope, loaded.proof, execution, input, raw);
           const factCurrent = await readApplicationCloseFact(document, ioScope);
-          const controlKeyId = envelope.keyId;
           const guard = async () => {
             await assertSnapshot(loaded.proof);
             const row = await sql.query(
@@ -3386,7 +3437,8 @@ export function createDockerContainerCoreOwner(
             )
               return fail();
             await assertExecution(execution);
-            if (!controlDecryptionKey || controlDecryptionKey(controlKeyId) !== key) return fail();
+            if (!controlDecryptionKey || controlDecryptionKey(originalControlKeyId) !== key)
+              return fail();
             factCurrent();
             if (
               signal.aborted ||
@@ -3429,7 +3481,7 @@ export function createDockerContainerCoreOwner(
                   lease.controller.signal.aborted ||
                   !leases.has(lease) ||
                   !controlDecryptionKey ||
-                  controlDecryptionKey(controlKeyId) !== key
+                  controlDecryptionKey(originalControlKeyId) !== key
                 )
                   return fail();
                 executionScope(execution);
@@ -4012,9 +4064,7 @@ export function createDockerContainerCoreOwner(
         return fail();
       executionScope(execution);
       return observation;
-    } finally {
-      plaintext?.fill(0);
-    }
+    });
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
@@ -4763,30 +4813,82 @@ export function createDockerContainerCoreOwner(
       // actual fact; no rollback, START/OPEN replay or manufactured completion.
       local();
     },
+    async readCurrentOciInit(input, originalCustody, signal) {
+      if (!runtimeApplicationOwner || !(signal instanceof AbortSignal) || signal.aborted)
+        return fail();
+      const { captured, loaded } = await loadServingOci(input, signal);
+      if (
+        loaded.proof.r_phase === "deleting" ||
+        !(await inspectV2ContainerOwnerSelectedSchema(sql, "allocation"))
+      )
+        return fail();
+      const coordinates = [
+        captured.intent.resourceUid,
+        captured.intent.policy.generation,
+        captured.claimId,
+        captured.nativeId,
+      ];
+      const allocationPredicate =
+        "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched'";
+      const rows = await sql.query(
+        "SELECT native_control FROM tf_v2_container_create_claims WHERE " + allocationPredicate,
+        coordinates,
+      );
+      const raw = rows[0]?.native_control;
+      if (rows.length !== 1 || typeof raw !== "string") return fail();
+      const snapshot = fence(loaded.proof);
+      const guard = {
+        sql:
+          snapshot.sql +
+          " AND EXISTS (SELECT 1 FROM tf_v2_container_create_claims WHERE " +
+          allocationPredicate +
+          " AND native_control=?)",
+        params: [...snapshot.params, ...coordinates, raw],
+      };
+      const currentRunning = async () =>
+        !signal.aborted && (await boundInitPhase(loaded, guard)) === "running" && !signal.aborted;
+      const { artifact, binding, originalControlKeyId, key } = await openOriginalParentControl(
+        captured,
+        originalCustody,
+        loaded.proof,
+        raw,
+        signal,
+        currentRunning,
+      );
+      freezeJson(artifact);
+      freezeJson(binding);
+      let active = true;
+      const assertLocal = () => {
+        if (!active || signal.aborted || controlDecryptionKey?.(originalControlKeyId) !== key)
+          return fail();
+      };
+      const assertCurrent = async () => {
+        assertLocal();
+        if (!(await currentRunning())) return fail();
+        assertLocal();
+      };
+      try {
+        await assertCurrent();
+        assertLocal();
+        const observed = await readOriginalLinuxOciLiveInit(
+          originalCustody,
+          result,
+          captured,
+          artifact,
+          binding,
+          signal,
+          assertCurrent,
+        );
+        await assertCurrent();
+        assertLocal();
+        if (observed.nativeId !== captured.nativeId) return fail();
+        return observed;
+      } finally {
+        active = false;
+      }
+    },
     async observeServingOciHttp(input, originalCustody, signal) {
-      if (
-        !own(input, ["claimId", "intent", "nativeId", "state"]) ||
-        !hex(input.claimId) ||
-        !hex(input.nativeId) ||
-        input.state !== "bound" ||
-        !(signal instanceof AbortSignal) ||
-        signal.aborted
-      )
-        return fail();
-      const captured = Object.freeze({
-        claimId: input.claimId,
-        intent: intentSnapshot(input.intent),
-        nativeId: input.nativeId,
-        state: "bound" as const,
-      });
-      const loaded = await boundStartRecord(captured);
-      if (
-        !usable(loaded.proof, "reconcile") ||
-        loaded.proof.i_serving_generation !== captured.intent.policy.generation ||
-        loaded.proof.v_retention !== "serving" ||
-        loaded.proof.i_retired_at_ms !== null
-      )
-        return fail();
+      const { captured, loaded } = await loadServingOci(input, signal);
       const spec = publicSpec(loaded.proof.a_accepted_spec_json);
       const port = spec[C.fields.httpPort];
       if (typeof port !== "number") return fail();

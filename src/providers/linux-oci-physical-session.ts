@@ -2079,7 +2079,10 @@ function readOriginalPeerResult(state: OriginalPeerReaderState, signal: AbortSig
 function readOriginalPeerTransport<T>(
   state: OriginalPeerReaderState,
   signal: AbortSignal,
-  argument: "--parent-peer-read-result" | "--parent-peer-read-application-owner",
+  argument:
+    | "--parent-peer-read-result"
+    | "--parent-peer-read-application-owner"
+    | "--parent-peer-read-live-init",
   parse: (body: Buffer) => T,
 ): Promise<T> {
   state.assertBinary();
@@ -2213,6 +2216,14 @@ function readOriginalPeerTransport<T>(
   });
 }
 
+function positiveU64String(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[1-9][0-9]{0,19}$/u.test(value) &&
+    BigInt(value) <= 18446744073709551615n
+  );
+}
+
 /** Owning internal entrance after AEAD and original-files validation. This
  * constructs only a one-use read-only connector, never a Parent or H session.
  * Its input is data, not authority; the original same-Sql creator owns the
@@ -2243,8 +2254,6 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     record(v) &&
     Reflect.ownKeys(v).length === names.length &&
     names.every((k) => Object.hasOwn(Object.getOwnPropertyDescriptor(v, k) ?? {}, "value"));
-  const u64 = (v: unknown): v is string =>
-    typeof v === "string" && /^[1-9][0-9]{0,19}$/u.test(v) && BigInt(v) <= 18446744073709551615n;
   if (
     !exact(value, keys) ||
     value.kind !== "linux-oci-original-peer-control@1" ||
@@ -2255,15 +2264,15 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     typeof value.claimId !== "string" ||
     !CLAIM.test(value.claimId) ||
     !integer(value.generation, 1) ||
-    !u64(value.listenerCookie) ||
+    !positiveU64String(value.listenerCookie) ||
     typeof value.capability !== "string" ||
     typeof value.createDigest !== "string" ||
     !DIGEST.test(value.createDigest) ||
     !exact(value.executable, ["path", "dev", "ino", "uid", "mode"]) ||
     !exact(value.peer, ["kind", "device", "inode", "bootId"]) ||
     value.peer.kind !== "linux-oci-parent-peer@1" ||
-    !u64(value.peer.device) ||
-    !u64(value.peer.inode) ||
+    !positiveU64String(value.peer.device) ||
+    !positiveU64String(value.peer.inode) ||
     typeof value.peer.bootId !== "string" ||
     !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value.peer.bootId) ||
     value.peer.bootId === "00000000-0000-0000-0000-000000000000" ||
@@ -2318,8 +2327,8 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     if (
       !exact(value.applicationOwner, ["kind", "device", "inode", "bootId"]) ||
       value.applicationOwner.kind !== "linux-oci-application-owner@1" ||
-      !u64(value.applicationOwner.device) ||
-      !u64(value.applicationOwner.inode) ||
+      !positiveU64String(value.applicationOwner.device) ||
+      !positiveU64String(value.applicationOwner.inode) ||
       value.applicationOwner.bootId !== peer.bootId
     )
       throw failure("parent_binding");
@@ -2409,6 +2418,67 @@ export function prepareAuthenticatedLinuxOciApplicationOwnerReader(
             device: owner.device,
             inode: owner.inode,
             bootId: owner.bootId,
+            barrier: "unproven",
+          });
+        },
+      );
+    } finally {
+      state.capability.fill(0);
+    }
+  };
+}
+
+export interface LinuxOciOriginalLiveInit {
+  readonly kind: "linux-oci-parent-live-init@1";
+  readonly nativeId: string;
+  readonly namespaceDevice: string;
+  readonly namespaceInode: string;
+  readonly barrier: "unproven";
+}
+
+/** Fresh init identity from the authenticated original P. This observation
+ * grants no serving, cleanup, or retirement authority. */
+export function prepareAuthenticatedLinuxOciLiveInitReader(
+  binary: string,
+  value: unknown,
+  lifetime: AbortSignal,
+) {
+  if (
+    !record(value) ||
+    Object.getOwnPropertyDescriptor(value, "purpose")?.value !==
+      RUNTIME_APPLICATION_RECONSTRUCTION_PURPOSE
+  )
+    throw failure("parent_binding");
+  const state = authenticatedPeerState(binary, value, lifetime);
+  let attempted = false;
+  return async (signal: AbortSignal): Promise<LinuxOciOriginalLiveInit> => {
+    if (attempted) throw failure("parent_peer_retained");
+    attempted = true;
+    try {
+      if (signal.aborted || lifetime.aborted) throw failure("parent_peer_retained");
+      return await readOriginalPeerTransport(
+        state,
+        signal,
+        "--parent-peer-read-live-init",
+        (body) => {
+          const observation = parseStrictJson(body, 512);
+          if (
+            !record(observation) ||
+            Reflect.ownKeys(observation).length !== 5 ||
+            JSON.stringify(observation) !==
+              new TextDecoder("utf-8", { fatal: true }).decode(body) ||
+            observation.kind !== "linux-oci-parent-live-init@1" ||
+            observation.nativeId !== state.claim ||
+            !positiveU64String(observation.namespaceDevice) ||
+            !positiveU64String(observation.namespaceInode) ||
+            observation.barrier !== "unproven"
+          )
+            throw failure("parent_binding");
+          return Object.freeze({
+            kind: "linux-oci-parent-live-init@1",
+            nativeId: state.claim,
+            namespaceDevice: observation.namespaceDevice,
+            namespaceInode: observation.namespaceInode,
             barrier: "unproven",
           });
         },
