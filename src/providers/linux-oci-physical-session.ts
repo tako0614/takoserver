@@ -2909,7 +2909,11 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       }
       return observed;
     },
-    advance(nativeId: string, actualSignal: AbortSignal) {
+    advance(
+      nativeId: string,
+      actualSignal: AbortSignal,
+      expectedStart?: "linux-oci-started@1" | "linux-oci-started-observation@1",
+    ) {
       current();
       if (
         signal !== actualSignal ||
@@ -2917,6 +2921,7 @@ export function prepareAuthenticatedLinuxOciPeerInit(
         phase !== "paused" ||
         !outcome ||
         !captured ||
+        (expectedStart !== undefined && captured.kind !== expectedStart) ||
         !CLAIM.test(nativeId) ||
         outcome.requestBytes === "0" ||
         outcome.requestBytes !== outcome.issuedBytes

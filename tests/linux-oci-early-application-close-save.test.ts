@@ -6,8 +6,13 @@ import {
 } from "../src/providers/container-secret-codec.ts";
 import * as originalBundle from "../src/providers/linux-oci-owned-bundle.ts";
 import {
+  v2ConfiguredUpdateDiscardTransition,
+  v2FinalDeleteConfiguredUpdateDiscardTransition,
+} from "../src/takoform-v2/configured-update-inputs-schema.ts";
+import {
   V2_CONTAINER_APPLICATION_IO_RESERVED,
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
 import {
   observeRawPromise,
@@ -178,6 +183,177 @@ async function untouched(f: PendingIo["f"]) {
 }
 const savesIo = (statement: string) =>
   statement.startsWith("UPDATE tf_v2_container_create_claims SET application_io_cleanup=");
+
+const trackedCloseCases = ["complete START", "incomplete START", "stale lease"] as const;
+for (const fault of trackedCloseCases) {
+  test(
+    `early-application-close-save tracked pre-STOP recovery with ${fault}`,
+    () => trackedPreStopClose(fault),
+    20000,
+  );
+}
+
+async function trackedPreStopClose(fault: (typeof trackedCloseCases)[number]) {
+  const f = await originalPeerDeleteFixture({
+    normal: true,
+    configuredPeer: true,
+    qualifiedProducer: true,
+    runtimeApplicationOwner: true,
+    allocationSchema: true,
+    ...(fault === "incomplete START" ? { managementFault: "incomplete" as const } : {}),
+  });
+  const health = acceptedRawHttp();
+  health.onEnd(() => {
+    health.reply();
+    health.join();
+  });
+  const count = (kind: string) => f.nativeCounts().requests.filter((k) => k === kind).length;
+  const stop = "linux-oci-stop-init@1";
+  let fresh: ReturnType<typeof f.reconstructNormal> | undefined;
+  try {
+    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })));
+    await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+    await f.sql.batch(v2ConfiguredUpdateDiscardTransition());
+    await f.sql.batch(v2FinalDeleteConfiguredUpdateDiscardTransition());
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+    expect(count("linux-oci-parent-bootstrap@6")).toBe(1);
+    health.restore();
+
+    // Join the actual serving exchange before DELETE so the original
+    // application's close can fulfill before any native stop is needed.
+    const io = ownedRawHttp();
+    try {
+      const response = f.composition.fetchServingHttp(
+        f.recordedCreate(),
+        new Request("http://ignored.invalid/NONSECRET-joined-response"),
+      );
+      await waitFor(() => io.counts().calls === 1);
+      io.head();
+      const serving = await response;
+      expect(serving.status).toBe(200);
+      io.incoming.end("NONSECRET joined body");
+      expect(await serving.text()).toBe("NONSECRET joined body");
+    } finally {
+      io.closeResponse();
+      io.closeRequest();
+      io.restore();
+    }
+    const removal = await f.engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    await untouched(f);
+    const actualRun = f.sql.run.bind(f.sql);
+    const actualQuery = f.sql.query.bind(f.sql);
+    let saves = 0,
+      changedLease = 0;
+    let stopsAtCommit: number | undefined;
+    const saving = spyOn(f.sql, "run").mockImplementation(async (statement, params) => {
+      const result = await actualRun(statement, params);
+      if (savesIo(statement) && ++saves === 1 && result.changes === 1) {
+        stopsAtCommit = count(stop);
+        if (fault !== "stale lease")
+          throw Error("NONSECRET close CAS acknowledgement lost after commit");
+      }
+      return result;
+    });
+    const reading =
+      fault === "stale lease"
+        ? spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+            if (
+              !changedLease &&
+              statement.startsWith("SELECT 1 FROM tf_v2_container_create_claims") &&
+              statement.includes("AND EXISTS (SELECT 1 FROM tf_v2_container_start_attempts") &&
+              statement.includes("AND EXISTS (SELECT 1 FROM tf_v2_operations")
+            ) {
+              const replaced = await actualRun(
+                "UPDATE tf_v2_operations SET lease_token=? WHERE id=? AND lease_token IS NOT NULL",
+                ["NONSECRET-replaced-lease", removal.id],
+              );
+              changedLease = replaced.changes;
+            }
+            return actualQuery(statement, params);
+          })
+        : undefined;
+    try {
+      expect(await f.engine.runNext()).toMatchObject({
+        id: removal.id,
+        status: "reconciling",
+        effect: "unknown",
+      });
+    } finally {
+      reading?.mockRestore();
+      saving.mockRestore();
+    }
+    expect(saves).toBe(1);
+    expect(stopsAtCommit).toBe(0);
+    expect(count(stop)).toBe(0);
+    const document = await closeDocument(f);
+    if (typeof document !== "string") throw Error("NONSECRET committed close fact missing");
+    expect(JSON.parse(document)).toMatchObject({
+      kind: "linux-oci-sealed-application-io-close@1",
+      scope: { operation: { operationId: removal.id, action: "delete", generation: 2 } },
+    });
+    if (fault === "stale lease") {
+      expect(changedLease).toBe(1);
+      expect(
+        await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
+      ).toEqual([{ state: "bound", allocation_cleanup: "untouched" }]);
+      expect(f.network).not.toHaveBeenCalled();
+      return;
+    }
+
+    fresh = f.reconstructNormal();
+    f.advanceNormalClock(61_000);
+    const beforeRead = count("linux-oci-parent-read-outcome@2");
+    let state = await fresh.engine.runNext();
+    expect(state).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+    expect(count("linux-oci-parent-read-outcome@2")).toBe(beforeRead + 1);
+    if (fault === "incomplete START") {
+      expect(count(stop)).toBe(0);
+      expect(await closeDocument(f)).toBe(document);
+      expect(
+        await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
+      ).toEqual([{ state: "bound", allocation_cleanup: "untouched" }]);
+      expect(f.network).not.toHaveBeenCalled();
+      return;
+    }
+    expect(count(stop)).toBe(1);
+    for (let phase = 0; phase < 20 && state?.status !== "succeeded"; phase++) {
+      f.advanceNormalClock(61_000);
+      state = await fresh.engine.runNext();
+    }
+    expect(state).toMatchObject({ id: removal.id, status: "succeeded", effect: "complete" });
+    expect(
+      (
+        await f.sql.query(
+          "SELECT state,allocation_cleanup,removed_at_ms FROM tf_v2_container_create_claims",
+        )
+      )[0],
+    ).toMatchObject({
+      state: "removed",
+      allocation_cleanup: "closed",
+      removed_at_ms: expect.any(Number),
+    });
+    expect(await closeDocument(f)).toBe(document);
+    for (const kind of [
+      "linux-oci-parent-bootstrap@6",
+      "linux-oci-create-stopped@1",
+      "linux-oci-start@1",
+      stop,
+      "linux-oci-read-tracked-join@1",
+    ])
+      expect(count(kind)).toBe(1);
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    health.restore();
+    await fresh?.close().catch(() => undefined);
+    await f.cleanup();
+  }
+}
 
 test("early-application-close-save cold recovery stops when cleanup advances after the parent read", async () => {
   const { f, io, removal } = await pendingIo();

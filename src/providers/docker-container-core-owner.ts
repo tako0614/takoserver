@@ -3568,22 +3568,28 @@ export function createDockerContainerCoreOwner(
             let detachCloseListener: (() => void) | undefined;
             try {
               const originalOutcome = await read.begin(signal); // authenticated P outcome; H writes still zero
+              const stopIssued = (originalOutcome.effects & (1 << 6)) !== 0;
               if (sealedCloseResume) {
-                // The sessionless path is continuation only. The cumulative
-                // original P ledger must prove a complete, known STOP; the
-                // exact request-specific next-stage checks remain in advance
-                // or advanceNamespace and emit no command when ambiguous.
+                // Older profiles continue a known STOP only. The tracked
+                // owner can start this DELETE from a known START and its
+                // genuinely saved close. The original P owns the effect latch.
+                const knownStart =
+                  runtimeApplicationOwner &&
+                  execution.action === "delete" &&
+                  originalOutcome.effects === ((1 << 1) | (1 << 4)) &&
+                  [4, 5].includes(originalOutcome.requestKind);
                 if (
                   originalOutcome.requestBytes === "0" ||
                   originalOutcome.requestBytes !== originalOutcome.issuedBytes ||
                   originalOutcome.replyBytes === "0" ||
-                  !(originalOutcome.effects & (1 << 6))
+                  (!stopIssued && !knownStart)
                 )
                   return fail();
               }
               await assertSnapshot(loaded.proof);
               await assertExecution(execution);
               const boundPhase = await boundInitPhase(await boundStartRecord(input));
+              if (sealedCloseResume && !stopIssued && boundPhase !== "running") return fail();
               const guarded = await sql.query(
                 "SELECT native_control FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=?",
                 [input.intent.resourceUid, input.intent.policy.generation, input.claimId],
@@ -3623,6 +3629,46 @@ export function createDockerContainerCoreOwner(
                   detachCloseListener = () =>
                     closeFinished.removeEventListener("abort", onCloseFinished);
                 }
+                if (
+                  applicationSchema &&
+                  runtimeApplicationOwner &&
+                  execution.action === "delete" &&
+                  !stopIssued &&
+                  boundPhase === "running" &&
+                  closeFinished.aborted &&
+                  (await terminal.then(
+                    () => true,
+                    () => false,
+                  ))
+                ) {
+                  // The real close already settled. Save it before the first
+                  // STOP so a lost CAS acknowledgement can be reconciled.
+                  const closedCurrent = await beginApplicationSave();
+                  if (!closedCurrent) return fail();
+                  const startGuard = fence(loaded.proof);
+                  const stillAuthorized = await sql.query(
+                    "SELECT 1 FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=? AND " +
+                      startGuard.sql +
+                      applicationLeaseSql +
+                      " AND EXISTS (SELECT 1 FROM tf_v2_container_start_attempts WHERE resource_uid=? AND generation=? AND create_claim_id=? AND native_id=? AND state='running' AND confirmed_exited_at_ms IS NULL)",
+                    [
+                      input.intent.resourceUid,
+                      input.intent.policy.generation,
+                      input.claimId,
+                      input.nativeId,
+                      raw,
+                      ...startGuard.params,
+                      ...applicationLeaseParams,
+                      input.intent.resourceUid,
+                      input.intent.policy.generation,
+                      input.claimId,
+                      input.nativeId,
+                    ],
+                  );
+                  if (stillAuthorized.length !== 1) return fail();
+                  closedCurrent();
+                  read.assertCurrent();
+                }
               }
               if (sealedCloseResume) {
                 await sealedCloseResume.assertCurrent(signal);
@@ -3638,7 +3684,15 @@ export function createDockerContainerCoreOwner(
               }
               observation = await (boundPhase === "exited"
                 ? read.advanceNamespace(input.nativeId, signal)
-                : read.advance(input.nativeId, signal));
+                : read.advance(
+                    input.nativeId,
+                    signal,
+                    sealedCloseResume && !stopIssued
+                      ? originalOutcome.requestKind === 4
+                        ? "linux-oci-started@1"
+                        : "linux-oci-started-observation@1"
+                      : undefined,
+                  ));
               if (observation.operation === "read-helper-result") {
                 // Exact original P's H join/EOF record only; no removed CAS or
                 // allocation cleanup is authorized by this private handoff.
