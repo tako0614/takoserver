@@ -260,6 +260,12 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciOriginalLiveInit>;
+  /** Select the current durable serving claim for this private observation. */
+  readCurrentOciInitForResource(
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciOriginalLiveInit>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
    * removal; the binding owner must authorize each application invocation. */
@@ -4066,6 +4072,86 @@ export function createDockerContainerCoreOwner(
       return observation;
     });
   }
+  async function readCurrentOciInit(
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    selectorFence?: ReturnType<typeof fence>,
+  ): Promise<LinuxOciOriginalLiveInit> {
+    if (!runtimeApplicationOwner || !(signal instanceof AbortSignal) || signal.aborted)
+      return fail();
+    const { captured, loaded } = await loadServingOci(input, signal);
+    if (
+      loaded.proof.r_phase === "deleting" ||
+      !(await inspectV2ContainerOwnerSelectedSchema(sql, "allocation"))
+    )
+      return fail();
+    const coordinates = [
+      captured.intent.resourceUid,
+      captured.intent.policy.generation,
+      captured.claimId,
+      captured.nativeId,
+    ];
+    const allocationPredicate =
+      "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched'";
+    const rows = await sql.query(
+      "SELECT native_control FROM tf_v2_container_create_claims WHERE " + allocationPredicate,
+      coordinates,
+    );
+    const raw = rows[0]?.native_control;
+    if (rows.length !== 1 || typeof raw !== "string") return fail();
+    const snapshot = fence(loaded.proof);
+    const guard = {
+      sql:
+        snapshot.sql +
+        " AND EXISTS (SELECT 1 FROM tf_v2_container_create_claims WHERE " +
+        allocationPredicate +
+        " AND native_control=?)" +
+        (selectorFence === undefined ? "" : ` AND ${selectorFence.sql}`),
+      params: [...snapshot.params, ...coordinates, raw, ...(selectorFence?.params ?? [])],
+    };
+    const currentRunning = async () =>
+      !signal.aborted && (await boundInitPhase(loaded, guard)) === "running" && !signal.aborted;
+    const { artifact, binding, originalControlKeyId, key } = await openOriginalParentControl(
+      captured,
+      originalCustody,
+      loaded.proof,
+      raw,
+      signal,
+      currentRunning,
+    );
+    freezeJson(artifact);
+    freezeJson(binding);
+    let active = true;
+    const assertLocal = () => {
+      if (!active || signal.aborted || controlDecryptionKey?.(originalControlKeyId) !== key)
+        return fail();
+    };
+    const assertCurrent = async () => {
+      assertLocal();
+      if (!(await currentRunning())) return fail();
+      assertLocal();
+    };
+    try {
+      await assertCurrent();
+      assertLocal();
+      const observed = await readOriginalLinuxOciLiveInit(
+        originalCustody,
+        result,
+        captured,
+        artifact,
+        binding,
+        signal,
+        assertCurrent,
+      );
+      await assertCurrent();
+      assertLocal();
+      if (observed.nativeId !== captured.nativeId) return fail();
+      return observed;
+    } finally {
+      active = false;
+    }
+  }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
       if (!runtimeApplicationOwner || signal.aborted) return fail();
@@ -4813,79 +4899,61 @@ export function createDockerContainerCoreOwner(
       // actual fact; no rollback, START/OPEN replay or manufactured completion.
       local();
     },
-    async readCurrentOciInit(input, originalCustody, signal) {
-      if (!runtimeApplicationOwner || !(signal instanceof AbortSignal) || signal.aborted)
-        return fail();
-      const { captured, loaded } = await loadServingOci(input, signal);
+    readCurrentOciInit(input, originalCustody, signal) {
+      return readCurrentOciInit(input, originalCustody, signal);
+    },
+    async readCurrentOciInitForResource(selector, originalCustody, signal) {
       if (
-        loaded.proof.r_phase === "deleting" ||
-        !(await inspectV2ContainerOwnerSelectedSchema(sql, "allocation"))
+        !runtimeApplicationOwner ||
+        !(signal instanceof AbortSignal) ||
+        signal.aborted ||
+        !own(selector, ["resourceUid", "incarnationId"]) ||
+        Reflect.ownKeys(selector).length !== 2 ||
+        (Object.getPrototypeOf(selector) !== Object.prototype &&
+          Object.getPrototypeOf(selector) !== null) ||
+        !text(selector.resourceUid) ||
+        !hex(selector.incarnationId)
       )
         return fail();
-      const coordinates = [
-        captured.intent.resourceUid,
-        captured.intent.policy.generation,
-        captured.claimId,
-        captured.nativeId,
+      const { resourceUid, incarnationId } = selector;
+      const serving =
+        "i.resource_uid=? AND i.incarnation_id=? AND i.installation_id=? AND i.backend_id=? AND i.target_key=? AND i.form_url=?" +
+        " AND i.serving_generation=v.generation AND v.retention='serving' AND i.retire_operation_id IS NULL AND i.retired_at_ms IS NULL" +
+        " AND o.status='succeeded' AND o.effect='complete'" +
+        " AND r.deleted_at IS NULL AND r.phase<>'deleting' AND r.observed_generation=v.generation" +
+        " AND json_type(r.observed_json, '$.ready')='true' AND json_extract(r.observed_json, '$.servingGeneration')=v.generation" +
+        " AND q.installation_id=i.installation_id AND q.state='bound' AND q.removed_at_ms IS NULL AND q.allocation_cleanup='untouched'" +
+        " AND NOT EXISTS (SELECT 1 FROM tf_v2_operations d WHERE d.resource_uid=i.resource_uid AND d.action='delete' AND d.status IN ('queued','running','reconciling','waiting_input'))";
+      const params = [
+        resourceUid,
+        incarnationId,
+        installationId,
+        backendId,
+        targetKey,
+        V2_CONTAINER_F2_FORM,
       ];
-      const allocationPredicate =
-        "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched'";
-      const rows = await sql.query(
-        "SELECT native_control FROM tf_v2_container_create_claims WHERE " + allocationPredicate,
-        coordinates,
-      );
-      const raw = rows[0]?.native_control;
-      if (rows.length !== 1 || typeof raw !== "string") return fail();
-      const snapshot = fence(loaded.proof);
-      const guard = {
-        sql:
-          snapshot.sql +
-          " AND EXISTS (SELECT 1 FROM tf_v2_container_create_claims WHERE " +
-          allocationPredicate +
-          " AND native_control=?)",
-        params: [...snapshot.params, ...coordinates, raw],
-      };
-      const currentRunning = async () =>
-        !signal.aborted && (await boundInitPhase(loaded, guard)) === "running" && !signal.aborted;
-      const { artifact, binding, originalControlKeyId, key } = await openOriginalParentControl(
-        captured,
-        originalCustody,
-        loaded.proof,
-        raw,
-        signal,
-        currentRunning,
-      );
-      freezeJson(artifact);
-      freezeJson(binding);
-      let active = true;
-      const assertLocal = () => {
-        if (!active || signal.aborted || controlDecryptionKey?.(originalControlKeyId) !== key)
-          return fail();
-      };
-      const assertCurrent = async () => {
-        assertLocal();
-        if (!(await currentRunning())) return fail();
-        assertLocal();
-      };
-      try {
-        await assertCurrent();
-        assertLocal();
-        const observed = await readOriginalLinuxOciLiveInit(
-          originalCustody,
-          result,
-          captured,
-          artifact,
-          binding,
-          signal,
-          assertCurrent,
-        );
-        await assertCurrent();
-        assertLocal();
-        if (observed.nativeId !== captured.nativeId) return fail();
-        return observed;
-      } finally {
-        active = false;
-      }
+      const rows = await sql.query(`${select} WHERE ${serving} LIMIT 2`, params);
+      const row = rows[0];
+      if (rows.length !== 1 || !row || typeof row.v_intent_json !== "string" || signal.aborted)
+        return fail();
+      const parsed = parseStrictJson(new TextEncoder().encode(row.v_intent_json), 1048576);
+      if (!isJsonObject(parsed)) return fail();
+      const intent = intentSnapshot(parsed as unknown as DockerContainerCreateIntent);
+      const selected = record(intent, rowProof(row));
+      if (
+        intent.resourceUid !== resourceUid ||
+        intent.incarnationId !== incarnationId ||
+        selected?.state !== "bound" ||
+        selected.nativeId === null
+      )
+        return fail();
+
+      // Keep the ready, non-deleting durable projection in the same running
+      // snapshot fence before and after the authenticated original peer read.
+      return readCurrentOciInit(selected, originalCustody, signal, {
+        sql: `EXISTS (SELECT 1${from} WHERE ${serving} AND q.claim_id=? AND q.native_id=?)`,
+        params: [...params, selected.claimId, selected.nativeId],
+      });
     },
     async observeServingOciHttp(input, originalCustody, signal) {
       const { captured, loaded } = await loadServingOci(input, signal);

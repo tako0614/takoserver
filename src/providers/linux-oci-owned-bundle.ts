@@ -2744,7 +2744,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     /** Private observation of a current same-Sql original. The result does
      * not register a replacement session or enable the application transport. */
     async readCurrentLiveInit(
-      record: DockerContainerCreateRecord,
+      identity: { readonly resourceUid: string; readonly incarnationId: string },
       signal: AbortSignal,
     ): Promise<LinuxOciOriginalLiveInit> {
       if (closed || !runtimeApplicationOwner || !physicalBinary) return fail("parent_custody");
@@ -2754,7 +2754,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       cancellation.add(cancel);
       signal.addEventListener("abort", abort, { once: true });
       const timer = setTimeout(abort, timeout);
-      const running = core.readCurrentOciInit(record, originalNativeCustody, cancel.signal);
+      const running = core.readCurrentOciInitForResource(
+        identity,
+        originalNativeCustody,
+        cancel.signal,
+      );
       scopes.add(running);
       try {
         const fact = await running;
