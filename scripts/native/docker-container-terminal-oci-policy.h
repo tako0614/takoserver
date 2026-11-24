@@ -548,7 +548,7 @@ static int oci_policy_compile(struct oci_policy_owner *p){
   if(!p->limits.internet && oci_policy_rule(p,"output","counter name outbound_denied drop","{\"counter\":\"outbound_denied\"},{\"drop\":null}")<0)return -1;
   if(oci_policy_format(text,sizeof(text),"ct count over %llu counter name cap_denied drop",(unsigned long long)p->limits.connections)<0 ||
       oci_policy_format(json,sizeof(json),"{\"ct count\":{\"val\":%llu,\"inv\":true}},{\"counter\":\"cap_denied\"},{\"drop\":null}",(unsigned long long)p->limits.connections)<0 || oci_policy_rule(p,"output",text,json)<0 ||
-      oci_policy_rule(p,"output","meta l4proto { tcp, udp } jump budgeted","{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"l4proto\"}},\"right\":{\"set\":[\"tcp\",\"udp\"]}}},{\"jump\":{\"target\":\"budgeted\"}}")<0 || oci_policy_chain_end(p)<0 || oci_policy_chain(p,"input","input",0,"drop")<0 ||
+      oci_policy_rule(p,"output","meta l4proto { tcp, udp } jump budgeted","{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"l4proto\"}},\"right\":{\"set\":[6,17]}}},{\"jump\":{\"target\":\"budgeted\"}}")<0 || oci_policy_chain_end(p)<0 || oci_policy_chain(p,"input","input",0,"drop")<0 ||
       oci_policy_rule(p,"input","iifname lo accept","{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"iifname\"}},\"right\":\"lo\"}},{\"accept\":null}")<0)return -1;
   char mac[18];
   if(oci_policy_format(mac,sizeof(mac),"%02x:%02x:%02x:%02x:%02x:%02x",u->host_mac[0],u->host_mac[1],u->host_mac[2],u->host_mac[3],u->host_mac[4],u->host_mac[5])<0)return -1;
@@ -558,7 +558,7 @@ static int oci_policy_compile(struct oci_policy_owner *p){
         oci_policy_format(json,sizeof(json),"{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"iifname\"}},\"right\":\"%s\"}},{\"match\":{\"op\":\"==\",\"left\":{\"payload\":{\"protocol\":\"ether\",\"field\":\"saddr\"}},\"right\":\"%s\"}},{\"match\":{\"op\":\"==\",\"left\":{\"payload\":{\"protocol\":\"%s\",\"field\":\"saddr\"}},\"right\":\"%s\"}},{\"match\":{\"op\":\"==\",\"left\":{\"payload\":{\"protocol\":\"%s\",\"field\":\"daddr\"}},\"right\":\"%s\"}},{\"match\":{\"op\":\"==\",\"left\":{\"payload\":{\"protocol\":\"tcp\",\"field\":\"dport\"}},\"right\":%u}},{\"match\":{\"op\":\"in\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":{\"set\":[\"new\",\"established\"]}}},{\"match\":{\"op\":\"==\",\"left\":{\"ct\":{\"key\":\"direction\"}},\"right\":\"original\"}},{\"accept\":null}",u->guest_name,mac,family,host[i],family,guest[i],p->service.port)<0 || oci_policy_rule(p,"input",text,json)<0)return -1;
   }
   for(size_t i=0;i<sizeof(blocked)/sizeof(blocked[0]);i++)if(oci_policy_deny(p,"input",blocked[i].family,"saddr",blocked[i].address,blocked[i].prefix)<0)return -1;
-  if(oci_policy_rule(p,"input","meta l4proto { tcp, udp } ct state { established, related } ct direction reply accept","{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"l4proto\"}},\"right\":{\"set\":[\"tcp\",\"udp\"]}}},{\"match\":{\"op\":\"in\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":{\"set\":[\"established\",\"related\"]}}},{\"match\":{\"op\":\"==\",\"left\":{\"ct\":{\"key\":\"direction\"}},\"right\":\"reply\"}},{\"accept\":null}")<0 ||
+  if(oci_policy_rule(p,"input","meta l4proto { tcp, udp } ct state { established, related } ct direction reply accept","{\"match\":{\"op\":\"==\",\"left\":{\"meta\":{\"key\":\"l4proto\"}},\"right\":{\"set\":[6,17]}}},{\"match\":{\"op\":\"in\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":{\"set\":[\"established\",\"related\"]}}},{\"match\":{\"op\":\"==\",\"left\":{\"ct\":{\"key\":\"direction\"}},\"right\":\"reply\"}},{\"accept\":null}")<0 ||
       oci_policy_rule(p,"input","counter name input_denied drop","{\"counter\":\"input_denied\"},{\"drop\":null}")<0 || oci_policy_chain_end(p)<0 || oci_policy_chain(p,"forward","forward",-310,"drop")<0 ||
       oci_policy_rule(p,"forward","counter name forward_denied drop","{\"counter\":\"forward_denied\"},{\"drop\":null}")<0 || oci_policy_chain_end(p)<0 || oci_policy_chain_end(p)<0 ||
       oci_policy_append(p->expected,&p->expected_size,sizeof(p->expected),"]}")<0)return -1;
@@ -685,8 +685,10 @@ static _Noreturn void oci_policy_child(struct oci_policy_owner *p,unsigned int s
   for(int fd=0;fd<3;fd++){int flags=fcntl(fd,F_GETFL);
   if(flags<0 || fcntl(fd,F_SETFL,flags&~O_NONBLOCK)<0 || fcntl(fd,F_SETFD,0)<0)_exit(125);
   }
-  char *const check[]={"nft","--check","-f","-",NULL},*const apply[]={"nft","-f","-",NULL},*const readback[]={"nft","-j","list","table","inet",OCI_POLICY_TABLE,NULL};
-  char *const ruleset[]={"nft","-j","list","ruleset",NULL};
+  char *const check[]={"nft","--check","-f","-",NULL},*const apply[]={"nft","-f","-",NULL};
+  /* Use stable protocol numbers for the compiled TCP (6) / UDP (17) sets. */
+  char *const readback[]={"nft","-j","-p","list","table","inet",OCI_POLICY_TABLE,NULL};
+  char *const ruleset[]={"nft","-j","-p","list","ruleset",NULL};
   char *const environment[]={"PATH=/usr/sbin:/usr/bin:/sbin:/bin",NULL};
   char *const *argv=stage==0?check:stage==1?apply:stage==2?(o->admission_ruleset_reads?ruleset:readback):NULL;
   if(!argv)_exit(125);

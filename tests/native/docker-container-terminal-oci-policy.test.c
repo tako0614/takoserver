@@ -411,7 +411,22 @@ static long raw_syscall(long number, ...) {
 
   if(pol.active && number==SYS_clone3){va_list ap;va_start(ap,number);struct clone_args *a=va_arg(ap,struct clone_args*);CHECK(va_arg(ap,size_t)==sizeof(*a));va_end(ap);CHECK(pol.spawns<3 && a->flags==(CLONE_PIDFD|CLONE_CLEAR_SIGHAND) && a->exit_signal==SIGCHLD && lock_taken);*(int *)(uintptr_t)a->pidfd=430+(int)pol.spawns;return 6000+(long)pol.spawns++;}
   if(pol.active && number==SYS_pidfd_send_signal){va_list ap;va_start(ap,number);int fd=va_arg(ap,int);if(fd>=430 && fd<=432){CHECK(va_arg(ap,int)==SIGKILL && pol.signals[fd-430]==0);pol.signals[fd-430]++;va_end(ap);return 0;}va_end(ap);}
-  if(pol.child && number==SYS_execveat){va_list ap;va_start(ap,number);CHECK(va_arg(ap,int)==3);CHECK(!strcmp(va_arg(ap,char*),""));char *const *args=va_arg(ap,char*const*),*const *env=va_arg(ap,char*const*);CHECK(va_arg(ap,int)==AT_EMPTY_PATH);va_end(ap);CHECK(eg.ranges==3 && eg.entered && lock_taken && !strcmp(env[0],"PATH=/usr/sbin:/usr/bin:/sbin:/bin") && !env[1]);CHECK(!strcmp(args[0],"nft") && !strcmp(args[1],"-j") && !strcmp(args[2],"list") && !strcmp(args[3],"table") && !strcmp(args[4],"inet") && !strcmp(args[5],OCI_POLICY_TABLE) && !args[6]);longjmp(child_exit,1);}
+  if(pol.child && number==SYS_execveat){
+    va_list ap;
+    va_start(ap,number);
+    CHECK(va_arg(ap,int)==3);
+    CHECK(!strcmp(va_arg(ap,char*),""));
+    char *const *args=va_arg(ap,char*const*),*const *env=va_arg(ap,char*const*);
+    CHECK(va_arg(ap,int)==AT_EMPTY_PATH);
+    va_end(ap);
+    CHECK(eg.ranges==3 && eg.entered && lock_taken && !strcmp(env[0],"PATH=/usr/sbin:/usr/bin:/sbin:/bin") && !env[1]);
+    CHECK(!strcmp(args[0],"nft") && !strcmp(args[1],"-j") && !strcmp(args[2],"-p") && !strcmp(args[3],"list"));
+    if(policy_subject->original->admission_ruleset_reads)
+      CHECK(!strcmp(args[4],"ruleset") && !args[5]);
+    else
+      CHECK(!strcmp(args[4],"table") && !strcmp(args[5],"inet") && !strcmp(args[6],OCI_POLICY_TABLE) && !args[7]);
+    longjmp(child_exit,1);
+  }
   if(up.active && number==SYS_clone3){
     va_list ap;va_start(ap,number);struct clone_args *a=va_arg(ap,struct clone_args*);CHECK(va_arg(ap,size_t)==sizeof(*a));va_end(ap);
     CHECK(a->flags==(CLONE_PIDFD|CLONE_CLEAR_SIGHAND) && a->exit_signal==SIGCHLD && !lock_taken);*(int *)(uintptr_t)a->pidfd=404;return 5000;
@@ -807,13 +822,39 @@ static void policy_codec_cases(void){struct tns_oci_owner o;struct tns_owner b;p
  policy_raw_readback();
  policy_change(pol.readback,&pol.readback_size,"\"op\":\"in\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":\"established\"", "\"op\":\"==\",\"left\":{\"ct\":{\"key\":\"state\"}},\"right\":\"established\"");
  CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)<0);
+ /* Numeric protocol sets are independent of the host's protocol database. */
+ policy_raw_readback();
+ policy_change(pol.readback,&pol.readback_size,"\"set\":[6,17]","\"set\":[17,6]");
+ CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)==0);
+ policy_change(pol.readback,&pol.readback_size,"\"set\":[17,6]","\"set\":[1,6]");
+ CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)<0);
+ policy_change(pol.readback,&pol.readback_size,"\"set\":[1,6]","\"set\":[6,6]");
+ CHECK(oci_policy_readback(policy_subject,pol.readback,pol.readback_size)<0);
  /* Compiler-data branch only: this is not another dispatched owner/policy. */policy_subject->limits.internet=0;CHECK(oci_policy_compile(policy_subject)==0 && strstr(policy_subject->script,"counter name outbound_denied drop"));policy_discard(&o);
 }
 static void policy_source_cases(void){struct tns_oci_owner o;struct tns_owner b;policy_prepare(&o,&b);pol.active=1;pol.partial=1;CHECK(oci_policy_install(policy_subject)==0 && policy_subject->verified && pol.spawns==3 && !lock_taken);for(unsigned int i=0;i<3;i++)CHECK(pol.joins[i]==1 && !pol.signals[i]);for(unsigned int i=0;i<2;i++)CHECK(pol.neighbors[i][0]==1 && pol.neighbors[i][1]==1);CHECK(pol.sent_size[0]==policy_subject->script_size && pol.sent_size[1]==policy_subject->script_size && !memcmp(pol.sent[0],policy_subject->script,pol.sent_size[0]));CHECK(oci_policy_install(policy_subject)<0 && pol.spawns==3);pol.active=0;CHECK(oci_policy_close(&o.policy)==0 && !o.policy);policy_subject=NULL;CHECK(oci_uplink_cleanup(&o.uplink)==0);
  policy_prepare(&o,&b);pol.active=1;pol.fault=1;CHECK(oci_policy_install(policy_subject)<0 && pol.applied && !policy_subject->verified && pol.spawns==2 && lock_taken);CHECK(oci_policy_install(policy_subject)<0 && pol.spawns==2);CHECK(tns_oci_close_transport(&o)<0 && o.policy && o.uplink && !up.deletes && b.phase==TNS_HELD);CHECK(pol.signals[1]==1 && pol.joins[1]==1);CHECK(tns_oci_close_transport(&o)<0 && pol.signals[1]==1 && !up.deletes);policy_discard(&o);
  policy_prepare(&o,&b);pol.active=1;pol.fault=2;CHECK(oci_policy_install(policy_subject)<0 && !pol.spawns && subject->broken && lock_taken);CHECK(tns_oci_close_transport(&o)<0 && !up.deletes && o.uplink && b.phase==TNS_HELD);policy_discard(&o);
 }
-static void policy_child_case(void){struct tns_oci_owner o;struct tns_owner b;policy_prepare(&o,&b);CHECK(oci_uplink_lock(subject)==0);pol.child=1;eg.child_mode=1;eg.ranges=eg.entered=0;if(!setjmp(child_exit))oci_policy_child(policy_subject,2,450,453);CHECK(lock_taken && eg.ranges==3 && eg.entered && eg.close_calls[4]>=1);pol.child=0;eg.child_mode=0;CHECK(oci_uplink_unlock(subject)==0);policy_discard(&o);}
+static void policy_child_case(void){
+ struct tns_oci_owner o;
+ struct tns_owner b;
+ policy_prepare(&o,&b);
+ CHECK(oci_uplink_lock(subject)==0);
+ pol.child=1;
+ eg.child_mode=1;
+ eg.ranges=eg.entered=0;
+ if(!setjmp(child_exit))oci_policy_child(policy_subject,2,450,453);
+ CHECK(lock_taken && eg.ranges==3 && eg.entered && eg.close_calls[4]>=1);
+ policy_subject->original->admission_ruleset_reads=1;
+ eg.ranges=eg.entered=0;
+ if(!setjmp(child_exit))oci_policy_child(policy_subject,2,450,453);
+ CHECK(lock_taken && eg.ranges==3 && eg.entered && eg.close_calls[4]>=2);
+ pol.child=0;
+ eg.child_mode=0;
+ CHECK(oci_uplink_unlock(subject)==0);
+ policy_discard(&o);
+}
 static void policy_multicast_neighbor_cases(void){
   const enum neighbor_fixture cases[]={
     NEIGHBOR_MULTICAST, NEIGHBOR_WRONG_MAC, NEIGHBOR_FLAGGED,
