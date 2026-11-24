@@ -184,19 +184,18 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   close(): Promise<void>;
 } {
   const {
-    sql,
     selection: selected,
     formSelectionFactory: baseFactory,
     privateInputCustody: custody,
   } = input;
-  const formRegistration = captureSelfhostLinuxContainerFormRegistration(
-    selected,
-    input.formRegistration,
-    input.retainedExecutionActions,
-  );
-  const complete = formRegistration === "complete";
-  if (complete && (selected === undefined || completeFormSql.get(selected) !== sql))
-    throw new Error("selfhost_linux_oci_complete_form_schema_required");
+  const requestedRegistration = input.formRegistration;
+  const complete =
+    requestedRegistration !== undefined &&
+    captureSelfhostLinuxContainerFormRegistration(
+      selected,
+      requestedRegistration,
+      input.retainedExecutionActions,
+    ) === "complete";
   if (selected === undefined) {
     return Object.freeze({
       appPorts: Object.freeze({
@@ -229,6 +228,12 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
     Object.freeze(retainedExecutionActions);
   }
   const allowed: readonly V2Action[] = retainedExecutionActions?.[V2_CONTAINER_F2_FORM] ?? [];
+  const sql = input.sql;
+  if (complete) {
+    const checkedSql = completeFormSql.get(selected);
+    if (!checkedSql || checkedSql !== sql)
+      throw new Error("selfhost_linux_oci_complete_form_schema_required");
+  }
   const oci =
     selected.kind === "oci"
       ? createSelfhostLinuxOciContainerBackend({
