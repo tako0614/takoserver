@@ -18,7 +18,11 @@ import {
   hasV2ForwardContainerOperationGenerationIndex,
   V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_NAME,
 } from "./operation-generation-index.ts";
-import { MAX_FAILED_TAIL } from "./worker-publication-state.ts";
+import {
+  MAX_FAILED_TAIL,
+  type V2ContainerServingTarget,
+  type V2ContainerServingTargetReader,
+} from "./worker-publication-state.ts";
 
 export interface V2ForwardContainerBindingClaim extends ContainerBindingClaim {
   /** Exact accepted generation that produced the private native Version. */
@@ -46,6 +50,8 @@ export interface V2ForwardContainerBindingSnapshot {
   /** Committed observation, which can predate a pending or failed desired generation. */
   readonly targetGeneration: number;
   readonly targetSourceOperationId: string;
+  /** Private OCI selection while the operation's public observation remains committed. */
+  readonly nativeServing?: V2ContainerServingTarget;
 }
 
 type VersionForm =
@@ -71,6 +77,7 @@ export function createV2ForwardContainerBindingReader(options: {
   readonly workerBackendId: string;
   readonly containerBackendId: string;
   readonly authorize: (principal: string, space: string) => Promise<boolean>;
+  readonly readCurrentServingTarget?: V2ContainerServingTargetReader;
 }) {
   if (
     !options?.sql ||
@@ -113,7 +120,8 @@ export function createV2ForwardContainerBindingReader(options: {
     }
     return rows;
   }
-  const { targetKey, workerBackendId, containerBackendId, authorize } = options;
+  const { targetKey, workerBackendId, containerBackendId, authorize, readCurrentServingTarget } =
+    options;
 
   function targetStatement(
     claim: V2ForwardContainerBindingClaim,
@@ -236,6 +244,7 @@ export function createV2ForwardContainerBindingReader(options: {
     row: Readonly<Record<string, unknown>>,
     observedOperationId: string,
     tailQuery: Sql["query"] = query,
+    nativeServing?: V2ContainerServingTarget,
   ): Promise<boolean> {
     if (
       !identity(row.uid) ||
@@ -253,6 +262,7 @@ export function createV2ForwardContainerBindingReader(options: {
       return false;
     if (row.generation === row.observed_generation) {
       return (
+        nativeServing === undefined &&
         row.current_operation_id === observedOperationId &&
         row.current_action !== "delete" &&
         row.current_status === "succeeded" &&
@@ -262,10 +272,24 @@ export function createV2ForwardContainerBindingReader(options: {
       );
     }
     if (row.current_action !== "update") return false;
-    const pending =
+    const undispatched =
       (row.current_status === "queued" || row.current_status === "waiting_input") &&
       row.current_effect === "none" &&
-      row.current_dispatch_possible === 0 &&
+      row.current_dispatch_possible === 0;
+    // Native proof can classify the current UPDATE even after dispatch. It
+    // does not replace the original observation or erase any earlier effect.
+    const pendingNativeUpdate =
+      nativeServing !== undefined &&
+      (undispatched || row.current_status === "running" || row.current_status === "reconciling") &&
+      ((nativeServing.generation === row.observed_generation &&
+        nativeServing.revisionOperationId === observedOperationId) ||
+        (row.current_status === "reconciling" &&
+          row.current_dispatch_possible === 1 &&
+          nativeServing.generation === row.generation &&
+          nativeServing.revisionOperationId === row.current_operation_id));
+    if (nativeServing !== undefined && !pendingNativeUpdate) return false;
+    const pending =
+      (undispatched || pendingNativeUpdate) &&
       row.current_result_observed_json === null &&
       row.current_result_output_json === null &&
       row.phase === "pending" &&
@@ -475,18 +499,39 @@ export function createV2ForwardContainerBindingReader(options: {
         )
       )
         return null;
+      const nativeTargets = readCurrentServingTarget
+        ? await Promise.all(
+            targetClaims.map((claim, index) =>
+              readCurrentServingTarget({
+                principal: claim.principal,
+                space: claim.space,
+                targetKey,
+                targetUid: claim.targetUid,
+                targetFormUrl: forms[index] as string,
+              }),
+            ),
+          )
+        : [];
       // Keep all original no-effect-tail predicates. Only independent tail
-      // SELECTs within this same bounded read are submitted together.
+      // SELECTs within this same bounded read are submitted together. The
+      // selected OCI owner can separately prove a serving UPDATE revision.
       const tailPlans: { statement: SqlStatement; resolve(rows: readonly Row[]): void }[] = [];
       let collecting = true;
       const tailChecks = Promise.all(
-        targets.map((target) =>
-          knownCurrentTail(target as Row, String(target?.observed_operation_id), (sql, params) =>
-            !collecting
-              ? Promise.resolve([])
-              : new Promise((resolve) =>
-                  tailPlans.push({ statement: { sql, ...(params ? { params } : {}) }, resolve }),
-                ),
+        targets.map((target, index) =>
+          knownCurrentTail(
+            target as Row,
+            String(target?.observed_operation_id),
+            (sql, params) =>
+              !collecting
+                ? Promise.resolve([])
+                : new Promise((resolve) =>
+                    tailPlans.push({
+                      statement: { sql, ...(params ? { params } : {}) },
+                      resolve,
+                    }),
+                  ),
+            nativeTargets[index] ?? undefined,
           ),
         ),
       );
@@ -503,7 +548,10 @@ export function createV2ForwardContainerBindingReader(options: {
         for (const plan of tailPlans) plan.resolve([]);
       }
       if (!(await tailChecks).every(Boolean)) return null;
-      const byUid = new Map<string, { target: Row; form: string }>();
+      const byUid = new Map<
+        string,
+        { target: Row; form: string; nativeServing?: V2ContainerServingTarget }
+      >();
       for (const [index, target] of targets.entries()) {
         const targetClaim = targetClaims[index],
           targetForm = forms[index];
@@ -518,7 +566,12 @@ export function createV2ForwardContainerBindingReader(options: {
             target.observed_generation
         )
           return null;
-        byUid.set(targetClaim.targetUid, { target, form: targetForm });
+        const nativeServing = nativeTargets[index];
+        byUid.set(targetClaim.targetUid, {
+          target,
+          form: targetForm,
+          ...(nativeServing ? { nativeServing } : {}),
+        });
       }
       return claims.map((claim) => {
         const selected = byUid.get(claim.targetUid);
@@ -535,6 +588,7 @@ export function createV2ForwardContainerBindingReader(options: {
           targetFormUrl: selected.form as V2ForwardContainerBindingSnapshot["targetFormUrl"],
           targetGeneration: selected.target.observed_generation as number,
           targetSourceOperationId: selected.target.observed_operation_id as string,
+          ...(selected.nativeServing ? { nativeServing: selected.nativeServing } : {}),
         };
       });
     } catch {

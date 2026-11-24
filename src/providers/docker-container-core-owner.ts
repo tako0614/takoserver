@@ -64,7 +64,7 @@ import {
   assertOriginalLinuxOciDispatchCustody,
   createOriginalLinuxOciSealedApplicationCloseResume,
   disposeOriginalLinuxOciAllocation,
-  drainOriginalLinuxOciSuccessorHttpForDelete,
+  drainOriginalLinuxOciSuccessorHttpForRetirement,
   type LinuxOciHeldLiveInit,
   type LinuxOciSealedApplicationCloseResume,
   observeOriginalLinuxOciOwnedInitReaped,
@@ -159,6 +159,25 @@ type Lease = {
   servingPublication?: ServingPublication;
 };
 
+export interface LinuxOciServingTargetScope {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly targetUid: string;
+  readonly targetFormUrl: string;
+}
+
+interface LinuxOciPendingServingTarget {
+  readonly incarnationId: string;
+  readonly generation: number;
+  readonly runtimeEpoch: number;
+  readonly revisionOperationId: string;
+  readonly revision: string;
+  readonly claimId: string;
+  readonly nativeId: string;
+  readonly successor: { readonly epoch: number; readonly ownerToken: string } | null;
+}
+
 export interface DockerContainerCoreOwnerOptions {
   readonly hostTopology?: LinuxOciHostTopology;
   readonly alternateHostTopology?: LinuxOciHostTopology;
@@ -185,6 +204,11 @@ export interface DockerContainerCoreOwnerOptions {
 }
 export interface DockerContainerCoreOwner {
   inspectApplicationSuccessorStore(): Promise<boolean>;
+  readPendingOciServingTarget(
+    scope: LinuxOciServingTargetScope,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciPendingServingTarget | null | undefined>;
   readonly acceptance: V2HostAcceptance;
   readonly owner: DockerPhysicalCoreOwnerPort;
   saveAcceptedParentControl(
@@ -314,7 +338,7 @@ export interface DockerContainerCoreOwner {
     readonly epoch: number;
     readonly ownerToken: string;
     recordClose(): Promise<void>;
-    recordDeleteClose(execution: V2Execution, signal: AbortSignal): Promise<void>;
+    recordRetirementClose(execution: V2Execution, signal: AbortSignal): Promise<void>;
   }>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
@@ -825,7 +849,7 @@ export function createDockerContainerCoreOwner(
   );
   if (
     topologies?.alternate !== undefined &&
-    (parentMode !== "sealed-peer-runtime@1" || qualifiedPhysicalDigest === undefined)
+    (!trackedPeer || qualifiedPhysicalDigest === undefined)
   )
     return fail();
   if (
@@ -3018,7 +3042,8 @@ export function createDockerContainerCoreOwner(
     if (
       !text(id) ||
       (execution.action !== "delete" && !currentUpdate) ||
-      !(await inspectV2ContainerOwnerHistoricalDeleteSchema(sql))
+      (!(await inspectV2ContainerOwnerHistoricalDeleteSchema(sql)) &&
+        !(runtimeApplicationOwner && (await inspectApplicationSuccessorStore())))
     )
       return fail();
     const historyFields = [
@@ -3235,9 +3260,121 @@ export function createDockerContainerCoreOwner(
     return (
       (await inspectV2ContainerOwnerSelectedSchema(sql, layer)) ||
       (runtimeApplicationOwner &&
-        execution.action === "delete" &&
+        (execution.action === "delete" || execution.action === "update") &&
         (await inspectApplicationSuccessorStore()))
     );
+  }
+  async function readPendingOciServingTarget(
+    scope: LinuxOciServingTargetScope,
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciPendingServingTarget | null | undefined> {
+    if (!runtimeApplicationOwner) return undefined;
+    const { targetKey: requestedTarget, targetFormUrl, targetUid, principal, space } = scope;
+    if (requestedTarget !== targetKey || targetFormUrl !== V2_CONTAINER_F2_FORM) return null;
+    assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
+    if (!(await inspectApplicationSuccessorStore())) return null;
+    assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
+    // The instance pointer is the durable result of the owned HTTP health CAS.
+    // Until it moves, the previously observed serving revision stays current.
+    const rows = await sql.query(
+      `SELECT i.incarnation_id, i.runtime_epoch, v.generation, v.operation_id, v.revision,
+        q.claim_id, q.native_id, held.epoch, held.owner_token${from}
+       JOIN main.tf_v2_container_start_attempts s ON s.resource_uid=v.resource_uid
+         AND s.generation=v.generation AND s.create_claim_id=q.claim_id AND s.native_id=q.native_id
+       LEFT JOIN main.tf_v2_container_application_successors held ON held.resource_uid=v.resource_uid
+         AND held.generation=v.generation AND held.claim_id=q.claim_id AND held.native_id=q.native_id
+         AND held.owner_token=la.application_successor_owner_token AND held.close_document IS NULL
+         AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors later
+           WHERE later.resource_uid=held.resource_uid AND later.generation=held.generation AND later.epoch>held.epoch)
+       WHERE i.resource_uid=? AND i.installation_id=? AND i.principal=? AND i.space=?
+         AND i.backend_id=? AND i.target_key=? AND i.form_url=?
+         AND i.retire_operation_id IS NULL AND i.retired_at_ms IS NULL
+         AND r.principal=i.principal AND r.space=i.space AND r.name=i.name
+         AND r.backend_id=i.backend_id AND r.target_key=i.target_key AND r.form_url=i.form_url
+         AND r.phase='pending' AND r.deleted_at IS NULL AND r.busy_operation=la.operation_id
+         AND la.action='update' AND la.resource_uid=i.resource_uid AND la.installation_id=i.installation_id
+         AND la.incarnation_id=i.incarnation_id AND la.principal=i.principal AND la.space=i.space AND la.name=i.name
+         AND la.backend_id=i.backend_id AND la.target_key=i.target_key AND la.form_url=i.form_url
+         AND r.generation=i.desired_generation AND la.generation=r.generation AND la.accepted_spec_json=r.spec_json
+         AND lo.resource_uid=la.resource_uid AND lo.generation=la.generation AND lo.action=la.action
+         AND lo.principal=la.principal AND lo.backend_id=la.backend_id AND lo.target_key=la.target_key
+         AND lo.backend_key=la.backend_key AND lo.replay_key=la.replay_key
+         AND lo.request_fingerprint=la.fingerprint AND lo.accepted_spec_json=la.accepted_spec_json
+         AND lo.created_at=la.accepted_at AND lo.retain_until>=la.retain_until
+         AND lo.status IN ('queued','running','reconciling','waiting_input')
+         AND a.resource_uid=i.resource_uid AND a.installation_id=i.installation_id AND a.incarnation_id=i.incarnation_id
+         AND a.generation=v.generation AND a.revision=v.revision AND a.principal=i.principal AND a.space=i.space
+         AND a.name=i.name AND a.form_url=i.form_url AND a.backend_id=i.backend_id AND a.target_key=i.target_key
+         AND o.resource_uid=a.resource_uid AND o.generation=a.generation AND o.action=a.action
+         AND o.principal=a.principal AND o.backend_id=a.backend_id AND o.target_key=a.target_key
+         AND o.backend_key=a.backend_key AND o.replay_key=a.replay_key
+         AND o.request_fingerprint=a.fingerprint AND o.accepted_spec_json=a.accepted_spec_json
+         AND o.created_at=a.accepted_at AND o.retain_until>=a.retain_until
+         AND v.generation=i.serving_generation AND v.retention='serving'
+         AND q.installation_id=i.installation_id AND q.state='bound' AND q.allocation_cleanup='untouched'
+         AND q.application_io_cleanup=? AND q.removed_at_ms IS NULL
+         AND json_extract(q.native_control,'$.kind')='linux-oci-sealed-control@1'
+         AND s.attempt=1 AND s.state='running' AND s.confirmed_running_at_ms IS NOT NULL
+         AND s.confirmed_exited_at_ms IS NULL
+         AND ((v.generation<la.generation AND o.status='succeeded' AND o.effect='complete'
+               AND r.observed_generation=v.generation AND json_type(r.observed_json,'$.ready')='true'
+               AND json_extract(r.observed_json,'$.servingGeneration')=v.generation
+               AND (la.application_successor_owner_token IS NULL OR held.owner_token IS NOT NULL))
+           OR (v.generation=la.generation AND v.operation_id=la.operation_id AND lo.effect='unknown'
+               AND lo.dispatch_possible=1))
+         AND ${applicationSuccessorStore.sql} LIMIT 2`,
+      [
+        targetUid,
+        installationId,
+        principal,
+        space,
+        backendId,
+        targetKey,
+        V2_CONTAINER_F2_FORM,
+        V2_CONTAINER_APPLICATION_IO_RESERVED,
+        ...applicationSuccessorStore.params,
+      ],
+    );
+    assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
+    const found = rows[0];
+    if (
+      rows.length !== 1 ||
+      !found ||
+      !hex(found.incarnation_id) ||
+      !hex(found.claim_id) ||
+      !hex(found.native_id) ||
+      !text(found.operation_id) ||
+      !text(found.revision) ||
+      typeof found.generation !== "number" ||
+      !Number.isSafeInteger(found.generation) ||
+      found.generation < 1 ||
+      typeof found.runtime_epoch !== "number" ||
+      !Number.isSafeInteger(found.runtime_epoch) ||
+      found.runtime_epoch < 1
+    )
+      return null;
+    let successor: LinuxOciPendingServingTarget["successor"] = null;
+    if (found.owner_token !== null || found.epoch !== null) {
+      if (
+        !hex(found.owner_token) ||
+        typeof found.epoch !== "number" ||
+        !Number.isSafeInteger(found.epoch) ||
+        found.epoch < 1
+      )
+        return null;
+      successor = Object.freeze({ epoch: found.epoch, ownerToken: found.owner_token });
+    }
+    return Object.freeze({
+      incarnationId: found.incarnation_id,
+      generation: found.generation,
+      runtimeEpoch: found.runtime_epoch,
+      revisionOperationId: found.operation_id,
+      revision: found.revision,
+      claimId: found.claim_id,
+      nativeId: found.native_id,
+      successor,
+    });
   }
   async function acceptedParentControl(
     execution: V2Execution,
@@ -3290,6 +3427,11 @@ export function createDockerContainerCoreOwner(
       const retained = accepted.retained.find((item) => item.record.claimId === input.claimId);
       if (
         (accepted.action !== "delete" && accepted.action !== "update") ||
+        (runtimeApplicationOwner &&
+          accepted.action === "update" &&
+          management !== "coordinates" &&
+          management !== "retired" &&
+          accepted.servingConfirmedAtMs === null) ||
         !retained ||
         (management === "retired" || (management === "coordinates" && input.state === "removed")
           ? retained.removedAtMs === null
@@ -3483,7 +3625,7 @@ export function createDockerContainerCoreOwner(
           if (
             management === "application-recovery" &&
             runtimeApplicationOwner &&
-            execution.action === "delete" &&
+            (execution.action === "delete" || execution.action === "update") &&
             document === V2_CONTAINER_APPLICATION_IO_RESERVED &&
             closed[0]?.allocation_cleanup === "untouched"
           ) {
@@ -3493,7 +3635,7 @@ export function createDockerContainerCoreOwner(
               input.claimId,
               input.nativeId,
             ];
-            const receipt = await readAcceptedDeleteCloseSource(
+            const receipt = await readAcceptedRetirementCloseSource(
               execution,
               input,
               originalCustody,
@@ -3503,7 +3645,7 @@ export function createDockerContainerCoreOwner(
             if (receipt) {
               // Carry the genuine original terminal fact into this operation's
               // existing one-use close slot. No mutation of the prior receipt
-              // and no native request until the same DELETE verifies its seal.
+              // and no native request until this same operation verifies its seal.
               const selected = await sealApplicationCloseFact(
                 await applicationCloseScope(scope, loaded.proof, execution, input, raw),
                 applicationCloseKind,
@@ -3942,11 +4084,11 @@ export function createDockerContainerCoreOwner(
               const stopIssued = (originalOutcome.effects & (1 << 6)) !== 0;
               if (sealedCloseResume) {
                 // Older profiles continue a known STOP only. The tracked
-                // owner can start this DELETE from a known START and its
+                // owner can retire this generation from a known START and its
                 // genuinely saved close. The original P owns the effect latch.
                 const knownStart =
                   runtimeApplicationOwner &&
-                  execution.action === "delete" &&
+                  (execution.action === "delete" || execution.action === "update") &&
                   originalOutcome.effects === ((1 << 1) | (1 << 4)) &&
                   [4, 5].includes(originalOutcome.requestKind);
                 if (
@@ -4662,7 +4804,7 @@ export function createDockerContainerCoreOwner(
   }
   const acceptedSuccessorTokenSql =
     " AND EXISTS (SELECT 1 FROM main.tf_v2_container_acceptances accepted WHERE accepted.operation_id=? AND accepted.resource_uid=? AND accepted.application_successor_owner_token=?)";
-  async function readAcceptedDeleteCloseSource(
+  async function readAcceptedRetirementCloseSource(
     execution: V2Execution,
     input: DockerContainerCreateRecord,
     originalCustody: object,
@@ -4687,7 +4829,7 @@ export function createDockerContainerCoreOwner(
         if (signal.aborted) return fail();
         let document = selected.document;
         if (document === null) {
-          await drainOriginalLinuxOciSuccessorHttpForDelete(
+          await drainOriginalLinuxOciSuccessorHttpForRetirement(
             originalCustody,
             result,
             input,
@@ -4764,7 +4906,7 @@ export function createDockerContainerCoreOwner(
     signal: AbortSignal,
   ) {
     if (
-      execution.action !== "delete" ||
+      (execution.action !== "delete" && execution.action !== "update") ||
       signal.aborted ||
       execution.resourceUid !== issued.record.intent.resourceUid ||
       !(await inspectApplicationSuccessorStore())
@@ -4775,10 +4917,16 @@ export function createDockerContainerCoreOwner(
     const lease = await activeRecord(input, "remove");
     const loaded = await load(input.intent);
     sameRecord(input, record(loaded.intent, loaded.proof));
+    const { proof } = loaded;
     if (
-      loaded.proof.i_retire_operation_id !== execution.operationId ||
-      loaded.proof.i_desired_generation !== execution.generation ||
-      input.intent.policy.generation >= execution.generation
+      proof.la_operation_id !== execution.operationId ||
+      proof.i_desired_generation !== execution.generation ||
+      input.intent.policy.generation >= execution.generation ||
+      (execution.action === "delete"
+        ? proof.i_retire_operation_id !== execution.operationId
+        : proof.i_retire_operation_id !== null ||
+          proof.i_serving_generation !== execution.generation ||
+          proof.v_retention !== "draining")
     )
       return fail();
     const coordinates = [
@@ -4940,6 +5088,7 @@ export function createDockerContainerCoreOwner(
     return "saved";
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
+    readPendingOciServingTarget,
     inspectApplicationSuccessorStore() {
       return runtimeApplicationOwner ? inspectApplicationSuccessorStore() : Promise.resolve(false);
     },
@@ -5053,11 +5202,11 @@ export function createDockerContainerCoreOwner(
         !usable(loaded.proof, "reconcile")
       )
         return fail();
-      const successorCreate =
+      const successorControl =
         runtimeApplicationOwner &&
-        loaded.proof.a_action === "create" &&
+        (loaded.proof.a_action === "create" || loaded.proof.a_action === "update") &&
         (await inspectApplicationSuccessorStore());
-      if (!successorCreate && !(await inspectV2ContainerOwnerSelectedSchema(sql, "control")))
+      if (!successorControl && !(await inspectV2ContainerOwnerSelectedSchema(sql, "control")))
         return fail();
       const scope = Object.freeze({
         purpose: peerMode ? peerPurpose : "takoserver.linux-oci-parent-control@1",
@@ -5080,10 +5229,10 @@ export function createDockerContainerCoreOwner(
       });
       const initializeAllocation =
         peerMode &&
-        (successorCreate || (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")));
+        (successorControl || (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")));
       const initializeApplicationIo =
         peerMode &&
-        (successorCreate || (await inspectV2ContainerOwnerSelectedSchema(sql, "application-io")));
+        (successorControl || (await inspectV2ContainerOwnerSelectedSchema(sql, "application-io")));
       freshControlClaims.delete(input); // consumed before async sealing/save, never a retry grant
       const sealed = await sealOriginalLinuxOciParentControl(
         originalCustody,
@@ -5117,7 +5266,7 @@ export function createDockerContainerCoreOwner(
             : "") +
           " WHERE resource_uid=? AND generation=? AND claim_id=? AND state='pending' AND native_id IS NULL AND native_control=? AND " +
           guard.sql +
-          (successorCreate ? " AND " + applicationSuccessorStore.sql : ""),
+          (successorControl ? " AND " + applicationSuccessorStore.sql : ""),
         [
           document,
           input.intent.resourceUid,
@@ -5125,7 +5274,7 @@ export function createDockerContainerCoreOwner(
           input.claimId,
           V2_CONTAINER_CONTROL_RESERVED,
           ...guard.params,
-          ...(successorCreate ? applicationSuccessorStore.params : []),
+          ...(successorControl ? applicationSuccessorStore.params : []),
         ],
       );
       if (write.changes !== 1 || !(await current(lease)) || signal.aborted) return fail();
@@ -5751,7 +5900,7 @@ export function createDockerContainerCoreOwner(
           });
           return closing;
         },
-        async recordDeleteClose(execution: V2Execution, signal: AbortSignal) {
+        async recordRetirementClose(execution: V2Execution, signal: AbortSignal) {
           if (acceptedOperationId !== undefined && acceptedOperationId !== execution.operationId)
             return fail();
           if (signal.aborted) return fail();

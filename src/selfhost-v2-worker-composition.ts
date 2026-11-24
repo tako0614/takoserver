@@ -637,18 +637,20 @@ function createWorkerComposition(
         }),
       })
     : undefined;
-  const publicationState = (
-    ociContainerBinding
-      ? createV2ForwardContainerWorkerPublicationState
-      : forwardFamily
-        ? createV2ForwardWorkerPublicationState
-        : createV2WorkerPublicationState
-  )({
+  const publicationOptions = {
     sql,
     now: clock,
     ...(bundleCustody ? { bundleCustody } : {}),
     ...(assetCustody ? { assetCustody } : {}),
-  });
+  };
+  const publicationState = ociContainerBinding
+    ? createV2ForwardContainerWorkerPublicationState(
+        publicationOptions,
+        ociContainerBinding.readCurrentServingTarget,
+      )
+    : (forwardFamily ? createV2ForwardWorkerPublicationState : createV2WorkerPublicationState)(
+        publicationOptions,
+      );
   const moduleInspector = createWorkerdWorkerModuleInspector({
     binary: options.workerdBinary,
     ...(options.moduleInspectionRoot === undefined

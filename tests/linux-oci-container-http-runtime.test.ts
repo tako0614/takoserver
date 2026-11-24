@@ -22,7 +22,10 @@ import {
   ownedRawHttp,
   rawTick,
 } from "./helpers/container-http-transport-fixture.ts";
-import { specOf } from "./helpers/linux-oci-normal-update-fixture.ts";
+import {
+  normalUpdateAlternateTopology,
+  specOf,
+} from "./helpers/linux-oci-normal-update-fixture.ts";
 import {
   acceptedHttpSelection,
   acceptedRawHttp,
@@ -422,23 +425,29 @@ async function verifySuccessorHttpClose(
     | "ack-lost"
     | "binding"
     | "pending-update"
+    | "update-cutover"
+    | "update-delete"
     | "delete"
     | "delete-late"
     | "delete-restart"
     | "delete-unknown",
 ) {
   const deleting = outcome.startsWith("delete");
-  const updating = outcome === "pending-update";
+  const deleteAfterUpdate = outcome === "update-delete";
+  const cutover = outcome === "update-cutover" || deleteAfterUpdate;
+  const updating = outcome === "pending-update" || cutover;
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
     qualifiedProducer: true,
     runtimeApplicationOwner: true,
     allocationSchema: true,
+    ...(cutover ? { alternateHostTopology: normalUpdateAlternateTopology() } : {}),
   });
   let fresh: ReturnType<typeof f.reconstructParent> | undefined;
   let restarted: ReturnType<typeof f.reconstructParent> | undefined;
   let creatorCloseChecked = false;
+  let caseFailed = false;
   const health = acceptedRawHttp();
   health.onEnd(() => {
     health.reply();
@@ -592,22 +601,37 @@ async function verifySuccessorHttpClose(
       const originalRows = await reservations();
       expect(originalRows).toMatchObject([{ epoch: 1, close_document: null }]);
       expect(raw.mock.calls).toHaveLength(existingCalls + 2);
+      const targetScope = {
+        targetUid: selector.resourceUid,
+        targetFormUrl: creator.formUrl,
+        targetKey: "synthetic-oci-target",
+        principal: "synthetic-oci-parent",
+        space: "synthetic-space",
+      };
+      const instance = () =>
+        f.sql.query(
+          "SELECT desired_generation,serving_generation,runtime_epoch FROM tf_v2_container_instances WHERE resource_uid=?",
+          [selector.resourceUid],
+        );
+      let now = Date.now();
+      let advance:
+        | (() => ReturnType<ReturnType<typeof createTakoformV2Engine>["runNext"]>)
+        | undefined;
+      let updateId: string | undefined;
+      let updateEngine: ReturnType<typeof createTakoformV2Engine> | undefined;
       if (updating) {
-        const instance = () =>
-          f.sql.query(
-            "SELECT desired_generation,serving_generation,runtime_epoch FROM tf_v2_container_instances WHERE resource_uid=?",
-            [selector.resourceUid],
-          );
-        const [before] = await instance();
+        const [previous] = await instance();
         const engine = createTakoformV2Engine(
           {
             sql: f.sql,
+            now: () => new Date(now),
             authorize: async () => true,
             replayWindowSeconds: 3600,
             forms: { [creator.formUrl]: creator.retainedForm },
           },
           creator.acceptance,
         );
+        updateEngine = engine;
         const update = await engine.acceptUpdate({
           principal: "synthetic-oci-parent",
           uid: selector.resourceUid,
@@ -618,13 +642,24 @@ async function verifySuccessorHttpClose(
             workloadRevision: "2".repeat(64),
           },
         });
-        expect(await instance()).toEqual([{ ...before, desired_generation: 2 }]);
+        updateId = update.id;
+        advance = () => {
+          now += 61_000;
+          return engine.runNext();
+        };
+        expect(await instance()).toEqual([{ ...previous, desired_generation: 2 }]);
         expect(
           await f.sql.query(
             "SELECT application_successor_owner_token FROM tf_v2_container_acceptances WHERE operation_id=?",
             [update.id],
           ),
         ).toEqual([{ application_successor_owner_token: originalRows[0]?.owner_token }]);
+        expect(await creator.observeCurrentServingTarget(targetScope)).toMatchObject({
+          generation: 1,
+          incarnationId: selector.incarnationId,
+          claimId: original.claimId,
+          revisionOperationId: accepted.id,
+        });
       }
 
       io.restore();
@@ -645,6 +680,138 @@ async function verifySuccessorHttpClose(
         const hit = await second.response;
         again.incoming.end("NONSECRET second binding exchange");
         expect(await hit.text()).toBe("NONSECRET second binding exchange");
+        if (cutover) {
+          if (!advance || !updateId) throw new Error("missing accepted UPDATE");
+          const oldStops = () =>
+            f.nativeCounts().requests.filter((kind) => kind === "linux-oci-stop-init@1").length;
+          const nextHealth = acceptedRawHttp();
+          Reflect.set(nextHealth.response, "statusCode", 503);
+          nextHealth.onEnd(() => {
+            nextHealth.reply();
+            nextHealth.join();
+          });
+          try {
+            expect(await advance()).toMatchObject({ id: updateId, effect: "unknown" });
+            expect(nextHealth.calls[0]).toMatchObject({ hostname: "10.240.0.5" });
+            expect((await instance())[0]?.serving_generation).toBe(1);
+            expect(await creator.observeCurrentServingTarget(targetScope)).toMatchObject({
+              generation: 1,
+            });
+            expect(again.counts().requestDestroy).toBe(0);
+            expect(oldStops()).toBe(0);
+
+            Reflect.set(nextHealth.response, "statusCode", 200);
+            expect(await advance()).toMatchObject({ id: updateId, effect: "unknown" });
+            expect((await instance())[0]?.serving_generation).toBe(2);
+            expect(await creator.observeCurrentServingTarget(targetScope)).toMatchObject({
+              generation: 2,
+              incarnationId: selector.incarnationId,
+              revisionOperationId: updateId,
+            });
+            expect(oldStops()).toBe(0);
+          } finally {
+            nextHealth.restore();
+          }
+
+          const finishing = observeRawPromise(advance());
+          for (let i = 0; i < 250 && !again.counts().requestDestroy; i++) await rawTick();
+          expect(again.counts().requestDestroy).toBe(1);
+          expect(heldCloses).toBe(0);
+          expect(oldStops()).toBe(0);
+          expect((await reservations())[0]?.close_document).toBeNull();
+
+          const newIo = ownedRawHttp();
+          try {
+            const newCall = await creator.openServingHttp(
+              { ...selector, generation: 2 },
+              new Request("http://caller.invalid/new"),
+              () => {},
+            );
+            for (let i = 0; i < 250 && !newIo.counts().calls; i++) await rawTick();
+            expect(newIo.counts().calls).toBe(1);
+            expect(String(newIo.targets[0])).toBe("http://10.240.0.5:8080/new");
+            newIo.head();
+            const newResponse = await newCall.response;
+            newIo.incoming.end("NONSECRET replacement binding exchange");
+            expect(await newResponse.text()).toBe("NONSECRET replacement binding exchange");
+            newIo.closeResponse();
+            newIo.closeRequest();
+            await newCall.settlement;
+          } finally {
+            newIo.restore();
+          }
+
+          again.closeResponse();
+          await rawTick();
+          expect(heldCloses).toBe(0);
+          expect(oldStops()).toBe(0);
+          again.closeRequest();
+          await second.settlement;
+          const resumed = await finishing.value;
+          if ("error" in resumed) throw resumed.error;
+          let result = resumed.result;
+          for (let i = 0; i < 12 && result?.status !== "succeeded"; i++) result = await advance();
+          expect(result).toMatchObject({ id: updateId, status: "succeeded", effect: "complete" });
+          expect(heldCloses).toBe(1);
+          expect(oldStops()).toBe(1);
+          expect(typeof (await reservations())[0]?.close_document).toBe("string");
+          const originalClaim = (
+            await f.sql.query(
+              "SELECT state, allocation_cleanup, application_io_cleanup FROM tf_v2_container_create_claims WHERE claim_id=?",
+              [original.claimId],
+            )
+          )[0];
+          expect(originalClaim).toMatchObject({ state: "removed", allocation_cleanup: "closed" });
+          expect(JSON.parse(String(originalClaim?.application_io_cleanup))).toMatchObject({
+            scope: { operation: { operationId: updateId, action: "update", generation: 2 } },
+          });
+          if (deleteAfterUpdate) {
+            if (!updateEngine) throw new Error("missing normal UPDATE engine");
+            const originalEpoch = await reservations();
+            const remove = await updateEngine.acceptDelete({
+              principal: targetScope.principal,
+              key: crypto.randomUUID(),
+              uid: selector.resourceUid,
+              expectedGeneration: 2,
+            });
+            expect(
+              await f.sql.query(
+                "SELECT application_successor_owner_token FROM tf_v2_container_acceptances WHERE operation_id=?",
+                [remove.id],
+              ),
+            ).toEqual([{ application_successor_owner_token: null }]);
+            let result = await advance();
+            for (let i = 0; i < 12 && result?.status !== "succeeded"; i++) result = await advance();
+            if (result?.status !== "succeeded") {
+              const operations = await f.sql.query(
+                "SELECT action,generation,status,effect FROM tf_v2_operations ORDER BY generation",
+              );
+              const claims = await f.sql.query(
+                "SELECT generation,state,allocation_cleanup,json_extract(application_io_cleanup,'$.kind') AS io_close FROM tf_v2_container_create_claims ORDER BY generation",
+              );
+              throw new Error(JSON.stringify({ operations, claims, stops: oldStops() }));
+            }
+            expect(result).toMatchObject({
+              id: remove.id,
+              status: "succeeded",
+              effect: "complete",
+            });
+            expect(await reservations()).toEqual(originalEpoch);
+            expect(oldStops()).toBe(2);
+            const retired = await f.sql.query(
+              "SELECT state,allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims ORDER BY generation",
+            );
+            expect(retired).toMatchObject([
+              originalClaim,
+              { state: "removed", allocation_cleanup: "closed" },
+            ]);
+            expect(JSON.parse(String(retired[1]?.application_io_cleanup))).toMatchObject({
+              scope: { operation: { operationId: remove.id, action: "delete", generation: 3 } },
+            });
+          }
+          expect(f.network).not.toHaveBeenCalled();
+          return;
+        }
         again.closeResponse();
         again.closeRequest();
         await second.settlement;
@@ -1006,12 +1173,19 @@ async function verifySuccessorHttpClose(
       }
     }
     expect(f.network).not.toHaveBeenCalled();
+  } catch (error) {
+    caseFailed = true;
+    throw error;
   } finally {
     cleanupIo();
     health.restore();
     try {
       await restarted?.close();
-      if (!creatorCloseChecked) await fresh?.close();
+      if (!creatorCloseChecked) {
+        const closing = fresh?.close();
+        if (caseFailed) await closing?.catch(() => undefined);
+        else await closing;
+      }
     } finally {
       await f.cleanup();
     }
@@ -1025,6 +1199,8 @@ test.each([
   "ack-lost",
   "binding",
   "pending-update",
+  "update-cutover",
+  "update-delete",
   "delete",
   "delete-late",
   "delete-restart",

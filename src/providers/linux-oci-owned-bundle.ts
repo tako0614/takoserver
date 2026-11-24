@@ -20,6 +20,7 @@ import {
   type DockerContainerCoreOwnerOptions,
   type LinuxOciAllocationDisposalObservation,
   type LinuxOciDisposalProgress,
+  type LinuxOciServingTargetScope,
 } from "./docker-container-core-owner.ts";
 import type {
   DockerContainerCreateIntent,
@@ -96,8 +97,9 @@ type OriginalOciSuccessorHttp = OriginalOciSuccessorHttpConnection & {
   readonly held: LinuxOciHeldLiveInit;
   readonly epoch: number;
   readonly ownerToken: string;
+  isOpen(): boolean;
   joined(): Promise<void>;
-  closeForDelete(execution: V2Execution, signal: AbortSignal): Promise<void>;
+  closeForRetirement(execution: V2Execution, signal: AbortSignal): Promise<void>;
   read(signal: AbortSignal): Promise<OriginalOciHttpRoute>;
 };
 
@@ -244,7 +246,7 @@ export function originalLinuxOciSuccessorHttpRetirementSource(
 
 /** Only the creator that still holds this exact registered epoch can drain
  * its application I/O for the accepted Core operation. */
-export async function drainOriginalLinuxOciSuccessorHttpForDelete(
+export async function drainOriginalLinuxOciSuccessorHttpForRetirement(
   original: object,
   core: DockerContainerCoreOwner,
   record: DockerContainerCreateRecord,
@@ -264,7 +266,7 @@ export async function drainOriginalLinuxOciSuccessorHttpForDelete(
   );
   const source = matches[0]?.[1];
   if (matches.length !== 1 || !source) return fail("http_custody");
-  await source.closeForDelete(execution, signal);
+  await source.closeForRetirement(execution, signal);
   assertOriginalLinuxOciDispatchCustody(original, core, signal);
 }
 
@@ -2992,7 +2994,12 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         return unknown();
       // Existing/pending claims never send CREATE or START. Only this private
       // creator's actual running attempt can pass the original HTTP publisher.
-      await creator.publishAcceptedServing(execution, cancel.signal);
+      if (
+        !runtimeApplicationOwner ||
+        accepted.action !== "update" ||
+        accepted.servingConfirmedAtMs === null
+      )
+        await creator.publishAcceptedServing(execution, cancel.signal);
       local();
       if (
         trackedPeer &&
@@ -3222,7 +3229,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       signal.addEventListener("abort", abort, { once: true });
       const timer = setTimeout(abort, timeout);
       const running = (async () => {
-        const { held, record, httpPort, epoch, ownerToken, recordClose, recordDeleteClose } =
+        const { held, record, httpPort, epoch, ownerToken, recordClose, recordRetirementClose } =
           await core.openCurrentApplicationSuccessorHttp(
             identity,
             generation,
@@ -3246,21 +3253,20 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             });
             return transportJoin;
           }
+          const isOpen = () =>
+            !closed &&
+            !transportJoin &&
+            !cancel.signal.aborted &&
+            !held.revocation.aborted &&
+            successorHttp.get(record) === source;
           const assertLocal = (actualSignal: AbortSignal) => {
-            if (
-              closed ||
-              transportJoin ||
-              cancel.signal.aborted ||
-              held.revocation.aborted ||
-              actualSignal.aborted ||
-              successorHttp.get(record) !== source
-            )
-              return fail("revoked");
+            if (!isOpen() || actualSignal.aborted) return fail("revoked");
           };
           const source: OriginalOciSuccessorHttp = {
             held,
             epoch,
             ownerToken,
+            isOpen,
             open(request, refuseIfRevoked) {
               assertLocal(request.signal);
               return runtime.open(request, refuseIfRevoked);
@@ -3290,9 +3296,9 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               joinTransport();
               return recordClose();
             },
-            closeForDelete(execution, signal) {
+            closeForRetirement(execution, signal) {
               joinTransport();
-              return recordDeleteClose(execution, signal);
+              return recordRetirementClose(execution, signal);
             },
           };
           successorHttp.set(record, source);
@@ -3329,6 +3335,56 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       request: Request,
     ) {
       return selectServingHttpRuntime(identity, request).then((runtime) => runtime.fetch(request));
+    },
+    /** Private selection for a committed serving pointer during a pending UPDATE.
+     * The original route independently rechecks its SQL and local I/O custody. */
+    async observeCurrentServingTarget(scope: LinuxOciServingTargetScope) {
+      if (!runtimeApplicationOwner) return undefined;
+      if (closed || nativeLifetime.signal.aborted) return null;
+      const { targetUid } = scope;
+      const candidate = await core.readPendingOciServingTarget(
+        scope,
+        originalNativeCustody,
+        nativeLifetime.signal,
+      );
+      if (!candidate || closed || nativeLifetime.signal.aborted) return null;
+      const { incarnationId, generation, runtimeEpoch, revisionOperationId, claimId, successor } =
+        candidate;
+      const matches = (record: DockerContainerCreateRecord) =>
+        record.claimId === claimId &&
+        record.nativeId === candidate.nativeId &&
+        record.state === "bound" &&
+        record.intent.resourceUid === targetUid &&
+        record.intent.incarnationId === incarnationId &&
+        record.intent.policy.generation === generation &&
+        record.intent.revision === candidate.revision;
+      if (successor) {
+        const owners = [...successorHttp].filter(
+          ([record, source]) =>
+            matches(record) &&
+            source.epoch === successor.epoch &&
+            source.ownerToken === successor.ownerToken &&
+            source.isOpen(),
+        );
+        if (owners.length !== 1) return null;
+      } else {
+        const record = httpRecords.get(claimId);
+        if (
+          !record ||
+          !matches(record) ||
+          nativeBindings.get(claimId) !== candidate.nativeId ||
+          !nativeSessions.has(claimId) ||
+          !httpRuntimes.has(claimId)
+        )
+          return null;
+      }
+      return Object.freeze({
+        incarnationId,
+        generation,
+        runtimeEpoch,
+        revisionOperationId,
+        claimId,
+      });
     },
     /** The binding has already selected a serving generation. The private
      * caller retains this same invocation through actual terminal I/O. */

@@ -942,7 +942,11 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     source: "src/takoform-v2/forward-container-binding-authority.ts",
     target: "src/takoform-v2/worker-publication-state.ts",
     typeOnly: false,
-    names: ["MAX_FAILED_TAIL"],
+    names: [
+      "MAX_FAILED_TAIL",
+      "type V2ContainerServingTarget",
+      "type V2ContainerServingTargetReader",
+    ],
   },
   {
     source: "src/entry-bun.ts",

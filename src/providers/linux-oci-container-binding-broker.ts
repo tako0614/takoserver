@@ -31,12 +31,14 @@ export function createLinuxOciContainerBindingSource(input: {
   const workerBackendId = input.workerBackendId;
   const containerBackendId = input.containerBackendId;
   const originalOpen = input.original.openServingHttp.bind(input.original);
+  const readCurrentServingTarget = input.original.observeCurrentServingTarget.bind(input.original);
   const query = sql.query.bind(sql);
   const read = createV2ForwardContainerBindingReader({
     sql,
     targetKey,
     workerBackendId,
     containerBackendId,
+    readCurrentServingTarget,
     // This accepted owner read does not authenticate a caller. Every use is
     // additionally fenced by its original private native Version and lease.
     async authorize(principal, space) {
@@ -55,6 +57,7 @@ export function createLinuxOciContainerBindingSource(input: {
     },
     targetKey,
     read,
+    readCurrentServingTarget,
     /** Eligibility of the original accepted, still-in-flight Version is not
      * the settled-Version dispatch reader (which would create a readiness cycle).
      * Its original resolution proves sealed references/currentness separately. */
@@ -91,6 +94,37 @@ export function createLinuxOciContainerBindingSource(input: {
       request: Request,
       refuseIfRevoked: () => void,
     ) {
+      if (snapshot.targetKey !== targetKey || request.signal.aborted)
+        throw new Error("oci_binding_target_current");
+      const serving = snapshot.nativeServing;
+      if (serving) {
+        const current = await readCurrentServingTarget({
+          principal: snapshot.principal,
+          space: snapshot.space,
+          targetKey,
+          targetUid: snapshot.targetUid,
+          targetFormUrl: snapshot.targetFormUrl,
+        });
+        if (
+          !current ||
+          current.incarnationId !== serving.incarnationId ||
+          current.generation !== serving.generation ||
+          current.runtimeEpoch !== serving.runtimeEpoch ||
+          current.revisionOperationId !== serving.revisionOperationId ||
+          current.claimId !== serving.claimId ||
+          request.signal.aborted
+        )
+          throw new Error("oci_binding_target_current");
+        return originalOpen(
+          {
+            resourceUid: snapshot.targetUid,
+            incarnationId: serving.incarnationId,
+            generation: serving.generation,
+          },
+          request,
+          refuseIfRevoked,
+        );
+      }
       const rows = await query(
         `SELECT incarnation_id FROM tf_v2_container_instances
          WHERE resource_uid=? AND principal=? AND space=? AND target_key=?
@@ -107,7 +141,6 @@ export function createLinuxOciContainerBindingSource(input: {
       );
       const incarnation = rows.length === 1 ? rows[0]?.incarnation_id : undefined;
       if (
-        snapshot.targetKey !== targetKey ||
         typeof incarnation !== "string" ||
         !/^[0-9a-f]{64}$/u.test(incarnation) ||
         request.signal.aborted
