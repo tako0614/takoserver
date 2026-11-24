@@ -2,6 +2,7 @@ import { expect, spyOn, test } from "bun:test";
 import type { Sql, SqlParam, SqlStatement } from "../src/ports.ts";
 import * as sqlite from "../src/sql-sqlite.ts";
 import {
+  createNativeOciContainerHostAcceptance,
   createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerApplicationSuccessorSchema,
   inspectV2ContainerOwnerSelectedSchema,
@@ -25,6 +26,16 @@ function selectedEngine(
   ociParentControl: "sealed-original@1" | "sealed-peer-runtime-application-owner@1",
 ) {
   const form = fixture.composition.retainedForm;
+  const options = {
+    sql: fixture.sql,
+    installationId: "synthetic-oci-installation",
+    backendId: form.backend.id,
+    targetKey: form.backend.targetKey,
+  };
+  const acceptance =
+    ociParentControl === "sealed-original@1"
+      ? createV2ContainerHostAcceptance({ ...options, ociParentControl })
+      : createNativeOciContainerHostAcceptance(options);
   return createTakoformV2Engine(
     {
       sql: fixture.sql,
@@ -32,13 +43,7 @@ function selectedEngine(
       replayWindowSeconds: 3600,
       forms: { [V2_CONTAINER_F2_FORM]: form },
     },
-    createV2ContainerHostAcceptance({
-      sql: fixture.sql,
-      installationId: "synthetic-oci-installation",
-      backendId: form.backend.id,
-      targetKey: form.backend.targetKey,
-      ociParentControl,
-    }),
+    acceptance,
   );
 }
 

@@ -1148,6 +1148,7 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     target: "src/takoform-v2/container-owner-schema.ts",
     typeOnly: false,
     names: [
+      "createNativeOciContainerHostAcceptance",
       "createV2ContainerHostAcceptance",
       "inspectV2ContainerOwnerHistoricalDeleteSchema",
       "inspectV2ContainerOwnerSelectedSchema",

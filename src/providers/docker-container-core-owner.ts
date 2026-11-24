@@ -8,6 +8,7 @@ import {
   v2FinalDeleteConfiguredUpdateSchemaFence,
 } from "../takoform-v2/configured-private-inputs.ts";
 import {
+  createNativeOciContainerHostAcceptance,
   createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerHistoricalDeleteSchema,
   inspectV2ContainerOwnerSelectedSchema,
@@ -876,19 +877,13 @@ export function createDockerContainerCoreOwner(
           ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
           : "takoserver.linux-oci-peer-reconstruction@1";
   if (parentMode !== undefined && parentMode !== "sealed-original@1" && !peerMode) return fail();
-  const original = createV2ContainerHostAcceptance({
-    sql,
-    installationId,
-    backendId,
-    targetKey,
-    ...(parentMode === undefined
-      ? {}
-      : {
-          ociParentControl: runtimeApplicationOwner
-            ? "sealed-peer-runtime-application-owner@1"
-            : "sealed-original@1",
-        }),
-  });
+  const acceptanceOptions = { sql, installationId, backendId, targetKey };
+  const original = runtimeApplicationOwner
+    ? createNativeOciContainerHostAcceptance(acceptanceOptions)
+    : createV2ContainerHostAcceptance({
+        ...acceptanceOptions,
+        ...(parentMode === undefined ? {} : { ociParentControl: "sealed-original@1" }),
+      });
   const freshControlClaims = new WeakSet<DockerContainerCreateRecord>();
   const controlKeyring = parentMode !== undefined ? options.configuredInputs?.keyring : undefined;
   const controlDecryptionKey = controlKeyring?.keyForDecryption.bind(controlKeyring);

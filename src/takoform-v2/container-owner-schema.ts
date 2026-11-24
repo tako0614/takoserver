@@ -1109,12 +1109,7 @@ export async function inspectV2ContainerOwnerShutdownIoSchema(sql: Sql): Promise
 }
 
 const applicationSuccessorOwnerToken = "application_successor_owner_token";
-const applicationSuccessorTable = `${PREFIX}application_successors`;
-const selectedServingApplicationOwner = `SELECT successor.owner_token
-  FROM main.${applicationSuccessorTable} successor
-  JOIN main.${I} instance ON instance.resource_uid = successor.resource_uid
-  WHERE successor.resource_uid = ? AND successor.generation = instance.serving_generation
-  ORDER BY successor.epoch DESC LIMIT 1`;
+const applicationSuccessorTable = "tf_v2_container_application_successors";
 
 function buildApplicationSuccessorSchema() {
   const successorOwnerColumn = `${applicationSuccessorOwnerToken} TEXT CHECK (${applicationSuccessorOwnerToken} IS NULL OR (form_url = ${literal(F2_FORM)} AND action IN ('update', 'delete') AND ${hex(applicationSuccessorOwnerToken)}))`;
@@ -1390,16 +1385,20 @@ function buildApplicationSuccessorSchema() {
 export const V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND =
   /* @__PURE__ */ buildApplicationSuccessorSchema();
 
-export async function inspectV2ContainerOwnerApplicationSuccessorSchema(
+async function inspectContainerOwnerReadiness(
   sql: Sql,
+  { sql: predicate, params }: SqlStatement,
 ): Promise<boolean> {
   try {
-    const { sql: predicate, params } = V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready;
     const rows = await sql.query(`SELECT ${predicate} AS ready`, params);
     return rows.length === 1 && Object.keys(rows[0] ?? {}).length === 1 && rows[0]?.ready === 1;
   } catch {
     return false;
   }
+}
+
+export function inspectV2ContainerOwnerApplicationSuccessorSchema(sql: Sql): Promise<boolean> {
+  return inspectContainerOwnerReadiness(sql, V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready);
 }
 
 /** Existing standalone inspectors retain their exact predecessor shapes. */
@@ -1432,19 +1431,46 @@ const historicalSelectedControlParams = Object.freeze([
   ...shutdownIoReadyParams,
 ]);
 
-/** Internal construction only. No request DTO, SQL claim or callback mints native authority. */
-export function createV2ContainerHostAcceptance(options: {
+interface ContainerHostAcceptanceOptions {
   readonly sql: Sql;
   readonly installationId: string;
   readonly backendId: string;
   readonly targetKey: string;
-  readonly ociParentControl?: "sealed-original@1" | "sealed-peer-runtime-application-owner@1";
-}): V2HostAcceptance {
+}
+
+/** Construct the public Host acceptance compiler for its existing SQL shapes. */
+export function createV2ContainerHostAcceptance(
+  options: ContainerHostAcceptanceOptions & { readonly ociParentControl?: "sealed-original@1" },
+): V2HostAcceptance {
+  return createContainerHostAcceptance(options, options.ociParentControl === "sealed-original@1");
+}
+
+/** The selected native application owner uses the same acceptance transaction. */
+export function createNativeOciContainerHostAcceptance(
+  options: ContainerHostAcceptanceOptions,
+): V2HostAcceptance {
+  return createContainerHostAcceptance(options, true, {
+    ready: V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready,
+    ownerTokenColumn: applicationSuccessorOwnerToken,
+    selectServingOwner: `SELECT successor.owner_token
+  FROM main.${applicationSuccessorTable} successor
+  JOIN main.${I} instance ON instance.resource_uid = successor.resource_uid
+  WHERE successor.resource_uid = ? AND successor.generation = instance.serving_generation
+  ORDER BY successor.epoch DESC LIMIT 1`,
+  });
+}
+
+/** No request DTO, SQL claim or callback mints native authority. */
+function createContainerHostAcceptance(
+  options: ContainerHostAcceptanceOptions,
+  usesOciControl: boolean,
+  applicationSuccessor?: {
+    readonly ready: Required<SqlStatement>;
+    readonly ownerTokenColumn: string;
+    readonly selectServingOwner: string;
+  },
+): V2HostAcceptance {
   const { sql, installationId, backendId, targetKey } = options;
-  const allowsApplicationSuccessor =
-    options.ociParentControl === "sealed-peer-runtime-application-owner@1";
-  const usesOciControl =
-    options.ociParentControl === "sealed-original@1" || allowsApplicationSuccessor;
   const selectedReady = usesOciControl ? historicalSelectedControlReady : runtimeReady;
   const selectedReadyParams = usesOciControl ? historicalSelectedControlParams : runtimeReadyParams;
   if (
@@ -1581,18 +1607,19 @@ export function createV2ContainerHostAcceptance(options: {
           ]
         : [];
       const selectedSuccessor =
-        allowsApplicationSuccessor &&
+        applicationSuccessor &&
         c.action === "update" &&
-        (await inspectV2ContainerOwnerApplicationSuccessorSchema(sql));
-      const successor = V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready;
-      const readiness = selectedSuccessor
-        ? successor
-        : allowsApplicationSuccessor && c.action === "create"
+        (await inspectContainerOwnerReadiness(sql, applicationSuccessor.ready))
+          ? applicationSuccessor
+          : undefined;
+      const readiness =
+        selectedSuccessor?.ready ??
+        (applicationSuccessor && c.action === "create"
           ? {
-              sql: `(${selectedReady} OR ${successor.sql})`,
-              params: [...selectedReadyParams, ...successor.params],
+              sql: `(${selectedReady} OR ${applicationSuccessor.ready.sql})`,
+              params: [...selectedReadyParams, ...applicationSuccessor.ready.params],
             }
-          : { sql: selectedReady, params: selectedReadyParams };
+          : { sql: selectedReady, params: selectedReadyParams });
       const guard: SqlStatement = {
         sql: `${readiness.sql} AND (${
           c.action === "create"
@@ -1626,9 +1653,9 @@ export function createV2ContainerHostAcceptance(options: {
         sql: `INSERT INTO main.${A} (operation_id, resource_uid, installation_id, incarnation_id,
           principal, space, name, form_url, backend_id, target_key, action, generation, backend_key,
           replay_key, fingerprint, accepted_spec_json, accepted_output_json, references_json,
-          configured_private_inputs_json, accepted_at, retain_until, revision${selectedSuccessor ? `, ${applicationSuccessorOwnerToken}` : ""})
+          configured_private_inputs_json, accepted_at, retain_until, revision${selectedSuccessor ? `, ${selectedSuccessor.ownerTokenColumn}` : ""})
           SELECT ?, ?, ?, ${c.action === "create" ? "?" : `(SELECT incarnation_id FROM main.${I} WHERE resource_uid = ?)`},
-            ?, ?, ?, ?, ?, ?, ?, ?, op.backend_key, ?, ?, ?, ?, ?, ?, ?, ?, ?${selectedSuccessor ? `, (${selectedServingApplicationOwner})` : ""}
+            ?, ?, ?, ?, ?, ?, ?, ?, op.backend_key, ?, ?, ?, ?, ?, ?, ?, ?, ?${selectedSuccessor ? `, (${selectedSuccessor.selectServingOwner})` : ""}
           FROM main.tf_v2_operations op WHERE op.id = ?`,
         params: [
           c.operationId,
@@ -1710,14 +1737,11 @@ export function createV2ContainerHostAcceptance(options: {
         throw new TypeError("invalid Container F2 workload revision");
       return (async () => {
         const successor =
-          allowsApplicationSuccessor &&
-          (await inspectV2ContainerOwnerApplicationSuccessorSchema(sql));
-        const readiness = successor
-          ? V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready
-          : {
-              sql: selectedReady,
-              params: selectedReadyParams,
-            };
+          applicationSuccessor &&
+          (await inspectContainerOwnerReadiness(sql, applicationSuccessor.ready))
+            ? applicationSuccessor
+            : undefined;
+        const readiness = successor?.ready ?? { sql: selectedReady, params: selectedReadyParams };
         const guard: SqlStatement = {
           sql: `${readiness.sql} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
@@ -1741,10 +1765,10 @@ export function createV2ContainerHostAcceptance(options: {
           sql: `INSERT OR ABORT INTO main.${A} (operation_id, resource_uid, installation_id, incarnation_id,
           principal, space, name, form_url, backend_id, target_key, action, generation, backend_key,
           replay_key, fingerprint, accepted_spec_json, accepted_output_json, references_json,
-          configured_private_inputs_json, accepted_at, retain_until, revision${successor ? `, ${applicationSuccessorOwnerToken}` : ""})
+          configured_private_inputs_json, accepted_at, retain_until, revision${successor ? `, ${successor.ownerTokenColumn}` : ""})
           VALUES ( ?, ?, ?, ${`(SELECT incarnation_id FROM main.${I} WHERE resource_uid = ?)`},
             ?, ?, ?, ?, ?, ?, ?, ?, (SELECT op.backend_key FROM main.tf_v2_operations op WHERE op.id = ?), ?, ?, ?, ?, ?, NULL, ?, ?, ?${
-              successor ? `, (${selectedServingApplicationOwner})` : ""
+              successor ? `, (${successor.selectServingOwner})` : ""
             }
           )`,
           params: [
