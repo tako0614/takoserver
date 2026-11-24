@@ -435,25 +435,30 @@ fail:
   return -1;
 }
 
-int tns_owner_observe(struct tns_owner *owner, struct tns_identity *identity) {
-  if (!owner || !identity || owner->phase != TNS_HELD) { errno = EINVAL; return -1; }
-  if (tns_kernel_observe(owner) < 0 || tns_alive(owner) < 0) goto fail;
+static int tns_owner_read_held_identity(struct tns_owner *owner, struct tns_identity *identity,
+                                        int exact_close) {
+  if (tns_kernel_observe(owner) < 0 || tns_alive(owner) < 0) return -1;
   struct tns_identity held, current;
-  if (tns_fd_identity(owner->netfd, &held) < 0) goto fail;
+  if (tns_fd_identity(owner->netfd, &held) < 0) return -1;
   int fd = openat(owner->procfd, "ns/net", O_RDONLY | O_CLOEXEC);
-  if (fd < 0) goto fail;
+  if (fd < 0) return -1;
   int result = tns_fd_identity(fd, &current);
   int saved = errno;
-  close(fd);
-  if (result < 0) { errno = saved; goto fail; }
+  int closed = close(fd);
+  if (result < 0) { errno = saved; return -1; }
+  if (exact_close && closed < 0) return -1;
   if (!tns_identity_equal(&owner->identity, &held) ||
-      !tns_identity_equal(&owner->identity, &current)) { errno = ESTALE; goto fail; }
-  if (tns_alive(owner) < 0 || tns_kernel_observe(owner) < 0) goto fail;
+      !tns_identity_equal(&owner->identity, &current)) { errno = ESTALE; return -1; }
+  if (tns_alive(owner) < 0 || tns_kernel_observe(owner) < 0) return -1;
   *identity = held;
   return 0;
-fail:
-  (void)tns_phase_close(&owner->phase);
-  return -1;
+}
+
+int tns_owner_observe(struct tns_owner *owner, struct tns_identity *identity) {
+  if (!owner || !identity || owner->phase != TNS_HELD) { errno = EINVAL; return -1; }
+  int result = tns_owner_read_held_identity(owner, identity, 0);
+  if (result < 0) (void)tns_phase_close(&owner->phase);
+  return result;
 }
 
 int tns_owner_observe_creator(struct tns_owner *owner, struct tns_identity *identity) {
@@ -609,6 +614,18 @@ int tns_owner_admission_current(struct tns_owner *owner) {
     errno=EUCLEAN;return -1;
   }
   return tns_kernel_observe(owner);
+}
+int tns_owner_read_admitted_identity(struct tns_owner *owner, struct tns_identity *identity) {
+  if (!owner || !identity || owner->phase != TNS_HELD || !owner->kernel_cookie ||
+      !owner->admission_attempted || owner->cut_confirmed ||
+      owner->kill_attempted || owner->custodian_close_unknown) {
+    errno = EUCLEAN;
+    return -1;
+  }
+  /* The cookie is already pinned. The shared identity check cannot populate
+   * it here and a failed observation does not close the original phase. */
+  if (tns_owner_admission_current(owner) < 0) return -1;
+  return tns_owner_read_held_identity(owner, identity, 1);
 }
 int tns_owner_open_admission(struct tns_owner *owner) {
   if (!owner || tns_controller(owner) < 0) return -1;
