@@ -2066,6 +2066,28 @@ the backup. Keep all copies in private storage. Restore service ownership on
 the prepared database when restoring that same complete installation, with
 the fencing and runtime identity checks below.
 
+### Resume accepted OCI Container operations
+
+An operator-owned Bun launcher selects the original OCI backend through
+[`startSelfhostBunHost`](../src/entry-bun.ts). Pass it
+`linuxContainerSelection: { kind: "oci", selection }` from your private
+operator code. Match the backend and target recorded by the accepted operations.
+The Bun Worker composition expects the OCI binding to use
+`selfhost-v2-worker-primary` as its target key. Keep the original installation,
+runtime custody and required private inputs through the restore below. Tracked
+OCI startup requires the shutdown evidence schema prepared above.
+
+With a Linux Container backend selected, the default for retained
+`Container/0.2.0` operations is DELETE only. To resume other already accepted
+actions, pass `v2RetainedExecutionActions` to the same launcher with the exact
+`https://edge.forms.takoform.com/forms/Container/0.2.0/` key and the action list
+this replacement owns. For example, `["create", "delete"]` resumes accepted
+CREATE and DELETE while holding UPDATE. Apply the selection on the replacement
+after fencing the previous Host. The [retained execution rules](takoform-v2.md)
+preserve the original backend, target and operation identity. When a send may
+have occurred, the executor reconciles that same operation. Fresh Container
+CREATE and UPDATE still require a complete Form registration.
+
 ## Restore boundary
 
 Restoring the files is not a safe way to validate a clone. Starting
