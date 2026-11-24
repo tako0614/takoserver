@@ -89,7 +89,10 @@ type OriginalOciHttpRoute = {
 
 type OriginalOciSuccessorHttp = {
   readonly held: LinuxOciHeldLiveInit;
+  readonly epoch: number;
+  readonly ownerToken: string;
   joined(): Promise<void>;
+  closeForDelete(execution: V2Execution, signal: AbortSignal): Promise<void>;
   read(signal: AbortSignal): Promise<OriginalOciHttpRoute>;
   close(): Promise<void>;
 };
@@ -233,6 +236,32 @@ export function originalLinuxOciSuccessorHttpRetirementSource(
   const source = custody.successorHttp.get(record);
   if (source?.held !== held) return fail("http_custody");
   return source.joined;
+}
+
+/** Only the creator that still holds this exact registered epoch can drain
+ * its application I/O for the accepted Core operation. */
+export async function drainOriginalLinuxOciSuccessorHttpForDelete(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  epoch: number,
+  ownerToken: string,
+  execution: V2Execution,
+  signal: AbortSignal,
+): Promise<void> {
+  assertOriginalLinuxOciDispatchCustody(original, core, signal);
+  const custody = originalOciCustodies.get(original);
+  const matches = [...(custody?.successorHttp.entries() ?? [])].filter(
+    ([captured, source]) =>
+      captured.claimId === record.claimId &&
+      source.epoch === epoch &&
+      source.ownerToken === ownerToken &&
+      canonicalJson(captured) === canonicalJson(record),
+  );
+  const source = matches[0]?.[1];
+  if (matches.length !== 1 || !source) return fail("http_custody");
+  await source.closeForDelete(execution, signal);
+  assertOriginalLinuxOciDispatchCustody(original, core, signal);
 }
 
 const observeOriginalOciStarted = LinuxOciPhysicalSession.prototype.observeStarted;
@@ -3188,7 +3217,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       signal.addEventListener("abort", abort, { once: true });
       const timer = setTimeout(abort, timeout);
       const running = (async () => {
-        const { held, record, httpPort, recordClose } =
+        const { held, record, httpPort, epoch, ownerToken, recordClose, recordDeleteClose } =
           await core.openCurrentApplicationSuccessorHttp(
             identity,
             generation,
@@ -3203,11 +3232,19 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           const runtime = createLinuxOciContainerHttpRuntime(originalNativeCustody, core, record);
           let reading = Promise.resolve();
           let transportJoin: Promise<void> | undefined;
-          let joining: Promise<void> | undefined;
+          function joinTransport() {
+            transportJoin ??= Promise.resolve().then(async () => {
+              // A rejected raw I/O join retains the connector and open epoch.
+              await runtime.close();
+              await reading;
+              await held.close();
+            });
+            return transportJoin;
+          }
           const assertLocal = (actualSignal: AbortSignal) => {
             if (
               closed ||
-              joining ||
+              transportJoin ||
               cancel.signal.aborted ||
               held.revocation.aborted ||
               actualSignal.aborted ||
@@ -3217,6 +3254,8 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           };
           const source: OriginalOciSuccessorHttp = {
             held,
+            epoch,
+            ownerToken,
             joined() {
               return transportJoin ?? fail("http_custody");
             },
@@ -3239,25 +3278,19 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               return check;
             },
             close() {
-              joining ??= Promise.resolve().then(async () => {
-                // A rejected transport join leaves the held connector and the
-                // open reservation in custody. Only a known join may close it.
-                transportJoin = (async () => {
-                  await runtime.close();
-                  await reading;
-                  await held.close();
-                })();
-                await transportJoin;
-                await recordClose();
-              });
-              return joining;
+              joinTransport();
+              return recordClose();
+            },
+            closeForDelete(execution, signal) {
+              joinTransport();
+              return recordDeleteClose(execution, signal);
             },
           };
           successorHttp.set(record, source);
           held.revocation.addEventListener(
             "abort",
             () => {
-              void source.close().catch(() => undefined);
+              void joinTransport().catch(() => undefined);
             },
             { once: true },
           );

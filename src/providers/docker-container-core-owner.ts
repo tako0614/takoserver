@@ -64,6 +64,7 @@ import {
   assertOriginalLinuxOciDispatchCustody,
   createOriginalLinuxOciSealedApplicationCloseResume,
   disposeOriginalLinuxOciAllocation,
+  drainOriginalLinuxOciSuccessorHttpForDelete,
   type LinuxOciHeldLiveInit,
   type LinuxOciSealedApplicationCloseResume,
   observeOriginalLinuxOciOwnedInitReaped,
@@ -309,7 +310,10 @@ export interface DockerContainerCoreOwner {
     readonly record: DockerContainerCreateRecord;
     readonly held: LinuxOciHeldLiveInit;
     readonly httpPort: number;
+    readonly epoch: number;
+    readonly ownerToken: string;
     recordClose(): Promise<void>;
+    recordDeleteClose(execution: V2Execution, signal: AbortSignal): Promise<void>;
   }>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
@@ -558,6 +562,7 @@ interface ApplicationSuccessorIssuance {
   readonly ownerToken: string;
   readonly predecessor: string;
   readonly controlDigest: string;
+  readonly predecessorFence: SqlStatement;
   readonly liveSql: string;
   readonly liveParams: readonly SqlParam[];
   readonly assertKeys: () => void;
@@ -803,7 +808,13 @@ export function createDockerContainerCoreOwner(
     installationId,
     backendId,
     targetKey,
-    ...(parentMode === undefined ? {} : { ociParentControl: "sealed-original@1" as const }),
+    ...(parentMode === undefined
+      ? {}
+      : {
+          ociParentControl: runtimeApplicationOwner
+            ? "sealed-peer-runtime-application-owner@1"
+            : "sealed-original@1",
+        }),
   });
   const freshControlClaims = new WeakSet<DockerContainerCreateRecord>();
   const controlKeyring = parentMode !== undefined ? options.configuredInputs?.keyring : undefined;
@@ -3157,6 +3168,28 @@ export function createDockerContainerCoreOwner(
       plaintext?.fill(0);
     }
   }
+  async function inspectApplicationSuccessorStore() {
+    try {
+      const rows = await sql.query(
+        "SELECT 1 AS ready WHERE " + applicationSuccessorStore.sql,
+        applicationSuccessorStore.params,
+      );
+      return rows.length === 1 && rows[0]?.ready === 1;
+    } catch {
+      return false;
+    }
+  }
+  async function inspectAcceptedContainerOwnerSchema(
+    execution: V2Execution,
+    layer: Parameters<typeof inspectV2ContainerOwnerSelectedSchema>[1],
+  ) {
+    return (
+      (await inspectV2ContainerOwnerSelectedSchema(sql, layer)) ||
+      (runtimeApplicationOwner &&
+        execution.action === "delete" &&
+        (await inspectApplicationSuccessorStore()))
+    );
+  }
   async function acceptedParentControl(
     execution: V2Execution,
     input: DockerContainerCreateRecord,
@@ -3228,7 +3261,7 @@ export function createDockerContainerCoreOwner(
     sameRecord(input, record(loaded.intent, loaded.proof));
     if (
       !usable(loaded.proof, phase) ||
-      !(await inspectV2ContainerOwnerSelectedSchema(sql, "control"))
+      !(await inspectAcceptedContainerOwnerSchema(execution, "control"))
     )
       return fail();
     const rows = await sql.query(
@@ -3298,7 +3331,7 @@ export function createDockerContainerCoreOwner(
           (execution.action === "delete"
             ? !retiredDeleteProof(loaded.proof, "a")
             : execution.action !== "update") ||
-          !(await inspectV2ContainerOwnerSelectedSchema(sql, "final-delete"))
+          !(await inspectAcceptedContainerOwnerSchema(execution, "final-delete"))
         )
           return fail();
         const rows = await sql.query(
@@ -3383,7 +3416,7 @@ export function createDockerContainerCoreOwner(
       if (
         (trackedPeer || parentMode === "sealed-peer-local-cleanup@1" || applicationOwnerPeer) &&
         phase === "remove" &&
-        (await inspectV2ContainerOwnerSelectedSchema(sql, "application-io"))
+        (await inspectAcceptedContainerOwnerSchema(execution, "application-io"))
       ) {
         const closed = await sql.query(
           "SELECT allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=?",
@@ -3403,8 +3436,7 @@ export function createDockerContainerCoreOwner(
             runtimeApplicationOwner &&
             execution.action === "delete" &&
             document === V2_CONTAINER_APPLICATION_IO_RESERVED &&
-            closed[0]?.allocation_cleanup === "untouched" &&
-            (await inspectV2ContainerOwnerShutdownIoSchema(sql))
+            closed[0]?.allocation_cleanup === "untouched"
           ) {
             const coordinates = [
               input.intent.resourceUid,
@@ -3412,19 +3444,14 @@ export function createDockerContainerCoreOwner(
               input.claimId,
               input.nativeId,
             ];
-            const shutdown = await sql.query(
-              "SELECT close_document FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=?",
-              coordinates,
+            const receipt = await readAcceptedDeleteCloseSource(
+              execution,
+              input,
+              originalCustody,
+              raw,
+              signal,
             );
-            if (shutdown.length > 1) return fail();
-            if (shutdown.length === 1) {
-              const receipt = shutdown[0]?.close_document;
-              if (typeof receipt !== "string") return fail();
-              const shutdownCurrent = await readApplicationCloseFact(
-                receipt,
-                await shutdownIoScope(input, raw),
-                shutdownIoCloseKind,
-              );
+            if (receipt) {
               // Carry the genuine original terminal fact into this operation's
               // existing one-use close slot. No mutation of the prior receipt
               // and no native request until the same DELETE verifies its seal.
@@ -3443,14 +3470,15 @@ export function createDockerContainerCoreOwner(
               )
                 return fail();
               executionScope(execution);
-              shutdownCurrent();
+              receipt.assertCurrent();
               selected.assertCurrent();
               const guard = fence(loaded.proof);
               const saved = await sql.run(
                 "UPDATE tf_v2_container_create_claims SET application_io_cleanup=? WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched' AND native_control=? AND application_io_cleanup=? AND " +
                   guard.sql +
                   reconcilerLeaseSql +
-                  " AND EXISTS (SELECT 1 FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND close_document=?)",
+                  " AND " +
+                  receipt.sql,
                 [
                   selected.document,
                   ...coordinates,
@@ -3460,12 +3488,11 @@ export function createDockerContainerCoreOwner(
                   execution.operationId,
                   execution.resourceUid,
                   execution.leaseToken,
-                  ...coordinates,
-                  receipt,
+                  ...receipt.params,
                 ],
               );
               if (saved.changes !== 1) return fail();
-              shutdownCurrent();
+              receipt.assertCurrent();
               selected.assertCurrent();
               document = selected.document;
             }
@@ -3603,7 +3630,7 @@ export function createDockerContainerCoreOwner(
             management &&
             finalProducer &&
             (execution.action === "delete" || execution.action === "update") &&
-            (await inspectV2ContainerOwnerSelectedSchema(sql, "final-delete"))
+            (await inspectAcceptedContainerOwnerSchema(execution, "final-delete"))
           ) {
             await guard();
             await confirmRemoved(
@@ -3633,7 +3660,7 @@ export function createDockerContainerCoreOwner(
           !applicationOwnerPeer ||
           phase !== "remove" ||
           missingApplicationDocument === undefined ||
-          !(await inspectV2ContainerOwnerSelectedSchema(sql, "allocation"))
+          !(await inspectAcceptedContainerOwnerSchema(execution, "allocation"))
         )
           return fail();
         // Only the successful exact schema+row read above proves missing.
@@ -3724,8 +3751,8 @@ export function createDockerContainerCoreOwner(
           if (management) {
             if (typeof read === "function") return fail();
             let complete = false;
-            const applicationSchema = await inspectV2ContainerOwnerSelectedSchema(
-              sql,
+            const applicationSchema = await inspectAcceptedContainerOwnerSchema(
+              execution,
               "application-io",
             );
             // The expanded schema persists the original close before helper
@@ -4005,7 +4032,7 @@ export function createDockerContainerCoreOwner(
                   await waitForOriginalApplicationClose(terminal, closeFinished, signal);
                 applicationFactCurrent = await beginApplicationSave();
                 localApplication();
-                if (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")) {
+                if (await inspectAcceptedContainerOwnerSchema(execution, "allocation")) {
                   const cleanup = await sql.query(
                     "SELECT allocation_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND state='bound' AND native_id=? AND native_control=?",
                     [
@@ -4103,7 +4130,7 @@ export function createDockerContainerCoreOwner(
                   finalProducer &&
                   (execution.action === "delete" || execution.action === "update") &&
                   applicationFactCurrent &&
-                  (await inspectV2ContainerOwnerSelectedSchema(sql, "final-delete"))
+                  (await inspectAcceptedContainerOwnerSchema(execution, "final-delete"))
                 ) {
                   const factCurrent = applicationFactCurrent;
                   await currentApplication();
@@ -4391,6 +4418,34 @@ export function createDockerContainerCoreOwner(
       },
     };
   }
+  async function readLatestApplicationSuccessor(input: DockerContainerCreateRecord) {
+    const rows = await sql.query(
+      "SELECT epoch,owner_token,claim_id,native_id,predecessor_close_document,close_document FROM main.tf_v2_container_application_successors " +
+        "WHERE resource_uid=? AND generation=? ORDER BY epoch DESC LIMIT 1",
+      [input.intent.resourceUid, input.intent.policy.generation],
+    );
+    if (!rows.length) return;
+    const row = rows[0];
+    if (
+      rows.length !== 1 ||
+      !row ||
+      row.claim_id !== input.claimId ||
+      row.native_id !== input.nativeId ||
+      typeof row.epoch !== "number" ||
+      !Number.isSafeInteger(row.epoch) ||
+      row.epoch < 1 ||
+      !hex(row.owner_token) ||
+      typeof row.predecessor_close_document !== "string" ||
+      (row.close_document !== null && typeof row.close_document !== "string")
+    )
+      return fail();
+    return {
+      epoch: row.epoch,
+      ownerToken: row.owner_token,
+      predecessor: row.predecessor_close_document,
+      document: row.close_document,
+    };
+  }
   async function readApplicationSuccessorPredecessor(
     input: DockerContainerCreateRecord,
     originalCloseScope: Awaited<ReturnType<typeof shutdownIoScope>>,
@@ -4398,27 +4453,10 @@ export function createDockerContainerCoreOwner(
     const { resourceUid, generation, claimId, nativeId, controlDigest } = originalCloseScope;
     const coordinates = [resourceUid, generation, claimId, nativeId];
     const currentClaim = "resource_uid=? AND generation=? AND claim_id=? AND native_id=?";
-    const rows = await sql.query(
-      "SELECT epoch,owner_token,claim_id,native_id,close_document FROM main.tf_v2_container_application_successors " +
-        "WHERE resource_uid=? AND generation=? ORDER BY epoch DESC LIMIT 1",
-      [resourceUid, generation],
-    );
-    if (rows.length) {
-      const latest = rows[0];
-      if (
-        rows.length !== 1 ||
-        !latest ||
-        latest.claim_id !== claimId ||
-        latest.native_id !== nativeId ||
-        typeof latest.epoch !== "number" ||
-        !Number.isSafeInteger(latest.epoch) ||
-        latest.epoch < 1 ||
-        latest.epoch >= Number.MAX_SAFE_INTEGER ||
-        !hex(latest.owner_token) ||
-        typeof latest.close_document !== "string"
-      )
-        return fail();
-      const { epoch, owner_token: ownerToken, close_document: document } = latest;
+    const latest = await readLatestApplicationSuccessor(input);
+    if (latest) {
+      const { epoch, ownerToken, document } = latest;
+      if (epoch >= Number.MAX_SAFE_INTEGER || document === null) return fail();
       return {
         epoch: epoch + 1,
         document,
@@ -4562,10 +4600,188 @@ export function createDockerContainerCoreOwner(
       current.finish();
     }
   }
+  const acceptedSuccessorTokenSql =
+    " AND EXISTS (SELECT 1 FROM main.tf_v2_container_acceptances accepted WHERE accepted.operation_id=? AND accepted.resource_uid=? AND accepted.application_successor_owner_token=?)";
+  async function readAcceptedDeleteCloseSource(
+    execution: V2Execution,
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    raw: string,
+    signal: AbortSignal,
+  ) {
+    const original = await shutdownIoScope(input, raw);
+    const { resourceUid, generation, claimId, nativeId, controlDigest } = original;
+    const coordinates = [resourceUid, generation, claimId, nativeId];
+    const successorSchema = await inspectApplicationSuccessorStore();
+    if (successorSchema) {
+      const selected = await readLatestApplicationSuccessor(input);
+      if (selected) {
+        const { epoch, ownerToken, predecessor } = selected;
+        const tokenParams = [execution.operationId, resourceUid, ownerToken];
+        const bound = await sql.query(
+          "SELECT 1 AS accepted WHERE 1" + acceptedSuccessorTokenSql,
+          tokenParams,
+        );
+        if (bound.length !== 1 || bound[0]?.accepted !== 1) return fail();
+        await assertExecution(execution);
+        if (signal.aborted) return fail();
+        let document = selected.document;
+        if (document === null) {
+          await drainOriginalLinuxOciSuccessorHttpForDelete(
+            originalCustody,
+            result,
+            input,
+            epoch,
+            ownerToken,
+            execution,
+            signal,
+          );
+          const confirmed = await readLatestApplicationSuccessor(input);
+          if (
+            !confirmed ||
+            confirmed.epoch !== epoch ||
+            confirmed.ownerToken !== ownerToken ||
+            confirmed.predecessor !== predecessor ||
+            confirmed.document === null
+          )
+            return fail();
+          document = confirmed.document;
+        }
+        return {
+          assertCurrent: await readApplicationCloseFact(
+            document,
+            successorIoScope(input, controlDigest, epoch, ownerToken),
+            successorCloseKind,
+          ),
+          sql:
+            "EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=? AND owner_token=? AND predecessor_close_document=? AND close_document=?)" +
+            " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=? AND epoch>?)" +
+            acceptedSuccessorTokenSql +
+            " AND " +
+            applicationSuccessorStore.sql,
+          params: [
+            ...coordinates,
+            epoch,
+            ownerToken,
+            predecessor,
+            document,
+            resourceUid,
+            generation,
+            epoch,
+            ...tokenParams,
+            ...applicationSuccessorStore.params,
+          ],
+        };
+      }
+    } else if (!(await inspectV2ContainerOwnerShutdownIoSchema(sql))) return;
+
+    const shutdown = await sql.query(
+      "SELECT close_document FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=?",
+      coordinates,
+    );
+    if (!shutdown.length) return;
+    const document = shutdown[0]?.close_document;
+    if (shutdown.length !== 1 || typeof document !== "string") return fail();
+    return {
+      assertCurrent: await readApplicationCloseFact(document, original, shutdownIoCloseKind),
+      sql:
+        "EXISTS (SELECT 1 FROM tf_v2_container_shutdown_io_closes WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND close_document=?)" +
+        (successorSchema
+          ? " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=?)" +
+            " AND " +
+            applicationSuccessorStore.sql
+          : ""),
+      params: [
+        ...coordinates,
+        document,
+        ...(successorSchema ? [resourceUid, generation, ...applicationSuccessorStore.params] : []),
+      ],
+    };
+  }
+  async function acceptedSuccessorSaveFence(
+    issued: ApplicationSuccessorIssuance,
+    execution: V2Execution,
+    signal: AbortSignal,
+  ) {
+    if (
+      execution.action !== "delete" ||
+      signal.aborted ||
+      execution.resourceUid !== issued.record.intent.resourceUid ||
+      !(await inspectApplicationSuccessorStore())
+    )
+      return fail();
+    await assertExecution(execution);
+    const input = issued.record;
+    const lease = await activeRecord(input, "remove");
+    const loaded = await load(input.intent);
+    sameRecord(input, record(loaded.intent, loaded.proof));
+    if (
+      loaded.proof.i_retire_operation_id !== execution.operationId ||
+      loaded.proof.i_desired_generation !== execution.generation ||
+      input.intent.policy.generation >= execution.generation
+    )
+      return fail();
+    const coordinates = [
+      input.intent.resourceUid,
+      input.intent.policy.generation,
+      input.claimId,
+      input.nativeId,
+    ];
+    const control = await sql.query(
+      "SELECT native_control FROM main.tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched' AND application_io_cleanup=?",
+      [...coordinates, V2_CONTAINER_APPLICATION_IO_RESERVED],
+    );
+    const raw = control[0]?.native_control;
+    if (
+      control.length !== 1 ||
+      typeof raw !== "string" ||
+      (await canonicalDigest(raw)) !== issued.controlDigest
+    )
+      return fail();
+    await assertExecution(execution);
+    if (!(await current(lease))) return fail();
+    const guard = fence(loaded.proof);
+    return {
+      sql:
+        guard.sql +
+        reconcilerLeaseSql +
+        acceptedSuccessorTokenSql +
+        " AND EXISTS (SELECT 1 FROM main.tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched' AND application_io_cleanup=? AND native_control=?)" +
+        " AND " +
+        issued.predecessorFence.sql +
+        " AND " +
+        applicationSuccessorStore.sql,
+      params: [
+        ...guard.params,
+        execution.operationId,
+        execution.resourceUid,
+        execution.leaseToken,
+        execution.operationId,
+        execution.resourceUid,
+        issued.ownerToken,
+        ...coordinates,
+        V2_CONTAINER_APPLICATION_IO_RESERVED,
+        raw,
+        ...(issued.predecessorFence.params ?? []),
+        ...applicationSuccessorStore.params,
+      ],
+      assertLocal() {
+        if (
+          signal.aborted ||
+          !lease.active ||
+          lease.controller.signal.aborted ||
+          !leases.has(lease)
+        )
+          return fail();
+        executionScope(execution);
+      },
+    };
+  }
   async function recordApplicationSuccessorClose(
     reservation: LinuxOciApplicationSuccessorReservation,
     held: LinuxOciHeldLiveInit,
-  ) {
+    deleting?: { readonly execution: V2Execution; readonly signal: AbortSignal },
+  ): Promise<"saved" | "not-written"> {
     const issued = LinuxOciApplicationSuccessorReservation.issuance(reservation);
     const { originalCustody, record, epoch, ownerToken, predecessor } = issued;
     const joined = originalLinuxOciSuccessorHttpRetirementSource(
@@ -4591,6 +4807,14 @@ export function createDockerContainerCoreOwner(
     const { intent, claimId, nativeId } = record;
     const { resourceUid } = intent;
     const generation = intent.policy.generation;
+    const guard = deleting
+      ? await acceptedSuccessorSaveFence(issued, deleting.execution, deleting.signal)
+      : {
+          sql:
+            "EXISTS (SELECT 1 FROM main.tf_v2_resources resource WHERE resource.uid=? AND resource.phase='idle' AND resource.busy_operation IS NULL) AND " +
+            issued.liveSql,
+          params: [resourceUid, ...issued.liveParams],
+        };
     const scope = successorIoScope(record, issued.controlDigest, epoch, ownerToken);
     const selected = await sealApplicationCloseFact(scope, successorCloseKind);
     const keyCurrent = await readApplicationCloseFact(selected.document, scope, successorCloseKind);
@@ -4608,18 +4832,11 @@ export function createDockerContainerCoreOwner(
     const current =
       ownedRow +
       " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors newer WHERE newer.resource_uid=? AND newer.generation=? AND newer.epoch>?)" +
-      " AND EXISTS (SELECT 1 FROM main.tf_v2_resources resource WHERE resource.uid=? AND resource.phase='idle' AND resource.busy_operation IS NULL)" +
       " AND " +
-      issued.liveSql;
-    const params = [
-      ...ownerParams,
-      resourceUid,
-      generation,
-      epoch,
-      resourceUid,
-      ...issued.liveParams,
-    ];
+      guard.sql;
+    const params = [...ownerParams, resourceUid, generation, epoch, ...guard.params];
     assertLocal();
+    if ("assertLocal" in guard) guard.assertLocal();
     selected.assertCurrent();
     keyCurrent();
     // A thrown write can have committed. One exact readback resolves this
@@ -4634,6 +4851,7 @@ export function createDockerContainerCoreOwner(
       .catch((error: unknown) => {
         writeError = error;
       });
+    if (saved?.changes === 0 && !deleting) return "not-written";
     if (saved && saved.changes !== 1) return fail();
     // Read confirmation of only this immutable row. A later owner may
     // legitimately reserve from these bytes as soon as they commit.
@@ -4646,8 +4864,10 @@ export function createDockerContainerCoreOwner(
       return fail();
     }
     assertLocal();
+    if ("assertLocal" in guard) guard.assertLocal();
     selected.assertCurrent();
     keyCurrent();
+    return "saved";
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
@@ -4877,7 +5097,7 @@ export function createDockerContainerCoreOwner(
         !trackedPeer ||
         execution.action !== "delete" ||
         signal.aborted ||
-        !(await inspectV2ContainerOwnerSelectedSchema(sql, "final-delete"))
+        !(await inspectAcceptedContainerOwnerSchema(execution, "final-delete"))
       )
         return fail();
       const accepted = await result.readAcceptedExecution(execution);
@@ -5420,14 +5640,36 @@ export function createDockerContainerCoreOwner(
         await held.close();
         return fail();
       }
-      let saved: Promise<void> | undefined;
+      const { epoch, ownerToken } = LinuxOciApplicationSuccessorReservation.issuance(reservation);
+      let idle: ReturnType<typeof recordApplicationSuccessorClose> | undefined;
+      let closing: Promise<void> | undefined;
+      let accepted: { readonly operationId: string; readonly closing: Promise<void> } | undefined;
       return Object.freeze({
         held,
         record,
         httpPort,
+        epoch,
+        ownerToken,
         recordClose() {
-          saved ??= recordApplicationSuccessorClose(reservation, held);
-          return saved;
+          if (accepted) return accepted.closing;
+          idle ??= recordApplicationSuccessorClose(reservation, held);
+          closing ??= idle.then((status) => {
+            if (status !== "saved") return fail();
+          });
+          return closing;
+        },
+        recordDeleteClose(execution: V2Execution, signal: AbortSignal) {
+          if (accepted && accepted.operationId !== execution.operationId) return fail();
+          accepted ??= {
+            operationId: execution.operationId,
+            closing: (async () => {
+              // An idle write can hand off only if SQL certainly wrote zero rows.
+              // A lost write or connector result never starts a second submission.
+              if (idle && (await idle) === "saved") return;
+              await recordApplicationSuccessorClose(reservation, held, { execution, signal });
+            })(),
+          };
+          return accepted.closing;
         },
       });
     },
@@ -5518,6 +5760,10 @@ export function createDockerContainerCoreOwner(
           ownerToken,
           predecessor: predecessor.document,
           controlDigest: originalCloseScope.controlDigest,
+          predecessorFence: Object.freeze({
+            sql: predecessor.sql,
+            params: Object.freeze(predecessor.params),
+          }),
           liveSql: live,
           liveParams: Object.freeze(liveParams),
           assertKeys() {

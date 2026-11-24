@@ -7,11 +7,16 @@ import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { LINUX_OCI_HOST_TOPOLOGY_FILE } from "../src/providers/linux-oci-host-topology.ts";
 import {
+  v2ConfiguredUpdateDiscardTransition,
+  v2FinalDeleteConfiguredUpdateDiscardTransition,
+} from "../src/takoform-v2/configured-update-inputs-schema.ts";
+import {
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
   V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND,
   V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
   V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
+import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import {
   observeRawPromise,
   ownedRawHttp,
@@ -408,7 +413,17 @@ function modelRootTopology(path: string) {
   };
 }
 
-async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unknown" | "ack-lost") {
+async function verifySuccessorHttpClose(
+  outcome:
+    | "joined"
+    | "withdrawn"
+    | "unknown"
+    | "ack-lost"
+    | "delete"
+    | "delete-restart"
+    | "delete-unknown",
+) {
+  const deleting = outcome.startsWith("delete");
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
@@ -429,6 +444,10 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })));
     await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
     await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+    if (deleting) {
+      await f.sql.batch(v2ConfiguredUpdateDiscardTransition());
+      await f.sql.batch(v2FinalDeleteConfiguredUpdateDiscardTransition());
+    }
     const accepted = await f.create();
     expect(await f.engine.runNext()).toMatchObject({
       id: accepted.id,
@@ -556,6 +575,117 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     expect(await response.text()).toBe("NONSECRET successor response");
     await rawTick();
     expect(settled.state()).toBe("pending");
+
+    if (deleting) {
+      let currentCreator = creator;
+      let priorClose: string | undefined;
+      if (outcome === "delete-restart") {
+        io.closeResponse();
+        io.closeRequest();
+        expect(await settled.value).toHaveProperty("result");
+        creatorCloseChecked = true;
+        await creator.close();
+        const document = (await reservations())[0]?.close_document;
+        if (typeof document !== "string") throw new Error("missing H1 close before restart");
+        priorClose = document;
+        currentCreator = restarted = f.reconstructParent();
+      }
+      let now = Date.now();
+      const engine = createTakoformV2Engine(
+        {
+          sql: f.sql,
+          now: () => new Date(now),
+          authorize: async () => true,
+          replayWindowSeconds: 3600,
+          forms: { [currentCreator.formUrl]: currentCreator.retainedForm },
+        },
+        currentCreator.acceptance,
+      );
+      const principal = "synthetic-oci-parent";
+      const removing = await engine.acceptDelete({
+        principal,
+        key: crypto.randomUUID(),
+        uid: selector.resourceUid,
+        expectedGeneration: selector.generation,
+      });
+      const acceptedDelete = await f.sql.query(
+        "SELECT application_successor_owner_token FROM tf_v2_container_acceptances WHERE operation_id=?",
+        [removing.id],
+      );
+      expect(acceptedDelete).toEqual([
+        { application_successor_owner_token: (await reservations())[0]?.owner_token },
+      ]);
+      expect(io.counts().requestDestroy).toBe(0);
+
+      const stops = () =>
+        f.nativeCounts().requests.filter((kind) => kind === "linux-oci-stop-init@1").length;
+      if (outcome === "delete-unknown") {
+        const uncertainty = new Error("NONSECRET uncertain original request closure");
+        const destroy = spyOn(io.request, "destroy").mockImplementation(() => {
+          throw uncertainty;
+        });
+        try {
+          expect(await engine.runNext()).toMatchObject({
+            id: removing.id,
+            status: "reconciling",
+            effect: "unknown",
+          });
+          expect(await settled.value).toHaveProperty("error", uncertainty);
+          expect(heldCloses).toBe(0);
+          expect(stops()).toBe(0);
+          expect((await reservations())[0]?.close_document).toBeNull();
+          io.closeResponse();
+          io.closeRequest();
+          creatorCloseChecked = true;
+          await expect(creator.close()).rejects.toThrow(uncertainty);
+          expect(f.network).not.toHaveBeenCalled();
+          return;
+        } finally {
+          destroy.mockRestore();
+        }
+      }
+
+      const pass = observeRawPromise(engine.runNext());
+      if (outcome === "delete") {
+        for (let i = 0; i < 250 && !io.counts().requestDestroy; i++) await rawTick();
+        expect(io.counts().requestDestroy).toBe(1);
+        expect(stops()).toBe(0);
+        expect(heldCloses).toBe(0);
+        expect((await reservations())[0]?.close_document).toBeNull();
+        io.closeResponse();
+        await rawTick();
+        expect(stops()).toBe(0);
+        expect(heldCloses).toBe(0);
+        io.closeRequest();
+        expect(await settled.value).toHaveProperty("result");
+      }
+      const first = await pass.value;
+      if ("error" in first) throw first.error;
+      let final = first.result;
+      for (let i = 0; i < 12 && final?.status !== "succeeded"; i++) {
+        now += 61000;
+        final = await engine.runNext();
+      }
+      expect(final).toMatchObject({ id: removing.id, status: "succeeded", effect: "complete" });
+      expect(stops()).toBe(1);
+      expect(heldCloses).toBe(1);
+      const stored = (await reservations())[0]?.close_document;
+      expect(typeof stored).toBe("string");
+      if (priorClose !== undefined) expect(stored).toBe(priorClose);
+      const claims = await f.sql.query(
+        "SELECT state,allocation_cleanup,application_io_cleanup FROM tf_v2_container_create_claims WHERE resource_uid=?",
+        [selector.resourceUid],
+      );
+      expect(claims).toMatchObject([{ state: "removed", allocation_cleanup: "closed" }]);
+      const close = claims[0]?.application_io_cleanup;
+      if (typeof close !== "string") throw new Error("missing accepted DELETE application close");
+      expect(JSON.parse(close)).toMatchObject({
+        kind: "linux-oci-sealed-application-io-close@1",
+        scope: { operation: { operationId: removing.id } },
+      });
+      expect(f.network).not.toHaveBeenCalled();
+      return;
+    }
 
     let closeWrites = 0;
     let next: Awaited<ReturnType<typeof creator.openCurrentSuccessorServingHttp>> | undefined;
@@ -736,7 +866,15 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
   }
 }
 
-test.each(["joined", "withdrawn", "unknown", "ack-lost"] as const)(
+test.each([
+  "joined",
+  "withdrawn",
+  "unknown",
+  "ack-lost",
+  "delete",
+  "delete-restart",
+  "delete-unknown",
+] as const)(
   "OCI HTTP successor closes its held connector only after confirmed I/O (%s)",
   verifySuccessorHttpClose,
   20_000,
