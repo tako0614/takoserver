@@ -489,43 +489,62 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     expect(io.counts().calls).toBe(0);
 
     let heldCloses = 0;
-    const live = successorPeer(() => [{ kind: "linux-oci-parent-live-init@1", ...identity }, true]);
-    let opened = false;
-    const held = successorPeer((command) => {
-      if (!opened) {
-        opened = true;
-        expect(command.startsWith("TKOPEER2")).toBe(true);
-        return [{ kind: "linux-oci-parent-held-live-init@1", ...identity }, false];
-      }
-      switch (JSON.parse(command).kind) {
-        case "linux-oci-parent-held-live-init-read@1":
-          return [{ kind: "linux-oci-parent-held-live-init-current@1" }, false];
-        case "linux-oci-parent-held-admission-read@1":
-          return [
-            {
-              kind: "linux-oci-parent-held-admission-current@1",
-              nativeId: identity.nativeId,
-              generation: String(original.generation),
-              namespaceDevice: identity.namespaceDevice,
-              namespaceInode: identity.namespaceInode,
-              topology,
-            },
-            false,
-          ];
-        case "linux-oci-parent-held-live-init-close@1":
-          heldCloses++;
-          return [{ kind: "linux-oci-parent-held-live-init-closed@1" }, true];
-        default:
-          throw new Error("unexpected held command");
-      }
-    });
+    function queueOriginalPeers() {
+      const live = successorPeer(() => [
+        { kind: "linux-oci-parent-live-init@1", ...identity },
+        true,
+      ]);
+      let opened = false;
+      const held = successorPeer((command) => {
+        if (!opened) {
+          opened = true;
+          expect(command.startsWith("TKOPEER2")).toBe(true);
+          return [{ kind: "linux-oci-parent-held-live-init@1", ...identity }, false];
+        }
+        switch (JSON.parse(command).kind) {
+          case "linux-oci-parent-held-live-init-read@1":
+            return [{ kind: "linux-oci-parent-held-live-init-current@1" }, false];
+          case "linux-oci-parent-held-admission-read@1":
+            return [
+              {
+                kind: "linux-oci-parent-held-admission-current@1",
+                nativeId: identity.nativeId,
+                generation: String(original.generation),
+                namespaceDevice: identity.namespaceDevice,
+                namespaceInode: identity.namespaceInode,
+                topology,
+              },
+              false,
+            ];
+          case "linux-oci-parent-held-live-init-close@1":
+            heldCloses++;
+            return [{ kind: "linux-oci-parent-held-live-init-closed@1" }, true];
+          default:
+            throw new Error("unexpected held command");
+        }
+      });
 
-    raw.mockReturnValueOnce(live).mockReturnValueOnce(held);
+      raw.mockReturnValueOnce(live).mockReturnValueOnce(held);
+    }
+
+    queueOriginalPeers();
     const connection = await creator.openCurrentSuccessorServingHttp(selector, signal);
     const originalCall = connection.open(
       new Request("https://caller.invalid/actual?x=1"),
       () => {},
     );
+    if (outcome === "joined") {
+      const contender = f.reconstructParent();
+      try {
+        // The latest owner is still active. A separate creator cannot renew or
+        // adopt the claim from the original H0 receipt in this interval.
+        await expect(contender.openCurrentSuccessorServingHttp(selector, signal)).rejects.toThrow();
+        expect(await reservations()).toMatchObject([{ epoch: 1, close_document: null }]);
+        expect(raw.mock.calls).toHaveLength(existingCalls + 2);
+      } finally {
+        await contender.close();
+      }
+    }
     const settled = observeRawPromise(originalCall.settlement);
     for (let i = 0; i < 250 && !io.counts().calls; i++) await rawTick();
     expect(io.counts().calls).toBe(1);
@@ -641,6 +660,59 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     await expect(creator.openCurrentSuccessorServingHttp(selector, signal)).rejects.toThrow();
     expect(raw.mock.calls).toHaveLength(existingCalls + 2);
     expect(io.counts().calls).toBe(1);
+    if (outcome === "joined") {
+      const restarted = f.reconstructParent();
+      io.restore();
+      const secondIo = ownedRawHttp();
+      try {
+        queueOriginalPeers();
+        const next = await restarted.openCurrentSuccessorServingHttp(selector, signal);
+        const second = next.open(new Request("http://caller.invalid/restarted"), () => {});
+        for (let i = 0; i < 250 && !secondIo.counts().calls; i++) await rawTick();
+        expect(secondIo.counts().calls).toBe(1);
+        expect(String(secondIo.targets[0])).toBe("http://10.240.0.3:8080/restarted");
+        secondIo.head();
+        const hit = await second.response;
+        secondIo.incoming.end("NONSECRET response after a second Host restart");
+        expect(await hit.text()).toBe("NONSECRET response after a second Host restart");
+        secondIo.closeResponse();
+        secondIo.closeRequest();
+        await second.settlement;
+        await restarted.close();
+
+        const chain = await f.sql.query(
+          "SELECT epoch,owner_token,claim_id,native_id,predecessor_close_document,close_document FROM tf_v2_container_application_successors ORDER BY epoch",
+        );
+        expect(chain).toMatchObject([
+          {
+            epoch: 1,
+            claim_id: original.claimId,
+            native_id: original.claimId,
+            close_document: rows[0]?.close_document,
+          },
+          {
+            epoch: 2,
+            claim_id: original.claimId,
+            native_id: original.claimId,
+            predecessor_close_document: rows[0]?.close_document,
+          },
+        ]);
+        expect(chain[1]?.owner_token).not.toBe(chain[0]?.owner_token);
+        const secondClose = chain[1]?.close_document;
+        if (typeof secondClose !== "string") throw new Error("missing second application close");
+        expect(JSON.parse(secondClose)).toMatchObject({
+          scope: { epoch: 2, ownerToken: chain[1]?.owner_token, nativeId: original.claimId },
+        });
+        expect(closeWrites).toBe(2);
+        expect(heldCloses).toBe(2);
+        expect(raw.mock.calls).toHaveLength(existingCalls + 4);
+      } finally {
+        secondIo.closeResponse();
+        secondIo.closeRequest();
+        secondIo.restore();
+        await restarted.close();
+      }
+    }
     expect(f.network).not.toHaveBeenCalled();
   } finally {
     cleanupIo();

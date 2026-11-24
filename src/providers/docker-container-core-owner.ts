@@ -271,8 +271,8 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciOriginalLiveInit>;
-  /** Reserve the first application successor after authenticating the original
-   * graceful close and current original init. No application I/O is authorized. */
+  /** Reserve the next application successor after authenticating the latest
+   * closed predecessor and current original init. No application I/O is authorized. */
   reserveOriginalApplicationSuccessor(
     selector: { readonly resourceUid: string; readonly incarnationId: string },
     originalCustody: object,
@@ -550,7 +550,7 @@ interface ApplicationSuccessorIssuance {
   readonly record: DockerContainerCreateRecord;
   readonly observation: LinuxOciOriginalLiveInit;
   readonly httpPort: number | undefined;
-  readonly epoch: 1;
+  readonly epoch: number;
   readonly ownerToken: string;
   readonly predecessor: string;
   readonly controlDigest: string;
@@ -2789,6 +2789,25 @@ export function createDockerContainerCoreOwner(
       controlDigest: await canonicalDigest(raw),
     };
   }
+  function successorIoScope(
+    input: DockerContainerCreateRecord,
+    controlDigest: string,
+    epoch: number,
+    ownerToken: string,
+  ) {
+    return Object.freeze({
+      purpose: "takoserver.linux-oci-host-application-successor-close@1",
+      resourceUid: input.intent.resourceUid,
+      incarnationId: input.intent.incarnationId,
+      installationId,
+      generation: input.intent.policy.generation,
+      claimId: input.claimId,
+      nativeId: input.nativeId,
+      controlDigest,
+      epoch,
+      ownerToken,
+    });
+  }
   async function sealApplicationCloseFact(ioScope: unknown, kind: ApplicationCloseKind) {
     const selection = controlKeyring?.current;
     if (!selection || !controlDecryptionKey) return fail();
@@ -4363,6 +4382,71 @@ export function createDockerContainerCoreOwner(
       },
     };
   }
+  async function readApplicationSuccessorPredecessor(
+    input: DockerContainerCreateRecord,
+    originalCloseScope: Awaited<ReturnType<typeof shutdownIoScope>>,
+  ) {
+    const { resourceUid, generation, claimId, nativeId, controlDigest } = originalCloseScope;
+    const coordinates = [resourceUid, generation, claimId, nativeId];
+    const currentClaim = "resource_uid=? AND generation=? AND claim_id=? AND native_id=?";
+    const rows = await sql.query(
+      "SELECT epoch,owner_token,claim_id,native_id,close_document FROM main.tf_v2_container_application_successors " +
+        "WHERE resource_uid=? AND generation=? ORDER BY epoch DESC LIMIT 1",
+      [resourceUid, generation],
+    );
+    if (rows.length) {
+      const latest = rows[0];
+      if (
+        rows.length !== 1 ||
+        !latest ||
+        latest.claim_id !== claimId ||
+        latest.native_id !== nativeId ||
+        typeof latest.epoch !== "number" ||
+        !Number.isSafeInteger(latest.epoch) ||
+        latest.epoch < 1 ||
+        latest.epoch >= Number.MAX_SAFE_INTEGER ||
+        !hex(latest.owner_token) ||
+        typeof latest.close_document !== "string"
+      )
+        return fail();
+      const { epoch, owner_token: ownerToken, close_document: document } = latest;
+      return {
+        epoch: epoch + 1,
+        document,
+        assertCurrent: await readApplicationCloseFact(
+          document,
+          successorIoScope(input, controlDigest, epoch, ownerToken),
+          successorCloseKind,
+        ),
+        sql:
+          "EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE " +
+          currentClaim +
+          " AND epoch=? AND owner_token=? AND close_document=?)",
+        params: [...coordinates, epoch, ownerToken, document],
+      };
+    }
+
+    const previous = await sql.query(
+      "SELECT close_document FROM main.tf_v2_container_shutdown_io_closes WHERE " + currentClaim,
+      coordinates,
+    );
+    const document = previous[0]?.close_document;
+    if (previous.length !== 1 || typeof document !== "string") return fail();
+    return {
+      epoch: 1,
+      document,
+      assertCurrent: await readApplicationCloseFact(
+        document,
+        originalCloseScope,
+        shutdownIoCloseKind,
+      ),
+      sql:
+        "EXISTS (SELECT 1 FROM main.tf_v2_container_shutdown_io_closes WHERE " +
+        currentClaim +
+        " AND close_document=?)",
+      params: [...coordinates, document],
+    };
+  }
   async function assertOriginalApplicationSuccessorReservation(
     reservation: LinuxOciApplicationSuccessorReservation,
     selector: { readonly resourceUid: string; readonly incarnationId: string },
@@ -4389,21 +4473,26 @@ export function createDockerContainerCoreOwner(
     assertLocal();
     const confirmed = await sql.query(
       "SELECT epoch,owner_token,predecessor_close_document,close_document FROM main.tf_v2_container_application_successors " +
-        "WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=1 AND owner_token=? AND " +
+        "WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=? AND owner_token=? AND " +
+        "NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors newer WHERE newer.resource_uid=? AND newer.generation=? AND newer.epoch>?) AND " +
         issued.liveSql,
       [
         resourceUid,
         intent.policy.generation,
         claimId,
         nativeId,
+        issued.epoch,
         issued.ownerToken,
+        resourceUid,
+        intent.policy.generation,
+        issued.epoch,
         ...issued.liveParams,
       ],
     );
     const row = confirmed[0];
     if (
       confirmed.length !== 1 ||
-      row?.epoch !== 1 ||
+      row?.epoch !== issued.epoch ||
       row.owner_token !== issued.ownerToken ||
       row.predecessor_close_document !== issued.predecessor ||
       row.close_document !== null
@@ -4491,26 +4580,14 @@ export function createDockerContainerCoreOwner(
     assertLocal();
 
     const { intent, claimId, nativeId } = record;
-    const { resourceUid, incarnationId } = intent;
+    const { resourceUid } = intent;
     const generation = intent.policy.generation;
-    const scope = Object.freeze({
-      purpose: "takoserver.linux-oci-host-application-successor-close@1",
-      resourceUid,
-      incarnationId,
-      installationId,
-      generation,
-      claimId,
-      nativeId,
-      controlDigest: issued.controlDigest,
-      epoch,
-      ownerToken,
-    });
+    const scope = successorIoScope(record, issued.controlDigest, epoch, ownerToken);
     const selected = await sealApplicationCloseFact(scope, successorCloseKind);
     const keyCurrent = await readApplicationCloseFact(selected.document, scope, successorCloseKind);
     const current =
       "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=? AND owner_token=? AND predecessor_close_document=?" +
       " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors newer WHERE newer.resource_uid=? AND newer.generation=? AND newer.epoch>?)" +
-      " AND EXISTS (SELECT 1 FROM main.tf_v2_container_shutdown_io_closes original WHERE original.resource_uid=? AND original.generation=? AND original.claim_id=? AND original.native_id=? AND original.close_document=?)" +
       " AND EXISTS (SELECT 1 FROM main.tf_v2_resources resource WHERE resource.uid=? AND resource.phase='idle' AND resource.busy_operation IS NULL)" +
       " AND " +
       issued.liveSql;
@@ -4525,11 +4602,6 @@ export function createDockerContainerCoreOwner(
       resourceUid,
       generation,
       epoch,
-      resourceUid,
-      generation,
-      claimId,
-      nativeId,
-      predecessor,
       resourceUid,
       ...issued.liveParams,
     ];
@@ -5379,52 +5451,45 @@ export function createDockerContainerCoreOwner(
             return fail();
           httpPort = port;
         }
-        const scope = "resource_uid=? AND generation=? AND claim_id=? AND native_id=?";
-        const unclaimed =
-          " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=?)";
-        const [resourceUid, generation] = coordinates;
-        const previous = await sql.query(
-          "SELECT close_document FROM main.tf_v2_container_shutdown_io_closes WHERE " +
-            scope +
-            unclaimed,
-          [...coordinates, resourceUid, generation],
-        );
-        const predecessor = previous[0]?.close_document;
-        if (previous.length !== 1 || typeof predecessor !== "string") return fail();
         const originalCloseScope = await shutdownIoScope(captured, raw);
-        const predecessorCurrent = await readApplicationCloseFact(
-          predecessor,
-          originalCloseScope,
-          shutdownIoCloseKind,
-        );
-        predecessorCurrent();
+        const predecessor = await readApplicationSuccessorPredecessor(captured, originalCloseScope);
+        const { epoch } = predecessor;
+        predecessor.assertCurrent();
         const observation = await current.observe();
 
         // Bind the exact main schema, current claim, and running attempt in the
         // statement comparing the authenticated predecessor bytes.
         const running =
           "EXISTS (SELECT 1 FROM main.tf_v2_container_start_attempts WHERE resource_uid=? AND generation=? AND create_claim_id=? AND native_id=? AND attempt=1 AND state='running' AND confirmed_running_at_ms IS NOT NULL AND confirmed_exited_at_ms IS NULL)";
-        const live = current.guard.sql + " AND " + running;
-        const liveParams = [...current.guard.params, ...coordinates];
+        const live = current.guard.sql + " AND " + running + " AND " + predecessor.sql;
+        const liveParams = [...current.guard.params, ...coordinates, ...predecessor.params];
         const ownerToken = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
           byte.toString(16).padStart(2, "0"),
         ).join("");
         current.assertLocal();
-        predecessorCurrent();
+        predecessor.assertCurrent();
+        const [resourceUid, generation] = coordinates;
         const inserted = await sql.run(
           "INSERT INTO main.tf_v2_container_application_successors(resource_uid,generation,claim_id,native_id,epoch,owner_token,predecessor_close_document) " +
-            "SELECT resource_uid,generation,claim_id,native_id,1,?,close_document FROM main.tf_v2_container_shutdown_io_closes WHERE " +
-            scope +
-            " AND close_document=? AND " +
+            "SELECT ?,?,?,?,?,?,? WHERE " +
             live +
-            unclaimed,
-          [ownerToken, ...coordinates, predecessor, ...liveParams, resourceUid, generation],
+            " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=? AND epoch>=?)",
+          [
+            ...coordinates,
+            epoch,
+            ownerToken,
+            predecessor.document,
+            ...liveParams,
+            resourceUid,
+            generation,
+            epoch,
+          ],
         );
         // A committed write can survive a lost acknowledgement or cancellation.
         // Only the original successful caller can continue to exact readback.
         if (inserted.changes !== 1) return fail();
         current.assertLocal();
-        predecessorCurrent();
+        predecessor.assertCurrent();
         const reservation = new LinuxOciApplicationSuccessorReservation(applicationSuccessorMint, {
           core: result,
           sql,
@@ -5433,15 +5498,15 @@ export function createDockerContainerCoreOwner(
           record: captured,
           observation,
           httpPort,
-          epoch: 1,
+          epoch,
           ownerToken,
-          predecessor,
+          predecessor: predecessor.document,
           controlDigest: originalCloseScope.controlDigest,
           liveSql: live,
           liveParams: Object.freeze(liveParams),
           assertKeys() {
             assertControlKey();
-            predecessorCurrent();
+            predecessor.assertCurrent();
           },
         });
         await assertOriginalApplicationSuccessorReservation(
@@ -5451,7 +5516,7 @@ export function createDockerContainerCoreOwner(
           signal,
         );
         current.assertLocal();
-        predecessorCurrent();
+        predecessor.assertCurrent();
         return reservation;
       } finally {
         current.finish();
