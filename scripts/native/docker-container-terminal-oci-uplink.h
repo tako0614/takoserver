@@ -259,6 +259,16 @@ static int oci_uplink_socket_identity(int fd, uint64_t cookie, uint32_t *port) {
       n != sizeof(address) || address.nl_family != AF_NETLINK || !address.nl_pid || address.nl_groups) return -1;
   *port = address.nl_pid; return 0;
 }
+static int oci_uplink_open_route(int *slot) {
+  int fd = *slot = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
+  int one = 1;
+  struct sockaddr_nl local = {.nl_family = AF_NETLINK};
+  if (fd < 0 || setsockopt(fd, SOL_NETLINK, NETLINK_GET_STRICT_CHK, &one, sizeof(one)) < 0 ||
+      setsockopt(fd, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one)) < 0 ||
+      setsockopt(fd, SOL_NETLINK, NETLINK_CAP_ACK, &one, sizeof(one)) < 0 ||
+      bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) return -1;
+  return 0;
+}
 static _Noreturn void oci_uplink_child(struct oci_uplink_owner *u, int channel) {
   int ns = fcntl(u->original->network, F_DUPFD_CLOEXEC, 10), io = fcntl(channel, F_DUPFD_CLOEXEC, 10);
   if (ns < 0 || io < 0 || dup3(ns, 3, O_CLOEXEC) < 0 || dup3(io, 4, O_CLOEXEC) < 0 ||
@@ -268,12 +278,9 @@ static _Noreturn void oci_uplink_child(struct oci_uplink_owner *u, int channel) 
   if (fstat(3, &st) < 0 || fstatfs(3, &fs) < 0 || (unsigned long)fs.f_type != (unsigned long)NSFS_MAGIC ||
       ioctl(3, NS_GET_NSTYPE) != CLONE_NEWNET || (uint64_t)st.st_dev != u->identity.device ||
       (uint64_t)st.st_ino != u->identity.inode || setns(3, CLONE_NEWNET) < 0 || close(3) < 0) _exit(125);
-  int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE), one = 1;
-  struct sockaddr_nl local = {.nl_family = AF_NETLINK}; uint32_t port;
-  if (fd < 0 || setsockopt(fd, SOL_NETLINK, NETLINK_GET_STRICT_CHK, &one, sizeof(one)) < 0 ||
-      setsockopt(fd, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one)) < 0 ||
-      setsockopt(fd, SOL_NETLINK, NETLINK_CAP_ACK, &one, sizeof(one)) < 0 ||
-      bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0 || oci_uplink_socket_identity(fd, u->cookie, &port) < 0) _exit(125);
+  int fd;
+  uint32_t port;
+  if (oci_uplink_open_route(&fd) < 0 || oci_uplink_socket_identity(fd, u->cookie, &port) < 0) _exit(125);
   struct { uint64_t device, inode, cookie; } fact = {u->identity.device, u->identity.inode, u->cookie};
   union { struct cmsghdr align; unsigned char bytes[CMSG_SPACE(sizeof(int))]; } ancillary;
   memset(&ancillary, 0, sizeof(ancillary));
@@ -302,26 +309,7 @@ static int oci_uplink_close_fd(struct oci_uplink_owner *u, int *slot) {
   if (close(fd) < 0) { u->close_unknown = 1; return -1; }
   return 0;
 }
-static int oci_uplink_guest_channel(struct tns_oci_owner *o, struct oci_uplink_owner *u) {
-  if (!o || !u || tns_oci_once(&u->attempt) < 0) { errno = EALREADY; return -1; }
-  u->original = o; u->controller = getpid(); u->identity = o->identity;
-  u->guest = u->host = u->channel = u->child_pidfd = u->netfd = u->lock_root = u->lock = -1;
-  struct tns_lifetime life;
-  if (tns_owner_observe_lifetime(o->birth, &life) < 0 || !tns_identity_equal(&life.identity, &u->identity)) return -1;
-  u->cookie = life.net_cookie;
-  if (oci_uplink_original(u) < 0) return -1;
-  int pair[2]; if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) < 0) return -1;
-  u->channel = pair[0];
-  int64_t now = oci_now(); if (now < 0) { (void)oci_uplink_close_fd(u, &pair[1]); return -1; }
-  int64_t deadline = now + 2500;
-  struct clone_args args; memset(&args, 0, sizeof(args)); args.flags = CLONE_PIDFD | CLONE_CLEAR_SIGHAND;
-  args.pidfd = (uint64_t)(uintptr_t)&u->child_pidfd; args.exit_signal = SIGCHLD;
-  long child = syscall(SYS_clone3, &args, sizeof(args));
-  if (!child) oci_uplink_child(u, pair[1]);
-  (void)oci_uplink_close_fd(u, &pair[1]);
-  if (child < 0) return -1;
-  u->child = (pid_t)child;
-  if (oci_uplink_original(u) < 0) return -1;
+static int oci_uplink_guest_receive(struct oci_uplink_owner *u, int64_t deadline) {
   struct pollfd p = {.fd = u->channel, .events = POLLIN}; int left = oci_egress_left(deadline);
   /* A complete reply can remain queued after the child closes its endpoint. */
   if (left < 0 || poll(&p, 1, left) != 1 || !(p.revents & POLLIN) ||
@@ -363,17 +351,38 @@ static int oci_uplink_guest_channel(struct tns_oci_owner *o, struct oci_uplink_o
   }
   u->guest = u->received_rights[0]; u->received_rights[0] = -1; u->received_count = 0;
   if (oci_uplink_socket_identity(u->guest, u->cookie, &u->guest_port) < 0) { errno = EPROTO; return -1; }
-  left = oci_egress_left(deadline);
+  return 0;
+}
+
+static int oci_uplink_guest_channel(struct tns_oci_owner *o, struct oci_uplink_owner *u) {
+  if (!o || !u || tns_oci_once(&u->attempt) < 0) { errno = EALREADY; return -1; }
+  u->original = o; u->controller = getpid(); u->identity = o->identity;
+  u->guest = u->host = u->channel = u->child_pidfd = u->netfd = u->lock_root = u->lock = -1;
+  struct tns_lifetime life;
+  if (tns_owner_observe_lifetime(o->birth, &life) < 0 || !tns_identity_equal(&life.identity, &u->identity)) return -1;
+  u->cookie = life.net_cookie;
+  if (oci_uplink_original(u) < 0) return -1;
+  int pair[2]; if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, pair) < 0) return -1;
+  u->channel = pair[0];
+  int64_t now = oci_now(); if (now < 0) { (void)oci_uplink_close_fd(u, &pair[1]); return -1; }
+  int64_t deadline = now + 2500;
+  struct clone_args args; memset(&args, 0, sizeof(args)); args.flags = CLONE_PIDFD | CLONE_CLEAR_SIGHAND;
+  args.pidfd = (uint64_t)(uintptr_t)&u->child_pidfd; args.exit_signal = SIGCHLD;
+  long child = syscall(SYS_clone3, &args, sizeof(args));
+  if (!child) oci_uplink_child(u, pair[1]);
+  (void)oci_uplink_close_fd(u, &pair[1]);
+  if (child < 0) return -1;
+  u->child = (pid_t)child;
+  if (oci_uplink_original(u) < 0 || oci_uplink_guest_receive(u, deadline) < 0) return -1;
+  int left = oci_egress_left(deadline);
   if (left < 0 || oci_uplink_join(u, left) < 0 || !u->child_ok ||
       oci_uplink_close_fd(u, &u->channel) < 0 || oci_uplink_original(u) < 0) return -1;
   return 0;
 }
 
-static int oci_uplink_dump_query(struct oci_uplink_owner *u, int guest, uint16_t type,
-                                  int route_exceptions, int64_t deadline,
-                                  struct oci_uplink_dump *out) {
-  if (oci_uplink_original(u) < 0 || !u->child_joined || !u->child_ok ||
-      (guest ? u->guest : u->host) < 0 || u->sequence == UINT32_MAX) return -1;
+static int oci_uplink_dump_exchange(int fd, uint32_t port, uint32_t *sequence, uint16_t type,
+                                    int route_exceptions, int cleaning, int64_t deadline,
+                                    struct oci_uplink_dump *out, int *sent) {
   struct { struct nlmsghdr h; union {struct ifinfomsg link; struct ifaddrmsg addr; struct rtmsg route; struct fib_rule_hdr rule;} p; } request;
   memset(&request, 0, sizeof(request)); request.h.nlmsg_type = type;
   size_t fixed = type == RTM_GETLINK ? sizeof(request.p.link) : type == RTM_GETADDR ? sizeof(request.p.addr) :
@@ -381,22 +390,22 @@ static int oci_uplink_dump_query(struct oci_uplink_owner *u, int guest, uint16_t
   if (!fixed) { errno = EINVAL; return -1; }
   if (route_exceptions) request.p.route.rtm_flags = RTM_F_CLONED;
   request.h.nlmsg_len = (uint32_t)NLMSG_LENGTH(fixed); request.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
-  request.h.nlmsg_seq = ++u->sequence;
+  request.h.nlmsg_seq = ++*sequence;
   struct sockaddr_nl kernel = {.nl_family = AF_NETLINK};
   struct iovec iov = {&request, request.h.nlmsg_len};
   struct msghdr message = {.msg_name = &kernel, .msg_namelen = sizeof(kernel), .msg_iov = &iov, .msg_iovlen = 1};
   if (oci_egress_left(deadline) < 0) return -1;
-  int fd = guest ? u->guest : u->host;
-  if (sendmsg(fd, &message, MSG_NOSIGNAL) != (ssize_t)request.h.nlmsg_len) goto fail;
+  *sent = 1;
+  if (sendmsg(fd, &message, MSG_NOSIGNAL) != (ssize_t)request.h.nlmsg_len) return -1;
   out->done = 0;
   out->route_exceptions = route_exceptions;
   out->sequence = request.h.nlmsg_seq;
-  out->port = guest ? u->guest_port : u->host_port;
+  out->port = port;
   out->type = type == RTM_GETLINK ? RTM_NEWLINK : type == RTM_GETADDR ? RTM_NEWADDR : type == RTM_GETROUTE ? RTM_NEWROUTE : RTM_NEWRULE;
   while (!out->done) {
-    int left = oci_egress_left(deadline); if (left < 0 || (!u->cleaning && oci_not_canceled() < 0)) goto fail;
+    int left = oci_egress_left(deadline); if (left < 0 || (!cleaning && oci_not_canceled() < 0)) return -1;
     struct pollfd p = {.fd = fd, .events = POLLIN};
-    if (poll(&p, 1, left) != 1 || p.revents != POLLIN) goto fail;
+    if (poll(&p, 1, left) != 1 || p.revents != POLLIN) return -1;
     union {struct nlmsghdr align; unsigned char bytes[OCI_UPLINK_PACKET_MAX];} packet;
     struct sockaddr_nl source; memset(&source, 0, sizeof(source));
     struct iovec received = {packet.bytes, sizeof(packet.bytes)};
@@ -404,14 +413,25 @@ static int oci_uplink_dump_query(struct oci_uplink_owner *u, int guest, uint16_t
     ssize_t n = recvmsg(fd, &actual, MSG_DONTWAIT);
     if (n <= 0 || actual.msg_flags || actual.msg_namelen != sizeof(source) ||
         source.nl_family != AF_NETLINK || source.nl_pid || source.nl_groups || actual.msg_controllen ||
-        oci_uplink_dump_feed(out, packet.bytes, (size_t)n) < 0) goto fail;
+        oci_uplink_dump_feed(out, packet.bytes, (size_t)n) < 0) return -1;
   }
-  uint32_t port;
-  if (oci_uplink_socket_identity(fd, guest ? u->cookie : u->host_cookie, &port) < 0 ||
-      port != (guest ? u->guest_port : u->host_port) || oci_uplink_original(u) < 0) goto fail;
   return 0;
-fail:
-  u->broken = 1; if (!errno) errno = EPROTO; return -1;
+}
+
+static int oci_uplink_dump_query(struct oci_uplink_owner *u, int guest, uint16_t type,
+                                  int route_exceptions, int64_t deadline,
+                                  struct oci_uplink_dump *out) {
+  int fd = guest ? u->guest : u->host;
+  uint32_t expected = guest ? u->guest_port : u->host_port, actual;
+  int sent = 0;
+  if (oci_uplink_original(u) < 0 || !u->child_joined || !u->child_ok ||
+      fd < 0 || u->sequence == UINT32_MAX) return -1;
+  if (oci_uplink_dump_exchange(fd, expected, &u->sequence, type, route_exceptions,
+                               (int)u->cleaning, deadline, out, &sent) == 0 &&
+      oci_uplink_socket_identity(fd, guest ? u->cookie : u->host_cookie, &actual) == 0 &&
+      actual == expected && oci_uplink_original(u) == 0) return 0;
+  if (sent) { u->broken = 1; if (!errno) errno = EPROTO; }
+  return -1;
 }
 static int oci_uplink_dump_side(struct oci_uplink_owner *u, int guest, uint16_t type,
                                 struct oci_uplink_dump *out) {
@@ -491,12 +511,8 @@ static int oci_uplink_host_channel(struct oci_uplink_owner *u) {
       tns_owner_observe_creator(u->original->birth, &u->creator) < 0) return -1;
   u->netfd = open("/proc/self/ns/net", O_RDONLY | O_CLOEXEC);
   if (u->netfd < 0 || oci_uplink_host_current(u) < 0) return -1;
-  u->host = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, NETLINK_ROUTE);
-  int one = 1; struct sockaddr_nl local = {.nl_family = AF_NETLINK}; socklen_t size = sizeof(u->host_cookie);
-  if (u->host < 0 || setsockopt(u->host, SOL_NETLINK, NETLINK_GET_STRICT_CHK, &one, sizeof(one)) < 0 ||
-      setsockopt(u->host, SOL_NETLINK, NETLINK_EXT_ACK, &one, sizeof(one)) < 0 ||
-      setsockopt(u->host, SOL_NETLINK, NETLINK_CAP_ACK, &one, sizeof(one)) < 0 ||
-      bind(u->host, (struct sockaddr *)&local, sizeof(local)) < 0 ||
+  socklen_t size = sizeof(u->host_cookie);
+  if (oci_uplink_open_route(&u->host) < 0 ||
       getsockopt(u->host, SOL_SOCKET, SO_NETNS_COOKIE, &u->host_cookie, &size) < 0 ||
       size != sizeof(u->host_cookie) || !u->host_cookie || u->host_cookie == u->cookie ||
       oci_uplink_socket_identity(u->host, u->host_cookie, &u->host_port) < 0 || oci_uplink_original(u) < 0) return -1;
@@ -1129,4 +1145,5 @@ static int oci_uplink_cleanup(struct oci_uplink_owner **slot) {
   if (saved || u->close_unknown) { errno = saved ? saved : EUCLEAN; return -1; }
   explicit_bzero(u, sizeof(*u)); free(u); *slot = NULL; return 0;
 }
+#include "docker-container-terminal-oci-uplink-read.h"
 #endif

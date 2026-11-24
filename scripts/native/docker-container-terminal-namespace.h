@@ -27,6 +27,9 @@ int tns_owner_cut_admission(struct tns_owner *owner);
 /* Fresh same-owner uncut identity observation after its original OPEN effect;
  * still not serving/packet-barrier/terminal authority. */
 int tns_owner_admission_current(struct tns_owner *owner);
+/* Read the already-pinned original namespace and its custodian after OPEN.
+ * Refusal leaves the original owner phase available to its ordinary lifecycle. */
+int tns_owner_read_admitted_identity(struct tns_owner *owner, struct tns_identity *identity);
 /* Read ONLY this original controller's actual current namespace and compare
  * it to the saved pre-birth creator identity, bookended by original guest
  * custody checks. No namespace/PID/FD/path is accepted or exported. */

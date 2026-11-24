@@ -53,7 +53,7 @@ static struct {
 struct admission_io {int kind,stage,base;size_t at;};
 static struct {
  int active,fault,kernel_open,sealed,birth_drop,exec_changed,io_count,pipe_count,drop_spawn,init_signals;
- unsigned int opens,cuts,start_spawns,start_joins,spawns,joins[3],signals[3],closes[1400];
+ unsigned int opens,cuts,observations,wrong_cookie_at,start_spawns,start_joins,spawns,joins[3],signals[3],closes[1400];
  int child_mode,close_unknown_sent;
  char sent[256];size_t sent_size;
  struct admission_io io[48];
@@ -547,6 +547,7 @@ static int raw_ioctl(int fd, unsigned long request, ...) {
   if (request == TAKO_TERMINAL_OBSERVE) {
     struct tako_terminal_observation *out = va_arg(ap, struct tako_terminal_observation *);
     *out = (struct tako_terminal_observation){.net_cookie = 777, .namespace_inum = 77,.sealed=(uint32_t)ad.sealed};
+    if (++ad.observations == ad.wrong_cookie_at) out->net_cookie++;
     va_end(ap); return 0;
   }
   if (request == TAKO_TERMINAL_RELEASE_NAMESPACE) {
@@ -775,6 +776,60 @@ static void admission_cases(void){struct tns_oci_owner o;struct tns_owner b;stru
  admission_prepare(&o,&b);ad.fault=7;CHECK(tns_oci_stop_init(&o,&reaped)<0 && ad.cuts==1 && ad.sealed && !ad.init_signals);CHECK(tns_owner_cut_admission(&b)<0 && ad.cuts==1);CHECK(tns_owner_open_admission(&b)<0 && !ad.opens);admission_discard(&o);
  admission_prepare(&o,&b);CHECK(tns_oci_start(&o,&started)==0);ad.birth_drop=1;CHECK(tns_oci_observe_started(&o,&started)<0 && ad.cuts==1 && ad.sealed);admission_discard(&o);
 }
+static void original_kernel_admission_cases(void) {
+ struct tns_oci_owner o;struct tns_owner b;struct tns_oci_started started;
+ memset(&ad,0,sizeof(ad));memset(&rt,0,sizeof(rt));memset(&pol,0,sizeof(pol));
+ prepare(&o,&b);
+ int n=snprintf(pol.file,sizeof(pol.file),"{\"kind\":\"linux-oci-owned-service@1\",\"artifact\":%s,\"service\":{\"httpPort\":8080,\"healthPath\":\"/health\"}}",eg.artifact);
+ CHECK(n>0 && (size_t)n<sizeof(pol.file));pol.file_size=(size_t)n;
+ CHECK(oci_policy_select(&o,&o.policy)==0 && o.policy);
+ CHECK(tns_oci_check_original_kernel_admission(&o)<0 && !ad.opens && !ad.cuts && !ad.start_spawns);
+ /* Prepare completed private phase records. Only this focused component's
+  * kernel OPEN/OBSERVE and the held init/file identity checks are modeled. */
+ o.uplink->identity=o.identity;o.uplink->configured=o.uplink->pair_known=1;
+ o.policy->verified=1;
+ o.admission=calloc(1,sizeof(*o.admission));CHECK(o.admission);o.admission->original=&o;
+ o.admission_attempt=o.admission_ruleset_reads=o.admission->finished=1;
+ o.command_pid=4000;o.start_attempt=o.start_joined=o.start_ok=1;o.stopped_exe=603;
+ ad.active=ad.birth_drop=ad.exec_changed=1;
+ CHECK(tns_owner_open_admission(&b)==0 && ad.opens==1 && ad.kernel_open);
+ o.admission->open_acknowledged=1;ad.birth_drop=0;
+ unsigned int before=ad.observations,queries=rt.spawns,dumps=up.dumps,sequence=o.uplink->sequence;
+ unsigned int mutations=up.mutations;
+ CHECK(tns_oci_check_original_kernel_admission(&o)==0 && ad.observations>before);
+
+ struct oci_policy_owner *p=o.policy;
+ o.policy=NULL;
+ CHECK(tns_oci_read_live_init(&o,&started)==0);
+ CHECK(tns_oci_check_original_kernel_admission(&o)<0);
+ o.policy=p;
+ p->verified=0;CHECK(tns_oci_check_original_kernel_admission(&o)<0);p->verified=1;
+ pol.file[0]^=1;CHECK(tns_oci_check_original_kernel_admission(&o)<0);pol.file[0]^=1;
+ eg.artifact[0]^=1;CHECK(tns_oci_check_original_kernel_admission(&o)<0);eg.artifact[0]^=1;
+ up.file[0]^=1;CHECK(tns_oci_check_original_kernel_admission(&o)<0);up.file[0]^=1;
+ uint64_t cookie=b.kernel_cookie;b.kernel_cookie=0;before=ad.observations;
+ CHECK(tns_oci_check_original_kernel_admission(&o)<0 && !b.kernel_cookie && ad.observations==before);
+ b.kernel_cookie=cookie;
+ ad.wrong_cookie_at=ad.observations+2;
+ CHECK(tns_oci_check_original_kernel_admission(&o)<0 && b.kernel_cookie==cookie);
+ ad.wrong_cookie_at=ad.observations+5;
+ CHECK(tns_oci_check_original_kernel_admission(&o)<0 && ad.observations==ad.wrong_cookie_at);
+ ad.sealed=1;CHECK(tns_oci_check_original_kernel_admission(&o)<0);ad.sealed=0;
+ model.init_exited=1;CHECK(tns_oci_check_original_kernel_admission(&o)<0);model.init_exited=0;
+ o.init_stop_attempt=1;CHECK(tns_oci_check_original_kernel_admission(&o)<0);o.init_stop_attempt=0;
+ tns_oci_note_cancel();CHECK(tns_oci_check_original_kernel_admission(&o)<0);oci_cancel_requested=0;
+ CHECK(tns_oci_check_original_kernel_admission(&o)==0);
+
+ CHECK(b.phase==TNS_HELD && !o.invalid && !b.cut_attempted && ad.opens==1 && !ad.cuts && !ad.init_signals);
+ CHECK(!ad.start_spawns && rt.spawns==queries && up.dumps==dumps && up.mutations==mutations &&
+       o.uplink->sequence==sequence && !o.uplink->broken && !o.policy->runtime && !lock_taken);
+ struct tns_oci_init_reaped reaped;
+ CHECK(tns_oci_stop_init(&o,&reaped)==0 && ad.cuts==1 && ad.init_signals==1);
+ struct tns_identity identity;
+ ad.wrong_cookie_at=ad.observations+1;
+ CHECK(tns_owner_observe(&b,&identity)<0 && b.phase==TNS_CLOSING);
+ admission_discard(&o);
+}
 /* Selected negative/raw-state regression. No namespace/device was fabricated;
  * only the never-attempted branch may repeat cancellation without a target. */
 static void no_device_case(void){
@@ -796,6 +851,7 @@ static void no_device_case(void){
 }
 int main(int argc,char **argv){(void)codec_cases_uplink;(void)source_cases;(void)new_edge_cases;(void)child_case;(void)ack_loss_cases;(void)policy_change;
  if(argc==2 && !strcmp(argv[1],"--no-device"))no_device_case();
+ else if(argc==2 && !strcmp(argv[1],"--kernel-admission-read"))original_kernel_admission_cases();
  else if(argc==2 && !strcmp(argv[1],"--all"))admission_cases();
  else return 2;
  printf("new original-admission selected raw boundary: %lu checks\n",checks);return 0;}
