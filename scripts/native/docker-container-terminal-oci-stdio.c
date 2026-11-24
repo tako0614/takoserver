@@ -31,21 +31,79 @@ static int64_t ocip_now(void) {
   return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 
-static int ocip_private_channel(int fd) {
-  struct stat st;
-  if (fstat(fd, &st) < 0 || st.st_uid != 0) return -1;
-  if (S_ISFIFO(st.st_mode)) return tns_ocip_private_fifo(st.st_mode, st.st_uid) ? 0 : -1;
-  if (!S_ISSOCK(st.st_mode)) return -1;
+static int ocip_private_socket(int fd, int expected_type) {
   int domain = 0, type = 0; socklen_t size = sizeof(domain);
   if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &domain, &size) < 0 ||
       size != sizeof(domain) || domain != AF_UNIX) return -1;
   size = sizeof(type);
   if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &size) < 0 ||
-      size != sizeof(type) || type != SOCK_STREAM) return -1;
+      size != sizeof(type) || type != expected_type) return -1;
   struct ucred peer; size = sizeof(peer);
   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) < 0 ||
       size != sizeof(peer) || peer.uid != 0 || peer.pid != getppid()) return -1;
   return 0;
+}
+
+static int ocip_private_channel(int fd) {
+  struct stat st;
+  if (fstat(fd, &st) < 0 || st.st_uid != 0) return -1;
+  if (S_ISFIFO(st.st_mode)) return tns_ocip_private_fifo(st.st_mode, st.st_uid) ? 0 : -1;
+  return S_ISSOCK(st.st_mode) ? ocip_private_socket(fd, SOCK_STREAM) : -1;
+}
+
+/* The tracked P gives this single H a dedicated packet socket. Its requests
+ * never enter the mutation decoder and its replies never enter H stdout. */
+enum { OCIP_LIVE_INIT_FD = 4, OCIP_LIVE_INIT_REPLY = 88, OCIP_LIVE_INIT_TIMEOUT = 1000 };
+static const unsigned char ocip_live_init_request[] = "TKOLIVE1";
+static const unsigned char ocip_live_init_ok[] = "TKOLIVR1";
+static const unsigned char ocip_live_init_refused[] = "TKOLIVN1";
+
+static int ocip_live_init_channel(int fd) {
+  struct stat st;
+  if (fstat(fd, &st) < 0 || st.st_uid || !S_ISSOCK(st.st_mode) ||
+      ocip_private_socket(fd, SOCK_SEQPACKET) < 0) return -1;
+  return fcntl(fd, F_SETFD, FD_CLOEXEC);
+}
+
+static void ocipp_put64(unsigned char *p, uint64_t value) {
+  for (unsigned int i = 0; i < 8; ++i) { p[7 - i] = (unsigned char)value; value >>= 8; }
+}
+
+static int ocip_live_init_read(int fd, struct tns_oci_owner *owner, int unavailable) {
+  unsigned char request[sizeof(ocip_live_init_request) - 1];
+  ssize_t n = recv(fd, request, sizeof(request), MSG_DONTWAIT | MSG_TRUNC);
+  if (n != (ssize_t)sizeof(request) || memcmp(request, ocip_live_init_request, sizeof(request)))
+    return -1;
+  unsigned char reply[OCIP_LIVE_INIT_REPLY];
+  const size_t tag = sizeof(ocip_live_init_ok) - 1;
+  struct tns_oci_started observed;
+  size_t size = tag;
+  if (unavailable || interrupted || !owner || tns_oci_read_live_init(owner, &observed) < 0 ||
+      interrupted || observed.native_id[64] || tns_oci_claim(observed.native_id) < 0 ||
+      !observed.namespace_device || !observed.namespace_inode) {
+    memcpy(reply, ocip_live_init_refused, tag);
+  } else {
+    memcpy(reply, ocip_live_init_ok, tag);
+    memcpy(reply + tag, observed.native_id, 64);
+    ocipp_put64(reply + 72, observed.namespace_device);
+    ocipp_put64(reply + 80, observed.namespace_inode);
+    size = sizeof(reply);
+  }
+  return send(fd, reply, size, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)size ? 0 : -1;
+}
+
+/* Until stdio is ready, service only complete packets from the original P.
+ * Auxiliary read loss leaves the existing stdio/retirement lifecycle intact. */
+static void ocip_live_init_wait(int *fd, struct tns_oci_owner *owner, int unavailable) {
+  while (*fd >= 0 && !interrupted) {
+    struct pollfd events[] = {{.fd = 0, .events = POLLIN}, {.fd = *fd, .events = POLLIN}};
+    int ready = poll(events, 2, -1);
+    if (ready < 0 && errno == EINTR) continue;
+    if (events[0].revents || interrupted) return;
+    if (events[1].revents == POLLIN && !ocip_live_init_read(*fd, owner, unavailable)) continue;
+    (void)close(*fd);
+    *fd = -1;
+  }
 }
 
 static int ocip_io(int fd, void *bytes, size_t size, int writing,
@@ -479,11 +537,15 @@ int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--persistent-parent-peer-runtime-application-owner")) return ocipp_runtime_application_peer_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-result")) return ocipp_connector_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-application-owner")) return ocipp_application_connector_main();
+  if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-live-init")) return ocipp_live_init_connector_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-manage-init")) return ocipp_connector_management_main();
+  int live_init_fd = argc == 2 && !strcmp(argv[1], "--selected-runtime-live-init-owner") ?
+    OCIP_LIVE_INIT_FD : -1;
   int runtime_first = argc == 2 && !strcmp(argv[1], "--selected-runtime-local-cleanup-owner") ? 2 :
-                      argc == 2 && !strcmp(argv[1], "--selected-runtime-owner") ? 1 : 0;
+                      live_init_fd >= 0 || (argc == 2 && !strcmp(argv[1], "--selected-runtime-owner")) ? 1 : 0;
   if ((argc != 1 && !runtime_first) || geteuid() != 0 || fcntl(2, F_GETFD) < 0 ||
-      ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
+      ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0 ||
+      (live_init_fd >= 0 && ocip_live_init_channel(live_init_fd) < 0)) return 77;
   int input_flags = fcntl(0, F_GETFL), output_flags = fcntl(1, F_GETFL);
   if (input_flags < 0 || output_flags < 0 ||
       fcntl(0, F_SETFL, input_flags | O_NONBLOCK) < 0 ||
@@ -509,6 +571,7 @@ int main(int argc, char **argv) {
   struct ocip_retirement_state retirement_state = {.runtime_first = runtime_first};
   int cleanup_done = 0;
   for (;;) {
+    ocip_live_init_wait(&live_init_fd, owner, sealed || namespace_state.entered || retirement_state.entered);
     unsigned char *body = NULL; uint32_t size = 0;
     int result = ocip_read(&body, &size);
     if (result) {
@@ -629,6 +692,7 @@ int main(int argc, char **argv) {
       if (ocip_error("linux-oci-refused@1", stage, failure, owner) < 0) break;
     }
   }
+  if (live_init_fd >= 0) (void)close(live_init_fd);
   if (!cleanup_done) (void)ocip_cleanup_routed(&owner, &retirement_state);
   if (owner) ocip_retain(&owner, &retirement_state);
   return 0;

@@ -442,8 +442,53 @@ static int late_cancel_cases(void) {
   printf("late-cancel selected actual-body raw model: %lu boundary checks\n", checks);
   return first && second ? 0 : 1;
 }
+
+static void live_init_case(enum fault fault, unsigned int phase) {
+  struct tns_oci_owner owner, prior;
+  struct tns_oci_started observed, sentinel;
+  initialize(&owner, NONE);
+  memset(&sentinel, 0xa5, sizeof(sentinel));
+  CHECK(tns_oci_start(&owner, &observed) == 0);
+  memcpy(&observed, &sentinel, sizeof(observed));
+  model.fault = fault;
+  if (phase == 1) owner.init_stop_attempt = 1;
+  if (phase == 2) owner.namespace_release_attempt = 1;
+  if (phase == 3) owner.delete_attempt = 1;
+  if (phase == 4) owner.born_dispose_phase = 1;
+  if (phase == 5) oci_cancel_requested = 1;
+  if (phase == 6) model.cancel_at_config_read = model.config_reads + 3;
+  memcpy(&prior, &owner, sizeof(prior));
+  unsigned int clones = model.clones, stops = model.stops;
+  unsigned int cuts = model.admission_cuts, kills = model.kills;
+  unsigned int joins = model.joins, birth_reads = model.birth_reads;
+  int result = tns_oci_read_live_init(&owner, &observed);
+  if (fault == NONE && phase == 0) {
+    CHECK(result == 0 && !strcmp(observed.native_id, owner.id));
+    CHECK(observed.namespace_device == owner.identity.device && observed.namespace_inode == 77);
+  } else {
+    CHECK(result < 0 && !memcmp(&observed, &sentinel, sizeof(observed)));
+  }
+  if (phase == 6) CHECK(oci_cancel_requested && errno == ECANCELED);
+  CHECK(!memcmp(&owner, &prior, sizeof(owner)));
+  CHECK(model.clones == clones && model.stops == stops &&
+        model.admission_cuts == cuts && model.kills == kills &&
+        model.joins == joins && model.birth_reads == birth_reads);
+}
+
+static int live_init_cases(void) {
+  const enum fault faults[] = {
+    NONE, WRONG_CONTROLLER, NOT_ROOT, CONFIG_CHANGED, BUNDLE_CHANGED,
+    INIT_DEAD, NET_CHANGED, SAME_EXE, EXE_STAT_LOST,
+  };
+  for (size_t i = 0; i < sizeof(faults) / sizeof(faults[0]); ++i) live_init_case(faults[i], 0);
+  for (unsigned int phase = 1; phase <= 6; ++phase) live_init_case(NONE, phase);
+  printf("actual original live-init read raw model: %lu boundary checks\n", checks);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--late-cancel")) return late_cancel_cases();
+  if (argc == 2 && !strcmp(argv[1], "--read-live-init")) return live_init_cases();
   if (argc != 1) return 2;
   start_cases(); exec_wait_cases(); parser_cases();
   printf("actual OCI START body + closed parser raw model: %lu checks\n", checks);

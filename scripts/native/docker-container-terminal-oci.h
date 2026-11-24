@@ -67,6 +67,9 @@ int tns_oci_observe(struct tns_oci_owner *owner, struct tns_oci_created *created
 int tns_oci_start(struct tns_oci_owner *owner, struct tns_oci_started *started);
 int tns_oci_observe_started(struct tns_oci_owner *owner,
                               struct tns_oci_started *started);
+/* Read the original held init and allocation without changing the owner's
+ * phase on refusal. This fact does not check policy or authorize serving. */
+int tns_oci_read_live_init(struct tns_oci_owner *owner, struct tns_oci_started *started);
 /* Dedicated single-thread subreaper, default SIGCHLD and exclusive exact-child
  * reaping are required before CREATE; the library never changes caller state.
  * STOP consumes one original-init SIGKILL attempt. JOIN can only join/reap that

@@ -680,6 +680,30 @@ int tns_oci_observe_started(struct tns_oci_owner *o, struct tns_oci_started *sta
   return oci_observe_started_exec(o,started);
 }
 
+int tns_oci_read_live_init(struct tns_oci_owner *o, struct tns_oci_started *started) {
+  if (!o || !started || o->invalid || !o->start_attempt || !o->start_joined || !o->start_ok ||
+      o->stopped_exe < 0 || !o->init_custody || o->init_stop_attempt || o->init_joined ||
+      o->namespace_release_attempt || o->delete_attempt || o->born_dispose_phase) {
+    errno = EINVAL;
+    return -1;
+  }
+  /* The ordinary observation owns policy verification and its failure CUT.
+   * This read uses only the held original init and artifact checks. */
+  if (oci_not_canceled() < 0 || oci_held_inputs(o) < 0 || oci_private_init_current(o) < 0)
+    return -1;
+  int executed = oci_started_executable(o);
+  if (executed <= 0) {
+    if (!executed) errno = ESTALE;
+    return -1;
+  }
+  if (oci_held_inputs(o) < 0 || oci_private_init_current(o) < 0 || oci_not_canceled() < 0)
+    return -1;
+  memcpy(started->native_id, o->id, sizeof(started->native_id));
+  started->namespace_device = o->identity.device;
+  started->namespace_inode = o->identity.inode;
+  return 0;
+}
+
 int tns_oci_start(struct tns_oci_owner *o, struct tns_oci_started *started) {
   if (!o || !started) { errno = EINVAL; return -1; }
   if (o->start_attempt) { errno = EALREADY; return -1; }

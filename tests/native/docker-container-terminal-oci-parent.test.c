@@ -21,6 +21,10 @@
 
 struct ocipp_owner;
 static int model_management_send(const void *bytes,size_t size);
+enum live_fault {
+  LIVE_OK, LIVE_SEALED, LIVE_STALE, LIVE_FOREIGN, LIVE_SHORT, LIVE_TIMEOUT,
+  LIVE_CLIENT_LOST, LIVE_H_EXITED, LIVE_CANCELED, LIVE_TRAILING, LIVE_BAD_REQUEST
+};
 static struct {
   int wrong_controller, not_root, tamper, close_fault, wait_kind, host_eof, host_epipe;
   int child, wrong_parent, read_error[2], eof[2], writes_again, write_toggle;
@@ -38,6 +42,7 @@ static struct {
   unsigned char *frontend_sent; size_t frontend_sent_size;
   int frontend_eof, frontend_epipe, peer_uid, accept_ready, bind_error;
   size_t frontend_write_chunk;
+  int frontend_stalled, frontend_eagain, live_wait, step_wait, live_preflight_elapsed;
   unsigned int frontend_reads; int frontend_oversize;
   unsigned int executable_stats; int tamper_after;
   int manage_mode, retirement_refusal; struct ocipp_owner *manage_owner;
@@ -53,7 +58,11 @@ static struct {
   int application_cookie_changed, application_poll_error, application_stat_changed;
   unsigned int application_gets, application_polls;
   uint64_t application_inode;
-
+  enum live_fault live_fault;
+  unsigned int live_sockets, live_reads, live_writes, live_receives, live_checks;
+  int live_connector, live_legacy, live_polls, live_peer_mismatch;
+  unsigned char live_request[8], live_reply[88];
+  size_t live_reply_size;
 } pm;
 static jmp_buf parent_jump;
 static int parent_exit_code;
@@ -79,6 +88,10 @@ static int parent_sigprocmask(int how, const sigset_t *in, sigset_t *out);
 static int parent_clock(clockid_t kind, struct timespec *out);
 static int parent_getsockopt(int fd, int level, int option, void *out, socklen_t *size);
 static int parent_socket(int family, int type, int protocol);
+static int parent_socketpair(int family, int type, int protocol, int ends[2]);
+static ssize_t parent_send(int fd, const void *bytes, size_t size, int flags);
+static ssize_t parent_recv(int fd, void *bytes, size_t size, int flags);
+static int parent_live_observe(struct tns_oci_owner *owner, struct tns_oci_started *started);
 static int parent_bind(int fd, const struct sockaddr *address, socklen_t size);
 static int parent_listen(int fd, int backlog);
 static int parent_getsockname(int fd, struct sockaddr *address, socklen_t *size);
@@ -110,6 +123,10 @@ static _Noreturn void parent_exit(int status);
 #define clock_gettime parent_clock
 #define getsockopt parent_getsockopt
 #define socket parent_socket
+#define socketpair parent_socketpair
+#define send parent_send
+#define recv parent_recv
+#define tns_oci_read_live_init parent_live_observe
 #define bind parent_bind
 #define listen parent_listen
 #define getsockname parent_getsockname
@@ -128,6 +145,10 @@ static _Noreturn void parent_exit(int status);
 #undef getsockname
 #undef listen
 #undef bind
+#undef tns_oci_read_live_init
+#undef recv
+#undef send
+#undef socketpair
 #undef socket
 #undef clock_gettime
 #undef sigprocmask
@@ -158,6 +179,7 @@ static int parent_open(const char *name, int flags, ...) {
   CHECK(!strcmp(name, "/proc/self/exe") && flags == (O_PATH | O_CLOEXEC)); return 60;
 }
 static int parent_fstat(int fd, struct stat *out) {
+  if(fd==4){CHECK(pm.child);*out=(struct stat){.st_mode=S_IFSOCK|0600};return 0;}
   if(fd==93){CHECK(pm.application_profile);*out=(struct stat){.st_dev=42,.st_ino=pm.application_inode+(pm.application_stat_changed?1u:0u)};return 0;}
   if(fd==61 || fd==92){*out=(struct stat){.st_dev=42,.st_ino=fd==61?pm.self_inode:pm.peer_inode,.st_mode=0700};return 0;}
   CHECK(fd == 60 || (pm.child && fd == 3));
@@ -185,12 +207,12 @@ static int parent_pipe2(int ends[2], int flags) {
 }
 static int parent_fcntl(int fd, int command, ...) {
   va_list ap; va_start(ap,command); int minimum=va_arg(ap,int); va_end(ap);
-  if(command==F_SETFD){CHECK((fd==61 || fd==92 || (fd==93 && pm.application_profile)) && minimum==FD_CLOEXEC);return 0;}
+  if(command==F_SETFD){CHECK((fd==61 || fd==92 || (fd==93 && pm.application_profile) || (fd==4 && pm.child)) && minimum==FD_CLOEXEC);return 0;}
   CHECK(pm.child && command==F_DUPFD_CLOEXEC && minimum==10);
-  CHECK(fd==70 || fd==73 || fd==75 || fd==60); return 100+(int)pm.duplicates++;
+  CHECK(fd==70 || fd==73 || fd==75 || fd==60 || (fd==77 && pm.live_sockets)); return 100+(int)pm.duplicates++;
 }
 static int parent_dup3(int source,int target,int flags) {
-  CHECK(pm.child && source==100+target && target>=0 && target<=3);
+  CHECK(pm.child && source==100+target && target>=0 && target<=(pm.live_sockets ? 4 : 3));
   CHECK(flags==(target==3?O_CLOEXEC:0)); return target;
 }
 static long parent_syscall(long number, ...) {
@@ -207,17 +229,19 @@ static long parent_syscall(long number, ...) {
   }
   if(number==SYS_close_range) {
     unsigned int first=va_arg(ap,unsigned int),last=va_arg(ap,unsigned int),flags=va_arg(ap,unsigned int);
-    CHECK(pm.child && first==4 && last==~0u && !flags);pm.ranges++;va_end(ap);return 0;
+    CHECK(pm.child && first==(pm.live_sockets ? 5u : 4u) && last==~0u && !flags);pm.ranges++;va_end(ap);return 0;
   }
   CHECK(number==SYS_execveat && pm.child);
   int fd=va_arg(ap,int);const char *path=va_arg(ap,const char*);
   char *const *args=va_arg(ap,char*const*),*const *env=va_arg(ap,char*const*);int flags=va_arg(ap,int);
   CHECK(fd==3 && !*path && !strcmp(args[0],"docker-container-terminal-oci") && !env[0] && flags==AT_EMPTY_PATH);
-  if (cloned_image.runtime_first)
+  if (pm.live_sockets)
+    CHECK(args[1] && !strcmp(args[1], "--selected-runtime-live-init-owner") && !args[2]);
+  else if (cloned_image.runtime_first)
     CHECK(args[1] && !strcmp(args[1], cloned_image.runtime_first == 1 ?
           "--selected-runtime-owner" : "--selected-runtime-local-cleanup-owner") && !args[2]);
   else CHECK(!args[1]);
-  CHECK(pm.ranges==1 && pm.duplicates==4);pm.execs++;va_end(ap);longjmp(parent_jump,1);
+  CHECK(pm.ranges==1 && pm.duplicates==(pm.live_sockets ? 5u : 4u));pm.execs++;va_end(ap);longjmp(parent_jump,1);
 }
 static int parent_prctl(int option,...) {
   va_list ap;va_start(ap,option);int signal=va_arg(ap,int);va_end(ap);
@@ -236,6 +260,14 @@ static int parent_clock(clockid_t kind,struct timespec *out) {
 }
 static int parent_getsockopt(int fd,int level,int option,void *out,socklen_t *size) {
   CHECK(level==SOL_SOCKET);
+  if(fd==4) {
+    CHECK(pm.child);
+    if(option==SO_DOMAIN || option==SO_TYPE) {
+      CHECK(*size==sizeof(int));*(int*)out=option==SO_DOMAIN?AF_UNIX:SOCK_SEQPACKET;return 0;
+    }
+    CHECK(option==SO_PEERCRED && *size==sizeof(struct ucred));
+    *(struct ucred*)out=(struct ucred){.pid=pm.live_peer_mismatch ? 6001 : 5000,.uid=0};return 0;
+  }
   if(fd==0){
     CHECK(pm.application_profile);
     if(pm.application_unsupported){errno=ENOTSOCK;return -1;}
@@ -253,6 +285,47 @@ static int parent_getsockopt(int fd,int level,int option,void *out,socklen_t *si
   *(struct ucred*)out=(struct ucred){.pid=7000,.uid=(uid_t)pm.peer_uid,.gid=0};return 0;
 }
 static int parent_socket(int family,int type,int protocol){CHECK(family==AF_UNIX && type==(SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC) && !protocol);pm.sockets++;return 90;}
+static int parent_socketpair(int family, int type, int protocol, int ends[2]) {
+  CHECK(family==AF_UNIX && type==(SOCK_SEQPACKET|SOCK_NONBLOCK|SOCK_CLOEXEC) && !protocol && pm.application_profile);
+  ends[0]=76;ends[1]=77;pm.live_sockets++;return 0;
+}
+static struct tns_oci_owner live_owner;
+static int parent_live_observe(struct tns_oci_owner *owner, struct tns_oci_started *started) {
+  CHECK(owner==&live_owner);
+  pm.live_checks++;
+  if(pm.live_fault==LIVE_STALE){errno=ESTALE;return -1;}
+  memcpy(started->native_id,CLAIM,65);
+  started->namespace_device=4;
+  started->namespace_inode=55;
+  return 0;
+}
+static ssize_t parent_send(int fd, const void *bytes, size_t size, int flags) {
+  CHECK(flags==(MSG_DONTWAIT|MSG_NOSIGNAL));
+  if(fd==4) {
+    CHECK(size==8 || size==sizeof(pm.live_reply));
+    memcpy(pm.live_reply,bytes,size);pm.live_reply_size=size;
+    if(pm.live_fault==LIVE_FOREIGN)pm.live_reply[8]='b';
+    if(pm.live_fault==LIVE_SHORT)pm.live_reply_size--;
+    return (ssize_t)size;
+  }
+  CHECK(fd==76 && size==8 && !memcmp(bytes,"TKOLIVE1",8));
+  memcpy(pm.live_request,bytes,size);
+  if(pm.live_fault==LIVE_BAD_REQUEST)pm.live_request[7]='2';
+  pm.live_writes++;
+  CHECK(ocip_live_init_read(4,&live_owner,pm.live_fault==LIVE_SEALED)==
+        (pm.live_fault==LIVE_BAD_REQUEST ? -1 : 0));
+  return (ssize_t)size;
+}
+static ssize_t parent_recv(int fd, void *bytes, size_t size, int flags) {
+  CHECK(flags==(MSG_DONTWAIT|MSG_TRUNC));
+  if(fd==4) {
+    CHECK(size==sizeof(pm.live_request));memcpy(bytes,pm.live_request,size);
+    pm.live_reads++;return (ssize_t)size;
+  }
+  CHECK(fd==76 && size==sizeof(pm.live_reply) && pm.live_reply_size);
+  size=pm.live_reply_size;memcpy(bytes,pm.live_reply,size);
+  pm.live_reply_size=0;pm.live_receives++;return (ssize_t)size;
+}
 static int parent_bind(int fd,const struct sockaddr *address,socklen_t size){
   CHECK(fd==90 && size<=sizeof(pm.address));const struct sockaddr_un *a=(const struct sockaddr_un*)address;
   CHECK(a->sun_family==AF_UNIX && !a->sun_path[0] && !memcmp(a->sun_path+1,"tako-oci-parent-v1:",19));
@@ -278,7 +351,7 @@ static ssize_t parent_read(int fd,void *bytes,size_t size) {
     if(pm.boot_at)return 0;
     size_t n=pm.boot_short?36:37;CHECK(size>=n);memcpy(bytes,boot,n);pm.boot_at=n;return (ssize_t)n;}
   if(fd==90 && pm.connector){size_t n=pm.connector_size-pm.connector_at;if(n>size)n=size;
-    if(!n){errno=EAGAIN;return -1;}memcpy(bytes,pm.connector_reply+pm.connector_at,n);pm.connector_at+=n;return (ssize_t)n;}
+    if(!n){if(pm.live_legacy)return 0;errno=EAGAIN;return -1;}memcpy(bytes,pm.connector_reply+pm.connector_at,n);pm.connector_at+=n;return (ssize_t)n;}
   if(fd==91){
     pm.frontend_reads++;
     if(pm.frontend_oversize)return (ssize_t)(size+1); /* impossible oversized syscall return, no memory write */
@@ -305,6 +378,12 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
     if(pm.connector_auth_at<sizeof(pm.expected_auth)){CHECK(size<=sizeof(pm.expected_auth)-pm.connector_auth_at);
       CHECK(!memcmp(bytes,pm.expected_auth+pm.connector_auth_at,size));pm.connector_auth_at+=size;pm.cap_writes++;}
     else if(pm.manage_mode) return model_management_send(bytes,size);
+    else if(pm.live_connector) {
+      static const char request[]="{\"kind\":\"linux-oci-parent-read-live-init@1\"}";
+      unsigned char frame[sizeof(request)+3]={0,0,0,sizeof(request)-1};
+      memcpy(frame+4,request,sizeof(request)-1);
+      CHECK(size==sizeof(frame) && !memcmp(bytes,frame,size));pm.readonly_writes++;
+    }
     else if(pm.application_profile){static const char request[]="{\"kind\":\"linux-oci-parent-read-application-owner@1\"}";
       unsigned char frame[4+sizeof(request)-1];size_t n=sizeof(request)-1;frame[0]=frame[1]=frame[2]=0;frame[3]=(unsigned char)n;memcpy(frame+4,request,n);
       CHECK(size<=sizeof(frame)-pm.connector_request_at && !memcmp(bytes,frame+pm.connector_request_at,size));pm.connector_request_at+=size;pm.readonly_writes++;}
@@ -313,7 +392,8 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
       CHECK(size<=sizeof(frame)-pm.connector_request_at && !memcmp(bytes,frame+pm.connector_request_at,size));pm.connector_request_at+=size;pm.readonly_writes++;}
     return (ssize_t)size;
   }
-  if(fd==91){if(pm.frontend_epipe){errno=EPIPE;return -1;}if(pm.frontend_write_chunk && size>pm.frontend_write_chunk)size=pm.frontend_write_chunk;CHECK(pm.frontend_sent_size+size<=TNS_OCI_MAX_JSON+1024);memcpy(pm.frontend_sent+pm.frontend_sent_size,bytes,size);pm.frontend_sent_size+=size;return (ssize_t)size;}
+  if(fd==91){if(pm.frontend_stalled){pm.frontend_eagain++;errno=EAGAIN;return -1;}
+    if(pm.frontend_epipe){errno=EPIPE;return -1;}if(pm.frontend_write_chunk && size>pm.frontend_write_chunk)size=pm.frontend_write_chunk;CHECK(pm.frontend_sent_size+size<=TNS_OCI_MAX_JSON+1024);memcpy(pm.frontend_sent+pm.frontend_sent_size,bytes,size);pm.frontend_sent_size+=size;return (ssize_t)size;}
   if(fd==71) {
     pm.writes++;
     if(pm.writes_again && !pm.write_toggle++){errno=EAGAIN;return -1;}
@@ -326,6 +406,25 @@ static ssize_t parent_write(int fd,const void *bytes,size_t size) {
   CHECK(pm.delivered_size+size<=sizeof(pm.delivered));memcpy(pm.delivered+pm.delivered_size,bytes,size);pm.delivered_size+=size;return (ssize_t)size;
 }
 static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
+  if(count==3) {
+    CHECK(fds[0].fd==76 && fds[0].events==POLLIN &&
+          fds[1].fd==91 && fds[1].events==(POLLIN|POLLRDHUP) &&
+          fds[2].fd==80 && fds[2].events==POLLIN);
+    for(nfds_t i=0;i<count;++i)fds[i].revents=0;
+    pm.live_polls++;
+    if(!timeout) {
+      if(pm.live_polls==1)pm.clock+=pm.live_preflight_elapsed;
+      if(pm.live_fault==LIVE_TRAILING && pm.live_receives){fds[0].revents=POLLIN;return 1;}
+      return 0;
+    }
+    CHECK(timeout>0 && timeout<=OCIP_LIVE_INIT_TIMEOUT);
+    pm.live_wait=timeout;
+    if(pm.live_fault==LIVE_TIMEOUT || pm.live_fault==LIVE_BAD_REQUEST){pm.clock+=timeout;return 0;}
+    if(pm.live_fault==LIVE_CLIENT_LOST){fds[1].revents=POLLRDHUP;return 1;}
+    if(pm.live_fault==LIVE_H_EXITED){fds[2].revents=POLLIN;return 1;}
+    if(pm.live_fault==LIVE_CANCELED)ocipp_interrupted=1;
+    fds[0].revents=POLLIN;return 1;
+  }
   if(count==1){
     if(fds[0].fd==93){CHECK(pm.application_profile && timeout==0 && fds[0].events==POLLIN);pm.application_polls++;fds[0].revents=0;
       if(pm.application_poll_error){errno=EIO;return -1;}
@@ -333,10 +432,11 @@ static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
     if(timeout==0 && (fds[0].fd==61 || fds[0].fd==92)){CHECK(fds[0].events==POLLIN);fds[0].revents=0;
       if(fds[0].fd==92){pm.peer_checks++;if(pm.peer_dead){fds[0].revents=POLLIN;return 1;}}return 0;}
     if(fds[0].fd==90 && pm.connector){fds[0].revents=0;if(fds[0].events==POLLIN && pm.connector_at<pm.connector_size){fds[0].revents=POLLIN;return 1;}
-      if(fds[0].events==POLLOUT){fds[0].revents=POLLOUT;return 1;}CHECK(timeout==0);return 0;}
+      if(fds[0].events==POLLOUT){fds[0].revents=POLLOUT;return 1;}
+      if(pm.live_legacy && timeout>0){fds[0].revents=POLLHUP;return 1;}CHECK(timeout==0);return 0;}
     CHECK(fds[0].fd==1 && fds[0].events==POLLOUT && timeout>0);fds[0].revents=POLLOUT;pm.clock++;return 1;
   }
-  CHECK(count==7 && timeout==1000);pm.polls++;int ready=0;
+  CHECK(count==7 && timeout>0 && timeout<=1000);pm.polls++;pm.step_wait=timeout;int ready=0;
   for(nfds_t i=0;i<count;i++) {
     fds[i].revents=0;if(fds[i].fd<0)continue;
     if(fds[i].fd==0) {
@@ -344,7 +444,7 @@ static int parent_poll(struct pollfd *fds,nfds_t count,int timeout) {
       if(pm.host_eof)fds[i].revents=POLLHUP;
       else if(pm.host_at<pm.host_size && (fds[i].events&POLLIN))fds[i].revents=POLLIN;
     } else if(fds[i].fd==90){if(pm.accept_ready)fds[i].revents=POLLIN;}
-    else if(fds[i].fd==91){if(fds[i].events&POLLOUT)fds[i].revents=POLLOUT;else if(pm.frontend_eof)fds[i].revents=POLLHUP;else if(pm.frontend_at<pm.frontend_size)fds[i].revents=POLLIN;}
+    else if(fds[i].fd==91){if(fds[i].events&POLLOUT)fds[i].revents=POLLOUT;else if(pm.frontend_eof)fds[i].revents=(short)(POLLHUP|(pm.frontend_at<pm.frontend_size?POLLIN:0));else if(pm.frontend_at<pm.frontend_size)fds[i].revents=POLLIN;}
     else if(fds[i].fd==71) {CHECK(fds[i].events==POLLOUT);pm.writable_interest++;fds[i].revents=POLLOUT;}
     else {
       CHECK(fds[i].fd==72 || fds[i].fd==74);unsigned int which=fds[i].fd==72?0u:1u;
@@ -456,8 +556,9 @@ static void auth_bytes(struct ocipp_owner *o,unsigned char out[124]) {
   memcpy(out+12,o->claim,64);ocipp_put64(out+76,o->generation);
   ocipp_put64(out+84,o->listener_cookie);memcpy(out+92,o->capability,32);
 }
-static void authenticate_frontend(struct ocipp_owner *o,int fault) {
+static void accept_frontend_for(struct ocipp_owner *o,int fault,int live_init) {
   unsigned char bytes[124];auth_bytes(o,bytes);
+  if(live_init)memcpy(bytes+4,"TKOAUTH2",8);
   if(fault==1)bytes[92]^=1; /* fixed nonsecret capability mismatch */
   if(fault==2)bytes[12]^=1;
   if(fault==3)bytes[83]^=1;
@@ -469,10 +570,20 @@ static void authenticate_frontend(struct ocipp_owner *o,int fault) {
   unsigned int rounds=0;
   while(o->candidate>=0){CHECK(ocipp_read_authentication(o)==0 && ++rounds<30);}
   if(fault){CHECK(o->frontend<0 && o->host_lost);return;}
-  CHECK(o->frontend==91 && !o->host_lost && o->replay_required);
+  CHECK(o->frontend==91 && o->host_lost==(unsigned int)live_init &&
+        o->frontend_live_init==(unsigned int)live_init);
+  if(!live_init)CHECK(o->replay_required);
+}
+static void authenticate_frontend_for(struct ocipp_owner *o,int fault,int live_init) {
+  accept_frontend_for(o,fault,live_init);
+  if(fault)return;
   CHECK(ocipp_management_flush(o)==0 && o->management_sent==o->management_size);
-  CHECK(memmem(pm.frontend_sent,pm.frontend_sent_size,"linux-oci-parent-authenticated@1",strlen("linux-oci-parent-authenticated@1")));
+  const char *ack=live_init?ocipp_live_init_ack:ocipp_auth_ack;
+  CHECK(memmem(pm.frontend_sent,pm.frontend_sent_size,ack,strlen(ack)));
   pm.frontend_sent_size=0;
+}
+static void authenticate_frontend(struct ocipp_owner *o,int fault) {
+  authenticate_frontend_for(o,fault,0);
 }
 static int frontend_command(struct ocipp_owner *o,const char *body) {
   unsigned char frame[256];size_t n=frame_bytes(frame,body);CHECK(n<=sizeof(frame));
@@ -688,10 +799,15 @@ static void application_peer_profile(int tracked) {
   if (tracked) CHECK(!memcmp(pm.delivered + 160, "NCLOSE01", 8));
   CHECK(ocipp_first_create(&o, (const unsigned char *)valid, (uint32_t)strlen(valid)) == 0);
   CHECK(ocipp_spawn(&o) == 0 && ocipp_flush_input(&o) == 0);
+  CHECK(pm.live_sockets == (unsigned int)tracked && pm.closes[77] == (unsigned int)tracked);
   pm.child = 1;
   int jumped = setjmp(parent_jump);
   if (!jumped) ocipp_child(&cloned_image);
   CHECK(jumped == 1 && pm.execs == 1);
+  if(tracked) {
+    CHECK(ocip_live_init_channel(4)==0);
+    pm.live_peer_mismatch=1;CHECK(ocip_live_init_channel(4)<0);
+  }
   pm.child = 0;
 
   ocipp_host_lost(&o);
@@ -726,6 +842,207 @@ static void application_peer_profile(int tracked) {
   CHECK(!o.joined && !pm.closes[71] && pm.clones == 1);
   CHECK(ocipp_close(&o, &o.application_pidfd) == 0 && ocipp_close(&o, &o.self_pidfd) == 0);
   dispose_fixture(&o);
+}
+static const char live_command[]="{\"kind\":\"linux-oci-parent-read-live-init@1\"}";
+static const char live_outcome[]="{\"kind\":\"linux-oci-parent-read-outcome@1\"}";
+static const char live_stop[]="{\"kind\":\"linux-oci-stop-init@1\"}";
+static const char live_positive[]="{\"kind\":\"linux-oci-parent-live-init@1\",\"nativeId\":\"" CLAIM
+  "\",\"namespaceDevice\":\"4\",\"namespaceInode\":\"55\",\"barrier\":\"unproven\"}";
+static void live_parent_reply(struct ocipp_owner *o, const char *body) {
+  pm.stream_size[0]=frame_bytes(pm.manage_h_reply,body);pm.stream[0]=pm.manage_h_reply;pm.stream_at[0]=0;
+  pm.delivered_size=0;
+  CHECK(ocipp_drain(o,0)==1 && ocipp_parse_reply(o)==0 && ocipp_forward(o,0)==0 && !o->awaiting);
+}
+static void prepare_live_parent(struct ocipp_owner *o) {
+  prepare_peer_fixture(o);
+  pm.application_profile=1;pm.application_inode=77;
+  unsigned char bind[112];memcpy(bind,"TKOBIND6",8);memcpy(bind+8,CLAIM,64);
+  ocipp_put64(bind+72,1);memset(bind+80,0xa5,32);
+  CHECK(ocipp_application_peer_bootstrap(o,bind,sizeof(bind),1)==0);
+  CHECK(ocipp_first_create(o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
+  CHECK(ocipp_spawn(o)==0 && o->live_init[0]==76 && pm.clones==1 && ocipp_flush_input(o)==0);
+  live_parent_reply(o,"{\"kind\":\"linux-oci-created-stopped@1\"}");
+  static const char start[]="{\"kind\":\"linux-oci-start@1\"}";
+  CHECK(ocipp_queue(o,(const unsigned char*)start,sizeof(start)-1)==0 && ocipp_flush_input(o)==0);
+  live_parent_reply(o,"{\"kind\":\"linux-oci-started@1\"}");
+  ocipp_host_lost(o);
+}
+static void live_connector_round(struct ocipp_owner *o, int foreign, int legacy) {
+  unsigned char request[172], reply[512];size_t size=0;
+  peer_request(o,request);
+  struct ocipp_connector c={0};
+  pm.connector=pm.live_connector=1;pm.live_legacy=legacy;pm.peer_inode+=(unsigned int)foreign;
+  int allowed=!foreign && !legacy;
+  CHECK((ocipp_live_init_connector_read(&c,request,sizeof(request),reply,&size)==0)==allowed);
+  CHECK(pm.cap_writes==(unsigned int)!foreign && pm.readonly_writes==(unsigned int)allowed);
+  if(allowed)CHECK(size==sizeof(live_positive)-1 && !memcmp(reply,live_positive,size));
+  CHECK(ocipp_connector_close(&c)==0);
+  ocipp_connector_free(&c);pm.connector=0;
+}
+static void live_init_readonly(void) {
+  for(enum live_fault fault=LIVE_OK;fault<=LIVE_BAD_REQUEST;++fault) {
+    struct ocipp_owner o;
+    prepare_live_parent(&o);
+    authenticate_frontend_for(&o,0,1);
+    pm.live_fault=fault;
+    unsigned int writes=pm.writes,waits=pm.waits,effects=o.effects;
+    size_t bytes=o.used[0],start=o.last_reply_start,end=o.last_reply_end;
+    unsigned char stdout_before[512];CHECK(bytes<=sizeof(stdout_before));
+    memcpy(stdout_before,o.captured[0],bytes);
+    CHECK(!o.replay_required && !o.pending && !o.awaiting);
+    memcpy(pm.connector_reply,o.management_output,o.management_size);
+    pm.connector_size=o.management_size;auth_bytes(&o,pm.expected_auth);
+    memcpy(pm.expected_auth+4,"TKOAUTH2",8);
+    CHECK(frontend_command(&o,live_command)==0);
+    CHECK(!o.replay_required && !o.pending && !o.awaiting && !o.reply_unknown);
+    CHECK(pm.writes==writes && pm.waits==waits && pm.clones==1 &&
+          o.request_kind==TNS_OCIP_START && o.effects==effects);
+    CHECK(o.used[0]==bytes && o.last_reply_start==start && o.last_reply_end==end &&
+          !memcmp(o.captured[0],stdout_before,bytes));
+    CHECK(pm.live_writes==1 && pm.live_reads==1);
+    if(fault==LIVE_OK) {
+      unsigned char expected[256];size_t expected_size=frame_bytes(expected,live_positive);
+      CHECK(pm.frontend_sent_size==expected_size && !memcmp(pm.frontend_sent,expected,expected_size));
+      memcpy(pm.connector_reply+pm.connector_size,expected,expected_size);
+      pm.connector_size+=expected_size;
+      live_connector_round(&o,0,0);
+      pm.cap_writes=pm.readonly_writes=0;
+      live_connector_round(&o,1,0);
+      CHECK(ocipp_live_init_connector_reply((const unsigned char*)live_positive,sizeof(live_positive)-2,
+                                          (const unsigned char*)CLAIM)<0);
+      CHECK(ocipp_live_init_connector_reply((const unsigned char*)live_positive,sizeof(live_positive),
+                                          (const unsigned char*)CLAIM)<0);
+      CHECK(frontend_command(&o,live_command)<0 && o.frontend<0 && pm.live_writes==1);
+      authenticate_frontend(&o,0);
+      CHECK(frontend_command(&o,live_outcome)==0 && !o.replay_required);
+      CHECK(frontend_command(&o,live_stop)==0 && o.pending);
+      ocipp_host_lost(&o);
+      CHECK(o.input_paused);
+      authenticate_frontend_for(&o,0,1);
+      CHECK(frontend_command(&o,live_command)==0 && pm.live_writes==1 && o.pending && o.input_paused);
+      ocipp_host_lost(&o);
+      authenticate_frontend(&o,0);
+      CHECK(frontend_command(&o,live_outcome)==0 && !o.replay_required);
+      CHECK(frontend_command(&o,"{\"kind\":\"linux-oci-parent-continue-frame@1\"}")==0);
+      CHECK(ocipp_flush_input(&o)==0 && pm.writes==writes+1);
+      live_parent_reply(&o,"{\"kind\":\"linux-oci-init-reaped@1\"}");
+      start=o.last_reply_start;end=o.last_reply_end;bytes=o.used[0];
+      CHECK(bytes<=sizeof(stdout_before));memcpy(stdout_before,o.captured[0],bytes);
+      ocipp_host_lost(&o);
+      authenticate_frontend_for(&o,0,1);
+      CHECK(frontend_command(&o,live_command)==0 && pm.live_writes==1 && pm.writes==writes+1);
+      CHECK(o.request_kind==TNS_OCIP_STOP_INIT && (o.effects & (1u<<TNS_OCIP_STOP_INIT)) &&
+            o.last_reply_start==start && o.last_reply_end==end && o.used[0]==bytes &&
+            !memcmp(o.captured[0],stdout_before,bytes));
+    } else {
+      static const char refused[]="linux-oci-parent-live-init-refused@1";
+      CHECK(memmem(pm.frontend_sent,pm.frontend_sent_size,refused,sizeof(refused)-1));
+      int still_current=fault==LIVE_SEALED || fault==LIVE_STALE;
+      CHECK(o.live_init[0]==(still_current ? 76 : -1) && pm.closes[76]==(unsigned int)!still_current);
+      if(fault==LIVE_SEALED || fault==LIVE_BAD_REQUEST)CHECK(!pm.live_checks);
+    }
+    CHECK(!pm.closes[71] && !o.close_unknown);
+    dispose_fixture(&o);
+  }
+}
+static void live_init_auth_and_loss(void) {
+  for(unsigned int fault=0;fault<5;++fault) {
+    struct ocipp_owner o;
+    prepare_live_parent(&o);
+    unsigned int effects=o.effects,writes=pm.writes;
+    size_t start=o.last_reply_start,end=o.last_reply_end;
+    if(!fault) {
+      /* A pre-feature peer closes on TKOAUTH2. A generic ACK itself also
+       * carries no permission to send the live-init management command. */
+      auth_bytes(&o,pm.expected_auth);
+      memcpy(pm.expected_auth+4,"TKOAUTH2",8);
+      live_connector_round(&o,0,1);
+      pm.cap_writes=0;pm.connector_auth_at=0;pm.connector_at=0;
+      pm.connector_size=frame_bytes(pm.connector_reply,ocipp_auth_ack);
+      live_connector_round(&o,0,1);
+    } else {
+      authenticate_frontend_for(&o,0,1);
+      unsigned char prefix[256];
+      size_t frame_size=frame_bytes(prefix,live_command);
+      if(fault<=2) {
+        pm.frontend_bytes=prefix;pm.frontend_size=frame_size;pm.frontend_at=0;
+        pm.frontend_chunk=3;
+        CHECK(ocipp_frontend_read(&o)==0 && ocipp_frontend_read(&o)==0 && o.frontend_used==4);
+        if(fault==2)CHECK(ocipp_frontend_read(&o)==0 && o.frontend_used==7);
+        pm.frontend_eof=1;
+        pm.close_fault=91; /* A lost read frontend is never mutation UNKNOWN. */
+        CHECK(ocipp_step(&o)<0 && o.frontend<0);
+        pm.close_fault=0;
+      } else if(fault==3) {
+        CHECK(frontend_command(&o,live_stop)<0 && o.frontend<0);
+      } else {
+        char invalid[sizeof(live_command)];memcpy(invalid,live_command,sizeof(invalid));
+        invalid[sizeof(invalid)-3]='x';
+        CHECK(frontend_command(&o,invalid)<0 && o.frontend<0);
+      }
+    }
+    CHECK(o.host_lost && !o.reply_unknown && !o.management_unknown && !o.replay_required &&
+          !o.pending && !o.input_paused && !o.frontend_live_init && !pm.live_writes);
+    CHECK(o.effects==effects && pm.writes==writes && o.last_reply_start==start && o.last_reply_end==end);
+    authenticate_frontend(&o,0);
+    CHECK(frontend_command(&o,live_outcome)==0 && !o.replay_required);
+    CHECK(frontend_command(&o,live_stop)==0 && o.pending && ocipp_flush_input(&o)==0);
+    CHECK(pm.writes==writes+1 && o.request_kind==TNS_OCIP_STOP_INIT);
+    dispose_fixture(&o);
+  }
+}
+static void live_init_frontend_deadline(void) {
+  enum { IDLE, PREFIX, BODY, ACK_STALLED, REPLY_STALLED, H_TIMEOUT, PREFLIGHT_EXPIRED };
+  for(int phase=IDLE;phase<=PREFLIGHT_EXPIRED;++phase) {
+    struct ocipp_owner o;
+    prepare_live_parent(&o);
+    unsigned int effects=o.effects,writes=pm.writes;
+    size_t start=o.last_reply_start,end=o.last_reply_end;
+    o.replay_required=1;
+    if(phase==ACK_STALLED) {
+      accept_frontend_for(&o,0,1);
+      pm.frontend_stalled=1;
+      CHECK(ocipp_management_flush(&o)==0 && pm.frontend_eagain==1);
+    } else authenticate_frontend_for(&o,0,1);
+    CHECK(o.host_lost && o.replay_required && o.frontend_live_init);
+    int64_t deadline=o.authentication_started+OCIPP_AUTH_TIMEOUT;
+    unsigned char frame[256];
+    if(phase==PREFIX || phase==BODY) {
+      frame_bytes(frame,live_command);
+      pm.frontend_bytes=frame;pm.frontend_at=0;pm.frontend_size=phase==PREFIX?4u:8u;
+      CHECK(ocipp_frontend_read(&o)==0 && o.frontend_used==4);
+      if(phase==BODY)CHECK(ocipp_frontend_read(&o)==0 && o.frontend_used==8);
+    } else if(phase==REPLY_STALLED) {
+      pm.frontend_stalled=1;
+      CHECK(frontend_command(&o,live_command)==0 && pm.frontend_eagain==1 && pm.live_writes==1);
+    }
+    if(phase==H_TIMEOUT) {
+      pm.clock=deadline-7;
+      pm.live_fault=LIVE_TIMEOUT;
+      CHECK(frontend_command(&o,live_command)==0 && pm.live_wait==7 && o.live_init[0]==-1);
+    } else if(phase==PREFLIGHT_EXPIRED) {
+      pm.clock=deadline-1;pm.live_preflight_elapsed=1;
+      CHECK(frontend_command(&o,live_command)<0 && pm.live_polls==1 && !pm.live_writes);
+      CHECK(o.live_init[0]==76 && !pm.closes[76]);
+    } else {
+      int stalled=phase==ACK_STALLED || phase==REPLY_STALLED;
+      if(stalled)CHECK(o.management_sent==0 && o.management_size>0);
+      pm.frontend_stalled=0; /* Writability exactly at expiry cannot publish an ACK or reply. */
+      pm.clock=deadline-(stalled?1:7);
+      CHECK(ocipp_step(&o)<0 && pm.step_wait==(stalled?1:7) && pm.frontend_sent_size==0);
+    }
+    CHECK(pm.clock==deadline && o.frontend<0 && pm.closes[91]==1 && !o.frontend_live_init);
+    CHECK(o.host_lost && o.replay_required && !o.reply_unknown && !o.management_unknown &&
+          !o.pending && !o.input_paused && !o.frontend_used && !o.management_size);
+    CHECK(o.effects==effects && pm.writes==writes && o.last_reply_start==start && o.last_reply_end==end);
+    authenticate_frontend(&o,0);
+    pm.clock+=OCIPP_AUTH_TIMEOUT;
+    CHECK(ocipp_step(&o)<0 && o.frontend==91 && !o.frontend_live_init);
+    CHECK(frontend_command(&o,live_outcome)==0 && !o.replay_required);
+    CHECK(frontend_command(&o,live_stop)==0 && o.pending && ocipp_flush_input(&o)==0);
+    CHECK(pm.writes==writes+1 && o.request_kind==TNS_OCIP_STOP_INIT);
+    dispose_fixture(&o);
+  }
 }
 static void peer_server_replies(struct ocipp_owner *o,int pending) {
   CHECK(ocipp_first_create(o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
@@ -960,6 +1277,10 @@ static void peer_instance_only(void) {
   pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"peer-live-init")) {
+    live_init_readonly();live_init_auth_and_loss();live_init_frontend_deadline();
+    printf("peer live-init read-only boundaries: %lu checks\n",checks);return 0;
+  }
   if(argc==2 && !strcmp(argv[1],"runtime-application-owner")) {
     application_peer_profile(0);application_peer_profile(1);
     printf("runtime application-owner profiles: %lu checks\n",checks);return 0;
