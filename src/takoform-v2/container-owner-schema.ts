@@ -1148,14 +1148,14 @@ function buildApplicationSuccessorSchema() {
     AND operation.status = 'succeeded' AND operation.effect = 'complete')`;
   const applicationSuccessorClaim = `resource_uid = NEW.resource_uid AND generation = NEW.generation
       AND claim_id = NEW.claim_id AND native_id = NEW.native_id`;
-  const acceptedApplicationSuccessorDelete = `EXISTS (
+  const acceptedApplicationSuccessorRetirement = `EXISTS (
     SELECT 1 FROM ${Q} claim
     JOIN ${I} instance ON instance.resource_uid = claim.resource_uid
     JOIN ${R} revision ON revision.resource_uid = claim.resource_uid AND revision.generation = claim.generation
     JOIN ${S} started ON started.resource_uid = claim.resource_uid AND started.generation = claim.generation
-    JOIN ${A} deletion ON deletion.operation_id = instance.retire_operation_id
-    JOIN main.tf_v2_operations operation ON operation.id = deletion.operation_id
     JOIN main.tf_v2_resources resource ON resource.uid = instance.resource_uid
+    JOIN ${A} management ON management.operation_id = resource.busy_operation
+    JOIN main.tf_v2_operations operation ON operation.id = management.operation_id
     WHERE claim.resource_uid = NEW.resource_uid AND claim.generation = NEW.generation
       AND claim.claim_id = NEW.claim_id AND claim.native_id = NEW.native_id
       AND claim.installation_id = instance.installation_id AND claim.state = 'bound'
@@ -1163,29 +1163,47 @@ function buildApplicationSuccessorSchema() {
       AND claim.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
       AND json_extract(claim.native_control, '$.kind') = 'linux-oci-sealed-control@1'
       AND json_extract(claim.native_control, '$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1'
-      AND instance.form_url = ${literal(F2_FORM)} AND instance.retired_at_ms IS NOT NULL
-      AND instance.serving_generation IS NULL AND revision.retention = 'retired'
+      AND instance.form_url = ${literal(F2_FORM)}
       AND started.attempt = 1 AND started.create_claim_id = claim.claim_id
       AND started.native_id = claim.native_id AND started.state = 'running'
       AND started.confirmed_running_at_ms IS NOT NULL AND started.confirmed_exited_at_ms IS NULL
-      AND deletion.${applicationSuccessorOwnerToken} = NEW.owner_token AND deletion.action = 'delete'
-      AND deletion.resource_uid = instance.resource_uid AND deletion.installation_id = instance.installation_id
-      AND deletion.incarnation_id = instance.incarnation_id AND deletion.principal = instance.principal
-      AND deletion.space = instance.space AND deletion.name = instance.name AND deletion.form_url = instance.form_url
-      AND deletion.backend_id = instance.backend_id AND deletion.target_key = instance.target_key
-      AND deletion.generation = instance.desired_generation AND deletion.generation > claim.generation
+      AND management.${applicationSuccessorOwnerToken} = NEW.owner_token
+      AND management.resource_uid = instance.resource_uid AND management.installation_id = instance.installation_id
+      AND management.incarnation_id = instance.incarnation_id AND management.principal = instance.principal
+      AND management.space = instance.space AND management.name = instance.name AND management.form_url = instance.form_url
+      AND management.backend_id = instance.backend_id AND management.target_key = instance.target_key
+      AND management.generation = instance.desired_generation AND management.generation > claim.generation
       AND resource.principal = instance.principal AND resource.space = instance.space AND resource.name = instance.name
       AND resource.form_url = instance.form_url AND resource.backend_id = instance.backend_id
-      AND resource.target_key = instance.target_key AND resource.generation = deletion.generation
+      AND resource.target_key = instance.target_key AND resource.generation = management.generation
       AND resource.last_operation = operation.id AND resource.busy_operation = operation.id
-      AND resource.phase = 'deleting' AND resource.deleted_at IS NULL
-      AND resource.spec_json = deletion.accepted_spec_json
-      AND operation.resource_uid = deletion.resource_uid AND operation.principal = deletion.principal
-      AND operation.action = deletion.action AND operation.generation = deletion.generation
-      AND operation.backend_id = deletion.backend_id AND operation.target_key = deletion.target_key
-      AND operation.backend_key = deletion.backend_key AND operation.accepted_spec_json = deletion.accepted_spec_json
+      AND resource.deleted_at IS NULL AND resource.spec_json = management.accepted_spec_json
+      AND operation.resource_uid = management.resource_uid AND operation.principal = management.principal
+      AND operation.action = management.action AND operation.generation = management.generation
+      AND operation.backend_id = management.backend_id AND operation.target_key = management.target_key
+      AND operation.backend_key = management.backend_key AND operation.accepted_spec_json = management.accepted_spec_json
       AND operation.status = 'reconciling' AND operation.effect = 'unknown' AND operation.dispatch_possible = 1
       AND operation.lease_token IS NOT NULL AND operation.lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000
+      AND ((management.action = 'delete' AND instance.retire_operation_id = management.operation_id
+        AND instance.retired_at_ms IS NOT NULL AND instance.serving_generation IS NULL
+        AND resource.phase = 'deleting' AND revision.retention = 'retired')
+      OR (management.action = 'update' AND instance.retire_operation_id IS NULL
+        AND instance.retired_at_ms IS NULL AND instance.serving_generation = management.generation
+        AND resource.phase = 'pending' AND revision.retention = 'draining'
+        AND EXISTS (
+          SELECT 1 FROM ${R} serving
+          JOIN ${Q} replacement ON replacement.resource_uid = serving.resource_uid AND replacement.generation = serving.generation
+          JOIN ${S} running ON running.resource_uid = replacement.resource_uid AND running.generation = replacement.generation
+          WHERE serving.resource_uid = management.resource_uid AND serving.generation = management.generation
+            AND serving.operation_id = management.operation_id AND serving.revision = management.revision
+            AND serving.retention = 'serving' AND replacement.installation_id = instance.installation_id
+            AND replacement.state = 'bound' AND replacement.allocation_cleanup = 'untouched'
+            AND replacement.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+            AND json_extract(replacement.native_control, '$.kind') = 'linux-oci-sealed-control@1'
+            AND json_extract(replacement.native_control, '$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1'
+            AND running.attempt = 1 AND running.create_claim_id = replacement.claim_id
+            AND running.native_id = replacement.native_id AND running.state = 'running'
+            AND running.confirmed_running_at_ms IS NOT NULL AND running.confirmed_exited_at_ms IS NULL)))
   )`;
   const applicationSuccessorClose = `CASE WHEN json_valid(NEW.close_document) THEN
     json_type(NEW.close_document) = 'object'
@@ -1249,7 +1267,7 @@ function buildApplicationSuccessorSchema() {
     AND OLD.close_document IS NULL AND ${applicationSuccessorClose}
     AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable} later
       WHERE later.resource_uid = NEW.resource_uid AND later.generation = NEW.generation AND later.epoch > NEW.epoch)
-    AND (${currentApplicationSuccessorClaim} OR ${acceptedApplicationSuccessorDelete})`),
+    AND (${currentApplicationSuccessorClaim} OR ${acceptedApplicationSuccessorRetirement})`),
     ),
     trigger(
       "application_successor_retain",
@@ -1262,8 +1280,21 @@ function buildApplicationSuccessorSchema() {
       A,
       "BEFORE INSERT",
       `  SELECT CASE WHEN NEW.action IN ('update', 'delete') AND NOT (
-    (NEW.${applicationSuccessorOwnerToken} IS NULL AND NOT EXISTS (
-      SELECT 1 FROM ${applicationSuccessorTable} WHERE resource_uid = NEW.resource_uid))
+    NOT EXISTS (
+      SELECT 1 FROM ${applicationSuccessorTable} historical
+      JOIN ${I} instance ON instance.resource_uid = historical.resource_uid
+      WHERE historical.resource_uid = NEW.resource_uid
+        AND historical.generation IS NOT instance.serving_generation
+        AND (historical.close_document IS NULL OR NOT EXISTS (
+          SELECT 1 FROM ${Q} claim
+          WHERE claim.resource_uid = historical.resource_uid AND claim.generation = historical.generation
+            AND claim.claim_id = historical.claim_id AND claim.native_id = historical.native_id
+            AND claim.installation_id = instance.installation_id AND claim.state = 'removed'
+            AND claim.allocation_cleanup = 'closed' AND historical.generation < NEW.generation)))
+    AND ((NEW.${applicationSuccessorOwnerToken} IS NULL AND NOT EXISTS (
+      SELECT 1 FROM ${applicationSuccessorTable} successor
+      JOIN ${I} instance ON instance.resource_uid = successor.resource_uid
+      WHERE successor.resource_uid = NEW.resource_uid AND instance.serving_generation = successor.generation))
     OR EXISTS (
       SELECT 1 FROM ${applicationSuccessorTable} successor
       JOIN ${I} instance ON instance.resource_uid = successor.resource_uid
@@ -1278,10 +1309,7 @@ function buildApplicationSuccessorSchema() {
         AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable} later
           WHERE later.resource_uid = successor.resource_uid AND later.generation = successor.generation
             AND later.epoch > successor.epoch)
-        AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable} outstanding
-          WHERE outstanding.resource_uid = successor.resource_uid
-            AND outstanding.generation <> successor.generation AND outstanding.close_document IS NULL)
-    )) THEN CASE WHEN NEW.action = 'delete' THEN RAISE(ABORT, 'container_owner_application_successor_delete')
+    ))) THEN CASE WHEN NEW.action = 'delete' THEN RAISE(ABORT, 'container_owner_application_successor_delete')
       ELSE RAISE(ABORT, 'container_owner_application_successor_update') END END;`,
     ),
     trigger(
@@ -1303,7 +1331,9 @@ function buildApplicationSuccessorSchema() {
               `, ${successorOwnerColumn},\n  UNIQUE (resource_uid, generation)`,
             ),
           )
-        : item,
+        : item.name === historicalDeleteAcceptance.name
+          ? historicalDeleteAcceptance
+          : item,
     ),
     ...applicationSuccessorObjects,
   ]);
@@ -1340,6 +1370,8 @@ function buildApplicationSuccessorSchema() {
           params: shutdownIoReadyParams,
         },
         { sql: `ALTER TABLE ${A} ADD COLUMN ${successorOwnerColumn}` },
+        { sql: `DROP TRIGGER ${historicalDeleteAcceptance.name}` },
+        { sql: historicalDeleteAcceptance.sql },
         ...applicationSuccessorObjects.map(({ sql }) => ({ sql })),
         {
           sql: `UPDATE temp.${applicationSuccessorTransition} SET ok = CASE WHEN ${applicationSuccessorReady} THEN 1 END`,

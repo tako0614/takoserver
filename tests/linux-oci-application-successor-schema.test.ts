@@ -112,9 +112,15 @@ async function withOriginal(
       await expect(contender.batch(otherwise)).rejects.toMatchObject({ code: "constraint" });
       expect(
         await contender.query(
-          "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'tf_v2_container_%' AND name NOT LIKE 'tf_v2_container_application_successor%' AND name <> 'tf_v2_container_acceptances' ORDER BY name",
+          "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'tf_v2_container_%' AND name NOT LIKE 'tf_v2_container_application_successor%' AND name NOT IN ('tf_v2_container_acceptances', 'tf_v2_container_acceptance_immutable') ORDER BY name",
         ),
-      ).toEqual(before.filter(({ name }) => name !== "tf_v2_container_acceptances"));
+      ).toEqual(
+        before.filter(
+          ({ name }) =>
+            name !== "tf_v2_container_acceptances" &&
+            name !== "tf_v2_container_acceptance_immutable",
+        ),
+      );
       expect(
         await contender.query(
           "SELECT count(*) AS selected FROM tf_v2_container_acceptances WHERE application_successor_owner_token IS NOT NULL",
