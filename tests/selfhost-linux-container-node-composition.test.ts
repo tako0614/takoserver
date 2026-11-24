@@ -8,9 +8,11 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { Sql } from "../src/ports.ts";
 import { parseRuntimeInputKeyAuthority } from "../src/runtime-input-seal-keyring.ts";
-import { createSelfhostLinuxContainerNodeComposition } from "../src/selfhost-linux-container-node-composition.ts";
 import {
   assertSelfhostLinuxContainerNodeSchema,
+  createSelfhostLinuxContainerNodeComposition,
+} from "../src/selfhost-linux-container-node-composition.ts";
+import {
   createSelfhostLinuxContainerNodeSelection,
   type SelfhostLinuxOciNodeSelectionSource,
 } from "../src/selfhost-linux-container-node-selection.ts";

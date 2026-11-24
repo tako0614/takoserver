@@ -948,7 +948,10 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     source: "src/entry-bun.ts",
     target: "src/selfhost-linux-container-node-composition.ts",
     typeOnly: false,
-    names: ["createSelfhostLinuxContainerNodeComposition"],
+    names: [
+      "assertSelfhostLinuxContainerNodeSchema",
+      "createSelfhostLinuxContainerNodeComposition",
+    ],
   },
   {
     source: "src/entry-bun.ts",
@@ -958,6 +961,20 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
       "createSelfhostLinuxContainerNodeSelection",
       "type SelfhostLinuxContainerNodeSelectionSource",
     ],
+  },
+  {
+    // Node composition preflights the selected owner's exact schema before startup.
+    source: "src/selfhost-linux-container-node-composition.ts",
+    target: "src/takoform-v2/container-owner-schema.ts",
+    typeOnly: false,
+    names: ["inspectV2ContainerOwnerShutdownIoSchema"],
+  },
+  {
+    // The tracked owner checks the close slot before detaching its original parent.
+    source: "src/providers/linux-oci-owned-bundle.ts",
+    target: "src/takoform-v2/container-owner-schema.ts",
+    typeOnly: false,
+    names: ["inspectV2ContainerOwnerShutdownIoSchema"],
   },
   {
     source: "src/providers/linux-oci-physical-session.ts",
@@ -1125,6 +1142,7 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
       "createV2ContainerHostAcceptance",
       "inspectV2ContainerOwnerHistoricalDeleteSchema",
       "inspectV2ContainerOwnerSelectedSchema",
+      "inspectV2ContainerOwnerShutdownIoSchema",
       "serializeV2ContainerConfiguredPrivateInputs",
       "V2_CONTAINER_APPLICATION_IO_RESERVED",
       "V2_CONTAINER_CONTROL_RESERVED",

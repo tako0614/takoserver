@@ -112,9 +112,11 @@ import {
   observeSelfhostBackgroundPasses,
   SELFHOST_BACKLOG_SAMPLE_INTERVAL_MS,
 } from "./selfhost-health-signals.ts";
-import { createSelfhostLinuxContainerNodeComposition } from "./selfhost-linux-container-node-composition.ts";
 import {
   assertSelfhostLinuxContainerNodeSchema,
+  createSelfhostLinuxContainerNodeComposition,
+} from "./selfhost-linux-container-node-composition.ts";
+import {
   createSelfhostLinuxContainerNodeSelection,
   type SelfhostLinuxContainerNodeSelectionSource,
 } from "./selfhost-linux-container-node-selection.ts";

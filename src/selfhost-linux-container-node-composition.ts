@@ -13,6 +13,7 @@ import {
 import { createSelfhostLinuxDockerContainerBackend } from "./selfhost-linux-docker-container-backend.ts";
 import { createSelfhostLinuxOciContainerBackend } from "./selfhost-linux-oci-container-backend.ts";
 import type { V2OperatorFormSelectionFactory } from "./takoform-v2/application.ts";
+import { inspectV2ContainerOwnerShutdownIoSchema } from "./takoform-v2/container-owner-schema.ts";
 import { isV2FormUrl } from "./takoform-v2/identity.ts";
 import {
   type V2PrivateInputCustody,
@@ -20,6 +21,18 @@ import {
 } from "./takoform-v2/private-inputs.ts";
 import type { V2Action, V2BackendResult, V2Execution, V2Form } from "./takoform-v2/types.ts";
 import { WORKER_VERSION_UNIFIED_BACKEND_ID } from "./takoform-v2/worker-lifecycle-backend.ts";
+
+export async function assertSelfhostLinuxContainerNodeSchema(
+  sql: Sql,
+  selected: SelfhostLinuxContainerNodeSelection | undefined,
+): Promise<void> {
+  if (
+    selected?.kind === "oci" &&
+    selected.selection.ociParentControl === "sealed-peer-runtime-application-owner@1" &&
+    !(await inspectV2ContainerOwnerShutdownIoSchema(sql))
+  )
+    throw new Error("selfhost_linux_oci_shutdown_io_schema_required");
+}
 
 /** Capture the existing code-only action selection, without widening it. The
  * engine still performs its original pre-claim retained-adapter binding. */
