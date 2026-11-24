@@ -20,6 +20,28 @@ const successors = "tf_v2_container_application_successors";
 const predecessors = "tf_v2_container_shutdown_io_closes";
 const fenceDelete = "container_owner_application_successor_delete";
 
+function deleteEngine(
+  fixture: Awaited<ReturnType<typeof originalPeerDeleteFixture>>,
+  ociParentControl: "sealed-original@1" | "sealed-peer-runtime-application-owner@1",
+) {
+  const form = fixture.composition.retainedForm;
+  return createTakoformV2Engine(
+    {
+      sql: fixture.sql,
+      authorize: async () => true,
+      replayWindowSeconds: 3600,
+      forms: { [V2_CONTAINER_F2_FORM]: form },
+    },
+    createV2ContainerHostAcceptance({
+      sql: fixture.sql,
+      installationId: "synthetic-oci-installation",
+      backendId: form.backend.id,
+      targetKey: form.backend.targetKey,
+      ociParentControl,
+    }),
+  );
+}
+
 async function withOriginal(
   check: (
     fixture: Awaited<ReturnType<typeof originalPeerDeleteFixture>>,
@@ -281,19 +303,14 @@ test("a committed successor defeats a prepared stale DELETE and remains held aft
     const close = closeDocument(closeScope);
     expect((await recordClose(close)).changes).toBe(1);
     await expect(recordClose(close)).rejects.toMatchObject({ code: "constraint" });
-    const deleteAfterShapeOnly = f.reconstructNormal();
-    try {
-      await expect(
-        deleteAfterShapeOnly.engine.acceptDelete({
-          principal: "synthetic-oci-parent",
-          key: crypto.randomUUID(),
-          uid: coordinates[0],
-          expectedGeneration: coordinates[1],
-        }),
-      ).rejects.toThrow();
-    } finally {
-      await deleteAfterShapeOnly.close();
-    }
+    await expect(
+      deleteEngine(f, "sealed-original@1").acceptDelete({
+        principal: "synthetic-oci-parent",
+        key: crypto.randomUUID(),
+        uid: coordinates[0],
+        expectedGeneration: coordinates[1],
+      }),
+    ).rejects.toThrow();
     await expect(reserve(contender, coordinates, predecessor, 2, other)).rejects.toMatchObject({
       code: "constraint",
     });
@@ -345,22 +362,7 @@ test("selected OCI DELETE atomically binds the latest application owner without 
     await expand();
     const token = "d".repeat(64);
     expect((await reserve(contender, coordinates, predecessor, 1, token)).changes).toBe(1);
-    const form = f.composition.retainedForm;
-    const engine = createTakoformV2Engine(
-      {
-        sql: f.sql,
-        authorize: async () => true,
-        replayWindowSeconds: 3600,
-        forms: { [V2_CONTAINER_F2_FORM]: form },
-      },
-      createV2ContainerHostAcceptance({
-        sql: f.sql,
-        installationId: "synthetic-oci-installation",
-        backendId: form.backend.id,
-        targetKey: form.backend.targetKey,
-        ociParentControl: "sealed-peer-runtime-application-owner@1",
-      }),
-    );
+    const engine = deleteEngine(f, "sealed-peer-runtime-application-owner@1");
     const accepted = await engine.acceptDelete({
       principal: "synthetic-oci-parent",
       key: crypto.randomUUID(),
@@ -384,4 +386,34 @@ test("selected OCI DELETE atomically binds the latest application owner without 
       { close_document: null },
     ]);
   });
+}, 20_000);
+
+test("selected OCI Host accepts its first CREATE on the exact successor schema", async () => {
+  const fixture = await originalPeerDeleteFixture({
+    normal: true,
+    configuredPeer: true,
+    qualifiedProducer: true,
+    runtimeApplicationOwner: true,
+    allocationSchema: true,
+  });
+  try {
+    await fixture.sql.batch(
+      V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })),
+    );
+    await fixture.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+    await fixture.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+    await fixture.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
+    const created = await fixture.create();
+    expect(created).toMatchObject({ status: "queued", effect: "none", generation: 1 });
+    expect(
+      await fixture.sql.query(
+        "SELECT action, application_successor_owner_token FROM tf_v2_container_acceptances WHERE operation_id=?",
+        [created.id],
+      ),
+    ).toEqual([{ action: "create", application_successor_owner_token: null }]);
+    expect(await fixture.sql.query(`SELECT owner_token FROM ${successors}`)).toEqual([]);
+    expect(fixture.nativeCounts()).toEqual({ processes: 0, requests: [] });
+  } finally {
+    await fixture.cleanup();
+  }
 }, 20_000);

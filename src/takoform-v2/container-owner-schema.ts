@@ -1544,8 +1544,12 @@ export function createV2ContainerHostAcceptance(options: {
             c.generation,
           ]
         : [];
+      const successorCreate =
+        allowsApplicationSuccessor && c.action === "create"
+          ? V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready
+          : undefined;
       const guard: SqlStatement = {
-        sql: `${selectedReady} AND (${
+        sql: `${successorCreate ? `(${selectedReady} OR ${successorCreate.sql})` : selectedReady} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
@@ -1554,6 +1558,7 @@ export function createV2ContainerHostAcceptance(options: {
         })${retainedMaterialGuard}`,
         params: [
           ...selectedReadyParams,
+          ...(successorCreate?.params ?? []),
           ...(c.action === "create"
             ? [c.resourceUid]
             : [
