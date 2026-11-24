@@ -184,6 +184,7 @@ export interface DockerContainerCoreOwnerOptions {
   };
 }
 export interface DockerContainerCoreOwner {
+  inspectApplicationSuccessorStore(): Promise<boolean>;
   readonly acceptance: V2HostAcceptance;
   readonly owner: DockerPhysicalCoreOwnerPort;
   saveAcceptedParentControl(
@@ -4887,6 +4888,9 @@ export function createDockerContainerCoreOwner(
     return "saved";
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
+    inspectApplicationSuccessorStore() {
+      return runtimeApplicationOwner ? inspectApplicationSuccessorStore() : Promise.resolve(false);
+    },
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
       if (!runtimeApplicationOwner || signal.aborted) return fail();
       const application = originalLinuxOciHttpRetirementSource(
@@ -4910,10 +4914,12 @@ export function createDockerContainerCoreOwner(
       if (
         !usable(loaded.proof, "observe") ||
         loaded.proof.i_serving_generation !== input.intent.policy.generation ||
-        (await boundInitPhase(loaded)) !== "running" ||
-        !(await inspectV2ContainerOwnerShutdownIoSchema(sql))
+        (await boundInitPhase(loaded)) !== "running"
       )
         return fail();
+      const shutdownSchema = await inspectV2ContainerOwnerShutdownIoSchema(sql);
+      const successorSchema = !shutdownSchema && (await inspectApplicationSuccessorStore());
+      if (!shutdownSchema && !successorSchema) return fail();
       const coordinates = [
         input.intent.resourceUid,
         input.intent.policy.generation,
@@ -4955,8 +4961,16 @@ export function createDockerContainerCoreOwner(
       selected.assertCurrent();
       const saved = await sql.run(
         "INSERT INTO tf_v2_container_shutdown_io_closes (resource_uid,generation,claim_id,native_id,close_document) SELECT ?,?,?,?,? WHERE EXISTS (SELECT 1 FROM tf_v2_container_create_claims WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched' AND native_control=?) AND " +
-          guard.sql,
-        [...coordinates, selected.document, ...coordinates, raw, ...guard.params],
+          guard.sql +
+          (successorSchema ? " AND " + applicationSuccessorStore.sql : ""),
+        [
+          ...coordinates,
+          selected.document,
+          ...coordinates,
+          raw,
+          ...guard.params,
+          ...(successorSchema ? applicationSuccessorStore.params : []),
+        ],
       );
       if (saved.changes !== 1) return fail();
       const confirmed = await sql.query(
@@ -4977,8 +4991,7 @@ export function createDockerContainerCoreOwner(
       )
         return fail();
       const lease = await activeRecord(input, "reconcile");
-      if (!(await current(lease)) || !(await inspectV2ContainerOwnerSelectedSchema(sql, "control")))
-        return fail();
+      if (!(await current(lease))) return fail();
       const entry = originalLinuxOciParentControlSource(originalCustody, result, input, signal);
       const loaded = await load(input.intent),
         saved = sameRecord(input, record(loaded.intent, loaded.proof));
@@ -4987,6 +5000,12 @@ export function createDockerContainerCoreOwner(
         saved.nativeId !== null ||
         !usable(loaded.proof, "reconcile")
       )
+        return fail();
+      const successorCreate =
+        runtimeApplicationOwner &&
+        loaded.proof.a_action === "create" &&
+        (await inspectApplicationSuccessorStore());
+      if (!successorCreate && !(await inspectV2ContainerOwnerSelectedSchema(sql, "control")))
         return fail();
       const scope = Object.freeze({
         purpose: peerMode ? peerPurpose : "takoserver.linux-oci-parent-control@1",
@@ -5008,9 +5027,11 @@ export function createDockerContainerCoreOwner(
         artifact: entry.receipt,
       });
       const initializeAllocation =
-        peerMode && (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation"));
+        peerMode &&
+        (successorCreate || (await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")));
       const initializeApplicationIo =
-        peerMode && (await inspectV2ContainerOwnerSelectedSchema(sql, "application-io"));
+        peerMode &&
+        (successorCreate || (await inspectV2ContainerOwnerSelectedSchema(sql, "application-io")));
       freshControlClaims.delete(input); // consumed before async sealing/save, never a retry grant
       const sealed = await sealOriginalLinuxOciParentControl(
         originalCustody,
@@ -5043,7 +5064,8 @@ export function createDockerContainerCoreOwner(
             ? ",application_io_cleanup=" + "'" + V2_CONTAINER_APPLICATION_IO_RESERVED + "'"
             : "") +
           " WHERE resource_uid=? AND generation=? AND claim_id=? AND state='pending' AND native_id IS NULL AND native_control=? AND " +
-          guard.sql,
+          guard.sql +
+          (successorCreate ? " AND " + applicationSuccessorStore.sql : ""),
         [
           document,
           input.intent.resourceUid,
@@ -5051,6 +5073,7 @@ export function createDockerContainerCoreOwner(
           input.claimId,
           V2_CONTAINER_CONTROL_RESERVED,
           ...guard.params,
+          ...(successorCreate ? applicationSuccessorStore.params : []),
         ],
       );
       if (write.changes !== 1 || !(await current(lease)) || signal.aborted) return fail();

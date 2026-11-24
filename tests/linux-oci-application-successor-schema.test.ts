@@ -388,13 +388,18 @@ test("selected OCI DELETE atomically binds the latest application owner without 
   });
 }, 20_000);
 
-test("selected OCI Host accepts its first CREATE on the exact successor schema", async () => {
+test("selected OCI Host starts its first accepted CREATE on the exact successor schema", async () => {
   const fixture = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
     qualifiedProducer: true,
     runtimeApplicationOwner: true,
     allocationSchema: true,
+  });
+  const health = acceptedRawHttp();
+  health.onEnd(() => {
+    health.reply();
+    health.join();
   });
   try {
     await fixture.sql.batch(
@@ -413,7 +418,52 @@ test("selected OCI Host accepts its first CREATE on the exact successor schema",
     ).toEqual([{ action: "create", application_successor_owner_token: null }]);
     expect(await fixture.sql.query(`SELECT owner_token FROM ${successors}`)).toEqual([]);
     expect(fixture.nativeCounts()).toEqual({ processes: 0, requests: [] });
+    expect(await fixture.engine.runNext()).toMatchObject({
+      id: created.id,
+      status: "succeeded",
+      effect: "complete",
+    });
+    const original = fixture.recordedCreate();
+    expect(
+      await fixture.sql.query(
+        `SELECT claim_id, native_id, state, allocation_cleanup,
+          json_extract(native_control, '$.kind') AS control_kind,
+          application_io_cleanup IS NOT NULL AS application_io_initialized
+         FROM tf_v2_container_create_claims WHERE resource_uid=?`,
+        [created.resourceUid],
+      ),
+    ).toEqual([
+      {
+        claim_id: original.claimId,
+        native_id: original.claimId,
+        state: "bound",
+        allocation_cleanup: "untouched",
+        control_kind: "linux-oci-sealed-control@1",
+        application_io_initialized: 1,
+      },
+    ]);
+    expect(
+      await fixture.sql.query(
+        "SELECT native_id, state FROM tf_v2_container_start_attempts WHERE resource_uid=?",
+        [created.resourceUid],
+      ),
+    ).toEqual([{ native_id: original.claimId, state: "running" }]);
+    await fixture.composition.close();
+    expect(
+      await fixture.sql.query(
+        `SELECT claim_id, native_id, json_extract(close_document, '$.kind') AS kind
+         FROM ${predecessors} WHERE resource_uid=?`,
+        [created.resourceUid],
+      ),
+    ).toEqual([
+      {
+        claim_id: original.claimId,
+        native_id: original.claimId,
+        kind: "linux-oci-sealed-host-shutdown-io-close@1",
+      },
+    ]);
   } finally {
+    health.restore();
     await fixture.cleanup();
   }
 }, 20_000);

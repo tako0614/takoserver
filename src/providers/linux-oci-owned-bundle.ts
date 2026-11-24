@@ -87,14 +87,18 @@ type OriginalOciHttpRoute = {
   assertLocal(): void;
 };
 
-type OriginalOciSuccessorHttp = {
+type OriginalOciSuccessorHttpConnection = {
+  readonly open: ReturnType<typeof createLinuxOciContainerHttpRuntime>["open"];
+  close(): Promise<void>;
+};
+
+type OriginalOciSuccessorHttp = OriginalOciSuccessorHttpConnection & {
   readonly held: LinuxOciHeldLiveInit;
   readonly epoch: number;
   readonly ownerToken: string;
   joined(): Promise<void>;
   closeForDelete(execution: V2Execution, signal: AbortSignal): Promise<void>;
   read(signal: AbortSignal): Promise<OriginalOciHttpRoute>;
-  close(): Promise<void>;
 };
 
 type OriginalOciCustody = {
@@ -1917,6 +1921,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const httpRecords = new Map<string, DockerContainerCreateRecord>();
   const httpRuntimes = new Map<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>();
   const successorHttp = new Map<DockerContainerCreateRecord, OriginalOciSuccessorHttp>();
+  const successorHttpOpenings = new Map<string, Promise<OriginalOciSuccessorHttpConnection>>();
   const heldLiveInits: OriginalOciCustody["heldLiveInits"] = new Set();
   const nativeLifetime = new AbortController();
   originalOciCustodies.set(originalNativeCustody, {
@@ -3203,7 +3208,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         readonly generation: number;
       },
       signal: AbortSignal,
-    ) {
+    ): Promise<OriginalOciSuccessorHttpConnection> {
       if (closed || !runtimeApplicationOwner || !physicalBinary) return fail("parent_custody");
       if (!(signal instanceof AbortSignal) || signal.aborted) return fail("revoked");
       const identity = Object.freeze({
@@ -3256,6 +3261,10 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             held,
             epoch,
             ownerToken,
+            open(request, refuseIfRevoked) {
+              assertLocal(request.signal);
+              return runtime.open(request, refuseIfRevoked);
+            },
             joined() {
               return transportJoin ?? fail("http_custody");
             },
@@ -3295,7 +3304,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             { once: true },
           );
           return Object.freeze({
-            open: runtime.open,
+            open: source.open,
             close: source.close,
           });
         } catch (error) {
@@ -3323,7 +3332,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     },
     /** The binding has already selected a serving generation. The private
      * caller retains this same invocation through actual terminal I/O. */
-    openServingHttp(
+    async openServingHttp(
       identity: {
         readonly resourceUid: string;
         readonly incarnationId: string;
@@ -3333,11 +3342,58 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       refuseIfRevoked: () => void,
     ) {
       const generation = identity?.generation;
-      if (!Number.isSafeInteger(generation) || generation < 1)
-        return Promise.reject(new Error("linux_oci_owned_bundle_http_custody"));
-      return selectServingHttpRuntime(identity, request, generation).then((runtime) =>
-        runtime.open(request, refuseIfRevoked),
-      );
+      if (!Number.isSafeInteger(generation) || generation < 1) return fail("http_custody");
+      const { resourceUid, incarnationId } = identity;
+      const sameGeneration = (record: DockerContainerCreateRecord) =>
+        record.intent.resourceUid === resourceUid &&
+        record.intent.incarnationId === incarnationId &&
+        record.intent.policy.generation === generation;
+      if (
+        !runtimeApplicationOwner ||
+        !physicalBinary ||
+        [...httpRecords.values()].some(sameGeneration)
+      ) {
+        // A selected original H0 owns its own refusal. Never turn it into an H1 opening.
+        const runtime = await selectServingHttpRuntime(identity, request, generation);
+        return runtime.open(request, refuseIfRevoked);
+      }
+      if (!(request instanceof Request)) return fail("revoked");
+      const callerCurrent = () => {
+        if (closed || request.signal.aborted) return fail("revoked");
+        refuseIfRevoked();
+      };
+      callerCurrent();
+      const registered = [...successorHttp].filter(([record]) => sameGeneration(record));
+      if (registered.length > 1) return fail("http_custody");
+      if (registered[0]) return registered[0][1].open(request, callerCurrent);
+
+      const key = JSON.stringify([resourceUid, incarnationId, generation]);
+      let opening = successorHttpOpenings.get(key);
+      if (!opening) {
+        // Core checks the exact successor schema and generation and owns the
+        // one-use reservation. Request cancellation only ends that caller's wait.
+        const pending = creator
+          .openCurrentSuccessorServingHttp(
+            { resourceUid, incarnationId, generation },
+            nativeLifetime.signal,
+          )
+          .catch(() => fail("http_custody"))
+          .finally(() => {
+            if (successorHttpOpenings.get(key) === pending) successorHttpOpenings.delete(key);
+          });
+        successorHttpOpenings.set(key, pending);
+        opening = pending;
+      }
+      const canceled = Promise.withResolvers<never>();
+      const abort = () => canceled.reject(new Error("linux_oci_owned_bundle_revoked"));
+      request.signal.addEventListener("abort", abort, { once: true });
+      if (request.signal.aborted) abort();
+      try {
+        const connection = await Promise.race([opening, canceled.promise]);
+        return connection.open(request, callerCurrent);
+      } finally {
+        request.signal.removeEventListener("abort", abort);
+      }
     },
     /** Original same-Sql binding readback only; no restart peer/session adoption. */
     readRetainedParentControls,
@@ -3831,7 +3887,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             }
             if (parents.size || nativeSessions.size) {
               const custody = originalOciCustodies.get(originalNativeCustody);
-              if (!custody || !(await inspectV2ContainerOwnerShutdownIoSchema(sql)))
+              if (
+                !custody ||
+                (!(await inspectV2ContainerOwnerShutdownIoSchema(sql)) &&
+                  !(await core.inspectApplicationSuccessorStore()))
+              )
                 return fail("parent_control_retained");
               const claims = new Set([...parents.keys(), ...nativeSessions.keys()]);
               const outcomes = await Promise.allSettled(

@@ -419,6 +419,7 @@ async function verifySuccessorHttpClose(
     | "withdrawn"
     | "unknown"
     | "ack-lost"
+    | "binding"
     | "delete"
     | "delete-late"
     | "delete-restart"
@@ -457,8 +458,6 @@ async function verifySuccessorHttpClose(
     });
     await f.composition.close();
     health.restore();
-    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
-
     const original = f.recordedCreate();
     const selector = {
       resourceUid: accepted.resourceUid,
@@ -468,6 +467,12 @@ async function verifySuccessorHttpClose(
     const signal = new AbortController().signal;
     const creator = f.reconstructParent();
     fresh = creator;
+    const before = f.nativeCounts();
+    await expect(
+      creator.openServingHttp(selector, new Request("http://caller.invalid/"), () => {}),
+    ).rejects.toThrow("http_custody");
+    expect(f.nativeCounts()).toEqual(before);
+    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
     const path = join(original.allocationRoot, LINUX_OCI_HOST_TOPOLOGY_FILE);
     const identity = { nativeId: original.claimId, namespaceDevice: "4", namespaceInode: "5" };
     const stat = await files.lstat(path, { bigint: true });
@@ -504,9 +509,6 @@ async function verifySuccessorHttpClose(
     ).rejects.toThrow();
     expect(await reservations()).toEqual([]);
     expect(raw.mock.calls).toHaveLength(existingCalls);
-    await expect(
-      creator.openServingHttp(selector, new Request("http://caller.invalid/"), () => {}),
-    ).rejects.toThrow("http_custody");
     expect(io.counts().calls).toBe(0);
 
     let heldCloses = 0;
@@ -549,6 +551,80 @@ async function verifySuccessorHttpClose(
     }
 
     queueOriginalPeers();
+    if (outcome === "binding") {
+      const cancel = new AbortController();
+      const canceled = creator.openServingHttp(
+        selector,
+        new Request("http://caller.invalid/canceled", { signal: cancel.signal }),
+        () => {},
+      );
+      let revoked = false;
+      const revokedCall = creator.openServingHttp(
+        selector,
+        new Request("http://caller.invalid/revoked"),
+        () => {
+          if (revoked) throw new Error("NONSECRET caller lost its binding");
+        },
+      );
+      const opening = creator.openServingHttp(
+        selector,
+        new Request("http://caller.invalid/first"),
+        () => {},
+      );
+      cancel.abort();
+      revoked = true;
+      await expect(canceled).rejects.toThrow("revoked");
+      await expect(revokedCall).rejects.toThrow("caller lost its binding");
+      const first = await opening;
+      for (let i = 0; i < 250 && !io.counts().calls; i++) await rawTick();
+      expect(io.counts().calls).toBe(1);
+      expect(String(io.targets[0])).toBe("http://10.240.0.3:8080/first");
+      io.head();
+      const response = await first.response;
+      io.incoming.end("NONSECRET first binding exchange");
+      expect(await response.text()).toBe("NONSECRET first binding exchange");
+      io.closeResponse();
+      io.closeRequest();
+      await first.settlement;
+      const originalRows = await reservations();
+      expect(originalRows).toMatchObject([{ epoch: 1, close_document: null }]);
+      expect(raw.mock.calls).toHaveLength(existingCalls + 2);
+
+      io.restore();
+      const again = ownedRawHttp();
+      try {
+        await expect(
+          creator.fetchServingHttp(selector, new Request("http://caller.invalid/legacy")),
+        ).rejects.toThrow("http_custody");
+        const second = await creator.openServingHttp(
+          selector,
+          new Request("http://caller.invalid/again"),
+          () => {},
+        );
+        for (let i = 0; i < 250 && !again.counts().calls; i++) await rawTick();
+        expect(again.counts().calls).toBe(1);
+        expect(String(again.targets[0])).toBe("http://10.240.0.3:8080/again");
+        again.head();
+        const hit = await second.response;
+        again.incoming.end("NONSECRET second binding exchange");
+        expect(await hit.text()).toBe("NONSECRET second binding exchange");
+        again.closeResponse();
+        again.closeRequest();
+        await second.settlement;
+        expect(await reservations()).toEqual(originalRows);
+        expect(raw.mock.calls).toHaveLength(existingCalls + 2);
+        creatorCloseChecked = true;
+        await creator.close();
+        expect(heldCloses).toBe(1);
+        expect(typeof (await reservations())[0]?.close_document).toBe("string");
+        expect(f.network).not.toHaveBeenCalled();
+        return;
+      } finally {
+        again.closeResponse();
+        again.closeRequest();
+        again.restore();
+      }
+    }
     const connection = await creator.openCurrentSuccessorServingHttp(selector, signal);
     const originalCall = connection.open(
       new Request("https://caller.invalid/actual?x=1"),
@@ -905,6 +981,7 @@ test.each([
   "withdrawn",
   "unknown",
   "ack-lost",
+  "binding",
   "delete",
   "delete-late",
   "delete-restart",
