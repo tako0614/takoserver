@@ -4256,7 +4256,10 @@ export function createDockerContainerCoreOwner(
       if (observed.nativeId !== captured.nativeId) return fail();
       return observed;
     };
-    const openHeld = async (assertReservation: (signal: AbortSignal) => Promise<void>) => {
+    const openHeld = async (
+      assertReservation: (signal: AbortSignal) => Promise<void>,
+      closeOwner?: "application",
+    ) => {
       if (!successor) return fail();
       await assertCurrent();
       return openOriginalLinuxOciHeldLiveInit(
@@ -4271,6 +4274,7 @@ export function createDockerContainerCoreOwner(
           await assertReservation(actualSignal);
           assertControlKey();
         },
+        closeOwner,
       );
     };
     const finish = () => {
@@ -4426,13 +4430,15 @@ export function createDockerContainerCoreOwner(
     );
     let held: LinuxOciHeldLiveInit | undefined;
     try {
-      held = await current.openHeld((actualSignal) =>
-        assertOriginalApplicationSuccessorReservation(
-          reservation,
-          identity,
-          originalCustody,
-          actualSignal,
-        ),
+      held = await current.openHeld(
+        (actualSignal) =>
+          assertOriginalApplicationSuccessorReservation(
+            reservation,
+            identity,
+            originalCustody,
+            actualSignal,
+          ),
+        expectedGeneration === undefined ? undefined : "application",
       );
       current.assertLocal();
       if (

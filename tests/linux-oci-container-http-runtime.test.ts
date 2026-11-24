@@ -408,7 +408,7 @@ function modelRootTopology(path: string) {
   };
 }
 
-test("OCI HTTP successor owns the accepted endpoint and joins its raw I/O before held close", async () => {
+async function verifySuccessorHttpClose(outcome: "joined" | "unknown") {
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
@@ -417,6 +417,7 @@ test("OCI HTTP successor owns the accepted endpoint and joins its raw I/O before
     allocationSchema: true,
   });
   let fresh: ReturnType<typeof f.reconstructParent> | undefined;
+  let creatorCloseChecked = false;
   const health = acceptedRawHttp();
   health.onEnd(() => {
     health.reply();
@@ -536,17 +537,49 @@ test("OCI HTTP successor owns the accepted endpoint and joins its raw I/O before
     await rawTick();
     expect(settled.state()).toBe("pending");
 
-    const closing = observeRawPromise(connection.close());
-    await rawTick();
-    expect(closing.state()).toBe("pending");
-    expect(heldCloses).toBe(0);
-    io.closeResponse();
-    await rawTick();
-    expect(closing.state()).toBe("pending");
-    io.closeRequest();
-    expect(await settled.value).toHaveProperty("result");
-    expect(await closing.value).toHaveProperty("result");
-    expect(heldCloses).toBe(1);
+    if (outcome === "joined") {
+      // Serving readiness was withdrawn while the original exchange still
+      // owns its raw handles. This refusal starts the H1 drain.
+      await f.sql.run(
+        "UPDATE tf_v2_resources SET observed_json=json_set(observed_json,'$.ready',json('false')) WHERE uid=?",
+        [selector.resourceUid],
+      );
+      const refusal = connection.open(new Request("http://caller.invalid/"), () => {});
+      await expect(refusal.response).rejects.toThrow();
+      await refusal.settlement;
+      expect(io.counts().requestDestroy).toBe(1);
+
+      const closing = observeRawPromise(connection.close());
+      await rawTick();
+      expect(closing.state()).toBe("pending");
+      expect(heldCloses).toBe(0);
+      io.closeResponse();
+      await rawTick();
+      expect(closing.state()).toBe("pending");
+      io.closeRequest();
+      expect(await settled.value).toHaveProperty("result");
+      expect(await closing.value).toHaveProperty("result");
+      expect(heldCloses).toBe(1);
+    } else {
+      const failure = new Error("NONSECRET uncertain raw request shutdown");
+      const requestDestroy = spyOn(io.request, "destroy").mockImplementation(() => {
+        throw failure;
+      });
+      try {
+        const closing = connection.close();
+        await expect(closing).rejects.toThrow(failure);
+        expect(connection.close()).toBe(closing);
+        expect(await settled.value).toHaveProperty("error", failure);
+        io.closeResponse();
+        io.closeRequest();
+        const creatorClose = creator.close();
+        creatorCloseChecked = true;
+        await expect(creatorClose).rejects.toThrow(failure);
+        expect(heldCloses).toBe(0);
+      } finally {
+        requestDestroy.mockRestore();
+      }
+    }
     expect(await reservations()).toEqual([
       {
         generation: original.generation,
@@ -563,9 +596,15 @@ test("OCI HTTP successor owns the accepted endpoint and joins its raw I/O before
     cleanupIo();
     health.restore();
     try {
-      await fresh?.close();
+      if (!creatorCloseChecked) await fresh?.close();
     } finally {
       await f.cleanup();
     }
   }
-}, 20_000);
+}
+
+test.each(["joined", "unknown"] as const)(
+  "OCI HTTP successor closes its held connector only after confirmed I/O (%s)",
+  verifySuccessorHttpClose,
+  20_000,
+);

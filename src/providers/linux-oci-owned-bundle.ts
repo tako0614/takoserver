@@ -740,6 +740,7 @@ export async function openOriginalLinuxOciHeldLiveInit(
   binding: unknown,
   signal: AbortSignal,
   assertCurrent: (signal: AbortSignal) => Promise<void>,
+  closeOwner?: "application",
 ): Promise<LinuxOciHeldLiveInit> {
   const { custody, binary } = originalPeerCustody(original, core, signal);
   if (record.state !== "bound" || record.nativeId !== record.claimId) return fail("parent_custody");
@@ -796,8 +797,17 @@ export async function openOriginalLinuxOciHeldLiveInit(
       return joining;
     },
   };
+  const refuse = () => {
+    // An adopted application's TCP streams can outlive a failed source read.
+    // Its owner sees revocation immediately and owns any voluntary close.
+    if (closeOwner === "application") {
+      revocation.abort();
+      return;
+    }
+    return source.close().catch(() => undefined);
+  };
   const revoke = () => {
-    void source.close().catch(() => undefined);
+    void refuse();
   };
   // Own this opening before the subprocess starts, including any failure
   // between the first retained transport and a valid handoff.
@@ -837,7 +847,7 @@ export async function openOriginalLinuxOciHeldLiveInit(
         assertLocal(actualSignal);
         return finish(value);
       } catch (error) {
-        await source.close().catch(() => undefined);
+        await refuse();
         throw error;
       } finally {
         checking = undefined;
@@ -3182,11 +3192,11 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             },
             close() {
               joining ??= Promise.resolve().then(async () => {
-                const [io] = await Promise.allSettled([runtime.close()]);
+                // A rejected transport join leaves the held connector and the
+                // open reservation in custody. Only a known join may close it.
+                await runtime.close();
                 await reading;
-                const [connector] = await Promise.allSettled([held.close()]);
-                if (io.status === "rejected") throw io.reason;
-                if (connector.status === "rejected") throw connector.reason;
+                await held.close();
               });
               return joining;
             },
