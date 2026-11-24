@@ -150,8 +150,8 @@ static inline int oci_uplink_read_guest(struct oci_uplink_read *r) {
 /* Caller serializes the original H and initializes r to zero. Its one
  * monotonic deadline covers construction, GETs and the positive join. Retain
  * a failed lease while it still owns a pending or unknown worker PIDFD. */
-static inline int oci_uplink_read_open(struct tns_oci_owner *o, struct oci_uplink_read *r,
-                                      int64_t deadline) {
+static inline int oci_uplink_read_prepare(struct tns_oci_owner *o, struct oci_uplink_read *r,
+                                         int64_t deadline) {
   if (!r || r->attempted) { errno = EALREADY; return -1; }
   r->attempted = 1;
   int64_t now = oci_now();
@@ -200,6 +200,21 @@ static inline int oci_uplink_read_open(struct tns_oci_owner *o, struct oci_uplin
       oci_uplink_socket_identity(s->host, s->host_cookie, &s->host_port) < 0 ||
       oci_uplink_read_guest(r) < 0) goto fail;
   if (s->host_port == u->host_port || s->guest_port == u->guest_port) { errno = ESTALE; goto fail; }
+  r->prepared = 1;
+  return 0;
+fail: {
+  int saved = errno ? errno : EPROTO;
+  r->failed = 1;
+  (void)oci_uplink_read_close(r);
+  errno = saved;
+  return -1;
+}
+}
+
+static inline int oci_uplink_read_lock(struct oci_uplink_read *r) {
+  if (!r || !r->prepared || !r->scratch || r->ready || r->failed) { errno = EINVAL; return -1; }
+  int64_t deadline = r->deadline;
+  struct oci_uplink_owner *s = r->scratch, *u = r->original;
   /* Join the producer before opening the read OFD. Even a failed or stalled
    * worker cannot inherit and prolong this cooperating read lock. */
   if (oci_egress_left(deadline) < 0 || oci_not_canceled() < 0) goto fail;
@@ -218,6 +233,12 @@ fail: {
   errno = saved;
   return -1;
 }
+}
+
+static inline int oci_uplink_read_open(struct tns_oci_owner *o, struct oci_uplink_read *r,
+                                      int64_t deadline) {
+  if (oci_uplink_read_prepare(o, r, deadline) < 0) return -1;
+  return oci_uplink_read_lock(r);
 }
 
 static inline int oci_uplink_read_dump_one(struct oci_uplink_read *r, int guest, uint16_t type,

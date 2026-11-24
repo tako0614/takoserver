@@ -1293,4 +1293,5 @@ static int oci_host_path_close(struct oci_uplink_owner *u) {
   if (p->close_unknown) { errno = EUCLEAN; return -1; }
   explicit_bzero(p, sizeof(*p)); free(p); u->host_path = NULL; return 0;
 }
+#include "docker-container-terminal-oci-policy-read.h"
 #endif

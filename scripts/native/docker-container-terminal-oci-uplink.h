@@ -89,7 +89,7 @@ struct oci_uplink_owner {
 struct oci_uplink_read {
   struct oci_uplink_owner *original, *scratch;
   int64_t deadline;
-  int attempted, ready, failed, waited, close_unknown;
+  int attempted, prepared, ready, failed, waited, close_unknown;
 };
 
 /* Definitions follow in the original policy implementation. */

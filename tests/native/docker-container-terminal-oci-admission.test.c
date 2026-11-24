@@ -240,6 +240,7 @@ static struct {
  char artifact[8192], policy[32769], table[65536], sent[3][1024];
  size_t artifact_size, policy_size, table_size, sent_size[3], read_at[3];
  unsigned int pipes, spawns, joins, signals, close_calls[600], reads;
+ int advance_ms;
  int no_file, bad_mode, bad_magic, bad_table, fail_write, bad_wait, bad_poll, timeout, close_error;
  int cancel_read, child_mode, ranges, entered, null_opened, exec_stage;
 } eg;
@@ -467,7 +468,7 @@ static int raw_poll(struct pollfd *p, nfds_t count, int timeout) {
   if(p->fd>=2000 && p->fd<3006){CHECK((p->fd<2024 || p->fd>=3000) && count==1 && timeout>0);p->revents=p->events;return 1;}
 
   if(ad.active && ((p->fd>=600 && p->fd<660)||(p->fd>=1000 && p->fd<1400))){CHECK(count==1 && timeout>0);p->revents=p->events;return 1;}
-  if(rt.active && p->fd>=480 && p->fd<576){CHECK(count==1 && timeout>0);if(rt.fault==4){errno=EINTR;return -1;}p->revents=p->events;return 1;}
+  if(rt.active && p->fd>=480 && p->fd<576){CHECK(count==1 && (timeout>0 || (timeout==0 && eg.advance_ms)));if(rt.fault==4){errno=EINTR;return -1;}p->revents=p->events;return 1;}
   CHECK(count == 1);
   if((p->fd>=430 && p->fd<=432)||(p->fd>=450 && p->fd<=473)){CHECK(timeout>0);p->revents=p->events;return 1;}
   if(p->fd>=400 && p->fd<=410){CHECK(timeout>0);if(up.drop_ack && up.mutations && p->fd!=400 && p->fd!=404)return 0;p->revents=POLLIN;return 1;}
@@ -651,7 +652,7 @@ static int eg_dup2(int from,int to){CHECK(eg.child_mode && from>=500 && (to==0 |
 static int eg_dup3(int from,int to,int flags){CHECK((eg.child_mode || up.child) && from>=500 && (to==3 || to==4) && flags==O_CLOEXEC);return to;}
 static int eg_setns(int fd,int kind){CHECK((eg.child_mode || up.child) && fd==(up.child ? 3 : 4) && kind==CLONE_NEWNET && eg.ranges==3 && !eg.entered);eg.entered=1;return 0;}
 static pid_t eg_getppid(void){CHECK(eg.child_mode || up.child);return 1000;}
-static int eg_clock(clockid_t kind,struct timespec *out){CHECK(kind==CLOCK_MONOTONIC);*out=(struct timespec){.tv_sec=1};return 0;}
+static int eg_clock(clockid_t kind,struct timespec *out){CHECK(kind==CLOCK_MONOTONIC);*out=(struct timespec){.tv_sec=1+eg.advance_ms/1000,.tv_nsec=(eg.advance_ms%1000)*1000000L};return 0;}
 static _Noreturn void eg_exit(int code){CHECK(eg.child_mode || up.child);longjmp(child_exit,code ? code : 1);}
 
 static void initialize_egress(struct tns_oci_owner *o,struct tns_owner *b) {

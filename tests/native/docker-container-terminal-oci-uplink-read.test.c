@@ -1,10 +1,12 @@
 /* The legacy model supplies the actual parsers and held-owner kernel reads.
  * Reinclude only the new lease body with mocks for its independently owned IO. */
 #define DOCKER_CONTAINER_TERMINAL_OCI_UPLINK_READ_H
+#define DOCKER_CONTAINER_TERMINAL_OCI_POLICY_READ_H
 #define main prior_admission_main
 #include "docker-container-terminal-oci-admission.test.c"
 #undef main
 #undef DOCKER_CONTAINER_TERMINAL_OCI_UPLINK_READ_H
+#undef DOCKER_CONTAINER_TERMINAL_OCI_POLICY_READ_H
 
 enum { READ_LOCK = 124, READ_HOST_NS = 125, READ_SELF_NS = 126, READ_CHILD_PIDFD = 404 };
 static struct {
@@ -226,6 +228,155 @@ static void read_topology_cases(void) {
   }
 }
 
+static struct {
+  unsigned int pairs, pipes, spawns, go[2], kills[2];
+  size_t at[2];
+  int cancel_at_host_eof, expire_at_host_eof;
+} policy_worker;
+
+static int worker_pair(int domain, int type, int protocol, int pair[2]) {
+  CHECK(domain == AF_UNIX && type == (SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK) && !protocol);
+  CHECK(policy_worker.pairs < 2 && !read_model.lock_opens);
+  pair[0] = 510 + 4 * (int)policy_worker.pairs++;
+  pair[1] = pair[0] + 1;
+  return 0;
+}
+
+static int worker_pipe(int pair[2], int flags) {
+  CHECK(flags == (O_CLOEXEC | O_NONBLOCK) && policy_worker.pipes + 1 == policy_worker.pairs);
+  pair[0] = 512 + 4 * (int)policy_worker.pipes++;
+  pair[1] = pair[0] + 1;
+  return 0;
+}
+
+static long worker_syscall(long number, ...) {
+  va_list ap; va_start(ap, number);
+  if (number == SYS_clone3) {
+    struct clone_args *args = va_arg(ap, struct clone_args *);
+    CHECK(va_arg(ap, size_t) == sizeof(*args) && args->flags == (CLONE_PIDFD | CLONE_CLEAR_SIGHAND));
+    CHECK(args->exit_signal == SIGCHLD && !read_model.lock_opens && policy_worker.spawns + 1 == policy_worker.pipes);
+    *(int *)(uintptr_t)args->pidfd = 480 + (int)policy_worker.spawns;
+    va_end(ap);
+    return 7000 + (long)policy_worker.spawns++;
+  }
+  CHECK(number == SYS_pidfd_send_signal);
+  int fd = va_arg(ap, int);
+  CHECK(fd >= 480 && fd <= 481 && va_arg(ap, int) == SIGKILL && va_arg(ap, void *) == NULL && !va_arg(ap, int));
+  CHECK(!policy_worker.kills[fd-480]++);
+  va_end(ap);
+  return 0;
+}
+
+static ssize_t worker_send(int fd, const void *bytes, size_t size, int flags) {
+  CHECK((fd == 510 || fd == 514) && size == 1 && *(const unsigned char *)bytes == 1);
+  CHECK(flags == (MSG_NOSIGNAL | MSG_DONTWAIT) && policy_worker.spawns == 2 && read_model.read_locks == 1);
+  CHECK(!policy_worker.go[(fd-510)/4]++);
+  return 1;
+}
+
+static ssize_t worker_read(int fd, void *bytes, size_t size) {
+  CHECK(fd == 512 || fd == 516);
+  unsigned int side = (unsigned int)(fd-512)/4;
+  CHECK(policy_worker.go[side] == 1);
+  const char *text = side ? up.host_output[2] : pol.readback;
+  size_t total = side ? up.host_size[2] : pol.readback_size;
+  size_t n = total - policy_worker.at[side];
+  if (n > size) n = size;
+  if (n > 199) n = 199;
+  if (!n && side && policy_worker.cancel_at_host_eof) tns_oci_note_cancel();
+  if (!n && side && policy_worker.expire_at_host_eof) eg.advance_ms = 2000;
+  memcpy(bytes, text + policy_worker.at[side], n);
+  policy_worker.at[side] += n;
+  return (ssize_t)n;
+}
+
+#define close raw_close
+#define socketpair worker_pair
+#define pipe2 worker_pipe
+#define syscall worker_syscall
+#define poll raw_poll
+#define getpid raw_getpid
+#define send worker_send
+#define read worker_read
+#include "../../scripts/native/docker-container-terminal-oci-policy-read.h"
+#undef read
+#undef send
+#undef getpid
+#undef poll
+#undef syscall
+#undef pipe2
+#undef socketpair
+#undef close
+
+static void read_policy_prepare(struct tns_oci_owner *o, struct tns_owner *b) {
+  read_topology_prepare(o, b);
+  struct oci_uplink_owner *u = o->uplink;
+  struct oci_host_path_owner *host = calloc(1, sizeof(*host));
+  CHECK(host);
+  u->host_path = host;
+  host->uplink = u;
+  host->controller = o->controller_pid;
+  host->creator = u->creator;
+  host->cookie = u->host_cookie;
+  host->host_index = u->host_index;
+  host->guest_index = u->guest_index;
+  host->uplink_index = u->expected.index;
+  memcpy(host->claim, o->id, sizeof(host->claim));
+  memcpy(host->host_name, u->host_name, sizeof(host->host_name));
+  memcpy(host->uplink_name, u->expected.name, sizeof(host->uplink_name));
+  CHECK(oci_host_path_program(host) == 0);
+  host->verified = 1;
+  host->handle = 7001;
+  host_raw_output(2);
+  CHECK(oci_policy_compile(o->policy) == 0);
+  policy_subject = o->policy;
+  policy_raw_readback();
+  rt.active = 1;
+  memset(&policy_worker, 0, sizeof(policy_worker));
+}
+
+static void read_policy_cases(void) {
+  for (unsigned int fault = 0; fault < 8; ++fault) {
+    struct tns_oci_owner o;
+    struct tns_owner b;
+    struct oci_held_admission_read scope = {0};
+    struct oci_held_admission_observation actual, sentinel;
+    memset(&actual, 0xa5, sizeof(actual));
+    memset(&sentinel, 0xa5, sizeof(sentinel));
+    read_policy_prepare(&o, &b);
+    if (fault == 1) policy_change(pol.readback, &pol.readback_size, "\"right\":8080", "\"right\":8081");
+    if (fault == 2) { char *handle = strstr(up.host_output[2], "7001"); CHECK(handle); handle[3] = '2'; }
+    if (fault == 3) rt.fault = 3;
+    if (fault == 4) pol.fault = 2;
+    if (fault == 5) policy_worker.cancel_at_host_eof = 1;
+    if (fault == 6) o.uplink->host_path->verified = 0;
+    if (fault == 7) policy_worker.expire_at_host_eof = 1;
+    int result = oci_admission_read_published(&o, &scope, 3000, &actual);
+    if (!fault) {
+      CHECK(result == 0 && !strcmp(actual.init.native_id, o.id));
+      CHECK(actual.init.namespace_device == o.identity.device && actual.init.namespace_inode == o.identity.inode);
+      CHECK(oci_egress_same_stat(&actual.topology, &o.uplink->file_identity));
+      CHECK(policy_worker.go[0] == 1 && policy_worker.go[1] == 1 && rt.joins[0] == 1 && rt.joins[1] == 1);
+      CHECK(!policy_worker.kills[0] && !policy_worker.kills[1]);
+    } else {
+      CHECK(result < 0 && !memcmp(&actual, &sentinel, sizeof(actual)));
+      if (fault == 1) CHECK(policy_worker.go[0] == 1 && !policy_worker.go[1]);
+      if (fault == 4 || fault == 6) CHECK(!policy_worker.go[0] && !policy_worker.go[1]);
+      if (fault == 6) CHECK(!policy_worker.spawns && !read_model.lock_opens);
+      if (fault == 7) CHECK(eg.advance_ms == 2000 && policy_worker.go[1] == 1 && policy_worker.kills[1] == 1);
+      if (fault == 3) CHECK(scope.workers[0].pidfd == 480 && scope.workers[0].wait_attempted && rt.joins[0] == 1);
+    }
+    CHECK(!scope.uplink.scratch && !scope.uplink.ready);
+    CHECK(o.uplink->host_path->handle == 7001 && !o.uplink->host_path->unknown);
+    CHECK(!o.policy->observed_packets[0] && !o.policy->observed_quota);
+    original_untouched(&o, &b);
+    oci_cancel_requested = 0;
+    struct tns_oci_init_reaped reaped;
+    CHECK(tns_oci_stop_init(&o, &reaped) == 0 && ad.cuts == 1 && ad.init_signals == 1);
+    admission_discard(&o);
+  }
+}
+
 static void read_cases(void) {
   struct tns_oci_owner o;
   struct tns_owner b;
@@ -289,6 +440,7 @@ static void read_cases(void) {
 int main(void) {
   read_cases();
   read_topology_cases();
+  read_policy_cases();
   printf("isolated native uplink read model: %lu checks\n", checks);
   return 0;
 }
