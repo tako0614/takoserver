@@ -86,6 +86,35 @@ async function through(f: Fixture, predicate: () => Promise<boolean>) {
   throw Error("NONSECRET retirement boundary not reached");
 }
 
+test("normal-delete-consumer runtime application owner continues the same DELETE after verified JOIN", async () => {
+  const { f, accepted } = await live({ runtimeApplicationOwner: true });
+  try {
+    const removal = await deleting(f, accepted.resourceUid);
+    const joined = await through(
+      f,
+      async () =>
+        (await f.sql.query("SELECT state FROM tf_v2_container_start_attempts"))[0]?.state ===
+        "exited",
+    );
+    expect(joined).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+    const [checkpoint] = await f.sql.query(
+      "SELECT dispatch_possible,error_code,next_attempt_at_ms,updated_at FROM tf_v2_operations WHERE id=?",
+      [removal.id],
+    );
+    expect(checkpoint).toMatchObject({ dispatch_possible: 1, error_code: null });
+    expect(
+      Number(checkpoint?.next_attempt_at_ms) - Date.parse(String(checkpoint?.updated_at)),
+    ).toBe(1_000);
+    f.advanceNormalClock(1_000);
+    expect((await f.engine.runNext())?.id).toBe(removal.id);
+    expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-stop-init@1")).toHaveLength(1);
+    expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(1);
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("normal-delete-consumer revokes management only on accepted original dispatch", async () => {
   const createCore = coreOwner.createDockerContainerCoreOwner;
   let core: ReturnType<typeof createCore> | undefined;

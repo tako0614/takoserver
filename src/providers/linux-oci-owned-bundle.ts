@@ -2954,9 +2954,22 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         (accepted.action === "delete" ||
           (accepted.action === "update" && accepted.servingConfirmedAtMs !== null))
       ) {
-        await creator.manageRetainedPeerInit(execution, cancel.signal);
+        const progress = await creator.manageRetainedPeerInit(execution, cancel.signal);
         local();
         if (trackedPeer && accepted.action === "delete") {
+          // The owning JOIN has already fenced and persisted each original exit.
+          // Namespace retirement is still pending and needs the next reconcile.
+          if (
+            runtimeApplicationOwner &&
+            progress.length > 0 &&
+            progress.every(
+              (item) =>
+                item.kind === "linux-oci-peer-init-progress@1" &&
+                item.operation === "join-init" &&
+                item.reply.kind === "linux-oci-init-reaped-observation@1",
+            )
+          )
+            return { kind: "continue" };
           await core.withExecution(execution, () =>
             core.finalizeAcceptedDelete(execution, originalNativeCustody, cancel.signal),
           );

@@ -18,6 +18,7 @@ async function live(
     producerRevision?: "missing";
     producerDigest?: "missing" | "wrong";
     localCleanup?: boolean;
+    runtimeApplicationOwner?: boolean;
     alternateHostTopology?: NonNullable<
       Parameters<typeof originalPeerDeleteFixture>[0]
     >["alternateHostTopology"];
