@@ -2974,13 +2974,16 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   function selectServingHttpRuntime(
     identity: { readonly resourceUid: string; readonly incarnationId: string },
     request: Request,
+    expectedGeneration?: number,
   ) {
     if (closed || !identity || !(request instanceof Request))
       return Promise.reject(new Error("linux_oci_owned_bundle_revoked"));
     const selected = [...httpRecords.values()].filter(
       (record) =>
         record.intent.resourceUid === identity.resourceUid &&
-        record.intent.incarnationId === identity.incarnationId,
+        record.intent.incarnationId === identity.incarnationId &&
+        (expectedGeneration === undefined ||
+          record.intent.policy.generation === expectedGeneration),
     );
     // Core's fresh serving read chooses no fallback generation. If several
     // original revisions exist, only its actual serving generation can send.
@@ -3081,13 +3084,21 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     ) {
       return selectServingHttpRuntime(identity, request).then((runtime) => runtime.fetch(request));
     },
-    /** Private caller retains this same invocation through actual terminal I/O. */
+    /** The binding has already selected a serving generation. The private
+     * caller retains this same invocation through actual terminal I/O. */
     openServingHttp(
-      identity: { readonly resourceUid: string; readonly incarnationId: string },
+      identity: {
+        readonly resourceUid: string;
+        readonly incarnationId: string;
+        readonly generation: number;
+      },
       request: Request,
       refuseIfRevoked: () => void,
     ) {
-      return selectServingHttpRuntime(identity, request).then((runtime) =>
+      const generation = identity?.generation;
+      if (!Number.isSafeInteger(generation) || generation < 1)
+        return Promise.reject(new Error("linux_oci_owned_bundle_http_custody"));
+      return selectServingHttpRuntime(identity, request, generation).then((runtime) =>
         runtime.open(request, refuseIfRevoked),
       );
     },

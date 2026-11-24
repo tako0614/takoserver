@@ -114,7 +114,11 @@ export function createLinuxOciContainerBindingSource(input: {
       )
         throw new Error("oci_binding_target_current");
       return originalOpen(
-        { resourceUid: snapshot.targetUid, incarnationId: incarnation },
+        {
+          resourceUid: snapshot.targetUid,
+          incarnationId: incarnation,
+          generation: snapshot.targetGeneration,
+        },
         request,
         refuseIfRevoked,
       );

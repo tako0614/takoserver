@@ -356,7 +356,11 @@ test("a same-claim successor reservation is confined to its issuing creator and 
         const rawRequest = new Request("http://ignored.invalid/original-claim", { signal });
         try {
           await expect(
-            fresh.openServingHttp(selector, rawRequest, () => undefined),
+            fresh.openServingHttp(
+              { ...selector, generation: original.generation },
+              rawRequest,
+              () => undefined,
+            ),
           ).rejects.toThrow(/http_custody/);
           expect(io.counts().calls).toBe(0);
         } finally {
@@ -443,7 +447,7 @@ for (const variant of ["current", "cross-namespace", "post-read stale", "caller 
           try {
             await expect(
               fresh.openServingHttp(
-                selector,
+                { ...selector, generation: original.generation },
                 new Request("http://ignored.invalid/private-held-source", { signal }),
                 () => undefined,
               ),
@@ -512,7 +516,7 @@ for (const interruption of ["before read", "during final SQL", "creator close"] 
         try {
           await expect(
             fresh.openServingHttp(
-              selector,
+              { ...selector, generation: original.generation },
               new Request("http://ignored.invalid/"),
               () => undefined,
             ),
