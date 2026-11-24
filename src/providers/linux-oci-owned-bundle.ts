@@ -3202,8 +3202,9 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                     return fail("parent_control_retained");
                   await httpProbes.get(claimId)?.close();
                   await runtime.close();
-                  // Publish the readback only after the original P stdin has
-                  // finished. A successor still waits for normal Host exit.
+                  // Save the I/O close only after the original P stdin has
+                  // finished. The successor verifies the accepted DELETE
+                  // and exact original P before issuing its first STOP.
                   await detachOriginalLinuxOciRuntimePeer(session, nativeLifetime.signal);
                   await core.saveOriginalShutdownIoClose(
                     record,
