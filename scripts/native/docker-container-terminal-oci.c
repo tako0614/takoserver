@@ -29,6 +29,9 @@
 #ifndef NS_GET_PID_FROM_PIDNS
 #define NS_GET_PID_FROM_PIDNS _IOR(NSIO, 0x6, int)
 #endif
+#ifndef PID_FS_MAGIC
+#define PID_FS_MAGIC 0x50494446 /* Linux UAPI, including v6.12 */
+#endif
 
 /* Actual CREATE/START producer library; no admission/delete/retirement grant.
  * The persistent original helper must retain this private owner after return,
@@ -701,6 +704,31 @@ int tns_oci_read_live_init(struct tns_oci_owner *o, struct tns_oci_started *star
   memcpy(started->native_id, o->id, sizeof(started->native_id));
   started->namespace_device = o->identity.device;
   started->namespace_inode = o->identity.inode;
+  return 0;
+}
+
+int tns_oci_duplicate_live_init(struct tns_oci_owner *o,
+                                struct tns_oci_live_init_descriptor *descriptor) {
+  if (!descriptor) { errno = EINVAL; return -1; }
+  struct tns_oci_live_init_descriptor observed = {0};
+  if (tns_oci_read_live_init(o, &observed.started) < 0) return -1;
+  int pidfd = fcntl(o->init_pidfd, F_DUPFD_CLOEXEC, 3);
+  if (pidfd < 0) return -1;
+  struct statfs fs;
+  struct stat st;
+  int fault = 0;
+  if (fstatfs(pidfd, &fs) < 0 || fstat(pidfd, &st) < 0) fault = errno;
+  else if (fs.f_type != PID_FS_MAGIC || !st.st_ino) fault = ESTALE;
+  else if (oci_poll_alive(pidfd) < 0 || oci_not_canceled() < 0) fault = errno;
+  if (fault) {
+    (void)close(pidfd);
+    errno = fault;
+    return -1;
+  }
+  observed.pidfd_device = (uint64_t)st.st_dev;
+  observed.pidfd_inode = (uint64_t)st.st_ino;
+  observed.pidfd = pidfd;
+  *descriptor = observed;
   return 0;
 }
 

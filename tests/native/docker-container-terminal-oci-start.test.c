@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
@@ -24,13 +25,21 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+static int raw_close(int fd);
+static ssize_t raw_send(int fd, const void *bytes, size_t size, int flags);
+static ssize_t raw_sendmsg(int fd, const struct msghdr *message, int flags);
+#define close raw_close
+#define send raw_send
+#define sendmsg raw_sendmsg
 #include "../../scripts/native/docker-container-terminal-oci-stdio.h"
+#undef sendmsg
+#undef send
+#undef close
 #include "../../scripts/native/docker-container-terminal-namespace.h"
 
 static long raw_syscall(long number, ...);
 static int raw_open(const char *path, int flags, ...);
 static int raw_openat(int dir, const char *path, int flags, ...);
-static int raw_close(int fd);
 static int raw_fcntl(int fd, int command, ...);
 static int raw_fstat(int fd, struct stat *out);
 static int raw_fstatat(int dir, const char *path, struct stat *out, int flags);
@@ -99,18 +108,26 @@ static int raw_fsync(int fd);
 enum { ROOT = 10, ROOTFS, RECEIPT, RUNTIME, BUNDLE, STATE, NETWORK,
        CREATE_PIDFD, INIT_PIDFD, INIT_PROC, STOPPED_EXE, START_PIDFD,
        CONFIG = 30, NETNS, EXE, PARENT_PIDNS = 40, PRIVATE_PIDNS,
-       SELF_PIDNS, CHILDREN_PIDNS, PARENT_OF_INIT };
+       SELF_PIDNS, CHILDREN_PIDNS, PARENT_OF_INIT, DUPLICATE_INIT_PIDFD };
 enum fault { NONE, WRONG_CONTROLLER, NOT_ROOT, CONFIG_CHANGED, BUNDLE_CHANGED,
   BIRTH_CHANGED, CLONE_FAILED, TIMED_OUT, POLL_TIMED_OUT, POLL_INTERRUPTED,
   WAIT_WRONG_PID, WAIT_LOST, CHILD_FAILED, CHILD_KILLED, SAME_EXE,
   EXE_UNREADABLE, EXE_STAT_LOST, NET_CHANGED, INIT_DEAD, LATE_CONFIG, CANCEL_AFTER_SPAWN,
   EXEC_AFTER_WAIT, EXEC_WAIT_EXIT, EXEC_WAIT_CANCEL };
+enum descriptor_fault {
+  DESCRIPTOR_CURRENT, DESCRIPTOR_UNAVAILABLE, DESCRIPTOR_STOPPED, DESCRIPTOR_DUP_LOST,
+  DESCRIPTOR_LEGACY_FD, DESCRIPTOR_STAT_LOST, DESCRIPTOR_EXITED, DESCRIPTOR_CANCELED,
+  DESCRIPTOR_SEND_LOST, DESCRIPTOR_SEND_SHORT, DESCRIPTOR_CLOSE_LOST
+};
+static const uint64_t duplicate_inode = UINT64_C(0x100000321);
 struct raw_model {
   struct tns_oci_owner *owner;
   enum fault fault;
   unsigned int clones, kills, joins, polls, birth_reads, net_reads, stops;
   int64_t milliseconds;
   unsigned int config_reads, cancel_at_config_read, exec_waits, admission_cuts;
+  enum descriptor_fault descriptor_fault;
+  unsigned int descriptor_duplicates, descriptor_closes, descriptor_refusals, descriptor_sends;
 };
 static struct raw_model model;
 static unsigned long checks;
@@ -203,6 +220,11 @@ static int raw_clock_gettime(clockid_t id, struct timespec *out) {
   return 0;
 }
 static int raw_fstat(int fd, struct stat *out) {
+  if (fd == DUPLICATE_INIT_PIDFD) {
+    if (model.descriptor_fault == DESCRIPTOR_STAT_LOST) { errno = EIO; return -1; }
+    *out = (struct stat){.st_dev = 45, .st_ino = (ino_t)duplicate_inode};
+    return 0;
+  }
   CHECK(fd >= ROOT && fd <= PARENT_OF_INIT);
   if (fd == STOPPED_EXE && model.clones && model.fault == EXE_STAT_LOST) {
     errno = EIO; return -1;
@@ -234,14 +256,33 @@ static int raw_openat(int dir, const char *path, int flags, ...) {
   return EXE;
 }
 static int raw_close(int fd) {
+  if (fd == DUPLICATE_INIT_PIDFD) {
+    model.descriptor_closes++;
+    if (model.descriptor_fault == DESCRIPTOR_CLOSE_LOST) { errno = EINTR; return -1; }
+    return 0;
+  }
   CHECK(fd == CONFIG || fd == NETNS || fd == EXE || fd == PRIVATE_PIDNS ||
         fd == SELF_PIDNS || fd == CHILDREN_PIDNS || fd == PARENT_OF_INIT);
   return 0;
 }
 static int raw_fcntl(int fd, int command, ...) {
+  if (fd == INIT_PIDFD) {
+    va_list ap;
+    va_start(ap, command); int minimum = va_arg(ap, int); va_end(ap);
+    CHECK(command == F_DUPFD_CLOEXEC && minimum == 3);
+    model.descriptor_duplicates++;
+    if (model.descriptor_fault == DESCRIPTOR_DUP_LOST) { errno = EMFILE; return -1; }
+    return DUPLICATE_INIT_PIDFD;
+  }
   CHECK(fd == EXE && command == F_DUPFD_CLOEXEC); return STOPPED_EXE;
 }
 static int raw_fstatfs(int fd, struct statfs *out) {
+  if (fd == DUPLICATE_INIT_PIDFD) {
+    memset(out, 0, sizeof(*out));
+    out->f_type = (long)(model.descriptor_fault == DESCRIPTOR_LEGACY_FD ?
+       ANON_INODE_FS_MAGIC : PID_FS_MAGIC);
+    return 0;
+  }
   CHECK(fd == NETNS || (fd >= PARENT_PIDNS && fd <= PARENT_OF_INIT));
   memset(out, 0, sizeof(*out)); out->f_type = (long)NSFS_MAGIC; return 0;
 }
@@ -265,6 +306,13 @@ static ssize_t raw_pread(int fd, void *out, size_t count, off_t offset) {
 }
 static int raw_poll(struct pollfd *p, nfds_t count, int timeout) {
   CHECK(count == 1 && p->events == POLLIN);
+  if (p->fd == DUPLICATE_INIT_PIDFD) {
+    CHECK(timeout == 0);
+    if (model.descriptor_fault == DESCRIPTOR_CANCELED) tns_oci_note_cancel();
+    int exited = model.descriptor_fault == DESCRIPTOR_EXITED;
+    p->revents = exited ? POLLIN : 0;
+    return exited;
+  }
   if (p->fd == INIT_PIDFD) {
     if (timeout > 0) {
       CHECK(model.owner->start_joined && model.owner->start_ok && model.clones == 1);
@@ -486,9 +534,72 @@ static int live_init_cases(void) {
   return 0;
 }
 
+static ssize_t raw_send(int fd, const void *bytes, size_t size, int flags) {
+  CHECK(fd == 4 && size == 8 && !memcmp(bytes, "TKOLIVN2", size));
+  CHECK(flags == (MSG_DONTWAIT | MSG_NOSIGNAL));
+  model.descriptor_refusals++;
+  return (ssize_t)size;
+}
+
+static uint64_t wire_u64(const unsigned char *bytes) {
+  uint64_t result = 0;
+  for (unsigned int i = 0; i < 8; ++i) result = (result << 8) | bytes[i];
+  return result;
+}
+
+static ssize_t raw_sendmsg(int fd, const struct msghdr *message, int flags) {
+  CHECK(fd == 4 && flags == (MSG_DONTWAIT | MSG_NOSIGNAL));
+  CHECK(message->msg_iovlen == 1 && message->msg_iov[0].iov_len == 104);
+  const unsigned char *body = message->msg_iov[0].iov_base;
+  CHECK(!memcmp(body, "TKOLIVR2", 8) && !memcmp(body + 8, model.owner->id, 64));
+  CHECK(wire_u64(body + 72) == model.owner->identity.device &&
+        wire_u64(body + 80) == model.owner->identity.inode);
+  CHECK(wire_u64(body + 88) == 45 && wire_u64(body + 96) == duplicate_inode);
+  CHECK(message->msg_controllen == CMSG_SPACE(sizeof(int)));
+  struct cmsghdr *control = CMSG_FIRSTHDR(message);
+  CHECK(control && control->cmsg_level == SOL_SOCKET && control->cmsg_type == SCM_RIGHTS &&
+        control->cmsg_len == CMSG_LEN(sizeof(int)));
+  int descriptor;
+  memcpy(&descriptor, CMSG_DATA(control), sizeof(descriptor));
+  CHECK(descriptor == DUPLICATE_INIT_PIDFD && !model.descriptor_closes);
+  model.descriptor_sends++;
+  if (model.descriptor_fault == DESCRIPTOR_SEND_LOST) { errno = EAGAIN; return -1; }
+  return model.descriptor_fault == DESCRIPTOR_SEND_SHORT ? 103 : 104;
+}
+
+static int live_init_descriptor_cases(void) {
+  for (enum descriptor_fault fault = DESCRIPTOR_CURRENT; fault <= DESCRIPTOR_CLOSE_LOST; ++fault) {
+    struct tns_oci_owner owner, prior;
+    struct tns_oci_started started;
+    initialize(&owner, NONE);
+    CHECK(tns_oci_start(&owner, &started) == 0);
+    model.descriptor_fault = fault;
+    if (fault == DESCRIPTOR_STOPPED) owner.init_stop_attempt = 1;
+    memcpy(&prior, &owner, sizeof(prior));
+    unsigned int clones = model.clones, stops = model.stops, joins = model.joins;
+    unsigned int kills = model.kills, cuts = model.admission_cuts;
+    volatile sig_atomic_t interrupted = 0;
+    int result = tns_ocip_reply_live_init_descriptor(4, &owner,
+      fault == DESCRIPTOR_UNAVAILABLE, &interrupted);
+    CHECK(result == (fault >= DESCRIPTOR_SEND_LOST ? -1 : 0));
+    int send = fault == DESCRIPTOR_CURRENT || fault >= DESCRIPTOR_SEND_LOST;
+    int duplicate = fault != DESCRIPTOR_UNAVAILABLE && fault != DESCRIPTOR_STOPPED;
+    CHECK(model.descriptor_sends == (unsigned int)send &&
+          model.descriptor_refusals == (unsigned int)!send);
+    CHECK(model.descriptor_duplicates == (unsigned int)duplicate &&
+          model.descriptor_closes == (unsigned int)(duplicate && fault != DESCRIPTOR_DUP_LOST));
+    CHECK(!memcmp(&owner, &prior, sizeof(owner)) && model.clones == clones &&
+          model.stops == stops && model.joins == joins && model.kills == kills &&
+          model.admission_cuts == cuts);
+  }
+  printf("actual held-init PIDFD descriptor producer: %lu boundary checks\n", checks);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--late-cancel")) return late_cancel_cases();
   if (argc == 2 && !strcmp(argv[1], "--read-live-init")) return live_init_cases();
+  if (argc == 2 && !strcmp(argv[1], "--duplicate-live-init")) return live_init_descriptor_cases();
   if (argc != 1) return 2;
   start_cases(); exec_wait_cases(); parser_cases();
   printf("actual OCI START body + closed parser raw model: %lu checks\n", checks);

@@ -57,6 +57,7 @@ enum { OCIP_LIVE_INIT_FD = 4, OCIP_LIVE_INIT_REPLY = 88, OCIP_LIVE_INIT_TIMEOUT 
 static const unsigned char ocip_live_init_request[] = "TKOLIVE1";
 static const unsigned char ocip_live_init_ok[] = "TKOLIVR1";
 static const unsigned char ocip_live_init_refused[] = "TKOLIVN1";
+static const unsigned char ocip_live_init_descriptor_request[] = "TKOLIVE2";
 
 static int ocip_live_init_channel(int fd) {
   struct stat st;
@@ -65,15 +66,13 @@ static int ocip_live_init_channel(int fd) {
   return fcntl(fd, F_SETFD, FD_CLOEXEC);
 }
 
-static void ocipp_put64(unsigned char *p, uint64_t value) {
-  for (unsigned int i = 0; i < 8; ++i) { p[7 - i] = (unsigned char)value; value >>= 8; }
-}
-
 static int ocip_live_init_read(int fd, struct tns_oci_owner *owner, int unavailable) {
   unsigned char request[sizeof(ocip_live_init_request) - 1];
   ssize_t n = recv(fd, request, sizeof(request), MSG_DONTWAIT | MSG_TRUNC);
-  if (n != (ssize_t)sizeof(request) || memcmp(request, ocip_live_init_request, sizeof(request)))
-    return -1;
+  if (n != (ssize_t)sizeof(request)) return -1;
+  if (!memcmp(request, ocip_live_init_descriptor_request, sizeof(request)))
+    return tns_ocip_reply_live_init_descriptor(fd, owner, unavailable, &interrupted);
+  if (memcmp(request, ocip_live_init_request, sizeof(request))) return -1;
   unsigned char reply[OCIP_LIVE_INIT_REPLY];
   const size_t tag = sizeof(ocip_live_init_ok) - 1;
   struct tns_oci_started observed;
@@ -538,6 +537,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-result")) return ocipp_connector_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-application-owner")) return ocipp_application_connector_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-read-live-init")) return ocipp_live_init_connector_main();
+  if (argc == 2 && !strcmp(argv[1], "--parent-peer-hold-live-init")) return ocipp_held_init_main();
   if (argc == 2 && !strcmp(argv[1], "--parent-peer-manage-init")) return ocipp_connector_management_main();
   int live_init_fd = argc == 2 && !strcmp(argv[1], "--selected-runtime-live-init-owner") ?
     OCIP_LIVE_INIT_FD : -1;
