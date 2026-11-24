@@ -166,7 +166,8 @@ export interface DockerContainerCoreOwnerOptions {
     | "sealed-peer@1"
     | "sealed-peer-runtime@1"
     | "sealed-peer-local-cleanup@1"
-    | "sealed-peer-application-owner@1";
+    | "sealed-peer-application-owner@1"
+    | "sealed-peer-runtime-application-owner@1";
   readonly configuredInputs?: {
     readonly keyring: HostedContainerSecretKeyring;
     readonly maxSecretBytes: number;
@@ -199,7 +200,7 @@ export interface DockerContainerCoreOwner {
     record: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
-  ): Promise<LinuxOciApplicationOwnerExit | LinuxOciParentHResult>;
+  ): Promise<LinuxOciApplicationOwnerExit | LinuxOciParentHResult | LinuxOciPeerInitProgress>;
   manageAcceptedPeerInit(
     execution: V2Execution,
     record: DockerContainerCreateRecord,
@@ -637,6 +638,10 @@ export function createDockerContainerCoreOwner(
   const { sql, clock, installationId, backendId, targetKey } = options;
   const parentMode = options.ociParentControl;
   const qualifiedPhysicalDigest = options.qualifiedPhysicalDigest;
+  const runtimeApplicationOwner = parentMode === "sealed-peer-runtime-application-owner@1";
+  const trackedPeer = parentMode === "sealed-peer-runtime@1" || runtimeApplicationOwner;
+  const applicationOwnerPeer =
+    parentMode === "sealed-peer-application-owner@1" || runtimeApplicationOwner;
   const topologies = snapshotLinuxOciTopologyPair(
     options.hostTopology,
     options.alternateHostTopology,
@@ -647,20 +652,22 @@ export function createDockerContainerCoreOwner(
   )
     return fail();
   if (
-    qualifiedPhysicalDigest !== undefined &&
-    !/^sha256:[a-f0-9]{64}$/u.test(qualifiedPhysicalDigest)
+    (runtimeApplicationOwner && qualifiedPhysicalDigest === undefined) ||
+    (qualifiedPhysicalDigest !== undefined &&
+      !/^sha256:[a-f0-9]{64}$/u.test(qualifiedPhysicalDigest))
   )
     return fail();
   const peerMode =
     parentMode === "sealed-peer@1" ||
-    parentMode === "sealed-peer-runtime@1" ||
+    trackedPeer ||
     parentMode === "sealed-peer-local-cleanup@1" ||
-    parentMode === "sealed-peer-application-owner@1";
+    applicationOwnerPeer;
   // Keep the existing durable peer domain/shape. The authenticated inner
   // purpose below fixes the original pre-CREATE profile without DDL retrofit.
   const peerPurpose = "takoserver.linux-oci-parent-peer-control@1";
-  const peerReconstructionPurpose =
-    parentMode === "sealed-peer-application-owner@1"
+  const peerReconstructionPurpose = runtimeApplicationOwner
+    ? "takoserver.linux-oci-peer-runtime-application-owner-reconstruction@1"
+    : parentMode === "sealed-peer-application-owner@1"
       ? "takoserver.linux-oci-peer-application-owner-reconstruction@1"
       : parentMode === "sealed-peer-local-cleanup@1"
         ? "takoserver.linux-oci-peer-local-cleanup-reconstruction@1"
@@ -871,7 +878,7 @@ export function createDockerContainerCoreOwner(
   function retiredDeleteProof(proof: Proof, alias: "a" | "la"): boolean {
     return (
       alias === "a" &&
-      parentMode === "sealed-peer-runtime@1" &&
+      trackedPeer &&
       proof.q_state === "removed" &&
       proof.la_action === "delete" &&
       proof.i_retire_operation_id === proof.la_operation_id &&
@@ -2971,12 +2978,13 @@ export function createDockerContainerCoreOwner(
       if (peerMode && (!isJsonObject(binding) || binding.purpose !== peerReconstructionPurpose))
         return fail();
       const finalProducer =
-        parentMode === "sealed-peer-runtime@1" &&
+        trackedPeer &&
         qualifiedPhysicalDigest !== undefined &&
         isJsonObject(binding) &&
         own(binding.retirementProducer, ["revision", "digest"]) &&
         binding.retirementProducer.revision === "NCLOSE01" &&
         binding.retirementProducer.digest === qualifiedPhysicalDigest;
+      if (runtimeApplicationOwner && !finalProducer) return fail();
       if (JSON.stringify(binding) !== new TextDecoder("utf-8", { fatal: true }).decode(plaintext))
         return fail();
       await assertSnapshot(loaded.proof);
@@ -3120,9 +3128,7 @@ export function createDockerContainerCoreOwner(
       let missingApplicationDocument: string | null | undefined;
       let sealedCloseResume: LinuxOciSealedApplicationCloseResume | undefined;
       if (
-        (parentMode === "sealed-peer-runtime@1" ||
-          parentMode === "sealed-peer-local-cleanup@1" ||
-          parentMode === "sealed-peer-application-owner@1") &&
+        (trackedPeer || parentMode === "sealed-peer-local-cleanup@1" || applicationOwnerPeer) &&
         phase === "remove" &&
         (await inspectV2ContainerOwnerSelectedSchema(sql, "application-io"))
       ) {
@@ -3141,10 +3147,7 @@ export function createDockerContainerCoreOwner(
           const document = closed[0]?.application_io_cleanup;
           if (document === null || document === V2_CONTAINER_APPLICATION_IO_RESERVED) {
             if (management === "application-recovery") missingApplicationDocument = document;
-          } else if (
-            parentMode === "sealed-peer-runtime@1" &&
-            closed[0]?.allocation_cleanup === "untouched"
-          ) {
+          } else if (trackedPeer && closed[0]?.allocation_cleanup === "untouched") {
             // A previously sealed close can resume the exact original P only
             // after fresh same-operation, key, lease, row, and AEAD checks.
             // P still independently refuses an attached frontend or foreign
@@ -3303,7 +3306,7 @@ export function createDockerContainerCoreOwner(
       }
       if (management === "application-recovery" && !sealedCloseResume) {
         if (
-          parentMode !== "sealed-peer-application-owner@1" ||
+          !applicationOwnerPeer ||
           phase !== "remove" ||
           missingApplicationDocument === undefined ||
           !(await inspectV2ContainerOwnerSelectedSchema(sql, "allocation"))
@@ -3971,7 +3974,8 @@ export function createDockerContainerCoreOwner(
       if (
         !observation ||
         (observation.kind !== "linux-oci-parent-application-owner-exited@1" &&
-          (observation.kind !== "linux-oci-parent-h-exited@1" || observation.error !== 0))
+          (observation.kind !== "linux-oci-parent-h-exited@1" || observation.error !== 0) &&
+          !(runtimeApplicationOwner && observation.kind === "linux-oci-peer-init-progress@1"))
       )
         return fail();
       return observation;
@@ -3994,7 +3998,7 @@ export function createDockerContainerCoreOwner(
     },
     async finalizeAcceptedDelete(execution, originalCustody, signal) {
       if (
-        parentMode !== "sealed-peer-runtime@1" ||
+        !trackedPeer ||
         execution.action !== "delete" ||
         signal.aborted ||
         !(await inspectV2ContainerOwnerSelectedSchema(sql, "final-delete"))

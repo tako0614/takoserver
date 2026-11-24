@@ -50,7 +50,7 @@ struct ocipp_owner {
   /* Fixed bootstrap3/held-executable H selection before first CREATE. */
   unsigned int runtime_first;
   uint64_t self_device, self_inode; char boot_id[37];
-  /* Fresh profile5 only: actual original stdin peer AND birth-parent relation.
+  /* Application-owner profiles: actual original stdin peer AND birth-parent relation.
    * This held pidfd is not our child and is never passed to consuming wait. */
   int application_pidfd;
   pid_t application_parent;
@@ -287,11 +287,16 @@ static int ocipp_application_state(struct ocipp_owner *o) {
   return ready; /* pidfs readiness: whole process exit, never consuming wait */
 }
 static int ocipp_application_peer_bootstrap(struct ocipp_owner *o,
-                                           const unsigned char *p,size_t size) {
-  if (!p || size != 112 || memcmp(p,"TKOBIND5",8)) { errno=EPROTO; return -1; }
+                                            const unsigned char *p, size_t size,
+                                            int tracked) {
+  if (!p || size != 112 || memcmp(p, tracked ? "TKOBIND6" : "TKOBIND5", 8)) {
+    errno = EPROTO; return -1;
+  }
   pid_t parent = getppid();
-  unsigned char original[112]; memcpy(original,p,sizeof(original));memcpy(original,"TKOBIND4",8);
-  int result = ocipp_local_peer_bootstrap(o,original,sizeof(original));
+  unsigned char original[112]; memcpy(original, p, sizeof(original));
+  memcpy(original, tracked ? "TKOBIND3" : "TKOBIND4", 8);
+  int result = tracked ? ocipp_runtime_peer_bootstrap(o, original, sizeof(original)) :
+                         ocipp_local_peer_bootstrap(o, original, sizeof(original));
   explicit_bzero(original,sizeof(original));
   if (result < 0 || o->application_attempt) return -1;
   o->application_attempt=1; /* before the sole original-peer pidfd acquisition */
@@ -320,15 +325,20 @@ unknown:
   o->application_unknown=1; errno=ESTALE; return -1;
 }
 static int ocipp_application_peer_bootstrap_reply(struct ocipp_owner *o) {
-  if (ocipp_application_state(o)!=0 || o->attempted || o->create) return -1;
-  unsigned char bytes[160]={0,0,0,156};
-  memcpy(bytes+4,"TKOINFO5",8);memcpy(bytes+12,o->claim,64);
+  if (ocipp_application_state(o) != 0 || o->attempted || o->create ||
+      (o->runtime_first != 1 && o->runtime_first != 2)) return -1;
+  int tracked = o->runtime_first == 1;
+  unsigned char bytes[168] = {0};
+  size_t size = tracked ? sizeof(bytes) : 160;
+  bytes[3] = (unsigned char)(size - 4);
+  memcpy(bytes + 4, tracked ? "TKOINFO6" : "TKOINFO5", 8); memcpy(bytes + 12, o->claim, 64);
   ocipp_put64(bytes+76,o->generation);ocipp_put64(bytes+84,o->listener_cookie);
   ocipp_put64(bytes+92,o->self_device);ocipp_put64(bytes+100,o->self_inode);
   memcpy(bytes+108,o->boot_id,36);
   ocipp_put64(bytes+144,o->application_device);ocipp_put64(bytes+152,o->application_inode);
+  if (tracked) memcpy(bytes + 160, "NCLOSE01", 8);
   int64_t now=ocip_now();if(now<0)return -1;
-  return ocip_io(1,bytes,sizeof(bytes),1,0,now+4000);
+  return ocip_io(1,bytes,size,1,0,now+4000);
 }
 /* TKOINFO2 is original info plus devBE64/inoBE64/canonical boot UUID36.
  * These are interval identity facts, no H/CREATE/SQL/retirement permission. */
@@ -794,14 +804,14 @@ static int ocipp_main(void) {
   unsigned char *body = NULL; uint32_t size = 0;
   if (ocip_read(&body, &size)) { if (body) { explicit_bzero(body, size); free(body); } return 77; }
   struct ocipp_owner *o = calloc(1, sizeof(*o));
-  int prepared = !o ? -1 : ocipp_peer_mode == 4 ?
-    ocipp_application_peer_bootstrap(o, body, size) : ocipp_peer_mode == 3 ?
+  int prepared = !o ? -1 : ocipp_peer_mode >= 4 ?
+    ocipp_application_peer_bootstrap(o, body, size, ocipp_peer_mode == 5) : ocipp_peer_mode == 3 ?
     ocipp_local_peer_bootstrap(o, body, size) : ocipp_peer_mode == 2 ?
     ocipp_runtime_peer_bootstrap(o, body, size) : ocipp_peer_mode ?
     ocipp_peer_bootstrap(o, body, size) : ocipp_bootstrap(o, body, size);
   explicit_bzero(body, size); free(body);
   if (prepared < 0) return 77; /* No H has been created or sent any bytes. */
-  if ((ocipp_peer_mode == 4 ? ocipp_application_peer_bootstrap_reply(o) :
+  if ((ocipp_peer_mode >= 4 ? ocipp_application_peer_bootstrap_reply(o) :
        ocipp_peer_mode >= 2 ? ocipp_runtime_peer_bootstrap_reply(o) :
        ocipp_peer_mode ? ocipp_peer_bootstrap_reply(o) : ocipp_bootstrap_reply(o)) < 0) return 77;
   /* This SAME P stays alive after Host loss AND after a known H exit. Facts and
@@ -1069,4 +1079,5 @@ static int ocipp_peer_main(void) { ocipp_peer_mode = 1; return ocipp_main(); }
 static int ocipp_runtime_peer_main(void) { ocipp_peer_mode = 2; return ocipp_main(); }
 static int ocipp_local_peer_main(void) { ocipp_peer_mode = 3; return ocipp_main(); }
 static int ocipp_application_peer_main(void) { ocipp_peer_mode = 4; return ocipp_main(); }
+static int ocipp_runtime_application_peer_main(void) { ocipp_peer_mode = 5; return ocipp_main(); }
 #endif

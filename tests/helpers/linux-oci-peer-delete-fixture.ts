@@ -18,6 +18,7 @@ async function fixture(
     producerDigest?: "missing" | "wrong";
     localCleanup?: boolean;
     applicationOwner?: boolean;
+    runtimeApplicationOwner?: boolean;
     configuredPeer?: boolean;
     alternateHostTopology?: NonNullable<
       Parameters<typeof originalOwnedOciFixture>[1]
@@ -81,6 +82,7 @@ async function fixture(
       ...(options.producerDigest === undefined ? {} : { producerDigest: options.producerDigest }),
       ...(options.localCleanup ? { parentPeerLocal: true } : {}),
       ...(options.applicationOwner ? { parentPeerApplicationOwner: true } : {}),
+      ...(options.runtimeApplicationOwner ? { parentPeerRuntimeApplicationOwner: true } : {}),
       ...(options.pending === undefined ? {} : { peerPending: options.pending }),
       ...(options.normal === undefined ? {} : { normalBackend: options.normal }),
       ...(options.managementFault === undefined

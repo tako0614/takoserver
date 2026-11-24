@@ -212,7 +212,11 @@ static long parent_syscall(long number, ...) {
   CHECK(number==SYS_execveat && pm.child);
   int fd=va_arg(ap,int);const char *path=va_arg(ap,const char*);
   char *const *args=va_arg(ap,char*const*),*const *env=va_arg(ap,char*const*);int flags=va_arg(ap,int);
-  CHECK(fd==3 && !*path && !strcmp(args[0],"docker-container-terminal-oci") && !args[1] && !env[0] && flags==AT_EMPTY_PATH);
+  CHECK(fd==3 && !*path && !strcmp(args[0],"docker-container-terminal-oci") && !env[0] && flags==AT_EMPTY_PATH);
+  if (cloned_image.runtime_first)
+    CHECK(args[1] && !strcmp(args[1], cloned_image.runtime_first == 1 ?
+          "--selected-runtime-owner" : "--selected-runtime-local-cleanup-owner") && !args[2]);
+  else CHECK(!args[1]);
   CHECK(pm.ranges==1 && pm.duplicates==4);pm.execs++;va_end(ap);longjmp(parent_jump,1);
 }
 static int parent_prctl(int option,...) {
@@ -640,11 +644,15 @@ static void authentication_bounds_only(void) {
   CHECK(o.candidate<0 && o.frontend<0 && !o.authentication_used && pm.frontend_reads==1);
   CHECK(pm.closes[91]==1 && !pm.clones && !pm.sent_size);dispose_fixture(&o);
 }
-static void prepare_peer_parent(struct ocipp_owner *o) {
+static void prepare_peer_fixture(struct ocipp_owner *o) {
   memset(&pm,0,sizeof(pm));ocipp_interrupted=0;pm.sent=calloc(1,TNS_OCI_MAX_JSON+4);
   pm.frontend_sent=calloc(1,TNS_OCI_MAX_JSON+1024);CHECK(pm.sent && pm.frontend_sent);
   pm.instance_cookie=UINT64_C(0xfedcba9876543210);pm.self_inode=pm.peer_inode=UINT64_C(0x1000000000000123);
-  memset(o,0,sizeof(*o));unsigned char body[112];memcpy(body,"TKOBIND2",8);memcpy(body+8,CLAIM,64);
+  memset(o,0,sizeof(*o));
+}
+static void prepare_peer_parent(struct ocipp_owner *o) {
+  prepare_peer_fixture(o);
+  unsigned char body[112];memcpy(body,"TKOBIND2",8);memcpy(body+8,CLAIM,64);
   ocipp_put64(body+72,1);memset(body+80,0xa5,32);
   CHECK(ocipp_peer_bootstrap(o,body,sizeof(body))==0 && pm.self_opens==1 && !pm.clones);
   CHECK(ocipp_peer_bootstrap_reply(o)==0 && pm.delivered_size==144 && !pm.sent_size);
@@ -654,6 +662,70 @@ static void peer_request(const struct ocipp_owner *o,unsigned char request[172])
   memcpy(request,"TKOPEER2",8);memcpy(request+8,o->claim,64);ocipp_put64(request+72,o->generation);
   ocipp_put64(request+80,o->listener_cookie);memcpy(request+88,o->capability,32);
   ocipp_put64(request+120,o->self_device);ocipp_put64(request+128,o->self_inode);memcpy(request+136,o->boot_id,36);
+}
+static void application_peer_profile(int tracked) {
+  struct ocipp_owner o;
+  prepare_peer_fixture(&o);
+  pm.application_profile = 1;
+  pm.application_inode = UINT64_C(0x1000000000000456);
+  unsigned char body[112];
+  memcpy(body, tracked ? "TKOBIND6" : "TKOBIND5", 8);
+  memcpy(body + 8, CLAIM, 64);
+  ocipp_put64(body + 72, 1);
+  memset(body + 80, 0xa5, 32);
+  CHECK(ocipp_application_peer_bootstrap(&o, body, sizeof(body), !tracked) < 0 && errno == EPROTO);
+  CHECK(!pm.self_opens && !pm.application_gets && !pm.clones && !pm.delivered_size);
+  CHECK(ocipp_application_peer_bootstrap(&o, body, sizeof(body), tracked) == 0);
+  CHECK(o.runtime_first == (tracked ? 1u : 2u) && pm.self_opens == 1 && pm.application_gets == 1);
+  CHECK(ocipp_application_peer_bootstrap_reply(&o) == 0 && !pm.clones && !pm.sent_size);
+  uint32_t size = 0;
+  CHECK(tns_ocip_frame(pm.delivered, &size) == 0 && size == (tracked ? 164u : 156u));
+  CHECK(pm.delivered_size == size + 4u && !memcmp(pm.delivered + 4, tracked ? "TKOINFO6" : "TKOINFO5", 8));
+  CHECK(!memcmp(pm.delivered + 12, CLAIM, 64) && ocipp_u64(pm.delivered + 76) == 1);
+  CHECK(ocipp_u64(pm.delivered + 84) == pm.instance_cookie && ocipp_u64(pm.delivered + 92) == 42);
+  CHECK(ocipp_u64(pm.delivered + 100) == pm.self_inode && !memcmp(pm.delivered + 108, o.boot_id, 36));
+  CHECK(ocipp_u64(pm.delivered + 144) == 42 && ocipp_u64(pm.delivered + 152) == pm.application_inode);
+  if (tracked) CHECK(!memcmp(pm.delivered + 160, "NCLOSE01", 8));
+  CHECK(ocipp_first_create(&o, (const unsigned char *)valid, (uint32_t)strlen(valid)) == 0);
+  CHECK(ocipp_spawn(&o) == 0 && ocipp_flush_input(&o) == 0);
+  pm.child = 1;
+  int jumped = setjmp(parent_jump);
+  if (!jumped) ocipp_child(&cloned_image);
+  CHECK(jumped == 1 && pm.execs == 1);
+  pm.child = 0;
+
+  ocipp_host_lost(&o);
+  authenticate_frontend(&o, 0);
+  pm.connector_size = o.management_size;
+  memcpy(pm.connector_reply, o.management_output, pm.connector_size);
+  auth_bytes(&o, pm.expected_auth);
+  unsigned int writes = pm.writes, waits = pm.waits;
+  static const char command[] = "{\"kind\":\"linux-oci-parent-read-application-owner@1\"}";
+  static const char refused[] = "application-owner-refused@1";
+  static const char exited[] = "application-owner-exited@1";
+  CHECK(frontend_command(&o, command) == 0);
+  CHECK(memmem(pm.frontend_sent, pm.frontend_sent_size, refused, sizeof(refused) - 1));
+  pm.frontend_sent_size = 0;
+  pm.application_dead = 1;
+  CHECK(frontend_command(&o, command) == 0);
+  CHECK(pm.connector_size + pm.frontend_sent_size <= sizeof(pm.connector_reply));
+  memcpy(pm.connector_reply + pm.connector_size, pm.frontend_sent, pm.frontend_sent_size);
+  pm.connector_size += pm.frontend_sent_size;
+  pm.connector = 1;
+  unsigned char request[172], reply[512];
+  size_t reply_size = 0;
+  struct ocipp_connector connector = {0};
+  peer_request(&o, request);
+  CHECK(ocipp_application_connector_read(&connector, request, sizeof(request), reply, &reply_size) == 0);
+  CHECK(memmem(reply, reply_size, exited, sizeof(exited) - 1));
+  CHECK(pm.cap_writes == 1 && pm.readonly_writes == 1);
+  CHECK(ocipp_connector_close(&connector) == 0);
+  ocipp_connector_free(&connector);
+  pm.connector = 0;
+  CHECK(pm.writes == writes && pm.waits == waits && o.effects == (1u << TNS_OCIP_CREATE));
+  CHECK(!o.joined && !pm.closes[71] && pm.clones == 1);
+  CHECK(ocipp_close(&o, &o.application_pidfd) == 0 && ocipp_close(&o, &o.self_pidfd) == 0);
+  dispose_fixture(&o);
 }
 static void peer_server_replies(struct ocipp_owner *o,int pending) {
   CHECK(ocipp_first_create(o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
@@ -888,6 +960,10 @@ static void peer_instance_only(void) {
   pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"runtime-application-owner")) {
+    application_peer_profile(0);application_peer_profile(1);
+    printf("runtime application-owner profiles: %lu checks\n",checks);return 0;
+  }
   if(argc==2 && !strcmp(argv[1],"peer-retirement")){peer_retirement_only();printf("new peer retirement only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-namespace")){peer_namespace_only();printf("new peer namespace only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-management")){peer_management_only();printf("new peer management only: %lu checks\n",checks);return 0;}

@@ -18,6 +18,8 @@ const INT_MAX = 2_147_483_647;
 const CLAIM = /^[a-f0-9]{64}$/u;
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
 const RETIREMENT_PRODUCER_REVISION = "NCLOSE01";
+const RUNTIME_APPLICATION_RECONSTRUCTION_PURPOSE =
+  "takoserver.linux-oci-peer-runtime-application-owner-reconstruction@1";
 function executableDigest(binary: string): string {
   const size = lstatSync(binary).size;
   if (!Number.isSafeInteger(size) || size < 1 || size > 64 * 1024 * 1024) throw failure("binary");
@@ -505,7 +507,7 @@ const parentHandoffs = new WeakMap<
   object,
   { readonly child: ChildProcessWithoutNullStreams; readonly current: () => void }
 >();
-const originalRuntime3Sessions = new WeakSet<LinuxOciPhysicalSession>();
+const originalRuntimePeerSessions = new WeakSet<LinuxOciPhysicalSession>();
 
 /** Holds its ORIGINAL child even when protocol/custody becomes unknown.
  * Its owner must retain this object; close cannot manufacture runtime deletion. */
@@ -967,11 +969,15 @@ export class LinuxOciPhysicalSession {
       throw failure("custody_retained");
   }
 
-  /** Close original runtime3 admission and detach only its idle P stdin.
+  /** Close original tracked-runtime admission and detach only its idle P stdin.
    * P/H remain alive; the caller must use the authenticated same-owner socket
    * before sending any subsequent H operation. */
   detachForPeerReconstruction(signal: AbortSignal): Promise<void> {
-    if (!originalRuntime3Sessions.has(this) || !(signal instanceof AbortSignal) || signal.aborted)
+    if (
+      !originalRuntimePeerSessions.has(this) ||
+      !(signal instanceof AbortSignal) ||
+      signal.aborted
+    )
       return Promise.reject(failure("parent_peer_retained"));
     if (this.#peerDetachState === "detached") return Promise.resolve();
     if (this.#peerDetachState === "attempted")
@@ -1317,13 +1323,13 @@ export function createLinuxOciPhysicalSession(options: {
   return new LinuxOciPhysicalSession(options);
 }
 
-/** Only a session born from this module's original runtime3 P handoff can
+/** Only a session born from this module's original tracked-runtime P handoff can
  * consume the one-shot stdin detach used by live authenticated reconstruction. */
 export function detachOriginalLinuxOciRuntimePeer(
   session: LinuxOciPhysicalSession,
   signal: AbortSignal,
 ): Promise<void> {
-  if (!originalRuntime3Sessions.has(session))
+  if (!originalRuntimePeerSessions.has(session))
     return Promise.reject(failure("parent_peer_retained"));
   return session.detachForPeerReconstruction(signal);
 }
@@ -1336,7 +1342,8 @@ export interface LinuxOciParentBootstrapInfo {
     | "linux-oci-parent-bootstrap@2"
     | "linux-oci-parent-bootstrap@3"
     | "linux-oci-parent-bootstrap@4"
-    | "linux-oci-parent-bootstrap@5";
+    | "linux-oci-parent-bootstrap@5"
+    | "linux-oci-parent-bootstrap@6";
   readonly peer?: LinuxOciParentPeerIdentity;
   readonly applicationOwner?: LinuxOciApplicationOwnerIdentity;
   readonly claimId: string;
@@ -1403,6 +1410,8 @@ export class LinuxOciParentBootstrap {
   readonly #runtimeFirst: boolean;
   readonly #localCleanup: boolean;
   readonly #applicationProfile: boolean;
+  readonly #runtimeApplicationProfile: boolean;
+  readonly #bootstrapVersion: 1 | 2 | 3 | 4 | 5 | 6;
   #retirementProducer: Readonly<{ revision: string; digest: string }> | undefined;
   #applicationOwner: LinuxOciApplicationOwnerIdentity | undefined;
   #peer: LinuxOciParentPeerIdentity | undefined;
@@ -1429,7 +1438,9 @@ export class LinuxOciParentBootstrap {
       | "pidfs64@1"
       | "pidfs64-runtime@1"
       | "pidfs64-local-cleanup@1"
-      | "pidfs64-application-owner@1";
+      | "pidfs64-application-owner@1"
+      | "pidfs64-runtime-application-owner@1";
+    readonly qualifiedPhysicalDigest?: string;
     readonly claimId: string;
     readonly generation: number;
     readonly capability: Uint8Array;
@@ -1441,14 +1452,31 @@ export class LinuxOciParentBootstrap {
       options.peerProfile !== "pidfs64@1" &&
       options.peerProfile !== "pidfs64-runtime@1" &&
       options.peerProfile !== "pidfs64-local-cleanup@1" &&
-      options.peerProfile !== "pidfs64-application-owner@1"
+      options.peerProfile !== "pidfs64-application-owner@1" &&
+      options.peerProfile !== "pidfs64-runtime-application-owner@1"
     )
       throw failure("parent_binding");
     this.#peerProfile = options.peerProfile !== undefined;
-    this.#applicationProfile = options.peerProfile === "pidfs64-application-owner@1";
+    const localApplicationProfile = options.peerProfile === "pidfs64-application-owner@1";
+    this.#runtimeApplicationProfile = options.peerProfile === "pidfs64-runtime-application-owner@1";
+    this.#applicationProfile = localApplicationProfile || this.#runtimeApplicationProfile;
     this.#localCleanup =
-      this.#applicationProfile || options.peerProfile === "pidfs64-local-cleanup@1";
-    this.#runtimeFirst = this.#localCleanup || options.peerProfile === "pidfs64-runtime@1";
+      localApplicationProfile || options.peerProfile === "pidfs64-local-cleanup@1";
+    this.#runtimeFirst =
+      this.#localCleanup ||
+      this.#runtimeApplicationProfile ||
+      options.peerProfile === "pidfs64-runtime@1";
+    this.#bootstrapVersion = this.#runtimeApplicationProfile
+      ? 6
+      : localApplicationProfile
+        ? 5
+        : this.#localCleanup
+          ? 4
+          : this.#runtimeFirst
+            ? 3
+            : this.#peerProfile
+              ? 2
+              : 1;
     this.#claim = options.claimId;
     this.#generation = options.generation;
     this.#timeout = options.timeoutMs ?? 20_000;
@@ -1479,19 +1507,30 @@ export class LinuxOciParentBootstrap {
     });
     this.#runtimeBinaryDigest =
       this.#runtimeFirst && !this.#localCleanup ? executableDigest(binary) : undefined;
+    if (this.#runtimeApplicationProfile) {
+      const qualifiedPhysicalDigest = options.qualifiedPhysicalDigest;
+      if (
+        typeof qualifiedPhysicalDigest !== "string" ||
+        !DIGEST.test(qualifiedPhysicalDigest) ||
+        this.#runtimeBinaryDigest !== qualifiedPhysicalDigest
+      )
+        throw failure("parent_binary");
+    }
     this.#assertBinary();
     this.#child = spawn(
       binary,
       [
-        this.#applicationProfile
-          ? "--persistent-parent-peer-application-owner"
-          : this.#localCleanup
-            ? "--persistent-parent-peer-local-cleanup"
-            : this.#runtimeFirst
-              ? "--persistent-parent-peer-runtime"
-              : this.#peerProfile
-                ? "--persistent-parent-peer"
-                : "--persistent-parent",
+        this.#runtimeApplicationProfile
+          ? "--persistent-parent-peer-runtime-application-owner"
+          : localApplicationProfile
+            ? "--persistent-parent-peer-application-owner"
+            : this.#localCleanup
+              ? "--persistent-parent-peer-local-cleanup"
+              : this.#runtimeFirst
+                ? "--persistent-parent-peer-runtime"
+                : this.#peerProfile
+                  ? "--persistent-parent-peer"
+                  : "--persistent-parent",
       ],
       {
         env: Object.create(null),
@@ -1529,19 +1568,7 @@ export class LinuxOciParentBootstrap {
     this.#signal = signal;
     this.#current(signal);
     const body = Buffer.alloc(112);
-    body.write(
-      this.#applicationProfile
-        ? "TKOBIND5"
-        : this.#localCleanup
-          ? "TKOBIND4"
-          : this.#runtimeFirst
-            ? "TKOBIND3"
-            : this.#peerProfile
-              ? "TKOBIND2"
-              : "TKOBIND1",
-      0,
-      "ascii",
-    );
+    body.write(`TKOBIND${this.#bootstrapVersion}`, 0, "ascii");
     body.write(this.#claim, 8, "ascii");
     body.writeBigUInt64BE(BigInt(this.#generation), 72);
     this.#capability.copy(body, 80);
@@ -1651,6 +1678,7 @@ export class LinuxOciParentBootstrap {
       !this.#peerProfile ||
       !this.#peer ||
       (this.#applicationProfile && !this.#applicationOwner) ||
+      (this.#runtimeApplicationProfile && !this.#retirementProducer) ||
       this.#sealAttempted ||
       !record(context) ||
       context.purpose !== "takoserver.linux-oci-parent-peer-control@1" ||
@@ -1680,13 +1708,15 @@ export class LinuxOciParentBootstrap {
         ...(originalAllocation === undefined
           ? {}
           : {
-              purpose: this.#applicationProfile
-                ? "takoserver.linux-oci-peer-application-owner-reconstruction@1"
-                : this.#localCleanup
-                  ? "takoserver.linux-oci-peer-local-cleanup-reconstruction@1"
-                  : this.#runtimeFirst
-                    ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
-                    : "takoserver.linux-oci-peer-reconstruction@1",
+              purpose: this.#runtimeApplicationProfile
+                ? RUNTIME_APPLICATION_RECONSTRUCTION_PURPOSE
+                : this.#applicationProfile
+                  ? "takoserver.linux-oci-peer-application-owner-reconstruction@1"
+                  : this.#localCleanup
+                    ? "takoserver.linux-oci-peer-local-cleanup-reconstruction@1"
+                    : this.#runtimeFirst
+                      ? "takoserver.linux-oci-peer-runtime-reconstruction@1"
+                      : "takoserver.linux-oci-peer-reconstruction@1",
               allocation: originalAllocation,
             }),
       }),
@@ -1738,7 +1768,7 @@ export class LinuxOciParentBootstrap {
         capability: this.#capability,
         lifetime: this.#lifetime,
         timeout: this.#timeout,
-        assertBinary: this.#assertBinary,
+        assertBinary: () => this.#assertCurrentBinary(),
         get connector() {
           return owner.#peerConnector;
         },
@@ -1783,7 +1813,7 @@ export class LinuxOciParentBootstrap {
     const observation = await session.createStopped(request, signal);
     this.assertCurrent(signal);
     this.#created = true;
-    if (this.#runtimeFirst && !this.#localCleanup) originalRuntime3Sessions.add(session);
+    if (this.#runtimeFirst && !this.#localCleanup) originalRuntimePeerSessions.add(session);
     return Object.freeze({ session, observation });
   }
 
@@ -1854,15 +1884,21 @@ export class LinuxOciParentBootstrap {
     if (!this.#usable || signal.aborted || this.#signal?.aborted || this.#lifetime?.aborted)
       throw failure("parent_retained");
     try {
-      this.#assertBinary();
-      if (
-        this.#retirementProducer &&
-        executableDigest(this.#binary) !== this.#retirementProducer.digest
-      )
-        throw failure("parent_binary");
+      this.#assertCurrentBinary();
     } catch {
       this.#break();
       throw failure("parent_binary");
+    }
+  }
+
+  #assertCurrentBinary(): void {
+    this.#assertBinary();
+    const digest = this.#runtimeApplicationProfile
+      ? this.#runtimeBinaryDigest
+      : this.#retirementProducer?.digest;
+    if (digest !== undefined) {
+      if (executableDigest(this.#binary) !== digest) throw failure("parent_binary");
+      this.#assertBinary();
     }
   }
 
@@ -1879,14 +1915,15 @@ export class LinuxOciParentBootstrap {
   #data(chunk: Buffer): void {
     if (!this.#usable || this.#handoff) return;
     try {
-      const extendedRuntime = this.#runtimeFirst && !this.#localCleanup;
-      const maximum = extendedRuntime
-        ? 148
+      const extendedRuntime = this.#bootstrapVersion === 3;
+      const expectedLength = this.#runtimeApplicationProfile
+        ? 164
         : this.#applicationProfile
           ? 156
           : this.#peerProfile
             ? 140
             : 88;
+      const maximum = extendedRuntime ? 148 : expectedLength;
       if (
         !this.#pending ||
         !Buffer.isBuffer(chunk) ||
@@ -1897,14 +1934,15 @@ export class LinuxOciParentBootstrap {
       if (this.#buffer.length < 4) return;
       const length = this.#buffer.readUInt32BE(0);
       if (
-        length !== (this.#applicationProfile ? 156 : this.#peerProfile ? 140 : 88) &&
-        !(extendedRuntime && length === 148)
+        (length !== expectedLength && !(extendedRuntime && length === 148)) ||
+        this.#buffer.length > length + 4
       )
         throw failure();
-      if (this.#buffer.length !== length + 4) return;
+      if (this.#buffer.length < length + 4) return;
       const body = this.#buffer.subarray(4);
-      if (extendedRuntime && length === 148) {
-        if (!body.subarray(140, 148).equals(Buffer.from(RETIREMENT_PRODUCER_REVISION, "ascii")))
+      if (this.#runtimeApplicationProfile || (extendedRuntime && length === 148)) {
+        const markerOffset = this.#runtimeApplicationProfile ? 156 : 140;
+        if (!body.subarray(markerOffset).equals(Buffer.from(RETIREMENT_PRODUCER_REVISION, "ascii")))
           throw failure();
         this.#assertBinary();
         const digest = this.#runtimeBinaryDigest;
@@ -1917,22 +1955,7 @@ export class LinuxOciParentBootstrap {
       }
       const cookie = body.readBigUInt64BE(80);
       if (
-        !body
-          .subarray(0, 8)
-          .equals(
-            Buffer.from(
-              this.#applicationProfile
-                ? "TKOINFO5"
-                : this.#localCleanup
-                  ? "TKOINFO4"
-                  : this.#runtimeFirst
-                    ? "TKOINFO3"
-                    : this.#peerProfile
-                      ? "TKOINFO2"
-                      : "TKOINFO1",
-              "ascii",
-            ),
-          ) ||
+        !body.subarray(0, 8).equals(Buffer.from(`TKOINFO${this.#bootstrapVersion}`, "ascii")) ||
         !body.subarray(8, 72).equals(Buffer.from(this.#claim, "ascii")) ||
         body.readBigUInt64BE(72) !== BigInt(this.#generation) ||
         cookie === 0n
@@ -1941,40 +1964,36 @@ export class LinuxOciParentBootstrap {
       if (this.#peerProfile) {
         const bootBytes = body.subarray(104, 140),
           bootId = bootBytes.toString("ascii");
-        const inode = body.readBigUInt64BE(96);
+        const device = body.readBigUInt64BE(88),
+          inode = body.readBigUInt64BE(96);
         if (
           !inode ||
+          (this.#runtimeApplicationProfile &&
+            (!device || bootId === "00000000-0000-0000-0000-000000000000")) ||
           !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(bootId) ||
           !bootBytes.equals(Buffer.from(bootId, "ascii"))
         )
           throw failure();
         this.#peer = Object.freeze({
           kind: "linux-oci-parent-peer@1",
-          device: body.readBigUInt64BE(88).toString(),
+          device: device.toString(),
           inode: inode.toString(),
           bootId,
         });
       }
       if (this.#applicationProfile) {
-        const inode = body.readBigUInt64BE(148);
-        if (!inode || !this.#peer) throw failure();
+        const device = body.readBigUInt64BE(140),
+          inode = body.readBigUInt64BE(148);
+        if (!inode || !this.#peer || (this.#runtimeApplicationProfile && !device)) throw failure();
         this.#applicationOwner = Object.freeze({
           kind: "linux-oci-application-owner@1",
-          device: body.readBigUInt64BE(140).toString(),
+          device: device.toString(),
           inode: inode.toString(),
           bootId: this.#peer.bootId,
         });
       }
       this.#info = Object.freeze({
-        kind: this.#applicationProfile
-          ? "linux-oci-parent-bootstrap@5"
-          : this.#localCleanup
-            ? "linux-oci-parent-bootstrap@4"
-            : this.#runtimeFirst
-              ? "linux-oci-parent-bootstrap@3"
-              : this.#peerProfile
-                ? "linux-oci-parent-bootstrap@2"
-                : "linux-oci-parent-bootstrap@1",
+        kind: `linux-oci-parent-bootstrap@${this.#bootstrapVersion}` as const,
         ...(this.#peer ? { peer: this.#peer } : {}),
         ...(this.#applicationOwner ? { applicationOwner: this.#applicationOwner } : {}),
         claimId: this.#claim,
@@ -2199,12 +2218,16 @@ function readOriginalPeerTransport<T>(
  * Its input is data, not authority; the original same-Sql creator owns the
  * authenticated callsite and must recheck that scope around this interval. */
 function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortSignal) {
-  const applicationProfile =
-    record(value) &&
-    value.purpose === "takoserver.linux-oci-peer-application-owner-reconstruction@1";
+  const purpose = record(value) ? value.purpose : undefined;
+  const runtimeApplicationOwner = purpose === RUNTIME_APPLICATION_RECONSTRUCTION_PURPOSE;
+  const localApplicationOwner =
+    purpose === "takoserver.linux-oci-peer-application-owner-reconstruction@1";
+  const applicationProfile = runtimeApplicationOwner || localApplicationOwner;
   const keys = [
     ...(applicationProfile ? ["applicationOwner"] : []),
-    ...(record(value) && Object.hasOwn(value, "retirementProducer") ? ["retirementProducer"] : []),
+    ...(runtimeApplicationOwner || (record(value) && Object.hasOwn(value, "retirementProducer"))
+      ? ["retirementProducer"]
+      : []),
     "kind",
     "claimId",
     "generation",
@@ -2225,10 +2248,10 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
   if (
     !exact(value, keys) ||
     value.kind !== "linux-oci-original-peer-control@1" ||
-    (value.purpose !== "takoserver.linux-oci-peer-reconstruction@1" &&
-      value.purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1" &&
-      value.purpose !== "takoserver.linux-oci-peer-local-cleanup-reconstruction@1" &&
-      value.purpose !== "takoserver.linux-oci-peer-application-owner-reconstruction@1") ||
+    (purpose !== "takoserver.linux-oci-peer-reconstruction@1" &&
+      purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1" &&
+      purpose !== "takoserver.linux-oci-peer-local-cleanup-reconstruction@1" &&
+      !applicationProfile) ||
     typeof value.claimId !== "string" ||
     !CLAIM.test(value.claimId) ||
     !integer(value.generation, 1) ||
@@ -2251,18 +2274,22 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     stat = lstatSync(binary),
     executable = value.executable;
   const producer = value.retirementProducer;
-  if (
-    producer !== undefined &&
-    (value.purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1" ||
+  let producerDigest: string | undefined;
+  if (producer !== undefined || runtimeApplicationOwner) {
+    if (
+      (!runtimeApplicationOwner &&
+        purpose !== "takoserver.linux-oci-peer-runtime-reconstruction@1") ||
       !exact(producer, ["revision", "digest"]) ||
       producer.revision !== RETIREMENT_PRODUCER_REVISION ||
       typeof producer.digest !== "string" ||
-      !DIGEST.test(producer.digest))
-  )
-    throw failure("parent_binding");
+      !DIGEST.test(producer.digest)
+    )
+      throw failure("parent_binding");
+    producerDigest = producer.digest;
+  }
   const assertBinary = () => {
     originalBinary();
-    if (producer !== undefined && executableDigest(binary) !== producer.digest)
+    if (producerDigest !== undefined && executableDigest(binary) !== producerDigest)
       throw failure("parent_binary");
     originalBinary();
   };
@@ -2305,10 +2332,10 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
   }
   const state: OriginalPeerReaderState = {
     ...(applicationOwner ? { applicationOwner } : {}),
-    runtimeFirst: value.purpose !== "takoserver.linux-oci-peer-reconstruction@1",
+    runtimeFirst: purpose !== "takoserver.linux-oci-peer-reconstruction@1",
     localCleanup:
-      applicationProfile ||
-      value.purpose === "takoserver.linux-oci-peer-local-cleanup-reconstruction@1",
+      localApplicationOwner ||
+      purpose === "takoserver.linux-oci-peer-local-cleanup-reconstruction@1",
     binary,
     claim: value.claimId,
     generation: value.generation,

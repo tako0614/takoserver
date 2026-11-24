@@ -1,14 +1,20 @@
 import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { createLinuxOciParentBootstrap } from "../src/providers/linux-oci-physical-session.ts";
+import {
+  createLinuxOciParentBootstrap,
+  prepareAuthenticatedLinuxOciApplicationOwnerReader,
+} from "../src/providers/linux-oci-physical-session.ts";
 
 // Explicit NONSECRET fixture bytes only. All spawn/streams are raw doubles;
 // no P/H, executable, AF_UNIX, key generator, database or provider is invoked.
 const CLAIM = "a".repeat(64);
 const COOKIE = 0xfedcba9876543210n;
+const HELPER_BYTES = "NONEXECUTED RAW FIXTURE";
+const HELPER_DIGEST = `sha256:${createHash("sha256").update(HELPER_BYTES).digest("hex")}`;
 const fixtureCapability = () => new Uint8Array(32).fill(0xa5);
 function info(claim = CLAIM, generation = 1n, cookie = COOKIE): Buffer {
   const frame = Buffer.alloc(92);
@@ -23,7 +29,7 @@ function fixture(timeoutMs = 40) {
   const root = mkdtempSync(join(process.env.TMPDIR ?? process.cwd(), ".oci-parent-raw-"));
   chmodSync(root, 0o700);
   const binary = join(root, "helper");
-  writeFileSync(binary, "NONEXECUTED RAW FIXTURE", { mode: 0o700 });
+  writeFileSync(binary, HELPER_BYTES, { mode: 0o700 });
   const stdin = new PassThrough(),
     stdout = new PassThrough(),
     stderr = new PassThrough();
@@ -326,6 +332,9 @@ test("binding validation and executable currentness refuse before bootstrap IO",
 // all native peer checks live in the separate actual-C syscall model.
 const PEER_BOOT = "11111111-1111-4111-8111-111111111111";
 const PEER_INODE = 0x1000000000000123n;
+const APPLICATION_INODE = 0x2000000000000456n;
+const RUNTIME_APPLICATION_PURPOSE =
+  "takoserver.linux-oci-peer-runtime-application-owner-reconstruction@1";
 function peerInfo() {
   const bytes = Buffer.alloc(144);
   bytes.writeUInt32BE(140);
@@ -338,14 +347,31 @@ function peerInfo() {
   bytes.write(PEER_BOOT, 108);
   return bytes;
 }
-function peerOpen(f: ReturnType<typeof fixture>) {
+function runtimeApplicationInfo() {
+  const bytes = Buffer.alloc(168);
+  peerInfo().copy(bytes);
+  bytes.writeUInt32BE(164);
+  bytes.write("TKOINFO6", 4);
+  bytes.writeBigUInt64BE(77n, 144);
+  bytes.writeBigUInt64BE(APPLICATION_INODE, 152);
+  bytes.write("NCLOSE01", 160);
+  return bytes;
+}
+function peerOpen(
+  f: ReturnType<typeof fixture>,
+  peerProfile: NonNullable<
+    Parameters<typeof createLinuxOciParentBootstrap>[0]["peerProfile"]
+  > = "pidfs64@1",
+  qualifiedPhysicalDigest?: string,
+) {
   return createLinuxOciParentBootstrap({
     binary: f.binary,
     claimId: CLAIM,
     generation: 1,
     capability: fixtureCapability(),
     timeoutMs: 200,
-    peerProfile: "pidfs64@1",
+    peerProfile,
+    ...(qualifiedPhysicalDigest !== undefined ? { qualifiedPhysicalDigest } : {}),
   });
 }
 async function readyPeer(f: ReturnType<typeof fixture>) {
@@ -404,18 +430,42 @@ function connectorStreams() {
     },
   };
 }
-function resultFrame(error = 0) {
-  const body = Buffer.from(
-    JSON.stringify({
-      kind: error ? "linux-oci-parent-h-result-refused@1" : "linux-oci-parent-h-exited@1",
-      error,
-      barrier: "unproven",
-    }),
-  );
+function jsonFrame(value: object) {
+  const body = Buffer.from(JSON.stringify(value));
   const bytes = Buffer.alloc(body.length + 4);
   bytes.writeUInt32BE(body.length);
   body.copy(bytes, 4);
   return bytes;
+}
+function resultFrame(error = 0) {
+  return jsonFrame({
+    kind: error ? "linux-oci-parent-h-result-refused@1" : "linux-oci-parent-h-exited@1",
+    error,
+    barrier: "unproven",
+  });
+}
+function parentCreateRequest() {
+  return {
+    allocationRoot: "/owned/allocation",
+    claimId: CLAIM,
+    installationId: "installation",
+    resourceUid: "resource",
+    incarnationId: "incarnation",
+    generation: 1,
+    revision: "revision",
+    sourceDigest: `sha256:${"1".repeat(64)}`,
+    manifestDigest: `sha256:${"2".repeat(64)}`,
+    configDigest: `sha256:${"3".repeat(64)}`,
+    archiveDigest: `sha256:${"4".repeat(64)}`,
+    args: ["/app"],
+    env: ["NONSECRET=fixture"],
+    cwd: "/",
+    uid: 0,
+    gid: 0,
+    memoryBytes: 1024,
+    nanoCpus: 10000000,
+    pidsLimit: 32,
+  };
 }
 
 test("peer instance bootstrap captures original lossless pidfs/boot before H and purpose seal keeps it", async () => {
@@ -453,32 +503,11 @@ test("peer instance bootstrap captures original lossless pidfs/boot before H and
       ["encrypt", "decrypt"],
     );
     const selected = { id: "NONSECRET-original", key };
-    const request = {
-      allocationRoot: "/owned/allocation",
-      claimId: CLAIM,
-      installationId: "installation",
-      resourceUid: "resource",
-      incarnationId: "incarnation",
-      generation: 1,
-      revision: "revision",
-      sourceDigest: `sha256:${"1".repeat(64)}`,
-      manifestDigest: `sha256:${"2".repeat(64)}`,
-      configDigest: `sha256:${"3".repeat(64)}`,
-      archiveDigest: `sha256:${"4".repeat(64)}`,
-      args: ["/app"],
-      env: ["NONSECRET=fixture"],
-      cwd: "/",
-      uid: 0,
-      gid: 0,
-      memoryBytes: 1024,
-      nanoCpus: 10000000,
-      pidsLimit: 32,
-    };
     const scope = JSON.stringify({
       purpose: "takoserver.linux-oci-parent-peer-control@1",
       claimId: CLAIM,
     });
-    const pending = parent.sealPeerControlBinding(selected, scope, signal(), request);
+    const pending = parent.sealPeerControlBinding(selected, scope, signal(), parentCreateRequest());
     selected.id = "NONSECRET-changed";
     selected.key = other;
     const sealed = await pending;
@@ -501,6 +530,189 @@ test("peer instance bootstrap captures original lossless pidfs/boot before H and
     expect(f.raw).toHaveBeenCalledTimes(1);
   } finally {
     f.cleanup();
+  }
+});
+
+test("runtime application profile seals both original identities and reads the original P application exit", async () => {
+  const f = fixture(),
+    reader = connectorStreams(),
+    lifetime = new AbortController();
+  try {
+    const parent = peerOpen(f, "pidfs64-runtime-application-owner@1", HELPER_DIGEST);
+    const bootstrapped = parent.bootstrap(signal());
+    await wrote();
+    expect(f.raw).toHaveBeenCalledWith(
+      f.binary,
+      ["--persistent-parent-peer-runtime-application-owner"],
+      { env: {}, shell: false, stdio: ["pipe", "pipe", "pipe"] },
+    );
+    const bind = Buffer.alloc(116);
+    bind.writeUInt32BE(112);
+    bind.write("TKOBIND6", 4);
+    bind.write(CLAIM, 12);
+    bind.writeBigUInt64BE(1n, 76);
+    bind.set(fixtureCapability(), 84);
+    expect(f.writes).toEqual([bind]);
+    for (const byte of runtimeApplicationInfo()) f.stdout.write(Buffer.from([byte]));
+    const original = await bootstrapped;
+    const applicationOwner = {
+      kind: "linux-oci-application-owner@1",
+      device: "77",
+      inode: APPLICATION_INODE.toString(),
+      bootId: PEER_BOOT,
+    } as const;
+    expect(original.kind).toBe("linux-oci-parent-bootstrap@6");
+    expect(original.peer?.inode).toBe(PEER_INODE.toString());
+    expect(original.applicationOwner).toEqual(applicationOwner);
+    const key = await crypto.subtle.importKey("raw", fixtureCapability(), "AES-GCM", false, [
+      "encrypt",
+      "decrypt",
+    ]);
+    const codec = await import("../src/providers/container-secret-codec.ts");
+    const scope = JSON.stringify({ purpose: "takoserver.linux-oci-parent-peer-control@1" });
+    const allocation = { fixture: true };
+    const sealed = await parent.sealPeerControlBinding(
+      { id: "NONSECRET-original", key },
+      scope,
+      signal(),
+      parentCreateRequest(),
+      allocation,
+    );
+    const plaintext = await codec.decryptContainerSecretBytes(
+      key,
+      codec.decodeContainerSecretBytes(sealed.nonce),
+      codec.decodeContainerSecretBytes(sealed.ciphertext),
+      new TextEncoder().encode(scope),
+    );
+    const value = JSON.parse(new TextDecoder().decode(plaintext)) as Record<string, unknown>;
+    plaintext.fill(0);
+    expect(value).toMatchObject({
+      purpose: RUNTIME_APPLICATION_PURPOSE,
+      peer: original.peer,
+      applicationOwner,
+      allocation,
+      retirementProducer: {
+        revision: "NCLOSE01",
+        digest: HELPER_DIGEST,
+      },
+    });
+    for (const name of ["applicationOwner", "retirementProducer"]) {
+      const missing = { ...value };
+      delete missing[name];
+      expect(() =>
+        prepareAuthenticatedLinuxOciApplicationOwnerReader(f.binary, missing, lifetime.signal),
+      ).toThrow("parent_binding");
+    }
+    expect(f.raw).toHaveBeenCalledTimes(1);
+    f.raw.mockReturnValueOnce(reader.child);
+    const readOwner = prepareAuthenticatedLinuxOciApplicationOwnerReader(
+      f.binary,
+      value,
+      lifetime.signal,
+    );
+    const pending = readOwner(signal());
+    await wrote();
+    expect(f.raw.mock.calls.at(-1)?.[1]).toEqual(["--parent-peer-read-application-owner"]);
+    const connectorBind = reader.writes[0];
+    expect(connectorBind?.subarray(4, 12).toString()).toBe("TKOPEER2");
+    expect(connectorBind?.readBigUInt64BE(132)).toBe(PEER_INODE);
+    const exited = {
+      ...applicationOwner,
+      kind: "linux-oci-parent-application-owner-exited@1",
+      barrier: "unproven",
+    } as const;
+    reader.stdout.write(jsonFrame(exited));
+    reader.stdout.emit("end");
+    reader.stderr.emit("end");
+    reader.child.emit("exit", 0, null);
+    reader.child.emit("close", 0, null);
+    expect(await pending).toEqual(exited);
+    await expect(readOwner(signal())).rejects.toThrow("parent_peer_retained");
+
+    expect(f.writes).toHaveLength(1);
+
+    writeFileSync(f.binary, "CHANGED RAW FIXTURE");
+    expect(() => parent.assertCurrent(signal())).toThrow("parent_binary");
+    expect(() =>
+      prepareAuthenticatedLinuxOciApplicationOwnerReader(f.binary, value, lifetime.signal),
+    ).toThrow("parent_binary");
+    expect(f.raw).toHaveBeenCalledTimes(2);
+  } finally {
+    lifetime.abort();
+    reader.close();
+    f.cleanup();
+  }
+});
+
+test("runtime application profile requires the selected executable digest before spawning", async () => {
+  const f = fixture();
+  try {
+    for (const digest of [undefined, "invalid", `sha256:${"0".repeat(64)}`]) {
+      expect(() => peerOpen(f, "pidfs64-runtime-application-owner@1", digest)).toThrow(
+        "parent_binary",
+      );
+    }
+    expect(f.raw).not.toHaveBeenCalled();
+    const parent = peerOpen(f, "pidfs64-runtime-application-owner@1", HELPER_DIGEST);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+    writeFileSync(f.binary, "CHANGED RAW FIXTURE");
+    await expect(parent.bootstrap(signal())).rejects.toThrow("parent_binary");
+    expect(f.writes).toHaveLength(0);
+    expect(f.raw).toHaveBeenCalledTimes(1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("runtime application info rejects other wire directions, sizes, and malformed fields", async () => {
+  const localApplication = runtimeApplicationInfo().subarray(0, 160);
+  localApplication.writeUInt32BE(156);
+  localApplication.write("TKOINFO5", 4);
+  const runtime = runtimeApplicationInfo().subarray(0, 152);
+  runtime.writeUInt32BE(148);
+  runtime.write("TKOINFO3", 4);
+  runtime.write("NCLOSE01", 144);
+  const bindDirection = runtimeApplicationInfo();
+  bindDirection.write("TKOBIND6", 4);
+  const oldMagic = runtimeApplicationInfo();
+  oldMagic.write("TKOINFO5", 4);
+  const wrongMarker = runtimeApplicationInfo();
+  wrongMarker.write("NCLOSE00", 160);
+  const zeroApplicationInode = runtimeApplicationInfo();
+  zeroApplicationInode.writeBigUInt64BE(0n, 152);
+  const oversized = runtimeApplicationInfo();
+  oversized.writeUInt32BE(165);
+  for (const bytes of [
+    localApplication,
+    runtime,
+    bindDirection,
+    oldMagic,
+    wrongMarker,
+    zeroApplicationInode,
+    oversized,
+    Buffer.concat([runtimeApplicationInfo(), Buffer.from([0])]),
+  ]) {
+    const f = fixture();
+    try {
+      const parent = peerOpen(f, "pidfs64-runtime-application-owner@1", HELPER_DIGEST);
+      let settled = false;
+      const rejected = parent.bootstrap(signal()).then(
+        () => undefined,
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      f.stdout.write(bytes);
+      await wrote();
+      expect(settled).toBe(true);
+      expect(await rejected).toBeInstanceOf(Error);
+      expect(f.writes).toHaveLength(1);
+      expect(f.raw).toHaveBeenCalledTimes(1);
+      expect(f.counts()).toEqual({ kills: 0, unrefs: 0, ended: 0 });
+    } finally {
+      f.cleanup();
+    }
   }
 });
 

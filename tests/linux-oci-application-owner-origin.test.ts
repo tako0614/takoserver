@@ -19,14 +19,66 @@ const exited = Object.freeze({
   bootId: "11111111-2222-4333-8444-555555555555",
   barrier: "unproven",
 });
-async function original(applicationOwner = true) {
+
+test("tracked application owner: a freshly accepted DELETE reads the original exit without accepting it as a close", async () => {
+  const f = await originalPeerDeleteFixture({
+    normal: true,
+    configuredPeer: true,
+    qualifiedProducer: true,
+    runtimeApplicationOwner: true,
+    allocationSchema: true,
+  });
+  const health = acceptedRawHttp();
+  health.onEnd(() => {
+    health.reply();
+    health.join();
+  });
+  try {
+    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })));
+    const accepted = await f.create();
+    expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
+    expect(f.nativeCounts().requests).toContain("linux-oci-parent-bootstrap@6");
+    const fresh = f.reconstructNormal();
+    try {
+      f.applicationOwnerState(true);
+      await fresh.engine.acceptDelete({
+        principal: "synthetic-oci-parent",
+        key: crypto.randomUUID(),
+        uid: accepted.resourceUid,
+        expectedGeneration: 1,
+      });
+      const before = f.nativeCounts();
+      const claim = await f.sql.query("SELECT * FROM tf_v2_container_create_claims");
+      f.advanceNormalClock(61_000);
+      expect(await fresh.engine.runNext()).toMatchObject({
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(f.nativeCounts()).toEqual({
+        processes: before.processes + 1,
+        requests: [...before.requests, "linux-oci-parent-read-application-owner@1"],
+      });
+      expect(await f.sql.query("SELECT * FROM tf_v2_container_create_claims")).toEqual(claim);
+      expect(f.network).not.toHaveBeenCalled();
+    } finally {
+      await fresh.close();
+    }
+  } finally {
+    health.restore();
+    await f.cleanup();
+  }
+});
+
+async function original(applicationOwner = true, runtimeApplicationOwner = false) {
   const f = await originalPeerDeleteFixture({
     normal: true,
     configuredPeer: true,
     runtimeFirst: true,
-    localCleanup: true,
+    localCleanup: !runtimeApplicationOwner,
     allocationSchema: true,
     applicationOwner,
+    runtimeApplicationOwner,
+    qualifiedProducer: runtimeApplicationOwner,
   });
   await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND.statements.map((sql) => ({ sql })));
   const health = acceptedRawHttp();
@@ -98,27 +150,33 @@ test("application-owner fresh normal reconcile consumes same original process ex
   }
 });
 
-test("application-owner original live creator keeps graceful close and STOP while its application process lives", async () => {
-  const { f } = await original();
-  try {
-    f.applicationOwnerState(false);
-    f.advanceNormalClock(61_000);
-    expect(await f.engine.runNext()).toMatchObject({ status: "reconciling", effect: "unknown" });
-    expect(f.nativeCounts().requests).toContain("linux-oci-stop-init@1");
-    expect(f.nativeCounts().requests).not.toContain("linux-oci-parent-read-application-owner@1");
-    const [claim] = await f.sql.query(
-      "SELECT application_io_cleanup,allocation_cleanup FROM tf_v2_container_create_claims",
-    );
-    if (typeof claim?.application_io_cleanup !== "string")
-      throw new Error("original application I/O close fact missing");
-    const closeFact = JSON.parse(claim.application_io_cleanup);
-    expect(closeFact.kind).toBe("linux-oci-sealed-application-io-close@1");
-    expect(closeFact.scope?.purpose).toBe("takoserver.linux-oci-application-io-close@1");
-    expect(claim.allocation_cleanup).toBe("untouched");
-  } finally {
-    await f.cleanup();
-  }
-});
+test.each([
+  ["local cleanup", false],
+  ["tracked runtime", true],
+] as const)(
+  "application-owner original live creator keeps graceful close and STOP (%s)",
+  async (_label, tracked) => {
+    const { f } = await original(true, tracked);
+    try {
+      f.applicationOwnerState(false);
+      f.advanceNormalClock(61_000);
+      expect(await f.engine.runNext()).toMatchObject({ status: "reconciling", effect: "unknown" });
+      expect(f.nativeCounts().requests).toContain("linux-oci-stop-init@1");
+      expect(f.nativeCounts().requests).not.toContain("linux-oci-parent-read-application-owner@1");
+      const [claim] = await f.sql.query(
+        "SELECT application_io_cleanup,allocation_cleanup FROM tf_v2_container_create_claims",
+      );
+      if (typeof claim?.application_io_cleanup !== "string")
+        throw new Error("original application I/O close fact missing");
+      const closeFact = JSON.parse(claim.application_io_cleanup);
+      expect(closeFact.kind).toBe("linux-oci-sealed-application-io-close@1");
+      expect(closeFact.scope?.purpose).toBe("takoserver.linux-oci-application-io-close@1");
+      expect(claim.allocation_cleanup).toBe("untouched");
+    } finally {
+      await f.cleanup();
+    }
+  },
+);
 
 test("application-owner accepted operation receives exact readonly data once without close backfill", async () => {
   const { f, row } = await original();

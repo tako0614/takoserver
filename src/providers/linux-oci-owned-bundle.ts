@@ -1420,7 +1420,17 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const hostTopology = topologies?.primary;
   if (hostTopology !== undefined && egressLimits === undefined)
     return fail("host_topology_requires_egress");
-  const core = createDockerContainerCoreOwner(options);
+  const { ociParentControl: parentMode, qualifiedPhysicalDigest } = options;
+  const runtimeApplicationOwner = parentMode === "sealed-peer-runtime-application-owner@1";
+  const core = createDockerContainerCoreOwner(
+    runtimeApplicationOwner
+      ? {
+          ...options,
+          ociParentControl: parentMode,
+          qualifiedPhysicalDigest: qualifiedPhysicalDigest ?? fail("parent_selection"),
+        }
+      : options,
+  );
   if (!options.configuredInputs) return fail("configured_inputs");
   const configured = createDockerContainerConfiguredInputs({
     sql: options.sql,
@@ -1442,12 +1452,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     return fail("invalid_request");
   if (physicalBinary !== undefined && (!text(physicalBinary) || !isAbsolute(physicalBinary)))
     return fail("invalid_request");
-  const parentMode = options.ociParentControl;
+  const trackedPeer = parentMode === "sealed-peer-runtime@1" || runtimeApplicationOwner;
+  const applicationOwnerPeer =
+    parentMode === "sealed-peer-application-owner@1" || runtimeApplicationOwner;
   const peerMode =
     parentMode === "sealed-peer@1" ||
-    parentMode === "sealed-peer-runtime@1" ||
+    trackedPeer ||
     parentMode === "sealed-peer-local-cleanup@1" ||
-    parentMode === "sealed-peer-application-owner@1";
+    applicationOwnerPeer;
   const nativeSessions = new Map<string, LinuxOciPhysicalSession>(),
     nativeBindings = new Map<string, string>();
   const parents = new Map<
@@ -1475,7 +1487,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const nativeLifetime = new AbortController();
   originalOciCustodies.set(originalNativeCustody, {
     core,
-    runtime3: parentMode === "sealed-peer-runtime@1",
+    runtime3: trackedPeer,
     artifactRoot,
     physicalBinary,
     hostTopology,
@@ -2363,7 +2375,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           const { record } = item;
           if (record.intent.policy.generation >= accepted.generation) continue;
           if (
-            parentMode === "sealed-peer-runtime@1" &&
+            trackedPeer &&
             (accepted.action === "delete" || accepted.action === "update") &&
             record.state === "removed" &&
             item.removedAtMs !== null
@@ -2406,10 +2418,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
                 | LinuxOciPeerInitProgress
                 | LinuxOciParentHResult
                 | LinuxOciApplicationOwnerExit;
-              if (
-                parentMode === "sealed-peer-application-owner@1" &&
-                !httpRuntimes.has(record.claimId)
-              ) {
+              if (applicationOwnerPeer && !httpRuntimes.has(record.claimId)) {
                 result = await core.readAcceptedApplicationRecovery(
                   execution,
                   record,
@@ -2485,15 +2494,14 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       ) {
         await creator.manageRetainedPeerInit(execution, cancel.signal);
         local();
-        if (parentMode === "sealed-peer-runtime@1" && accepted.action === "delete") {
+        if (trackedPeer && accepted.action === "delete") {
           await core.withExecution(execution, () =>
             core.finalizeAcceptedDelete(execution, originalNativeCustody, cancel.signal),
           );
           local();
           return { kind: "complete", observed: {}, output: {} };
         }
-        if (parentMode !== "sealed-peer-runtime@1" || accepted.action !== "update")
-          return unknown();
+        if (!trackedPeer || accepted.action !== "update") return unknown();
         const after = await core.withExecution(execution, () =>
           core.readAcceptedExecution(execution),
         );
@@ -2522,11 +2530,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       if (!current) {
         // A reconcile lease cannot infer that an earlier send cannot arrive.
         // Original CREATE and START run only on this first unsent dispatch.
-        if (
-          mode !== "execute" &&
-          !(parentMode === "sealed-peer-runtime@1" && accepted.action === "update")
-        )
-          return unknown();
+        if (mode !== "execute" && !(trackedPeer && accepted.action === "update")) return unknown();
         await creator.createAcceptedStopped(execution);
         local();
         await creator.startAccepted(execution);
@@ -2544,7 +2548,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       await creator.publishAcceptedServing(execution, cancel.signal);
       local();
       if (
-        parentMode === "sealed-peer-runtime@1" &&
+        trackedPeer &&
         accepted.action === "update" &&
         accepted.retained.some(
           (item) =>
@@ -2748,16 +2752,21 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         if (parentMode === "sealed-original@1" || peerMode) {
           parent = createLinuxOciParentBootstrap({
             binary: physicalBinary,
+            ...(runtimeApplicationOwner && qualifiedPhysicalDigest !== undefined
+              ? { qualifiedPhysicalDigest }
+              : {}),
             ...(peerMode
               ? {
                   peerProfile:
-                    parentMode === "sealed-peer-application-owner@1"
-                      ? ("pidfs64-application-owner@1" as const)
-                      : parentMode === "sealed-peer-local-cleanup@1"
-                        ? ("pidfs64-local-cleanup@1" as const)
-                        : parentMode === "sealed-peer-runtime@1"
-                          ? ("pidfs64-runtime@1" as const)
-                          : ("pidfs64@1" as const),
+                    parentMode === "sealed-peer-runtime-application-owner@1"
+                      ? ("pidfs64-runtime-application-owner@1" as const)
+                      : parentMode === "sealed-peer-application-owner@1"
+                        ? ("pidfs64-application-owner@1" as const)
+                        : parentMode === "sealed-peer-local-cleanup@1"
+                          ? ("pidfs64-local-cleanup@1" as const)
+                          : parentMode === "sealed-peer-runtime@1"
+                            ? ("pidfs64-runtime@1" as const)
+                            : ("pidfs64@1" as const),
                 }
               : {}),
             claimId: receipt.claimId,

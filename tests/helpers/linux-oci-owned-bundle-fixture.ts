@@ -97,6 +97,7 @@ async function fixture(
     readonly producerDigest?: "missing" | "wrong";
     readonly parentPeerLocal?: boolean;
     readonly parentPeerApplicationOwner?: boolean;
+    readonly parentPeerRuntimeApplicationOwner?: boolean;
     readonly peerPending?: boolean;
     readonly peerManagementFault?: "incomplete" | "missing-reply" | "lost-reply";
     readonly peerJoinFault?: "foreign" | "refused" | "unknown" | "pidns";
@@ -313,13 +314,15 @@ async function fixture(
       configuredInputs,
       ...(adversarial.parentPeer
         ? {
-            ociParentControl: adversarial.parentPeerApplicationOwner
-              ? ("sealed-peer-application-owner@1" as const)
-              : adversarial.parentPeerLocal
-                ? ("sealed-peer-local-cleanup@1" as const)
-                : adversarial.parentPeerRuntime
-                  ? ("sealed-peer-runtime@1" as const)
-                  : ("sealed-peer@1" as const),
+            ociParentControl: adversarial.parentPeerRuntimeApplicationOwner
+              ? ("sealed-peer-runtime-application-owner@1" as const)
+              : adversarial.parentPeerApplicationOwner
+                ? ("sealed-peer-application-owner@1" as const)
+                : adversarial.parentPeerLocal
+                  ? ("sealed-peer-local-cleanup@1" as const)
+                  : adversarial.parentPeerRuntime
+                    ? ("sealed-peer-runtime@1" as const)
+                    : ("sealed-peer@1" as const),
           }
         : adversarial.parentControl
           ? { ociParentControl: "sealed-original@1" as const }
@@ -417,6 +420,15 @@ async function fixture(
   const originalPeers = new Map<string, RawPeer>();
   let applicationOwnerExited = false;
   let applicationOwnerFault: "foreign" | "boot" | "lost" | "exit" | undefined;
+  const peerProfile = adversarial.parentPeerRuntimeApplicationOwner
+    ? { revision: 6, helper: "--persistent-parent-peer-runtime-application-owner" }
+    : adversarial.parentPeerApplicationOwner
+      ? { revision: 5, helper: "--persistent-parent-peer-application-owner" }
+      : adversarial.parentPeerLocal
+        ? { revision: 4, helper: "--persistent-parent-peer-local-cleanup" }
+        : adversarial.parentPeerRuntime
+          ? { revision: 3, helper: "--persistent-parent-peer-runtime" }
+          : { revision: 2, helper: "--persistent-parent-peer" };
   const raw = spyOn(childProcess, "spawn").mockImplementation(((
     file: string,
     args: readonly string[],
@@ -425,8 +437,7 @@ async function fixture(
     if (file === physicalBinary) {
       const managing = adversarial.parentPeer && args[0] === "--parent-peer-manage-init";
       const applicationReader =
-        adversarial.parentPeerApplicationOwner &&
-        args[0] === "--parent-peer-read-application-owner";
+        peerProfile.revision >= 5 && args[0] === "--parent-peer-read-application-owner";
       const connector =
         adversarial.parentPeer &&
         (args[0] === "--parent-peer-read-result" || managing || applicationReader);
@@ -440,15 +451,7 @@ async function fixture(
                   : "--parent-peer-read-result",
             ]
           : adversarial.parentPeer
-            ? [
-                adversarial.parentPeerApplicationOwner
-                  ? "--persistent-parent-peer-application-owner"
-                  : adversarial.parentPeerLocal
-                    ? "--persistent-parent-peer-local-cleanup"
-                    : adversarial.parentPeerRuntime
-                      ? "--persistent-parent-peer-runtime"
-                      : "--persistent-parent-peer",
-              ]
+            ? [peerProfile.helper]
             : adversarial.parentControl
               ? ["--persistent-parent"]
               : [],
@@ -796,70 +799,38 @@ async function fixture(
               return;
             }
             if (adversarial.parentPeer && frame.readUInt32BE(0) === 112) {
-              expect(
-                frame
-                  .subarray(4, 12)
-                  .equals(
-                    Buffer.from(
-                      adversarial.parentPeerApplicationOwner
-                        ? "TKOBIND5"
-                        : adversarial.parentPeerLocal
-                          ? "TKOBIND4"
-                          : adversarial.parentPeerRuntime
-                            ? "TKOBIND3"
-                            : "TKOBIND2",
-                    ),
-                  ),
-              ).toBe(true);
+              expect(frame.subarray(4, 12).toString("ascii")).toBe(
+                `TKOBIND${peerProfile.revision}`,
+              );
               peer.originalPeerBootstrap = Buffer.from(frame);
               if (adversarial.alternateHostTopology !== undefined) {
                 const claim = frame.subarray(12, 76).toString("ascii");
                 if (originalPeers.has(claim)) throw Error("NONSECRET original P replacement");
                 originalPeers.set(claim, peer);
               }
-              nativeRequests.push(
-                adversarial.parentPeerApplicationOwner
-                  ? "linux-oci-parent-bootstrap@5"
-                  : adversarial.parentPeerLocal
-                    ? "linux-oci-parent-bootstrap@4"
-                    : adversarial.parentPeerRuntime
-                      ? "linux-oci-parent-bootstrap@3"
-                      : "linux-oci-parent-bootstrap@2",
-              );
+              nativeRequests.push(`linux-oci-parent-bootstrap@${peerProfile.revision}`);
               const producer =
-                adversarial.qualifiedProducer &&
-                adversarial.parentPeerRuntime &&
-                !adversarial.parentPeerLocal &&
-                !adversarial.parentPeerApplicationOwner &&
+                (peerProfile.revision === 6 ||
+                  (peerProfile.revision === 3 && adversarial.qualifiedProducer)) &&
                 adversarial.producerRevision !== "missing";
               const response = Buffer.alloc(
-                producer ? 152 : adversarial.parentPeerApplicationOwner ? 160 : 144,
+                144 + (peerProfile.revision >= 5 ? 16 : 0) + (producer ? 8 : 0),
               );
               response.writeUInt32BE(response.length - 4);
-              response.write(
-                adversarial.parentPeerApplicationOwner
-                  ? "TKOINFO5"
-                  : adversarial.parentPeerLocal
-                    ? "TKOINFO4"
-                    : adversarial.parentPeerRuntime
-                      ? "TKOINFO3"
-                      : "TKOINFO2",
-                4,
-                "ascii",
-              );
+              response.write(`TKOINFO${peerProfile.revision}`, 4, "ascii");
               frame.copy(response, 12, 12, 84);
               response.writeBigUInt64BE(0xfedcba9876543210n, 84);
               response.writeBigUInt64BE(5n, 92);
               response.writeBigUInt64BE(peer.inode, 100);
               response.write("11111111-2222-4333-8444-555555555555", 108, "ascii");
-              if (adversarial.parentPeerApplicationOwner) {
+              if (peerProfile.revision >= 5) {
                 response.writeBigUInt64BE(5n, 144);
                 response.writeBigUInt64BE(0x123456789abcdef1n, 152);
               }
               if (producer)
                 response.write(
                   adversarial.producerRevision === "wrong" ? "NCLOSE00" : "NCLOSE01",
-                  144,
+                  peerProfile.revision === 6 ? 160 : 144,
                   "ascii",
                 );
               stdout.write(response);
