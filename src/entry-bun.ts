@@ -114,8 +114,10 @@ import {
 } from "./selfhost-health-signals.ts";
 import {
   assertSelfhostLinuxContainerNodeSchema,
+  captureSelfhostLinuxContainerFormRegistration,
   captureSelfhostLinuxContainerRetainedExecutionActions,
   createSelfhostLinuxContainerNodeComposition,
+  type SelfhostLinuxContainerFormRegistration,
   type SelfhostLinuxContainerRetainedExecutionActions,
 } from "./selfhost-linux-container-node-composition.ts";
 import {
@@ -209,7 +211,8 @@ const SELFHOST_BUN_HOST_STARTUP_SENTINEL = Symbol.for("takoserver.selfhost-bun-h
 /**
  * Run the ordinary Bun Host with an optional explicit, code-owned Linux
  * Container backend selection. The optional F2 action selection applies to
- * already accepted operations. This is the same initialization used by direct
+ * already accepted operations. A complete F2 Form is a separate code selection.
+ * This is the same initialization used by direct
  * `bun src/entry-bun.ts`, which leaves Linux Container disabled by default.
  * This process-owned startup is single-use: preflight failures reject before
  * state opens, while failures after resource initialization terminate the process.
@@ -217,6 +220,7 @@ const SELFHOST_BUN_HOST_STARTUP_SENTINEL = Symbol.for("takoserver.selfhost-bun-h
 export async function startSelfhostBunHost(
   options: {
     readonly linuxContainerSelection?: SelfhostLinuxContainerNodeSelectionSource;
+    readonly linuxContainerFormRegistration?: SelfhostLinuxContainerFormRegistration;
     readonly v2RetainedExecutionActions?: SelfhostLinuxContainerRetainedExecutionActions;
   } = {},
 ): Promise<void> {
@@ -239,6 +243,7 @@ export async function startSelfhostBunHost(
   });
 
   let selectionSource: SelfhostLinuxContainerNodeSelectionSource | undefined;
+  let formRegistration: SelfhostLinuxContainerFormRegistration | undefined;
   let retainedExecutionActions: SelfhostLinuxContainerRetainedExecutionActions | undefined;
   try {
     if (
@@ -250,7 +255,12 @@ export async function startSelfhostBunHost(
       throw new TypeError("invalid self-host Bun startup options");
     const keys = Reflect.ownKeys(options);
     if (
-      keys.some((key) => key !== "linuxContainerSelection" && key !== "v2RetainedExecutionActions")
+      keys.some(
+        (key) =>
+          key !== "linuxContainerSelection" &&
+          key !== "linuxContainerFormRegistration" &&
+          key !== "v2RetainedExecutionActions",
+      )
     ) {
       throw new TypeError("invalid self-host Bun startup options");
     }
@@ -271,12 +281,21 @@ export async function startSelfhostBunHost(
       selectionSource,
       actions?.value,
     );
+    const registration = Object.getOwnPropertyDescriptor(options, "linuxContainerFormRegistration");
+    if (registration && (!registration.enumerable || !("value" in registration))) {
+      throw new TypeError("invalid self-host Bun startup options");
+    }
+    formRegistration = captureSelfhostLinuxContainerFormRegistration(
+      selectionSource,
+      registration?.value,
+      retainedExecutionActions,
+    );
   } catch (cause) {
     return Promise.reject(cause);
   }
 
   let processResourcesStarted = false;
-  return runSelfhostBunHost(selectionSource, retainedExecutionActions, () => {
+  return runSelfhostBunHost(selectionSource, retainedExecutionActions, formRegistration, () => {
     processResourcesStarted = true;
   }).catch((cause: unknown) => {
     if (!processResourcesStarted) throw cause;
@@ -294,6 +313,7 @@ export async function startSelfhostBunHost(
 async function runSelfhostBunHost(
   selectionSource: SelfhostLinuxContainerNodeSelectionSource | undefined,
   retainedExecutionActions: SelfhostLinuxContainerRetainedExecutionActions | undefined,
+  formRegistration: SelfhostLinuxContainerFormRegistration | undefined,
   markProcessResourcesStarted: () => void,
 ): Promise<void> {
   /**
@@ -605,6 +625,11 @@ async function runSelfhostBunHost(
     if (!preflightLinuxContainerSelection) {
       throw new TypeError("Linux Container operator selection is unavailable");
     }
+    captureSelfhostLinuxContainerFormRegistration(
+      preflightLinuxContainerSelection,
+      formRegistration,
+      retainedExecutionActions,
+    );
     if (
       preflightLinuxContainerSelection.kind === "oci" &&
       preflightLinuxContainerSelection.selection.targetKey !== v2WorkerTargetKey
@@ -762,7 +787,11 @@ async function runSelfhostBunHost(
   try {
     // Explicit tracked OCI must be able to save its original shutdown proof
     // before the Node entry starts the runtime or admits a CREATE.
-    await assertSelfhostLinuxContainerNodeSchema(sql, preflightLinuxContainerSelection);
+    await assertSelfhostLinuxContainerNodeSchema(
+      sql,
+      preflightLinuxContainerSelection,
+      formRegistration,
+    );
   } catch (error) {
     controlDatabase.close();
     writeSync(
@@ -1271,6 +1300,7 @@ async function runSelfhostBunHost(
         clock,
         selection: selfhostLinuxContainerSelection,
         retainedExecutionActions,
+        ...(formRegistration === undefined ? {} : { formRegistration }),
         privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
         formSelectionFactory(context) {
           if (!workers || !completeV2WorkerForms) return { forms: {}, retainedForms: {} };
@@ -1754,6 +1784,7 @@ async function runSelfhostBunHost(
       clock,
       selection: selfhostLinuxContainerSelection,
       retainedExecutionActions,
+      ...(formRegistration === undefined ? {} : { formRegistration }),
       formSelectionFactory: v2FormSelectionFactory,
       privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
     });

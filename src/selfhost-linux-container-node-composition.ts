@@ -32,10 +32,29 @@ import type {
 } from "./takoform-v2/types.ts";
 import { WORKER_VERSION_UNIFIED_BACKEND_ID } from "./takoform-v2/worker-lifecycle-backend.ts";
 
+const completeFormSql = new WeakMap<SelfhostLinuxContainerNodeSelection, Sql>();
+
 export async function assertSelfhostLinuxContainerNodeSchema(
   sql: Sql,
   selected: SelfhostLinuxContainerNodeSelection | undefined,
+  formRegistration?: SelfhostLinuxContainerFormRegistration,
 ): Promise<void> {
+  if (formRegistration === "complete") {
+    captureSelfhostLinuxContainerFormRegistration(selected, formRegistration);
+    // The Node selection factory freezes both records. Direct composition must
+    // keep the same configured selection across the asynchronous schema check.
+    if (
+      selected === undefined ||
+      !Object.isFrozen(selected) ||
+      !Object.isFrozen(selected.selection)
+    )
+      throw new TypeError("selfhost_linux_oci_complete_form_fixed_selection_required");
+    completeFormSql.delete(selected);
+    if (!(await inspectV2ContainerOwnerApplicationSuccessorSchema(sql)))
+      throw new Error("selfhost_linux_oci_complete_form_schema_required");
+    completeFormSql.set(selected, sql);
+    return;
+  }
   if (
     selected?.kind === "oci" &&
     selected.selection.ociParentControl === "sealed-peer-runtime-application-owner@1" &&
@@ -94,6 +113,38 @@ export type SelfhostLinuxContainerRetainedExecutionActions = Pick<
   typeof V2_CONTAINER_F2_FORM
 >;
 
+export type SelfhostLinuxContainerFormRegistration = "complete";
+
+/** Capture a supported Form choice from operator code before opening state. */
+export function captureSelfhostLinuxContainerFormRegistration(
+  selection:
+    | SelfhostLinuxContainerNodeSelectionSource
+    | SelfhostLinuxContainerNodeSelection
+    | undefined,
+  input: unknown,
+  retainedExecutionActions?: V2RetainedExecutionActions,
+): SelfhostLinuxContainerFormRegistration | undefined {
+  if (input === undefined) return undefined;
+  if (input !== "complete" || selection === undefined)
+    throw new TypeError("invalid Linux Container Form registration");
+  if (retainedExecutionActions !== undefined)
+    throw new TypeError("complete Linux Container Form conflicts with retained execution actions");
+  containerRecord(selection);
+  if (selection.kind !== "oci")
+    throw new TypeError(
+      "complete Linux Container Form requires the selected OCI application owner",
+    );
+  containerRecord(selection.selection);
+  if (
+    selection.selection.ociParentControl !== "sealed-peer-runtime-application-owner@1" ||
+    selection.selection.alternateHostTopology === undefined
+  )
+    throw new TypeError(
+      "complete Linux Container Form requires the selected OCI application owner and two topology slots",
+    );
+  return input;
+}
+
 /** Snapshot only the one retained Form owned by the selected Linux backend. */
 export function captureSelfhostLinuxContainerRetainedExecutionActions(
   selection: SelfhostLinuxContainerNodeSelectionSource | undefined,
@@ -111,11 +162,9 @@ export function captureSelfhostLinuxContainerRetainedExecutionActions(
   return Object.freeze({ [V2_CONTAINER_F2_FORM]: actions });
 }
 
-/** Wire one genuine backend into the existing Node application options. This
- * neither registers public F2 support nor supplies a realized operator choice.
- * The existing entry must drain whole requests/passes (including engine settle)
- * before calling close and then closing its database.
- */
+/** Wire one selected backend into the existing Node application. Operator code
+ * can explicitly select its complete Form after the exact schema preflight.
+ * The entry drains requests and background passes before closing the backend. */
 export function createSelfhostLinuxContainerNodeComposition(input: {
   readonly sql: Sql;
   readonly clock: Clock;
@@ -123,6 +172,7 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   readonly formSelectionFactory: V2OperatorFormSelectionFactory | undefined;
   readonly privateInputCustody: V2PrivateInputCustody | undefined;
   readonly retainedExecutionActions?: Readonly<Record<string, readonly V2Action[]>> | undefined;
+  readonly formRegistration?: SelfhostLinuxContainerFormRegistration;
 }): {
   readonly appPorts: Pick<
     AppPorts,
@@ -133,9 +183,21 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   readonly containerBindingSource?: LinuxOciContainerBindingSource;
   close(): Promise<void>;
 } {
-  const baseFactory = input.formSelectionFactory;
-  const custody = input.privateInputCustody;
-  if (input.selection === undefined) {
+  const {
+    sql,
+    selection: selected,
+    formSelectionFactory: baseFactory,
+    privateInputCustody: custody,
+  } = input;
+  const formRegistration = captureSelfhostLinuxContainerFormRegistration(
+    selected,
+    input.formRegistration,
+    input.retainedExecutionActions,
+  );
+  const complete = formRegistration === "complete";
+  if (complete && (selected === undefined || completeFormSql.get(selected) !== sql))
+    throw new Error("selfhost_linux_oci_complete_form_schema_required");
+  if (selected === undefined) {
     return Object.freeze({
       appPorts: Object.freeze({
         ...(baseFactory ? { v2FormSelectionFactory: baseFactory } : {}),
@@ -147,7 +209,6 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
       close: () => Promise.resolve(),
     });
   }
-  const selected = input.selection;
   const choice = containerRecord(selected);
   if (
     Object.keys(choice).sort().join() !== "kind,selection" ||
@@ -158,16 +219,20 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   const prefix = selected.kind === "oci" ? "selfhost_linux_oci" : "selfhost_linux_docker";
   if (!custody) throw new TypeError(`${prefix}_private_input_custody_required`);
   validatePrivateInputCustody(custody);
-  const retainedExecutionActions = captureActions(input.retainedExecutionActions);
+  const retainedExecutionActions = complete
+    ? undefined
+    : captureActions(input.retainedExecutionActions);
   // Retirement is the default. Operator code can select other already accepted actions.
-  if (!Object.hasOwn(retainedExecutionActions, V2_CONTAINER_F2_FORM))
-    retainedExecutionActions[V2_CONTAINER_F2_FORM] = Object.freeze<V2Action[]>(["delete"]);
-  Object.freeze(retainedExecutionActions);
-  const allowed: readonly V2Action[] = retainedExecutionActions[V2_CONTAINER_F2_FORM] ?? [];
+  if (retainedExecutionActions) {
+    if (!Object.hasOwn(retainedExecutionActions, V2_CONTAINER_F2_FORM))
+      retainedExecutionActions[V2_CONTAINER_F2_FORM] = Object.freeze<V2Action[]>(["delete"]);
+    Object.freeze(retainedExecutionActions);
+  }
+  const allowed: readonly V2Action[] = retainedExecutionActions?.[V2_CONTAINER_F2_FORM] ?? [];
   const oci =
     selected.kind === "oci"
       ? createSelfhostLinuxOciContainerBackend({
-          sql: input.sql,
+          sql,
           clock: input.clock,
           selection: selected.selection,
         })
@@ -176,7 +241,7 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
     oci ??
     (selected.kind === "docker"
       ? createSelfhostLinuxDockerContainerBackend({
-          sql: input.sql,
+          sql,
           clock: input.clock,
           selection: selected.selection,
         })
@@ -185,7 +250,7 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   const containerBindingSource =
     oci && selected.kind === "oci"
       ? createLinuxOciContainerBindingSource({
-          sql: input.sql,
+          sql,
           targetKey: selected.selection.targetKey,
           workerBackendId: WORKER_VERSION_UNIFIED_BACKEND_ID,
           containerBackendId: selected.selection.backendId,
@@ -209,14 +274,16 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
         return { kind: "unknown" };
       }
     };
-  const retainedForm = Object.freeze({
-    ...native.retainedForm,
-    backend: Object.freeze({
-      ...native.retainedForm.backend,
-      execute: guarded(false),
-      reconcile: guarded(true),
-    }),
-  });
+  const form = complete
+    ? native.retainedForm
+    : Object.freeze({
+        ...native.retainedForm,
+        backend: Object.freeze({
+          ...native.retainedForm.backend,
+          execute: guarded(false),
+          reconcile: guarded(true),
+        }),
+      });
   const factory: V2OperatorFormSelectionFactory = (context) => {
     if (closed) throw new TypeError(`${prefix}_node_closed`);
     native.acceptance.assertSql(context.sql);
@@ -248,14 +315,15 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
       throw new TypeError(`${prefix}_form_already_composed`);
     // Preserve every original descriptor so application validation still refuses
     // malformed hidden/accessor entries instead of normalizing them by spread.
-    const retainedForms: Record<string, V2Form> = Object.create(
-      Object.getPrototypeOf(retained.value),
-      Object.getOwnPropertyDescriptors(retained.value),
+    const selectedMap = complete ? forms.value : retained.value;
+    const registered: Record<string, V2Form> = Object.create(
+      Object.getPrototypeOf(selectedMap),
+      Object.getOwnPropertyDescriptors(selectedMap),
     );
-    Object.defineProperty(retainedForms, native.formUrl, { value: retainedForm, enumerable: true });
+    Object.defineProperty(registered, native.formUrl, { value: form, enumerable: true });
     return Object.freeze({
-      forms: forms.value,
-      retainedForms: Object.freeze(retainedForms),
+      forms: complete ? Object.freeze(registered) : forms.value,
+      retainedForms: complete ? retained.value : Object.freeze(registered),
     });
   };
   return Object.freeze({
@@ -264,7 +332,9 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
       v2FormSelectionFactory: factory,
       v2ContainerHostAcceptance: native.acceptance,
       v2PrivateInputCustody: custody,
-      v2RetainedExecutionActions: retainedExecutionActions,
+      ...(retainedExecutionActions === undefined
+        ? {}
+        : { v2RetainedExecutionActions: retainedExecutionActions }),
     }),
     close() {
       closed = true;

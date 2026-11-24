@@ -10,6 +10,7 @@ import type { Sql } from "../src/ports.ts";
 import { parseRuntimeInputKeyAuthority } from "../src/runtime-input-seal-keyring.ts";
 import {
   assertSelfhostLinuxContainerNodeSchema,
+  captureSelfhostLinuxContainerFormRegistration,
   createSelfhostLinuxContainerNodeComposition,
 } from "../src/selfhost-linux-container-node-composition.ts";
 import {
@@ -126,6 +127,12 @@ async function fixture() {
   const compose = (
     factory?: V2OperatorFormSelectionFactory,
     actions?: Readonly<Record<string, readonly V2Action[]>>,
+    registration?: Partial<
+      Pick<
+        Parameters<typeof createSelfhostLinuxContainerNodeComposition>[0],
+        "selection" | "sql" | "formRegistration"
+      >
+    >,
   ) => {
     const node = createSelfhostLinuxContainerNodeComposition({
       sql,
@@ -134,6 +141,7 @@ async function fixture() {
       formSelectionFactory: factory,
       privateInputCustody: authority.privateInputCustody,
       ...(actions === undefined ? {} : { retainedExecutionActions: actions }),
+      ...registration,
     });
     nodes.push(node);
     return node;
@@ -455,6 +463,179 @@ test("OCI Node refuses missing topology limits or physical target before Sql and
 // Closed constructor/model source for the dedicated OCI binding cases only.
 export { fixture as originalOciNodeBindingFixture };
 
+async function applyFinalDeleteSchema(sql: Sql) {
+  for (const expand of [
+    V2_CONTAINER_OWNER_CONTROL_EXPAND,
+    V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+    V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  ])
+    await sql.batch(expand.statements.map((statement) => ({ sql: statement })));
+  await sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+}
+
+test("explicit OCI profile6 on exact H1 registers complete F2 and queues original CREATE without dispatch", async () => {
+  const f = await fixture();
+  try {
+    const alternateHostTopology = {
+      ...f.source.hostTopology,
+      peerIpv4Host: "10.240.0.4",
+      peerIpv4Guest: "10.240.0.5",
+      peerIpv6Host: "fd60:1234::4",
+      peerIpv6Guest: "fd60:1234::5",
+    };
+    const selectionSource = {
+      kind: "oci",
+      selection: {
+        ...f.source,
+        ociParentControl: "sealed-peer-runtime-application-owner@1",
+        qualifiedPhysicalDigest: `sha256:${"1".repeat(64)}`,
+        alternateHostTopology,
+      },
+    } as const;
+    expect(
+      captureSelfhostLinuxContainerFormRegistration(selectionSource, undefined),
+    ).toBeUndefined();
+    expect(() => captureSelfhostLinuxContainerFormRegistration(undefined, "complete")).toThrow(
+      "invalid Linux Container Form registration",
+    );
+    for (const selection of [
+      {
+        ...selectionSource.selection,
+        ociParentControl: "sealed-peer-application-owner@1",
+      } as const,
+      { ...f.source, ociParentControl: "sealed-peer-runtime-application-owner@1" } as const,
+    ]) {
+      expect(() =>
+        captureSelfhostLinuxContainerFormRegistration({ kind: "oci", selection }, "complete"),
+      ).toThrow("requires the selected OCI application owner and two topology slots");
+    }
+    expect(() =>
+      captureSelfhostLinuxContainerFormRegistration(selectionSource, "complete", {
+        [V2_CONTAINER_F2_FORM]: ["delete"],
+      }),
+    ).toThrow("conflicts with retained execution actions");
+
+    const selected = createSelfhostLinuxContainerNodeSelection({
+      selection: selectionSource,
+      sealKeys: f.authority.sealKeys,
+    });
+    if (selected?.kind !== "oci") throw new Error("selected complete OCI owner absent");
+    const complete = { selection: selected, formRegistration: "complete" } as const;
+    const schemaRequired = "selfhost_linux_oci_complete_form_schema_required";
+    const composeComplete = () => f.compose(undefined, undefined, complete);
+    await applyFinalDeleteSchema(f.sql);
+    await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+    expect(composeComplete).toThrow(schemaRequired);
+    await assertSelfhostLinuxContainerNodeSchema(f.sql, selected);
+    await expect(
+      assertSelfhostLinuxContainerNodeSchema(f.sql, selected, "complete"),
+    ).rejects.toThrow(schemaRequired);
+    await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
+    expect(composeComplete).toThrow(schemaRequired);
+    const preflightQuery = spyOn(f.sql, "query");
+    try {
+      for (const mutable of [
+        { ...selected },
+        Object.freeze({ ...selected, selection: { ...selected.selection } }),
+      ]) {
+        await expect(
+          assertSelfhostLinuxContainerNodeSchema(f.sql, mutable, "complete"),
+        ).rejects.toMatchObject({
+          name: "TypeError",
+          message: "selfhost_linux_oci_complete_form_fixed_selection_required",
+        });
+      }
+      expect(preflightQuery).not.toHaveBeenCalled();
+    } finally {
+      preflightQuery.mockRestore();
+    }
+    await assertSelfhostLinuxContainerNodeSchema(f.sql, selected, "complete");
+    expect(() =>
+      f.compose(undefined, undefined, { ...complete, selection: Object.freeze({ ...selected }) }),
+    ).toThrow(schemaRequired);
+    const otherSql = createSqliteSql(f.database);
+    expect(() => f.compose(undefined, undefined, { ...complete, sql: otherSql })).toThrow(
+      schemaRequired,
+    );
+
+    const { appPorts } = composeComplete();
+    const factory = appPorts.v2FormSelectionFactory;
+    const acceptance = appPorts.v2ContainerHostAcceptance;
+    if (!factory || !acceptance) throw new Error("original registration owner absent");
+    const maps = factory(f.context);
+    expect(Object.keys(maps.forms)).toEqual([V2_CONTAINER_F2_FORM]);
+    expect(Object.keys(maps.retainedForms)).toEqual([]);
+    expect(appPorts).not.toHaveProperty("v2RetainedExecutionActions");
+    expect(maps.forms[V2_CONTAINER_F2_FORM]?.backend).toMatchObject({
+      id: f.source.backendId,
+      targetKey: f.source.targetKey,
+    });
+    const principal = "synthetic-oci-node-parent";
+    const space = "synthetic-space";
+    const engine = createTakoformV2Engine(
+      {
+        sql: f.sql,
+        authorize: async (requestPrincipal, requestSpace) =>
+          requestPrincipal === principal && requestSpace === space,
+        replayWindowSeconds: 3600,
+        privateInputCustody: f.authority.privateInputCustody,
+        ...maps,
+      },
+      acceptance,
+    );
+    expect(engine.supportsForm(V2_CONTAINER_F2_FORM)).toBe(true);
+    const input = {
+      form: V2_CONTAINER_F2_FORM,
+      space,
+      name: "complete-node",
+      spec: {
+        image: `registry.example/app@sha256:${"1".repeat(64)}`,
+        httpPort: 8080,
+        healthPath: "/health",
+        workloadRevision: "1".repeat(64),
+        requiredSensitiveVars: ["SECRET"],
+      },
+      privateInputs: { SECRET: "synthetic-complete-node-loan" },
+    };
+    await expect(
+      engine.acceptCreate({ principal: "foreign-owner", key: crypto.randomUUID(), input }),
+    ).rejects.toMatchObject({ code: "forbidden" });
+    const accepted = await engine.acceptCreate({ principal, key: crypto.randomUUID(), input });
+    expect(accepted).toMatchObject({
+      action: "create",
+      generation: 1,
+      status: "queued",
+      effect: "none",
+    });
+    expect(
+      await f.sql.query(
+        "SELECT resource_uid,desired_generation,serving_generation FROM tf_v2_container_instances WHERE resource_uid=?",
+        [accepted.resourceUid],
+      ),
+    ).toEqual([
+      { resource_uid: accepted.resourceUid, desired_generation: 1, serving_generation: null },
+    ]);
+    expect(
+      await f.sql.query("SELECT dispatch_possible FROM tf_v2_operations WHERE id=?", [accepted.id]),
+    ).toEqual([{ dispatch_possible: 0 }]);
+    expect(
+      await f.sql.query("SELECT count(*) AS count FROM tf_v2_container_create_claims"),
+    ).toEqual([{ count: 0 }]);
+    const configured = await readV2ConfiguredPrivateInputs(f.sql, {
+      principal,
+      space: input.space,
+      name: input.name,
+      form: input.form,
+      resourceUid: accepted.resourceUid,
+    });
+    expect(configured?.keyId).toBe(f.authority.sealKeys.current.keyId);
+    expect(JSON.stringify(configured)).not.toContain(input.privateInputs.SECRET);
+    expect(f.io()).toBe(0);
+  } finally {
+    await f.close();
+  }
+});
+
 test("OCI Node shutdown schema preflight accepts exact H0 and H1 witness schemas", async () => {
   const f = await fixture();
   try {
@@ -473,13 +654,7 @@ test("OCI Node shutdown schema preflight accepts exact H0 and H1 witness schemas
     const assertReady = () => assertSelfhostLinuxContainerNodeSchema(f.sql, selected);
     const required = "selfhost_linux_oci_shutdown_io_schema_required";
     await expect(assertReady()).rejects.toThrow(required);
-    for (const expand of [
-      V2_CONTAINER_OWNER_CONTROL_EXPAND,
-      V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
-      V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
-    ])
-      await f.sql.batch(expand.statements.map((sql) => ({ sql })));
-    await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+    await applyFinalDeleteSchema(f.sql);
     await expect(assertReady()).rejects.toThrow(required);
     await f.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
     await assertReady();

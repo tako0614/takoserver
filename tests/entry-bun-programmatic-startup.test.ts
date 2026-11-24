@@ -240,6 +240,42 @@ for (const kind of ["oci", "docker"]) {
   }, 12_000);
 }
 
+for (const { name, options, error } of [
+  {
+    name: "complete without a Linux selection",
+    options: `{ linuxContainerFormRegistration: "complete" }`,
+    error: "invalid Linux Container Form registration",
+  },
+  {
+    name: "an unknown literal",
+    options: `{ linuxContainerFormRegistration: "allow-create" }`,
+    error: "invalid Linux Container Form registration",
+  },
+  {
+    name: "an accessor",
+    options: `{ get linuxContainerFormRegistration() { throw new Error("accessor invoked"); } }`,
+    error: "invalid self-host Bun startup options",
+  },
+]) {
+  test(`Bun rejects Linux Container Form registration with ${name} before opening local state`, async () => {
+    const dataRoot = join(tmpdir(), `selfhost-form-registration-${crypto.randomUUID()}`);
+    const entryUrl = new URL("../src/entry-bun.ts", import.meta.url).href;
+    const result = await runIsolated(`
+      import { existsSync } from "node:fs";
+      import { startSelfhostBunHost } from ${JSON.stringify(entryUrl)};
+      process.env.TAKOSERVER_DATA_ROOT = ${JSON.stringify(dataRoot)};
+      try {
+        await startSelfhostBunHost(${options});
+        throw new Error("unexpected-success");
+      } catch (cause) {
+        if (existsSync(process.env.TAKOSERVER_DATA_ROOT)) throw new Error("preflight opened state");
+        console.log(cause.message);
+      }
+    `);
+    expect(result).toEqual({ exitCode: 0, stdout: `${error}\n`, stderr: "" });
+  });
+}
+
 test("failure after process resources begin is process-fatal", async () => {
   const entryUrl = new URL("../src/entry-bun.ts", import.meta.url).href;
   const dataRoot = `/proc/selfhost-startup-${crypto.randomUUID()}`;

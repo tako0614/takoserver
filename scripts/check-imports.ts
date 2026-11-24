@@ -954,8 +954,10 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     typeOnly: false,
     names: [
       "assertSelfhostLinuxContainerNodeSchema",
+      "captureSelfhostLinuxContainerFormRegistration",
       "captureSelfhostLinuxContainerRetainedExecutionActions",
       "createSelfhostLinuxContainerNodeComposition",
+      "type SelfhostLinuxContainerFormRegistration",
       "type SelfhostLinuxContainerRetainedExecutionActions",
     ],
   },

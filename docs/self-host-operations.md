@@ -2085,8 +2085,16 @@ this replacement owns. For example, `["create", "delete"]` resumes accepted
 CREATE and DELETE while holding UPDATE. Apply the selection on the replacement
 after fencing the previous Host. The [retained execution rules](takoform-v2.md)
 preserve the original backend, target and operation identity. When a send may
-have occurred, the executor reconciles that same operation. Fresh Container
-CREATE and UPDATE still require a complete Form registration.
+have occurred, the executor reconciles that same operation.
+
+To exercise fresh Container CREATE and UPDATE on an isolated Host, pass
+`linuxContainerFormRegistration: "complete"` from the same private launcher.
+Select the OCI runtime application owner with two disjoint topology slots and
+prepare the exact application successor schema on the isolated control
+database. Omit `v2RetainedExecutionActions` when selecting the complete Form.
+The existing Host authentication and resource ownership checks apply to each
+request. Physical readiness still requires validating the actual runtime,
+topology, and image on that Host.
 
 ## Restore boundary
 
