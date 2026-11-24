@@ -1108,8 +1108,11 @@ export async function inspectV2ContainerOwnerShutdownIoSchema(sql: Sql): Promise
   }
 }
 
+const applicationSuccessorOwnerToken = "application_successor_owner_token";
+
 function buildApplicationSuccessorSchema() {
   const applicationSuccessorTable = `${PREFIX}application_successors`;
+  const successorDeleteColumn = `${applicationSuccessorOwnerToken} TEXT CHECK (${applicationSuccessorOwnerToken} IS NULL OR (form_url = ${literal(F2_FORM)} AND action = 'delete' AND ${hex(applicationSuccessorOwnerToken)}))`;
   const currentApplicationSuccessorClaim = `EXISTS (
   SELECT 1 FROM ${Q} claim
   JOIN ${I} instance ON instance.resource_uid = claim.resource_uid
@@ -1140,6 +1143,45 @@ function buildApplicationSuccessorSchema() {
     AND operation.status = 'succeeded' AND operation.effect = 'complete')`;
   const applicationSuccessorClaim = `resource_uid = NEW.resource_uid AND generation = NEW.generation
       AND claim_id = NEW.claim_id AND native_id = NEW.native_id`;
+  const acceptedApplicationSuccessorDelete = `EXISTS (
+    SELECT 1 FROM ${Q} claim
+    JOIN ${I} instance ON instance.resource_uid = claim.resource_uid
+    JOIN ${R} revision ON revision.resource_uid = claim.resource_uid AND revision.generation = claim.generation
+    JOIN ${S} started ON started.resource_uid = claim.resource_uid AND started.generation = claim.generation
+    JOIN ${A} deletion ON deletion.operation_id = instance.retire_operation_id
+    JOIN main.tf_v2_operations operation ON operation.id = deletion.operation_id
+    JOIN main.tf_v2_resources resource ON resource.uid = instance.resource_uid
+    WHERE claim.resource_uid = NEW.resource_uid AND claim.generation = NEW.generation
+      AND claim.claim_id = NEW.claim_id AND claim.native_id = NEW.native_id
+      AND claim.installation_id = instance.installation_id AND claim.state = 'bound'
+      AND claim.allocation_cleanup = 'untouched'
+      AND claim.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+      AND json_extract(claim.native_control, '$.kind') = 'linux-oci-sealed-control@1'
+      AND json_extract(claim.native_control, '$.scope.purpose') = 'takoserver.linux-oci-parent-peer-control@1'
+      AND instance.form_url = ${literal(F2_FORM)} AND instance.retired_at_ms IS NOT NULL
+      AND instance.serving_generation IS NULL AND revision.retention = 'retired'
+      AND started.attempt = 1 AND started.create_claim_id = claim.claim_id
+      AND started.native_id = claim.native_id AND started.state = 'running'
+      AND started.confirmed_running_at_ms IS NOT NULL AND started.confirmed_exited_at_ms IS NULL
+      AND deletion.${applicationSuccessorOwnerToken} = NEW.owner_token AND deletion.action = 'delete'
+      AND deletion.resource_uid = instance.resource_uid AND deletion.installation_id = instance.installation_id
+      AND deletion.incarnation_id = instance.incarnation_id AND deletion.principal = instance.principal
+      AND deletion.space = instance.space AND deletion.name = instance.name AND deletion.form_url = instance.form_url
+      AND deletion.backend_id = instance.backend_id AND deletion.target_key = instance.target_key
+      AND deletion.generation = instance.desired_generation AND deletion.generation > claim.generation
+      AND resource.principal = instance.principal AND resource.space = instance.space AND resource.name = instance.name
+      AND resource.form_url = instance.form_url AND resource.backend_id = instance.backend_id
+      AND resource.target_key = instance.target_key AND resource.generation = deletion.generation
+      AND resource.last_operation = operation.id AND resource.busy_operation = operation.id
+      AND resource.phase = 'deleting' AND resource.deleted_at IS NULL
+      AND resource.spec_json = deletion.accepted_spec_json
+      AND operation.resource_uid = deletion.resource_uid AND operation.principal = deletion.principal
+      AND operation.action = deletion.action AND operation.generation = deletion.generation
+      AND operation.backend_id = deletion.backend_id AND operation.target_key = deletion.target_key
+      AND operation.backend_key = deletion.backend_key AND operation.accepted_spec_json = deletion.accepted_spec_json
+      AND operation.status = 'reconciling' AND operation.effect = 'unknown' AND operation.dispatch_possible = 1
+      AND operation.lease_token IS NOT NULL AND operation.lease_until_ms > (CAST(strftime('%s','now') AS INTEGER) + 1) * 1000
+  )`;
   const applicationSuccessorClose = `CASE WHEN json_valid(NEW.close_document) THEN
     json_type(NEW.close_document) = 'object'
     AND (SELECT count(*) FROM json_each(NEW.close_document)) = 5
@@ -1200,7 +1242,9 @@ function buildApplicationSuccessorSchema() {
       "BEFORE UPDATE",
       refuse(`${same(["resource_uid", "generation", "claim_id", "native_id", "epoch", "owner_token", "predecessor_close_document"])}
     AND OLD.close_document IS NULL AND ${applicationSuccessorClose}
-    AND ${currentApplicationSuccessorClaim}`),
+    AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable} later
+      WHERE later.resource_uid = NEW.resource_uid AND later.generation = NEW.generation AND later.epoch > NEW.epoch)
+    AND (${currentApplicationSuccessorClaim} OR ${acceptedApplicationSuccessorDelete})`),
     ),
     trigger(
       "application_successor_retain",
@@ -1212,12 +1256,49 @@ function buildApplicationSuccessorSchema() {
       "application_successor_fence_delete",
       A,
       "BEFORE INSERT",
-      `  SELECT CASE WHEN NEW.action = 'delete' AND EXISTS (SELECT 1 FROM ${applicationSuccessorTable}
-    WHERE resource_uid = NEW.resource_uid) THEN RAISE(ABORT, 'container_owner_application_successor_delete') END;`,
+      `  SELECT CASE WHEN NEW.action = 'delete' AND NOT (
+    (NEW.${applicationSuccessorOwnerToken} IS NULL AND NOT EXISTS (
+      SELECT 1 FROM ${applicationSuccessorTable} WHERE resource_uid = NEW.resource_uid))
+    OR EXISTS (
+      SELECT 1 FROM ${applicationSuccessorTable} successor
+      JOIN ${I} instance ON instance.resource_uid = successor.resource_uid
+      JOIN ${Q} claim ON claim.resource_uid = successor.resource_uid AND claim.generation = successor.generation
+      WHERE successor.resource_uid = NEW.resource_uid AND successor.owner_token = NEW.${applicationSuccessorOwnerToken}
+        AND instance.installation_id = NEW.installation_id AND instance.incarnation_id = NEW.incarnation_id
+        AND instance.desired_generation = NEW.generation - 1 AND instance.serving_generation = successor.generation
+        AND instance.retire_operation_id IS NULL AND claim.installation_id = instance.installation_id
+        AND claim.state = 'bound' AND claim.native_id = successor.native_id AND claim.claim_id = successor.claim_id
+        AND claim.allocation_cleanup = 'untouched'
+        AND claim.application_io_cleanup = ${literal(V2_CONTAINER_APPLICATION_IO_RESERVED)}
+        AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable} later
+          WHERE later.resource_uid = successor.resource_uid AND later.generation = successor.generation
+            AND later.epoch > successor.epoch)
+        AND NOT EXISTS (SELECT 1 FROM ${applicationSuccessorTable} outstanding
+          WHERE outstanding.resource_uid = successor.resource_uid
+            AND outstanding.generation <> successor.generation AND outstanding.close_document IS NULL)
+    )) THEN RAISE(ABORT, 'container_owner_application_successor_delete') END;`,
+    ),
+    trigger(
+      "application_successor_acceptance_retain",
+      A,
+      "BEFORE UPDATE",
+      refuse(`NEW.${applicationSuccessorOwnerToken} IS OLD.${applicationSuccessorOwnerToken}`),
     ),
   ]);
   const applicationSuccessorSelectedObjects = Object.freeze([
-    ...shutdownIoSelectedObjects,
+    ...shutdownIoSelectedObjects.map((item) =>
+      item.type === "table" && item.name === A
+        ? object(
+            item.type,
+            item.name,
+            item.table,
+            item.sql.replace(
+              ",\n  UNIQUE (resource_uid, generation)",
+              ", " + successorDeleteColumn + ",\n  UNIQUE (resource_uid, generation)",
+            ),
+          )
+        : item,
+    ),
     ...applicationSuccessorObjects,
   ]);
   const applicationSuccessorRows = Object.freeze(
@@ -1252,6 +1333,7 @@ function buildApplicationSuccessorSchema() {
           sql: `INSERT INTO temp.${applicationSuccessorTransition} VALUES (CASE WHEN ${shutdownIoReady} THEN 1 END)`,
           params: shutdownIoReadyParams,
         },
+        { sql: `ALTER TABLE ${A} ADD COLUMN ${successorDeleteColumn}` },
         ...applicationSuccessorObjects.map(({ sql }) => ({ sql })),
         {
           sql: `UPDATE temp.${applicationSuccessorTransition} SET ok = CASE WHEN ${applicationSuccessorReady} THEN 1 END`,
@@ -1319,17 +1401,15 @@ export function createV2ContainerHostAcceptance(options: {
   readonly installationId: string;
   readonly backendId: string;
   readonly targetKey: string;
-  readonly ociParentControl?: "sealed-original@1";
+  readonly ociParentControl?: "sealed-original@1" | "sealed-peer-runtime-application-owner@1";
 }): V2HostAcceptance {
   const { sql, installationId, backendId, targetKey } = options;
-  const selectedReady =
-    options.ociParentControl === "sealed-original@1"
-      ? historicalSelectedControlReady
-      : runtimeReady;
-  const selectedReadyParams =
-    options.ociParentControl === "sealed-original@1"
-      ? historicalSelectedControlParams
-      : runtimeReadyParams;
+  const allowsApplicationSuccessor =
+    options.ociParentControl === "sealed-peer-runtime-application-owner@1";
+  const usesOciControl =
+    options.ociParentControl === "sealed-original@1" || allowsApplicationSuccessor;
+  const selectedReady = usesOciControl ? historicalSelectedControlReady : runtimeReady;
+  const selectedReadyParams = usesOciControl ? historicalSelectedControlParams : runtimeReadyParams;
   if (
     !sql ||
     typeof sql.query !== "function" ||
@@ -1578,58 +1658,78 @@ export function createV2ContainerHostAcceptance(options: {
       f2Names(record);
       if (typeof workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload))
         throw new TypeError("invalid Container F2 workload revision");
-      const guard: SqlStatement = {
-        sql: `${selectedReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+      return (async () => {
+        const successor =
+          allowsApplicationSuccessor &&
+          (await inspectV2ContainerOwnerApplicationSuccessorSchema(sql));
+        const readiness = successor
+          ? V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready
+          : {
+              sql: selectedReady,
+              params: selectedReadyParams,
+            };
+        const guard: SqlStatement = {
+          sql: `${readiness.sql} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
-        params: [
-          ...selectedReadyParams,
-          c.resourceUid,
-          installationId,
-          c.principal,
-          c.space,
-          c.name,
-          c.form,
-          backendId,
-          targetKey,
-          c.generation - 1,
-        ],
-      };
-      // A selected DELETE terminal always attempts insertion. Missing Core or
-      // owner proof must abort the bound batch rather than become zero-row success.
-      const terminal: SqlStatement = {
-        sql: `INSERT OR ABORT INTO main.${A} (operation_id, resource_uid, installation_id, incarnation_id,
+          params: [
+            ...readiness.params,
+            c.resourceUid,
+            installationId,
+            c.principal,
+            c.space,
+            c.name,
+            c.form,
+            backendId,
+            targetKey,
+            c.generation - 1,
+          ],
+        };
+        // A selected DELETE terminal always attempts insertion. Missing Core or
+        // owner proof must abort the bound batch rather than become zero-row success.
+        const terminal: SqlStatement = {
+          sql: `INSERT OR ABORT INTO main.${A} (operation_id, resource_uid, installation_id, incarnation_id,
           principal, space, name, form_url, backend_id, target_key, action, generation, backend_key,
           replay_key, fingerprint, accepted_spec_json, accepted_output_json, references_json,
-          configured_private_inputs_json, accepted_at, retain_until, revision)
+          configured_private_inputs_json, accepted_at, retain_until, revision${successor ? `, ${applicationSuccessorOwnerToken}` : ""})
           VALUES ( ?, ?, ?, ${`(SELECT incarnation_id FROM main.${I} WHERE resource_uid = ?)`},
-            ?, ?, ?, ?, ?, ?, ?, ?, (SELECT op.backend_key FROM main.tf_v2_operations op WHERE op.id = ?), ?, ?, ?, ?, ?, NULL, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, (SELECT op.backend_key FROM main.tf_v2_operations op WHERE op.id = ?), ?, ?, ?, ?, ?, NULL, ?, ?, ?${
+              successor
+                ? `,
+            (SELECT successor.owner_token FROM main.${PREFIX}application_successors successor
+             JOIN main.${I} instance ON instance.resource_uid = successor.resource_uid
+             WHERE successor.resource_uid = ? AND successor.generation = instance.serving_generation
+             ORDER BY successor.epoch DESC LIMIT 1)`
+                : ""
+            }
           )`,
-        params: [
-          c.operationId,
-          c.resourceUid,
-          installationId,
-          c.resourceUid,
-          c.principal,
-          c.space,
-          c.name,
-          c.form,
-          backendId,
-          targetKey,
-          c.action,
-          c.generation,
-          c.operationId,
-          c.key,
-          c.fingerprint,
-          c.specJson,
-          c.outputJson,
-          c.referencesJson,
-          c.at,
-          c.retainUntil,
-          `${c.generation}-${workload}`,
-        ],
-      };
-      return Promise.resolve(prepareV2HostAcceptance(sql, context, guard, terminal));
+          params: [
+            c.operationId,
+            c.resourceUid,
+            installationId,
+            c.resourceUid,
+            c.principal,
+            c.space,
+            c.name,
+            c.form,
+            backendId,
+            targetKey,
+            c.action,
+            c.generation,
+            c.operationId,
+            c.key,
+            c.fingerprint,
+            c.specJson,
+            c.outputJson,
+            c.referencesJson,
+            c.at,
+            c.retainUntil,
+            `${c.generation}-${workload}`,
+            ...(successor ? [c.resourceUid] : []),
+          ],
+        };
+        return prepareV2HostAcceptance(sql, context, guard, terminal);
+      })();
     },
     assertSql(candidate: Sql) {
       if (candidate !== sql) throw new TypeError("Container F2 Sql identity mismatch");

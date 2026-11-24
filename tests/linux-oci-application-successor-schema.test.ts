@@ -2,14 +2,17 @@ import { expect, spyOn, test } from "bun:test";
 import type { Sql, SqlParam, SqlStatement } from "../src/ports.ts";
 import * as sqlite from "../src/sql-sqlite.ts";
 import {
+  createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerApplicationSuccessorSchema,
   inspectV2ContainerOwnerSelectedSchema,
   inspectV2ContainerOwnerShutdownIoSchema,
+  V2_CONTAINER_F2_FORM,
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
   V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND,
   V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
   V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
+import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
@@ -87,9 +90,14 @@ async function withOriginal(
       await expect(contender.batch(otherwise)).rejects.toMatchObject({ code: "constraint" });
       expect(
         await contender.query(
-          "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'tf_v2_container_%' AND name NOT LIKE 'tf_v2_container_application_successor%' ORDER BY name",
+          "SELECT name, sql FROM sqlite_schema WHERE name LIKE 'tf_v2_container_%' AND name NOT LIKE 'tf_v2_container_application_successor%' AND name <> 'tf_v2_container_acceptances' ORDER BY name",
         ),
-      ).toEqual(before);
+      ).toEqual(before.filter(({ name }) => name !== "tf_v2_container_acceptances"));
+      expect(
+        await contender.query(
+          "SELECT count(*) AS selected FROM tf_v2_container_acceptances WHERE application_successor_owner_token IS NOT NULL",
+        ),
+      ).toEqual([{ selected: 0 }]);
     };
     await check(fixture, contender, coordinates, predecessor, expand);
     expect(await contender.query(`SELECT * FROM ${predecessors}`)).toEqual(prior);
@@ -166,7 +174,12 @@ test("a committed successor defeats a prepared stale DELETE and remains held aft
       Promise.all([
         f.sql.query("SELECT * FROM tf_v2_resources"),
         f.sql.query("SELECT * FROM tf_v2_operations"),
-        f.sql.query("SELECT * FROM tf_v2_container_acceptances"),
+        f.sql.query("SELECT * FROM tf_v2_container_acceptances").then((rows) =>
+          rows.map(({ application_successor_owner_token, ...accepted }) => {
+            expect(application_successor_owner_token ?? null).toBeNull();
+            return accepted;
+          }),
+        ),
         f.sql.query("SELECT * FROM tf_v2_container_instances"),
         f.sql.query("SELECT * FROM tf_v2_container_create_claims"),
       ]);
@@ -324,5 +337,51 @@ test("an accepted ordinary DELETE fences a reservation holding a previously read
     } finally {
       await fresh.close();
     }
+  });
+}, 20_000);
+
+test("selected OCI DELETE atomically binds the latest application owner without closing it", async () => {
+  await withOriginal(async (f, contender, coordinates, predecessor, expand) => {
+    await expand();
+    const token = "d".repeat(64);
+    expect((await reserve(contender, coordinates, predecessor, 1, token)).changes).toBe(1);
+    const form = f.composition.retainedForm;
+    const engine = createTakoformV2Engine(
+      {
+        sql: f.sql,
+        authorize: async () => true,
+        replayWindowSeconds: 3600,
+        forms: { [V2_CONTAINER_F2_FORM]: form },
+      },
+      createV2ContainerHostAcceptance({
+        sql: f.sql,
+        installationId: "synthetic-oci-installation",
+        backendId: form.backend.id,
+        targetKey: form.backend.targetKey,
+        ociParentControl: "sealed-peer-runtime-application-owner@1",
+      }),
+    );
+    const accepted = await engine.acceptDelete({
+      principal: "synthetic-oci-parent",
+      key: crypto.randomUUID(),
+      uid: coordinates[0],
+      expectedGeneration: coordinates[1],
+    });
+    expect(accepted.status).toBe("queued");
+    expect(
+      await contender.query(
+        "SELECT application_successor_owner_token FROM tf_v2_container_acceptances WHERE operation_id=?",
+        [accepted.id],
+      ),
+    ).toEqual([{ application_successor_owner_token: token }]);
+    expect(
+      await contender.query(
+        "SELECT retire_operation_id, serving_generation FROM tf_v2_container_instances WHERE resource_uid=?",
+        [coordinates[0]],
+      ),
+    ).toEqual([{ retire_operation_id: accepted.id, serving_generation: null }]);
+    expect(await contender.query(`SELECT close_document FROM ${successors}`)).toEqual([
+      { close_document: null },
+    ]);
   });
 }, 20_000);
