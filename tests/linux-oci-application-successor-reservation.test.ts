@@ -45,15 +45,85 @@ function replyToLiveInit(nativeId: string) {
   return child;
 }
 
+function heldLiveInitPeer(
+  nativeId: string,
+  namespaceInode: string,
+  beforeRead?: () => Promise<void>,
+  acknowledgeClose = true,
+) {
+  const stdin = new PassThrough();
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = Object.defineProperties(new childProcess.ChildProcess(), {
+    stdin: { value: stdin },
+    stdout: { value: stdout },
+    stderr: { value: stderr },
+  });
+  const operations: string[] = [];
+  const send = (value: object) => {
+    const body = Buffer.from(JSON.stringify(value));
+    const size = Buffer.alloc(4);
+    size.writeUInt32BE(body.length);
+    stdout.write(Buffer.concat([size, body]));
+  };
+  stdin.on("data", (bytes: Buffer) => {
+    if (operations.length === 0) {
+      expect(bytes.length).toBe(176);
+      expect(bytes.subarray(4, 12).toString()).toBe("TKOPEER2");
+      expect(bytes.subarray(12, 76).toString()).toBe(nativeId);
+      operations.push("open");
+      send({
+        kind: "linux-oci-parent-held-live-init@1",
+        nativeId,
+        namespaceDevice: "4",
+        namespaceInode,
+        barrier: "unproven",
+      });
+      return;
+    }
+    const command = bytes.subarray(4).toString();
+    if (command === '{"kind":"linux-oci-parent-held-live-init-read@1"}') {
+      operations.push("read");
+      void Promise.resolve(beforeRead?.()).then(
+        () => {
+          send({ kind: "linux-oci-parent-held-live-init-current@1", barrier: "unproven" });
+        },
+        (error) => child.emit("error", error),
+      );
+      return;
+    }
+    expect(command).toBe('{"kind":"linux-oci-parent-held-live-init-close@1"}');
+    operations.push("close");
+    if (acknowledgeClose)
+      send({ kind: "linux-oci-parent-held-live-init-closed@1", barrier: "unproven" });
+    stdout.emit("end");
+    stderr.emit("end");
+    child.emit("exit", 0, null);
+    child.emit("close", 0, null);
+  });
+  return {
+    child,
+    operations,
+    dispose() {
+      stdin.destroy();
+      stdout.destroy();
+      stderr.destroy();
+    },
+  };
+}
+
 async function withOriginal(
   check: (fixture: Awaited<ReturnType<typeof preparedOriginal>>) => Promise<void>,
+  expectUnknownClose = false,
 ) {
   const fixture = await preparedOriginal();
   try {
     await check(fixture);
     expect(fixture.f.network).not.toHaveBeenCalled();
   } finally {
-    await fixture.close();
+    const close = fixture.close();
+    if (expectUnknownClose) await expect(close).rejects.toThrow("parent_peer_retained");
+    else await close;
   }
 }
 
@@ -122,8 +192,11 @@ async function preparedOriginal() {
         await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
       },
       async close() {
-        await fresh?.close();
-        await f.cleanup();
+        try {
+          await fresh?.close();
+        } finally {
+          await f.cleanup();
+        }
       },
     };
   } catch (error) {
@@ -242,6 +315,190 @@ test("a same-claim successor reservation is confined to its issuing creator and 
     },
   );
 }, 20_000);
+
+for (const variant of ["current", "cross-namespace", "post-read stale", "caller abort"] as const) {
+  test(`owning creator held init validates its original source before handoff: ${variant}`, async () => {
+    await withOriginal(async ({ f, fresh, selector, signal, raw, original, expand }) => {
+      const baseline = raw.mock.calls.length;
+      await expect(fresh.openCurrentHeldLiveInit(selector, signal)).rejects.toThrow();
+      expect(raw.mock.calls.length).toBe(baseline);
+      await expand();
+      const caller = new AbortController();
+      const rawHeld = heldLiveInitPeer(
+        original.claimId,
+        variant === "cross-namespace" ? "6" : "5",
+        variant === "post-read stale"
+          ? async () => {
+              expect(
+                (
+                  await f.sql.run(
+                    "UPDATE tf_v2_resources SET observed_json=json_set(observed_json,'$.ready',json('false')) WHERE uid=?",
+                    [selector.resourceUid],
+                  )
+                ).changes,
+              ).toBe(1);
+            }
+          : variant === "caller abort"
+            ? async () => caller.abort()
+            : undefined,
+      );
+      try {
+        raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+        raw.mockReturnValueOnce(rawHeld.child);
+        const opening = fresh.openCurrentHeldLiveInit(selector, caller.signal);
+        if (variant === "current") {
+          const held = await opening;
+          expect(held.identity).toMatchObject({
+            nativeId: original.claimId,
+            namespaceDevice: "4",
+            namespaceInode: "5",
+          });
+          expect(rawHeld.operations).toEqual(["open", "read"]);
+          expect(held.revocation.aborted).toBe(false);
+          await held.assertCurrent(new AbortController().signal);
+          expect(rawHeld.operations).toEqual(["open", "read", "read"]);
+          await expect(fresh.openCurrentHeldLiveInit(selector, signal)).rejects.toThrow();
+          expect(raw.mock.calls.length).toBe(baseline + 2);
+          const io = ownedRawHttp();
+          try {
+            await expect(
+              fresh.openServingHttp(
+                selector,
+                new Request("http://ignored.invalid/private-held-source", { signal }),
+                () => undefined,
+              ),
+            ).rejects.toThrow(/http_custody/);
+            expect(io.counts().calls).toBe(0);
+          } finally {
+            io.restore();
+          }
+          await fresh.close();
+          expect(held.revocation.aborted).toBe(true);
+          expect(rawHeld.operations).toEqual(["open", "read", "read", "close"]);
+          await held.close();
+          await expect(held.assertCurrent(signal)).rejects.toThrow();
+        } else {
+          await expect(opening).rejects.toThrow();
+          expect(rawHeld.operations).toEqual(["open", "read", "close"]);
+          expect(rawHeld.child.stdin?.writableEnded).toBe(true);
+        }
+        expect(raw.mock.calls.slice(baseline).map(([binary, args]) => [binary, args])).toEqual([
+          [f.physicalBinary, ["--parent-peer-read-live-init"]],
+          [f.physicalBinary, ["--parent-peer-hold-live-init"]],
+        ]);
+        expect(await f.sql.query(`SELECT epoch, close_document FROM main.${reservations}`)).toEqual(
+          [{ epoch: 1, close_document: null }],
+        );
+        await expect(fresh.openCurrentHeldLiveInit(selector, signal)).rejects.toThrow();
+        expect(raw.mock.calls.length).toBe(baseline + 2);
+      } finally {
+        await fresh.close().catch(() => undefined);
+        rawHeld.dispose();
+      }
+    });
+  }, 20_000);
+}
+
+for (const terminal of [
+  "acknowledged",
+  "unknown",
+  "refused before handoff",
+  "opening lost",
+  "creator closes during acquisition",
+] as const) {
+  test(`held init owns close through caller abort or refused handoff: ${terminal}`, async () => {
+    await withOriginal(
+      async ({ fresh, selector, raw, original, expand }) => {
+        await expand();
+        const caller = new AbortController();
+        let entered!: () => void;
+        let release!: () => void;
+        const readEntered = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        const readMayFinish = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+        let reads = 0;
+        const inFlight = terminal === "acknowledged";
+        const acquiring = terminal === "creator closes during acquisition";
+        const openingLost = terminal === "opening lost";
+        const peer = heldLiveInitPeer(
+          original.claimId,
+          openingLost ? "invalid" : terminal === "refused before handoff" ? "6" : "5",
+          async () => {
+            reads++;
+            if ((inFlight && reads === 2) || (acquiring && reads === 1)) {
+              entered();
+              await readMayFinish;
+            }
+          },
+          inFlight || acquiring,
+        );
+        try {
+          raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+          raw.mockReturnValueOnce(peer.child);
+          const open = fresh.openCurrentHeldLiveInit(selector, caller.signal);
+          if (acquiring) {
+            const refused = open.then(
+              () => false,
+              () => true,
+            );
+            await readEntered;
+            const closing = fresh.close();
+            expect(peer.operations).toEqual(["open", "read"]);
+            expect(peer.child.stdin?.writableEnded).toBe(false);
+            release();
+            expect(await refused).toBe(true);
+            await closing;
+          } else if (openingLost || terminal === "refused before handoff") {
+            await expect(open).rejects.toThrow();
+          } else {
+            const held = await open;
+            const reading = inFlight
+              ? held.assertCurrent(caller.signal).then(
+                  () => false,
+                  () => true,
+                )
+              : undefined;
+            if (reading) await readEntered;
+            caller.abort();
+            expect(held.revocation.aborted).toBe(true);
+            await expect(held.assertCurrent(new AbortController().signal)).rejects.toThrow();
+            const close = held.close();
+            expect(held.close()).toBe(close);
+            if (inFlight) {
+              expect(peer.operations).toEqual(["open", "read", "read"]);
+              expect(peer.child.stdin?.writableEnded).toBe(false);
+              release();
+              expect(await reading).toBe(true);
+              await close;
+            } else {
+              await expect(close).rejects.toThrow("parent_peer_retained");
+            }
+          }
+          if (inFlight) {
+            await fresh.close();
+            expect(peer.operations).toEqual(["open", "read", "read", "close"]);
+          } else if (acquiring) {
+            expect(peer.operations).toEqual(["open", "read", "close"]);
+          } else {
+            await expect(fresh.close()).rejects.toThrow("parent_peer_retained");
+            await expect(fresh.close()).rejects.toThrow("parent_peer_retained");
+            expect(peer.operations).toEqual(openingLost ? ["open"] : ["open", "read", "close"]);
+          }
+        } finally {
+          release();
+          await fresh.close().catch(() => undefined);
+          peer.dispose();
+        }
+      },
+      terminal === "unknown" ||
+        terminal === "refused before handoff" ||
+        terminal === "opening lost",
+    );
+  }, 20_000);
+}
 
 test("authentic H0 and the still-current original peer reserve one opaque epoch", async () => {
   await withOriginal(

@@ -63,10 +63,12 @@ import {
   assertCurrentOriginalLinuxOciLiveInitCustody,
   createOriginalLinuxOciSealedApplicationCloseResume,
   disposeOriginalLinuxOciAllocation,
+  type LinuxOciHeldLiveInit,
   type LinuxOciSealedApplicationCloseResume,
   observeOriginalLinuxOciOwnedInitReaped,
   observeOriginalLinuxOciOwnedNamespaceLifetime,
   observeOriginalLinuxOciOwnedRunning,
+  openOriginalLinuxOciHeldLiveInit,
   originalLinuxOciHttpRetirementSource,
   originalLinuxOciParentControlSource,
   prepareOriginalLinuxOciAllocationDisposal,
@@ -283,6 +285,13 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<void>;
+  /** One private original held-init source from this creator's reservation.
+   * This selects only a serving original claim and does not admit traffic. */
+  openCurrentApplicationSuccessorLiveInit(
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciHeldLiveInit>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
    * removal; the binding owner must authorize each application invocation. */
@@ -524,6 +533,7 @@ interface ApplicationSuccessorIssuance {
   readonly originalCustody: object;
   readonly signal: AbortSignal;
   readonly record: DockerContainerCreateRecord;
+  readonly observation: LinuxOciOriginalLiveInit;
   readonly ownerToken: string;
   readonly predecessor: string;
   readonly liveSql: string;
@@ -4232,10 +4242,37 @@ export function createDockerContainerCoreOwner(
       if (observed.nativeId !== captured.nativeId) return fail();
       return observed;
     };
+    const openHeld = async (assertReservation: (signal: AbortSignal) => Promise<void>) => {
+      if (!successor) return fail();
+      await assertCurrent();
+      return openOriginalLinuxOciHeldLiveInit(
+        originalCustody,
+        result,
+        captured,
+        artifact,
+        binding,
+        signal,
+        async (actualSignal) => {
+          assertControlKey();
+          await assertReservation(actualSignal);
+          assertControlKey();
+        },
+      );
+    };
     const finish = () => {
       active = false;
     };
-    return { captured, coordinates, raw, guard, assertLocal, assertControlKey, observe, finish };
+    return {
+      captured,
+      coordinates,
+      raw,
+      guard,
+      assertLocal,
+      assertControlKey,
+      observe,
+      openHeld,
+      finish,
+    };
   }
   async function readCurrentOciInit(
     input: DockerContainerCreateRecord,
@@ -5102,6 +5139,51 @@ export function createDockerContainerCoreOwner(
       return readCurrentOciInit(selected, originalCustody, signal, guard);
     },
     assertOriginalApplicationSuccessorReservation,
+    async openCurrentApplicationSuccessorLiveInit(selector, originalCustody, signal) {
+      const identity = captureCurrentOciSelector(selector);
+      // Only this mint's acknowledged reservation can proceed to the one held
+      // connector. A prior reservation row never reconstructs this authority.
+      const reservation = await result.reserveOriginalApplicationSuccessor(
+        identity,
+        originalCustody,
+        signal,
+      );
+      const issued = LinuxOciApplicationSuccessorReservation.issuance(reservation);
+      const { selected, guard } = await selectCurrentOciInit(identity, signal);
+      sameRecord(issued.record, selected);
+      const current = await prepareCurrentOciInit(
+        selected,
+        originalCustody,
+        signal,
+        guard,
+        "application-successor",
+      );
+      let held: LinuxOciHeldLiveInit | undefined;
+      try {
+        held = await current.openHeld((actualSignal) =>
+          assertOriginalApplicationSuccessorReservation(
+            reservation,
+            identity,
+            originalCustody,
+            actualSignal,
+          ),
+        );
+        current.assertLocal();
+        if (
+          held.revocation.aborted ||
+          held.identity.namespaceDevice !== issued.observation.namespaceDevice ||
+          held.identity.namespaceInode !== issued.observation.namespaceInode
+        )
+          return fail();
+        return held;
+      } catch (error) {
+        // The creator retains an unacknowledged close independently of handoff.
+        await held?.close().catch(() => undefined);
+        throw error;
+      } finally {
+        current.finish();
+      }
+    },
     async reserveOriginalApplicationSuccessor(selector, originalCustody, signal) {
       if (!runtimeApplicationOwner || !(signal instanceof AbortSignal)) return fail();
       const identity = captureCurrentOciSelector(selector);
@@ -5139,7 +5221,7 @@ export function createDockerContainerCoreOwner(
           shutdownIoCloseKind,
         );
         predecessorCurrent();
-        await current.observe();
+        const observation = await current.observe();
 
         // Bind the exact main schema, current claim, and running attempt in the
         // statement comparing the authenticated predecessor bytes.
@@ -5172,6 +5254,7 @@ export function createDockerContainerCoreOwner(
           originalCustody,
           signal,
           record: captured,
+          observation,
           ownerToken,
           predecessor,
           liveSql: live,

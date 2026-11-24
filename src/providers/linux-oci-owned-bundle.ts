@@ -63,6 +63,7 @@ import {
   type LinuxOciStartedObservation,
   type LinuxOciStoppedObservation,
   prepareAuthenticatedLinuxOciApplicationOwnerReader,
+  prepareAuthenticatedLinuxOciHeldLiveInitReader,
   prepareAuthenticatedLinuxOciLiveInitReader,
   prepareAuthenticatedLinuxOciPeerInit,
   prepareAuthenticatedLinuxOciPeerReader,
@@ -88,6 +89,7 @@ type OriginalOciCustody = {
   readonly alternateHostTopology: LinuxOciHostTopology | undefined;
   readonly httpRecords: ReadonlyMap<string, DockerContainerCreateRecord>;
   readonly httpRuntimes: ReadonlyMap<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>;
+  readonly heldLiveInits: Set<{ close(): Promise<void> }>;
   readonly peerReads: Map<string, OriginalPeerRead>;
   readonly sessions: ReadonlyMap<string, LinuxOciPhysicalSession>;
   readonly parents: ReadonlyMap<
@@ -612,6 +614,124 @@ export async function readOriginalLinuxOciLiveInit(
   const fact = await read(signal);
   assertOpen();
   return fact;
+}
+
+export type LinuxOciHeldLiveInit = Awaited<
+  ReturnType<ReturnType<typeof prepareAuthenticatedLinuxOciHeldLiveInitReader>>
+>;
+
+/** Private bridge from the owning, authenticated Core to the exact original
+ * allocation and held native reader. The readback never supplies a route. */
+export async function openOriginalLinuxOciHeldLiveInit(
+  original: object,
+  core: DockerContainerCoreOwner,
+  record: DockerContainerCreateRecord,
+  artifact: unknown,
+  binding: unknown,
+  signal: AbortSignal,
+  assertCurrent: (signal: AbortSignal) => Promise<void>,
+): Promise<LinuxOciHeldLiveInit> {
+  const { custody, binary } = originalPeerCustody(original, core, signal);
+  if (record.state !== "bound" || record.nativeId !== record.claimId) return fail("parent_custody");
+  const current = async (actualSignal: AbortSignal) => {
+    assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
+    if (!(actualSignal instanceof AbortSignal) || actualSignal.aborted) return fail("revoked");
+    await readOriginalPeerAllocation(custody, record, artifact, binding, "present");
+    await assertCurrent(actualSignal);
+    assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
+    if (actualSignal.aborted) return fail("revoked");
+  };
+  await current(signal);
+  const open = prepareAuthenticatedLinuxOciHeldLiveInitReader(binary, binding, custody.signal);
+  // The creator owns the transport. Caller loss fences use and joins its close
+  // through the same connection instead of treating bare stdin EOF as terminal.
+  const transportSignal = new AbortController().signal;
+  const revocation = new AbortController();
+  let attempted = false;
+  let checking = false;
+  let nativeRead: Promise<void> | undefined;
+  let joining: Promise<void> | undefined;
+  let rawRevocation: AbortSignal | undefined;
+  const opening = Promise.resolve().then(() => {
+    assertCurrentOriginalLinuxOciLiveInitCustody(original, core, signal);
+    attempted = true;
+    return open(transportSignal);
+  });
+  const source = {
+    close() {
+      if (!joining) {
+        joining = Promise.resolve()
+          .then(async () => {
+            await nativeRead?.catch(() => undefined);
+            const held = await opening.catch((error: unknown) => {
+              // An attempted opener rejection cannot prove no child was allocated.
+              if (attempted) throw error;
+              return undefined;
+            });
+            await held?.close();
+            custody.heldLiveInits.delete(source);
+          })
+          .finally(() => {
+            signal.removeEventListener("abort", revoke);
+            rawRevocation?.removeEventListener("abort", revoke);
+          });
+        revocation.abort();
+      }
+      return joining;
+    },
+  };
+  const revoke = () => {
+    void source.close().catch(() => undefined);
+  };
+  // Own this opening before the subprocess starts, including any failure
+  // between the first retained transport and a valid handoff.
+  custody.heldLiveInits.add(source);
+  signal.addEventListener("abort", revoke, { once: true });
+  try {
+    const held = await opening;
+    rawRevocation = held.revocation;
+    rawRevocation.addEventListener("abort", revoke, { once: true });
+    if (rawRevocation.aborted) revoke();
+    const check = async (actualSignal: AbortSignal) => {
+      if (
+        !(actualSignal instanceof AbortSignal) ||
+        actualSignal.aborted ||
+        revocation.signal.aborted ||
+        checking
+      )
+        return fail("revoked");
+      checking = true;
+      try {
+        if (held.identity.nativeId !== record.nativeId) return fail("parent_custody");
+        await current(actualSignal);
+        if (revocation.signal.aborted) return fail("revoked");
+        nativeRead = held.assertCurrent(transportSignal);
+        try {
+          await nativeRead;
+        } finally {
+          nativeRead = undefined;
+        }
+        if (revocation.signal.aborted) return fail("revoked");
+        await current(actualSignal);
+        if (revocation.signal.aborted) return fail("revoked");
+      } catch (error) {
+        await source.close().catch(() => undefined);
+        throw error;
+      } finally {
+        checking = false;
+      }
+    };
+    await check(signal);
+    return Object.freeze({
+      identity: held.identity,
+      revocation: revocation.signal,
+      assertCurrent: check,
+      close: source.close,
+    });
+  } catch (error) {
+    await source.close().catch(() => undefined);
+    throw error;
+  }
 }
 
 export function prepareOriginalLinuxOciPeerRead(
@@ -1555,6 +1675,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
   const httpProbes = new Map<string, ReturnType<typeof createLinuxOciHttpHealthProbe>>();
   const httpRecords = new Map<string, DockerContainerCreateRecord>();
   const httpRuntimes = new Map<string, ReturnType<typeof createLinuxOciContainerHttpRuntime>>();
+  const heldLiveInits: OriginalOciCustody["heldLiveInits"] = new Set();
   const originalNativeCustody = Object.freeze({});
   const nativeLifetime = new AbortController();
   originalOciCustodies.set(originalNativeCustody, {
@@ -1567,6 +1688,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
     alternateHostTopology: topologies?.alternate,
     httpRecords,
     httpRuntimes,
+    heldLiveInits,
     peerReads: new Map(),
     sessions: nativeSessions,
     parents,
@@ -2781,6 +2903,47 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         scopes.delete(running);
       }
     },
+    /** Private held source. This registration has no transport admission. */
+    async openCurrentHeldLiveInit(
+      identity: { readonly resourceUid: string; readonly incarnationId: string },
+      signal: AbortSignal,
+    ): Promise<LinuxOciHeldLiveInit> {
+      if (closed || !runtimeApplicationOwner || !physicalBinary) return fail("parent_custody");
+      if (!(signal instanceof AbortSignal) || signal.aborted) return fail("revoked");
+      const cancel = new AbortController();
+      const abort = () => cancel.abort();
+      cancellation.add(cancel);
+      signal.addEventListener("abort", abort, { once: true });
+      const timer = setTimeout(abort, timeout);
+      let retained = false;
+      const running = (async () => {
+        const held = await core.openCurrentApplicationSuccessorLiveInit(
+          identity,
+          originalNativeCustody,
+          cancel.signal,
+        );
+        if (closed || cancel.signal.aborted || held.revocation.aborted) {
+          await held.close().catch(() => undefined);
+          return fail("revoked");
+        }
+        held.revocation.addEventListener(
+          "abort",
+          () => signal.removeEventListener("abort", abort),
+          { once: true },
+        );
+        retained = true;
+        return held;
+      })();
+      scopes.add(running);
+      try {
+        return await running;
+      } finally {
+        clearTimeout(timer);
+        cancellation.delete(cancel);
+        scopes.delete(running);
+        if (!retained) signal.removeEventListener("abort", abort);
+      }
+    },
     /** Internal application transport. Identity is a selector to revalidate,
      * never caller authorization; a real binding composition must authorize it. */
     fetchServingHttp(
@@ -3275,6 +3438,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             // Complete already-owned scopes without revoking the original
             // runtime identity needed to record the shutdown fact.
             await Promise.allSettled([...scopes]);
+            if (heldLiveInits.size) {
+              const held = await Promise.allSettled(
+                [...heldLiveInits].map((source) => source.close()),
+              );
+              const heldFailure = held.find((outcome) => outcome.status === "rejected");
+              if (heldFailure) throw heldFailure.reason;
+            }
             if (parents.size || nativeSessions.size) {
               const custody = originalOciCustodies.get(originalNativeCustody);
               if (!custody || !(await inspectV2ContainerOwnerShutdownIoSchema(sql)))
