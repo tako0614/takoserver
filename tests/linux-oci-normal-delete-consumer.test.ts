@@ -109,7 +109,8 @@ test("normal-delete-consumer revokes management only on accepted original dispat
         return batch(statements);
       });
       restoreBatch = () => spy.mockRestore();
-      return (core = createCore(...args));
+      core = createCore(...args);
+      return core;
     },
   );
   const started = await live()
