@@ -4585,13 +4585,9 @@ export function createDockerContainerCoreOwner(
     const scope = successorIoScope(record, issued.controlDigest, epoch, ownerToken);
     const selected = await sealApplicationCloseFact(scope, successorCloseKind);
     const keyCurrent = await readApplicationCloseFact(selected.document, scope, successorCloseKind);
-    const current =
-      "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=? AND owner_token=? AND predecessor_close_document=?" +
-      " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors newer WHERE newer.resource_uid=? AND newer.generation=? AND newer.epoch>?)" +
-      " AND EXISTS (SELECT 1 FROM main.tf_v2_resources resource WHERE resource.uid=? AND resource.phase='idle' AND resource.busy_operation IS NULL)" +
-      " AND " +
-      issued.liveSql;
-    const params = [
+    const ownedRow =
+      "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=? AND owner_token=? AND predecessor_close_document=?";
+    const ownerParams = [
       resourceUid,
       generation,
       claimId,
@@ -4599,6 +4595,15 @@ export function createDockerContainerCoreOwner(
       epoch,
       ownerToken,
       predecessor,
+    ];
+    const current =
+      ownedRow +
+      " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors newer WHERE newer.resource_uid=? AND newer.generation=? AND newer.epoch>?)" +
+      " AND EXISTS (SELECT 1 FROM main.tf_v2_resources resource WHERE resource.uid=? AND resource.phase='idle' AND resource.busy_operation IS NULL)" +
+      " AND " +
+      issued.liveSql;
+    const params = [
+      ...ownerParams,
       resourceUid,
       generation,
       epoch,
@@ -4621,9 +4626,11 @@ export function createDockerContainerCoreOwner(
         writeError = error;
       });
     if (saved && saved.changes !== 1) return fail();
+    // Read confirmation of only this immutable row. A later owner may
+    // legitimately reserve from these bytes as soon as they commit.
     const confirmed = await sql.query(
-      "SELECT close_document FROM main.tf_v2_container_application_successors WHERE " + current,
-      params,
+      "SELECT close_document FROM main.tf_v2_container_application_successors WHERE " + ownedRow,
+      ownerParams,
     );
     if (confirmed.length !== 1 || confirmed[0]?.close_document !== selected.document) {
       if (writeError !== undefined) throw writeError;

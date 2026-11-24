@@ -417,6 +417,7 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     allocationSchema: true,
   });
   let fresh: ReturnType<typeof f.reconstructParent> | undefined;
+  let restarted: ReturnType<typeof f.reconstructParent> | undefined;
   let creatorCloseChecked = false;
   const health = acceptedRawHttp();
   health.onEnd(() => {
@@ -557,6 +558,7 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     expect(settled.state()).toBe("pending");
 
     let closeWrites = 0;
+    let next: Awaited<ReturnType<typeof creator.openCurrentSuccessorServingHttp>> | undefined;
     let submittedClose: string | undefined;
     const run = f.sql.run.bind(f.sql);
     const write = spyOn(f.sql, "run").mockImplementation(async (statement, params) => {
@@ -571,6 +573,16 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
       if (typeof document !== "string") throw new Error("missing submitted close document");
       submittedClose = document;
       const result = await run(statement, params);
+      if (outcome === "joined" && closeWrites === 1 && result.changes === 1) {
+        // H2 can open using the committed H1 close before H1 gets the write ACK.
+        restarted = f.reconstructParent();
+        queueOriginalPeers();
+        next = await restarted.openCurrentSuccessorServingHttp(selector, signal);
+        expect(await reservations()).toMatchObject([
+          { epoch: 1, close_document: document },
+          { epoch: 2, close_document: null },
+        ]);
+      }
       if (outcome === "ack-lost" && result.changes === 1)
         throw new Error("NONSECRET simulated lost acknowledgement after commit");
       return result;
@@ -630,7 +642,7 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
       }
     }
     const rows = await reservations();
-    expect(rows).toHaveLength(1);
+    expect(rows).toHaveLength(outcome === "joined" ? 2 : 1);
     expect(rows[0]).toMatchObject({ generation: original.generation, epoch: 1 });
     if (outcome === "joined" || outcome === "ack-lost") {
       const document = rows[0]?.close_document;
@@ -658,15 +670,13 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     }
 
     await expect(creator.openCurrentSuccessorServingHttp(selector, signal)).rejects.toThrow();
-    expect(raw.mock.calls).toHaveLength(existingCalls + 2);
+    expect(raw.mock.calls).toHaveLength(existingCalls + (outcome === "joined" ? 4 : 2));
     expect(io.counts().calls).toBe(1);
     if (outcome === "joined") {
-      const restarted = f.reconstructParent();
+      if (!restarted || !next) throw new Error("missing H2 from committed H1 close");
       io.restore();
       const secondIo = ownedRawHttp();
       try {
-        queueOriginalPeers();
-        const next = await restarted.openCurrentSuccessorServingHttp(selector, signal);
         const second = next.open(new Request("http://caller.invalid/restarted"), () => {});
         for (let i = 0; i < 250 && !secondIo.counts().calls; i++) await rawTick();
         expect(secondIo.counts().calls).toBe(1);
@@ -718,6 +728,7 @@ async function verifySuccessorHttpClose(outcome: "joined" | "withdrawn" | "unkno
     cleanupIo();
     health.restore();
     try {
+      await restarted?.close();
       if (!creatorCloseChecked) await fresh?.close();
     } finally {
       await f.cleanup();
