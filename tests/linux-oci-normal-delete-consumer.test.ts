@@ -86,7 +86,7 @@ async function through(f: Fixture, predicate: () => Promise<boolean>) {
   throw Error("NONSECRET retirement boundary not reached");
 }
 
-test("normal-delete-consumer runtime application owner continues the same DELETE after verified JOIN", async () => {
+test("normal-delete-consumer runtime application owner settles the same DELETE after verified JOIN", async () => {
   const { f, accepted } = await live({ runtimeApplicationOwner: true });
   try {
     const removal = await deleting(f, accepted.resourceUid);
@@ -105,8 +105,18 @@ test("normal-delete-consumer runtime application owner continues the same DELETE
     expect(
       Number(checkpoint?.next_attempt_at_ms) - Date.parse(String(checkpoint?.updated_at)),
     ).toBe(1_000);
+    const claim = async () =>
+      (await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"))[0];
+    expect(await claim()).toMatchObject({ state: "bound", allocation_cleanup: "untouched" });
     f.advanceNormalClock(1_000);
-    expect((await f.engine.runNext())?.id).toBe(removal.id);
+    const continued = await f.engine.runNext();
+    expect(continued?.id).toBe(removal.id);
+    const final =
+      continued?.status === "succeeded"
+        ? continued
+        : await through(f, async () => (await claim())?.state === "removed");
+    expect(final).toMatchObject({ id: removal.id, status: "succeeded", effect: "complete" });
+    expect(await claim()).toMatchObject({ state: "removed", allocation_cleanup: "closed" });
     expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-stop-init@1")).toHaveLength(1);
     expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(1);
     expect(f.network).not.toHaveBeenCalled();
