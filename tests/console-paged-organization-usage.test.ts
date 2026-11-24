@@ -350,6 +350,25 @@ test("an unloaded saved Org cannot start billing reads; its actual next roster p
   expect(errors).toEqual([]);
 });
 
+test("included usage remains visible while the wallet loads or fails", async () => {
+  await identity();
+  let resolveWallet!: (response: Response) => void;
+  const pendingWallet = new Promise<Response>((resolve) => {
+    resolveWallet = resolve;
+  });
+  readReply = (request) => (suffixOf(request) === "wallet" ? pendingWallet : ready(request));
+  const page = render("org-a");
+  await tick();
+  const pendingText = page.textContent;
+
+  resolveWallet(unavailable());
+  await tick();
+  expect(page.textContent).toContain("The server refused this: unavailable");
+  expect(retries(page)).toHaveLength(1);
+  expect(page.textContent).toContain("Included usage25%");
+  expect(pendingText).toContain("Included usage25%");
+});
+
 for (const status of [200, 503]) {
   test(`retired billing reads cannot restore values or Retry after paged Org selection changes (${status})`, async () => {
     await identity();
