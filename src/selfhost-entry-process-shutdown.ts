@@ -7,10 +7,39 @@ import {
 
 /** The Bun Host's process outcome for the shared ordered shutdown lifecycle. */
 export function createSelfhostEntryProcessShutdown(
-  options: Pick<SelfhostEntryShutdownOptions, "stopIngress" | "finishShutdown">,
+  options: Pick<SelfhostEntryShutdownOptions, "stopIngress" | "finishShutdown"> & {
+    readonly ingressDrainTimeoutMs?: number;
+  },
 ): SelfhostEntryShutdown {
+  const { stopIngress, finishShutdown, ingressDrainTimeoutMs } = options;
+  if (
+    ingressDrainTimeoutMs !== undefined &&
+    (!Number.isSafeInteger(ingressDrainTimeoutMs) ||
+      ingressDrainTimeoutMs < 1 ||
+      ingressDrainTimeoutMs > 2_147_483_647)
+  )
+    throw new TypeError("invalid self-host ingress drain timeout");
   return createSelfhostEntryShutdown({
-    ...options,
+    stopIngress:
+      ingressDrainTimeoutMs === undefined
+        ? stopIngress
+        : async () => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([
+                Promise.resolve().then(stopIngress),
+                new Promise<never>((_, reject) => {
+                  timer = setTimeout(
+                    () => reject(new Error("self-host ingress drain expired")),
+                    ingressDrainTimeoutMs,
+                  );
+                }),
+              ]);
+            } finally {
+              clearTimeout(timer);
+            }
+          },
+    finishShutdown,
     onFailure: (stage) => {
       process.exitCode = 1;
       try {

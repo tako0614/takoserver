@@ -1921,6 +1921,14 @@ async function runSelfhostBunHost(
     },
   );
   const entryShutdown = createSelfhostEntryProcessShutdown({
+    // This opt-in tracked OCI owner may have an open streaming response.
+    // Leave time before the 30s Compose stop deadline to report an unclean
+    // drain and retain Native custody. Normal EOF still finishes gracefully.
+    ...(selfhostLinuxContainerSelection?.kind === "oci" &&
+    selfhostLinuxContainerSelection.selection.ociParentControl ===
+      "sealed-peer-runtime-application-owner@1"
+      ? { ingressDrainTimeoutMs: 25_000 }
+      : {}),
     stopIngress: async () => {
       const endpointClosings: Promise<void>[] = [];
       if (selfhostContainerEndpointHttps) {
