@@ -577,6 +577,16 @@ async function authenticatedOriginalPeerSource(
   return { custody, binary, allocation };
 }
 
+/** Negative-only fence for a caller that already read the fixed original owner. */
+export function assertCurrentOriginalLinuxOciLiveInitCustody(
+  original: object,
+  core: DockerContainerCoreOwner,
+  signal: AbortSignal,
+): void {
+  const { custody } = originalPeerCustody(original, core, signal);
+  if (!custody.runtime3 || custody.isClosed()) fail("parent_custody");
+}
+
 /** Fixed observation after Core authenticates its current same-Sql record.
  * The opened binding is consumed here, outside all caller-provided callbacks. */
 export async function readOriginalLinuxOciLiveInit(

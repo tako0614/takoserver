@@ -1240,6 +1240,7 @@ const applicationSuccessorTransition = "__tako_container_application_successor_t
 export const V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND = Object.freeze({
   from: V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
   objects: applicationSuccessorSelectedObjects,
+  ready: Object.freeze({ sql: applicationSuccessorReady, params: applicationSuccessorReadyParams }),
   statements: Object.freeze(
     [
       { sql: `CREATE TABLE temp.${applicationSuccessorTransition} (ok INTEGER NOT NULL)` },

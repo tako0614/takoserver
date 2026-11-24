@@ -16,6 +16,7 @@ import {
   V2_CONTAINER_APPLICATION_IO_RESERVED,
   V2_CONTAINER_CONTROL_RESERVED,
   V2_CONTAINER_F2_FORM,
+  V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND,
   validateV2ContainerF2SensitiveNames,
 } from "../takoform-v2/container-owner-schema.ts";
 import type {
@@ -59,6 +60,7 @@ import {
 } from "./linux-oci-host-topology.ts";
 import {
   advanceOriginalLinuxOciOwnedDisposal,
+  assertCurrentOriginalLinuxOciLiveInitCustody,
   createOriginalLinuxOciSealedApplicationCloseResume,
   disposeOriginalLinuxOciAllocation,
   type LinuxOciSealedApplicationCloseResume,
@@ -266,6 +268,13 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciOriginalLiveInit>;
+  /** Reserve the first application successor after authenticating the original
+   * graceful close and current original init. No application I/O is authorized. */
+  reserveOriginalApplicationSuccessor(
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<LinuxOciApplicationSuccessorReservation>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
    * removal; the binding owner must authorize each application invocation. */
@@ -491,6 +500,28 @@ const select = "SELECT " + fields.map(({ column, key }) => column + " AS " + key
 const fail: () => never = (): never => {
   throw new TypeError("Docker Core owner authority refused");
 };
+
+const applicationSuccessorSchema = V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.ready;
+const applicationSuccessorStore = {
+  sql:
+    applicationSuccessorSchema.sql +
+    " AND NOT EXISTS (SELECT 1 FROM temp.sqlite_schema WHERE type IN ('table','view') AND lower(name) GLOB 'tf_v2_*')",
+  params: applicationSuccessorSchema.params,
+};
+
+const applicationSuccessorMint = Symbol("application successor reservation");
+class LinuxOciApplicationSuccessorReservation {
+  #ownerToken: string;
+  constructor(mint: typeof applicationSuccessorMint, ownerToken: string) {
+    if (mint !== applicationSuccessorMint) fail();
+    this.#ownerToken = ownerToken;
+    Object.setPrototypeOf(this, null);
+    Object.freeze(this);
+  }
+  static matches(reservation: LinuxOciApplicationSuccessorReservation, ownerToken: unknown) {
+    return reservation.#ownerToken === ownerToken;
+  }
+}
 
 async function waitForOriginalApplicationClose(
   close: Promise<void>,
@@ -4072,18 +4103,20 @@ export function createDockerContainerCoreOwner(
       return observation;
     });
   }
-  async function readCurrentOciInit(
+  async function prepareCurrentOciInit(
     input: DockerContainerCreateRecord,
     originalCustody: object,
     signal: AbortSignal,
     selectorFence?: ReturnType<typeof fence>,
-  ): Promise<LinuxOciOriginalLiveInit> {
+    schema: "allocation" | "application-successor" = "allocation",
+  ) {
     if (!runtimeApplicationOwner || !(signal instanceof AbortSignal) || signal.aborted)
       return fail();
+    const successor = schema === "application-successor";
     const { captured, loaded } = await loadServingOci(input, signal);
     if (
       loaded.proof.r_phase === "deleting" ||
-      !(await inspectV2ContainerOwnerSelectedSchema(sql, "allocation"))
+      (!successor && !(await inspectV2ContainerOwnerSelectedSchema(sql, "allocation")))
     )
       return fail();
     const coordinates = [
@@ -4091,11 +4124,14 @@ export function createDockerContainerCoreOwner(
       captured.intent.policy.generation,
       captured.claimId,
       captured.nativeId,
-    ];
+    ] as const;
+    const claims = successor
+      ? "main.tf_v2_container_create_claims"
+      : "tf_v2_container_create_claims";
     const allocationPredicate =
       "resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND state='bound' AND allocation_cleanup='untouched'";
     const rows = await sql.query(
-      "SELECT native_control FROM tf_v2_container_create_claims WHERE " + allocationPredicate,
+      `SELECT native_control FROM ${claims} WHERE ${allocationPredicate}`,
       coordinates,
     );
     const raw = rows[0]?.native_control;
@@ -4104,11 +4140,16 @@ export function createDockerContainerCoreOwner(
     const guard = {
       sql:
         snapshot.sql +
-        " AND EXISTS (SELECT 1 FROM tf_v2_container_create_claims WHERE " +
-        allocationPredicate +
-        " AND native_control=?)" +
-        (selectorFence === undefined ? "" : ` AND ${selectorFence.sql}`),
-      params: [...snapshot.params, ...coordinates, raw, ...(selectorFence?.params ?? [])],
+        ` AND EXISTS (SELECT 1 FROM ${claims} WHERE ${allocationPredicate} AND native_control=?)` +
+        (selectorFence === undefined ? "" : ` AND ${selectorFence.sql}`) +
+        (successor ? ` AND ${applicationSuccessorStore.sql}` : ""),
+      params: [
+        ...snapshot.params,
+        ...coordinates,
+        raw,
+        ...(selectorFence?.params ?? []),
+        ...(successor ? applicationSuccessorStore.params : []),
+      ],
     };
     const currentRunning = async () =>
       !signal.aborted && (await boundInitPhase(loaded, guard)) === "running" && !signal.aborted;
@@ -4126,13 +4167,14 @@ export function createDockerContainerCoreOwner(
     const assertLocal = () => {
       if (!active || signal.aborted || controlDecryptionKey?.(originalControlKeyId) !== key)
         return fail();
+      if (successor) assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
     };
     const assertCurrent = async () => {
       assertLocal();
       if (!(await currentRunning())) return fail();
       assertLocal();
     };
-    try {
+    const observe = async () => {
       await assertCurrent();
       assertLocal();
       const observed = await readOriginalLinuxOciLiveInit(
@@ -4148,9 +4190,83 @@ export function createDockerContainerCoreOwner(
       assertLocal();
       if (observed.nativeId !== captured.nativeId) return fail();
       return observed;
-    } finally {
+    };
+    const finish = () => {
       active = false;
+    };
+    return { captured, coordinates, raw, guard, assertLocal, observe, finish };
+  }
+  async function readCurrentOciInit(
+    input: DockerContainerCreateRecord,
+    originalCustody: object,
+    signal: AbortSignal,
+    selectorFence?: ReturnType<typeof fence>,
+  ): Promise<LinuxOciOriginalLiveInit> {
+    const current = await prepareCurrentOciInit(input, originalCustody, signal, selectorFence);
+    try {
+      return await current.observe();
+    } finally {
+      current.finish();
     }
+  }
+  async function selectCurrentOciInit(
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    signal: AbortSignal,
+  ) {
+    if (
+      !runtimeApplicationOwner ||
+      !(signal instanceof AbortSignal) ||
+      signal.aborted ||
+      !own(selector, ["resourceUid", "incarnationId"]) ||
+      Reflect.ownKeys(selector).length !== 2 ||
+      (Object.getPrototypeOf(selector) !== Object.prototype &&
+        Object.getPrototypeOf(selector) !== null) ||
+      !text(selector.resourceUid) ||
+      !hex(selector.incarnationId)
+    )
+      return fail();
+    const { resourceUid, incarnationId } = selector;
+    const serving =
+      "i.resource_uid=? AND i.incarnation_id=? AND i.installation_id=? AND i.backend_id=? AND i.target_key=? AND i.form_url=?" +
+      " AND i.serving_generation=v.generation AND v.retention='serving' AND i.retire_operation_id IS NULL AND i.retired_at_ms IS NULL" +
+      " AND o.status='succeeded' AND o.effect='complete'" +
+      " AND r.deleted_at IS NULL AND r.phase<>'deleting' AND r.observed_generation=v.generation" +
+      " AND json_type(r.observed_json, '$.ready')='true' AND json_extract(r.observed_json, '$.servingGeneration')=v.generation" +
+      " AND q.installation_id=i.installation_id AND q.state='bound' AND q.removed_at_ms IS NULL AND q.allocation_cleanup='untouched'" +
+      " AND NOT EXISTS (SELECT 1 FROM tf_v2_operations d WHERE d.resource_uid=i.resource_uid AND d.action='delete' AND d.status IN ('queued','running','reconciling','waiting_input'))";
+    const params = [
+      resourceUid,
+      incarnationId,
+      installationId,
+      backendId,
+      targetKey,
+      V2_CONTAINER_F2_FORM,
+    ];
+    const rows = await sql.query(`${select} WHERE ${serving} LIMIT 2`, params);
+    const row = rows[0];
+    if (rows.length !== 1 || !row || typeof row.v_intent_json !== "string" || signal.aborted)
+      return fail();
+    const parsed = parseStrictJson(new TextEncoder().encode(row.v_intent_json), 1048576);
+    if (!isJsonObject(parsed)) return fail();
+    const intent = intentSnapshot(parsed as unknown as DockerContainerCreateIntent);
+    const selected = record(intent, rowProof(row));
+    if (
+      intent.resourceUid !== resourceUid ||
+      intent.incarnationId !== incarnationId ||
+      selected?.state !== "bound" ||
+      selected.nativeId === null
+    )
+      return fail();
+
+    // Keep the ready, non-deleting durable projection in the same running
+    // snapshot fence before and after the authenticated original peer read.
+    return {
+      selected,
+      guard: {
+        sql: `EXISTS (SELECT 1${from} WHERE ${serving} AND q.claim_id=? AND q.native_id=?)`,
+        params: [...params, selected.claimId, selected.nativeId],
+      },
+    };
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
@@ -4903,57 +5019,98 @@ export function createDockerContainerCoreOwner(
       return readCurrentOciInit(input, originalCustody, signal);
     },
     async readCurrentOciInitForResource(selector, originalCustody, signal) {
-      if (
-        !runtimeApplicationOwner ||
-        !(signal instanceof AbortSignal) ||
-        signal.aborted ||
-        !own(selector, ["resourceUid", "incarnationId"]) ||
-        Reflect.ownKeys(selector).length !== 2 ||
-        (Object.getPrototypeOf(selector) !== Object.prototype &&
-          Object.getPrototypeOf(selector) !== null) ||
-        !text(selector.resourceUid) ||
-        !hex(selector.incarnationId)
-      )
-        return fail();
-      const { resourceUid, incarnationId } = selector;
-      const serving =
-        "i.resource_uid=? AND i.incarnation_id=? AND i.installation_id=? AND i.backend_id=? AND i.target_key=? AND i.form_url=?" +
-        " AND i.serving_generation=v.generation AND v.retention='serving' AND i.retire_operation_id IS NULL AND i.retired_at_ms IS NULL" +
-        " AND o.status='succeeded' AND o.effect='complete'" +
-        " AND r.deleted_at IS NULL AND r.phase<>'deleting' AND r.observed_generation=v.generation" +
-        " AND json_type(r.observed_json, '$.ready')='true' AND json_extract(r.observed_json, '$.servingGeneration')=v.generation" +
-        " AND q.installation_id=i.installation_id AND q.state='bound' AND q.removed_at_ms IS NULL AND q.allocation_cleanup='untouched'" +
-        " AND NOT EXISTS (SELECT 1 FROM tf_v2_operations d WHERE d.resource_uid=i.resource_uid AND d.action='delete' AND d.status IN ('queued','running','reconciling','waiting_input'))";
-      const params = [
-        resourceUid,
-        incarnationId,
-        installationId,
-        backendId,
-        targetKey,
-        V2_CONTAINER_F2_FORM,
-      ];
-      const rows = await sql.query(`${select} WHERE ${serving} LIMIT 2`, params);
-      const row = rows[0];
-      if (rows.length !== 1 || !row || typeof row.v_intent_json !== "string" || signal.aborted)
-        return fail();
-      const parsed = parseStrictJson(new TextEncoder().encode(row.v_intent_json), 1048576);
-      if (!isJsonObject(parsed)) return fail();
-      const intent = intentSnapshot(parsed as unknown as DockerContainerCreateIntent);
-      const selected = record(intent, rowProof(row));
-      if (
-        intent.resourceUid !== resourceUid ||
-        intent.incarnationId !== incarnationId ||
-        selected?.state !== "bound" ||
-        selected.nativeId === null
-      )
-        return fail();
+      const { selected, guard } = await selectCurrentOciInit(selector, signal);
+      return readCurrentOciInit(selected, originalCustody, signal, guard);
+    },
+    async reserveOriginalApplicationSuccessor(selector, originalCustody, signal) {
+      if (!runtimeApplicationOwner || !(signal instanceof AbortSignal)) return fail();
+      assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
+      const schema = await sql.query(
+        "SELECT 1 AS ready WHERE " + applicationSuccessorStore.sql,
+        applicationSuccessorStore.params,
+      );
+      if (schema.length !== 1 || schema[0]?.ready !== 1) return fail();
+      const { selected, guard } = await selectCurrentOciInit(selector, signal);
+      const current = await prepareCurrentOciInit(
+        selected,
+        originalCustody,
+        signal,
+        guard,
+        "application-successor",
+      );
+      try {
+        const { captured, coordinates, raw } = current;
+        const scope = "resource_uid=? AND generation=? AND claim_id=? AND native_id=?";
+        const unclaimed =
+          " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=?)";
+        const [resourceUid, generation] = coordinates;
+        const previous = await sql.query(
+          "SELECT close_document FROM main.tf_v2_container_shutdown_io_closes WHERE " +
+            scope +
+            unclaimed,
+          [...coordinates, resourceUid, generation],
+        );
+        const predecessor = previous[0]?.close_document;
+        if (previous.length !== 1 || typeof predecessor !== "string") return fail();
+        const predecessorCurrent = await readApplicationCloseFact(
+          predecessor,
+          await shutdownIoScope(captured, raw),
+          shutdownIoCloseKind,
+        );
+        predecessorCurrent();
+        await current.observe();
 
-      // Keep the ready, non-deleting durable projection in the same running
-      // snapshot fence before and after the authenticated original peer read.
-      return readCurrentOciInit(selected, originalCustody, signal, {
-        sql: `EXISTS (SELECT 1${from} WHERE ${serving} AND q.claim_id=? AND q.native_id=?)`,
-        params: [...params, selected.claimId, selected.nativeId],
-      });
+        // Bind the exact main schema, current claim, and running attempt in the
+        // statement comparing the authenticated predecessor bytes.
+        const running =
+          "EXISTS (SELECT 1 FROM main.tf_v2_container_start_attempts WHERE resource_uid=? AND generation=? AND create_claim_id=? AND native_id=? AND attempt=1 AND state='running' AND confirmed_running_at_ms IS NOT NULL AND confirmed_exited_at_ms IS NULL)";
+        const live = current.guard.sql + " AND " + running;
+        const liveParams = [...current.guard.params, ...coordinates];
+        const ownerToken = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+          byte.toString(16).padStart(2, "0"),
+        ).join("");
+        current.assertLocal();
+        predecessorCurrent();
+        const inserted = await sql.run(
+          "INSERT INTO main.tf_v2_container_application_successors(resource_uid,generation,claim_id,native_id,epoch,owner_token,predecessor_close_document) " +
+            "SELECT resource_uid,generation,claim_id,native_id,1,?,close_document FROM main.tf_v2_container_shutdown_io_closes WHERE " +
+            scope +
+            " AND close_document=? AND " +
+            live +
+            unclaimed,
+          [ownerToken, ...coordinates, predecessor, ...liveParams, resourceUid, generation],
+        );
+        // A committed write can survive a lost acknowledgement or cancellation.
+        // Only the original successful caller can continue to exact readback.
+        if (inserted.changes !== 1) return fail();
+        current.assertLocal();
+        predecessorCurrent();
+        const confirmed = await sql.query(
+          "SELECT epoch,owner_token,predecessor_close_document,close_document FROM main.tf_v2_container_application_successors WHERE " +
+            scope +
+            " AND epoch=1 AND owner_token=? AND " +
+            live,
+          [...coordinates, ownerToken, ...liveParams],
+        );
+        const row = confirmed[0];
+        const reservation = new LinuxOciApplicationSuccessorReservation(
+          applicationSuccessorMint,
+          ownerToken,
+        );
+        if (
+          confirmed.length !== 1 ||
+          row?.epoch !== 1 ||
+          !LinuxOciApplicationSuccessorReservation.matches(reservation, row.owner_token) ||
+          row.predecessor_close_document !== predecessor ||
+          row.close_document !== null
+        )
+          return fail();
+        current.assertLocal();
+        predecessorCurrent();
+        return reservation;
+      } finally {
+        current.finish();
+      }
     },
     async observeServingOciHttp(input, originalCustody, signal) {
       const { captured, loaded } = await loadServingOci(input, signal);
