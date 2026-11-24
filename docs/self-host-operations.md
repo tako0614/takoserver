@@ -2035,6 +2035,37 @@ cp -a /etc/takoserver "$SNAP/etc"
 
 Record `$SNAP` with the commit that wrote the data (step 4).
 
+### Prepare an OCI shutdown evidence database
+
+The explicit tracked OCI selection requires the shutdown evidence schema. For an
+installation with the exact Container final-delete schema and the stock SQLite
+migration history, prepare the additive schema on a copy of the stopped
+control database. The backup procedure above preserves the service's file
+ownership. Make a separate private copy owned by the operator preparing it.
+Run the following as the same operator who owns the backup directory.
+For an installation with an external `TAKOSERVER_DB`, replace the
+`SOURCE_DB` assignment with its file from the same stopped backup window.
+
+```sh
+: "${SNAP:?Set SNAP to the completed stopped backup}"
+SOURCE_DB="$SNAP/data/control.sqlite"
+test -f "$SOURCE_DB" && test "$(realpath -- "$SOURCE_DB")" = "$SOURCE_DB" || exit 1
+for suffix in -wal -shm -journal; do
+  test ! -e "$SOURCE_DB$suffix" && test ! -L "$SOURCE_DB$suffix" || exit 1
+done
+OCI_PREP=$(mktemp -d "$SNAP/oci-prepare.XXXXXXXX") || exit 1
+install -m 0600 "$SOURCE_DB" "$OCI_PREP/control.sqlite" || exit 1
+bun --no-env-file scripts/selfhost-oci-shutdown-schema.ts prepare \
+  "$OCI_PREP/control.sqlite" "$OCI_PREP/control-with-oci-shutdown.sqlite"
+```
+
+The command reads the private copy and refuses SQLite sidecars, incomplete schema,
+and existing output. It publishes the new file after an atomic schema change,
+integrity check, and readback. The output contains the same private data as
+the backup. Keep all copies in private storage. Restore service ownership on
+the prepared database when restoring that same complete installation, with
+the fencing and runtime identity checks below.
+
 ## Restore boundary
 
 Restoring the files is not a safe way to validate a clone. Starting
