@@ -8,6 +8,7 @@ import {
   V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
   V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
+import { ownedRawHttp } from "./helpers/container-http-transport-fixture.ts";
 import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
@@ -86,29 +87,32 @@ async function preparedOriginal() {
     const signal = new AbortController().signal;
     fresh = f.reconstructParent();
     const raw = spyOn(childProcess, "spawn");
-    const readLiveInit = bundle.readOriginalLinuxOciLiveInit;
-    type Read = Parameters<typeof readLiveInit>;
-    let custody: Read[0] | undefined;
-    let core: Read[1] | undefined;
-    const capture = spyOn(bundle, "readOriginalLinuxOciLiveInit").mockImplementationOnce(
-      (...args) => {
-        [custody, core] = args;
-        return readLiveInit(...args);
-      },
-    );
-    try {
-      raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
-      expect(await fresh.readCurrentLiveInit(selector, signal)).toMatchObject({
-        nativeId: original.claimId,
-      });
-    } finally {
-      capture.mockRestore();
-    }
-    if (!core || !custody) throw Error("genuine fresh Core and custody not captured");
+    const captureCreator = async (creator: ReturnType<typeof f.reconstructParent>) => {
+      const readLiveInit = bundle.readOriginalLinuxOciLiveInit;
+      type Read = Parameters<typeof readLiveInit>;
+      let custody: Read[0] | undefined;
+      let core: Read[1] | undefined;
+      const capture = spyOn(bundle, "readOriginalLinuxOciLiveInit").mockImplementationOnce(
+        (...args) => {
+          [custody, core] = args;
+          return readLiveInit(...args);
+        },
+      );
+      try {
+        raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+        expect(await creator.readCurrentLiveInit(selector, signal)).toMatchObject({
+          nativeId: original.claimId,
+        });
+      } finally {
+        capture.mockRestore();
+      }
+      if (!core || !custody) throw Error("genuine fresh Core and custody not captured");
+      return { core, custody };
+    };
     return {
       f,
-      core,
-      custody,
+      ...(await captureCreator(fresh)),
+      captureCreator,
       fresh,
       selector,
       signal,
@@ -130,6 +134,114 @@ async function preparedOriginal() {
     health.restore();
   }
 }
+
+test("a same-claim successor reservation is confined to its issuing creator and cannot open HTTP", async () => {
+  await withOriginal(
+    async ({
+      f,
+      core,
+      custody,
+      fresh,
+      selector,
+      signal,
+      raw,
+      original,
+      captureCreator,
+      expand,
+    }) => {
+      const foreign = f.reconstructParent();
+      try {
+        const second = await captureCreator(foreign);
+        expect(second.core).not.toBe(core);
+        expect(second.custody).not.toBe(custody);
+        await expand();
+        raw.mockReturnValueOnce(replyToLiveInit(original.claimId));
+        const reservation = await core.reserveOriginalApplicationSuccessor(
+          selector,
+          custody,
+          signal,
+        );
+        const connectorCount = raw.mock.calls.length;
+
+        await expect(
+          core.assertOriginalApplicationSuccessorReservation(
+            reservation,
+            selector,
+            custody,
+            signal,
+          ),
+        ).resolves.toBeUndefined();
+        const rows = await f.sql.query(
+          `SELECT owner_token, close_document FROM main.${reservations}`,
+        );
+        expect(rows).toHaveLength(1);
+        const copied = Object.freeze({
+          ownerToken: rows[0]?.owner_token,
+        }) as unknown as typeof reservation;
+        for (const [owner, handle, identity, key] of [
+          [core, copied, selector, custody],
+          [core, reservation, { ...selector, incarnationId: "0".repeat(64) }, custody],
+          [core, reservation, selector, second.custody],
+          [second.core, reservation, selector, second.custody],
+        ] as const) {
+          await expect(
+            owner.assertOriginalApplicationSuccessorReservation(handle, identity, key, signal),
+          ).rejects.toThrow();
+        }
+        const abort = new AbortController();
+        abort.abort();
+        await expect(
+          core.assertOriginalApplicationSuccessorReservation(
+            reservation,
+            selector,
+            custody,
+            abort.signal,
+          ),
+        ).rejects.toThrow();
+
+        const io = ownedRawHttp();
+        const rawRequest = new Request("http://ignored.invalid/original-claim", { signal });
+        try {
+          await expect(
+            fresh.openServingHttp(selector, rawRequest, () => undefined),
+          ).rejects.toThrow(/http_custody/);
+          expect(io.counts().calls).toBe(0);
+        } finally {
+          io.restore();
+        }
+
+        const query = f.sql.query.bind(f.sql);
+        const closingRead = spyOn(f.sql, "query").mockImplementation(async (statement, params) => {
+          const result = await query(statement, params);
+          if (statement.startsWith("SELECT epoch,owner_token,predecessor_close_document")) {
+            expect(result).toHaveLength(1);
+            await fresh.close();
+            expect(signal.aborted).toBe(false);
+          }
+          return result;
+        });
+        try {
+          await expect(
+            core.assertOriginalApplicationSuccessorReservation(
+              reservation,
+              selector,
+              custody,
+              signal,
+            ),
+          ).rejects.toThrow(/parent_custody/);
+        } finally {
+          closingRead.mockRestore();
+        }
+        expect(raw.mock.calls.length).toBe(connectorCount);
+        expect(
+          await f.sql.query(`SELECT owner_token, close_document FROM main.${reservations}`),
+        ).toEqual(rows);
+      } finally {
+        await foreign.close();
+      }
+    },
+  );
+}, 20_000);
 
 test("authentic H0 and the still-current original peer reserve one opaque epoch", async () => {
   await withOriginal(

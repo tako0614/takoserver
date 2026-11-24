@@ -275,6 +275,14 @@ export interface DockerContainerCoreOwner {
     originalCustody: object,
     signal: AbortSignal,
   ): Promise<LinuxOciApplicationSuccessorReservation>;
+  /** Negative storage/owner check only. A separate held native source must
+   * authorize application I/O. The current reservation alone supplies none. */
+  assertOriginalApplicationSuccessorReservation(
+    reservation: LinuxOciApplicationSuccessorReservation,
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<void>;
   /** Original creator's live serving read, independent of a completed
    * management execution lease. It grants neither caller authorization nor
    * removal; the binding owner must authorize each application invocation. */
@@ -510,17 +518,47 @@ const applicationSuccessorStore = {
 };
 
 const applicationSuccessorMint = Symbol("application successor reservation");
+interface ApplicationSuccessorIssuance {
+  readonly core: DockerContainerCoreOwner;
+  readonly sql: Sql;
+  readonly originalCustody: object;
+  readonly signal: AbortSignal;
+  readonly record: DockerContainerCreateRecord;
+  readonly ownerToken: string;
+  readonly predecessor: string;
+  readonly liveSql: string;
+  readonly liveParams: readonly SqlParam[];
+  readonly assertKeys: () => void;
+}
 class LinuxOciApplicationSuccessorReservation {
-  #ownerToken: string;
-  constructor(mint: typeof applicationSuccessorMint, ownerToken: string) {
+  #issued: ApplicationSuccessorIssuance;
+  constructor(mint: typeof applicationSuccessorMint, issued: ApplicationSuccessorIssuance) {
     if (mint !== applicationSuccessorMint) fail();
-    this.#ownerToken = ownerToken;
+    this.#issued = Object.freeze(issued);
     Object.setPrototypeOf(this, null);
     Object.freeze(this);
   }
-  static matches(reservation: LinuxOciApplicationSuccessorReservation, ownerToken: unknown) {
-    return reservation.#ownerToken === ownerToken;
+  static issuance(reservation: unknown) {
+    if (!reservation || typeof reservation !== "object" || !(#issued in reservation)) return fail();
+    return reservation.#issued;
   }
+}
+
+function captureCurrentOciSelector(selector: {
+  readonly resourceUid: string;
+  readonly incarnationId: string;
+}) {
+  if (
+    !own(selector, ["resourceUid", "incarnationId"]) ||
+    Reflect.ownKeys(selector).length !== 2 ||
+    (Object.getPrototypeOf(selector) !== Object.prototype &&
+      Object.getPrototypeOf(selector) !== null) ||
+    !text(selector.resourceUid) ||
+    !hex(selector.incarnationId)
+  )
+    return fail();
+  const { resourceUid, incarnationId } = selector;
+  return { resourceUid, incarnationId };
 }
 
 async function waitForOriginalApplicationClose(
@@ -4164,9 +4202,12 @@ export function createDockerContainerCoreOwner(
     freezeJson(artifact);
     freezeJson(binding);
     let active = true;
+    const assertControlKey = () => {
+      if (controlDecryptionKey?.(originalControlKeyId) !== key) return fail();
+    };
     const assertLocal = () => {
-      if (!active || signal.aborted || controlDecryptionKey?.(originalControlKeyId) !== key)
-        return fail();
+      if (!active || signal.aborted) return fail();
+      assertControlKey();
       if (successor) assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
     };
     const assertCurrent = async () => {
@@ -4194,7 +4235,7 @@ export function createDockerContainerCoreOwner(
     const finish = () => {
       active = false;
     };
-    return { captured, coordinates, raw, guard, assertLocal, observe, finish };
+    return { captured, coordinates, raw, guard, assertLocal, assertControlKey, observe, finish };
   }
   async function readCurrentOciInit(
     input: DockerContainerCreateRecord,
@@ -4213,19 +4254,9 @@ export function createDockerContainerCoreOwner(
     selector: { readonly resourceUid: string; readonly incarnationId: string },
     signal: AbortSignal,
   ) {
-    if (
-      !runtimeApplicationOwner ||
-      !(signal instanceof AbortSignal) ||
-      signal.aborted ||
-      !own(selector, ["resourceUid", "incarnationId"]) ||
-      Reflect.ownKeys(selector).length !== 2 ||
-      (Object.getPrototypeOf(selector) !== Object.prototype &&
-        Object.getPrototypeOf(selector) !== null) ||
-      !text(selector.resourceUid) ||
-      !hex(selector.incarnationId)
-    )
+    if (!runtimeApplicationOwner || !(signal instanceof AbortSignal) || signal.aborted)
       return fail();
-    const { resourceUid, incarnationId } = selector;
+    const { resourceUid, incarnationId } = captureCurrentOciSelector(selector);
     const serving =
       "i.resource_uid=? AND i.incarnation_id=? AND i.installation_id=? AND i.backend_id=? AND i.target_key=? AND i.form_url=?" +
       " AND i.serving_generation=v.generation AND v.retention='serving' AND i.retire_operation_id IS NULL AND i.retired_at_ms IS NULL" +
@@ -4267,6 +4298,54 @@ export function createDockerContainerCoreOwner(
         params: [...params, selected.claimId, selected.nativeId],
       },
     };
+  }
+  async function assertOriginalApplicationSuccessorReservation(
+    reservation: LinuxOciApplicationSuccessorReservation,
+    selector: { readonly resourceUid: string; readonly incarnationId: string },
+    originalCustody: object,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (!runtimeApplicationOwner || !(signal instanceof AbortSignal)) return fail();
+    const { resourceUid, incarnationId } = captureCurrentOciSelector(selector);
+    const issued = LinuxOciApplicationSuccessorReservation.issuance(reservation);
+    const { intent, claimId, nativeId } = issued.record;
+    const assertLocal = () => {
+      if (
+        issued.core !== result ||
+        issued.sql !== sql ||
+        issued.originalCustody !== originalCustody ||
+        issued.signal.aborted ||
+        intent.resourceUid !== resourceUid ||
+        intent.incarnationId !== incarnationId
+      )
+        return fail();
+      assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
+      issued.assertKeys();
+    };
+    assertLocal();
+    const confirmed = await sql.query(
+      "SELECT epoch,owner_token,predecessor_close_document,close_document FROM main.tf_v2_container_application_successors " +
+        "WHERE resource_uid=? AND generation=? AND claim_id=? AND native_id=? AND epoch=1 AND owner_token=? AND " +
+        issued.liveSql,
+      [
+        resourceUid,
+        intent.policy.generation,
+        claimId,
+        nativeId,
+        issued.ownerToken,
+        ...issued.liveParams,
+      ],
+    );
+    const row = confirmed[0];
+    if (
+      confirmed.length !== 1 ||
+      row?.epoch !== 1 ||
+      row.owner_token !== issued.ownerToken ||
+      row.predecessor_close_document !== issued.predecessor ||
+      row.close_document !== null
+    )
+      return fail();
+    assertLocal();
   }
   const result: DockerContainerCoreOwner = Object.freeze<DockerContainerCoreOwner>({
     async saveOriginalShutdownIoClose(input, originalCustody, signal) {
@@ -5022,15 +5101,17 @@ export function createDockerContainerCoreOwner(
       const { selected, guard } = await selectCurrentOciInit(selector, signal);
       return readCurrentOciInit(selected, originalCustody, signal, guard);
     },
+    assertOriginalApplicationSuccessorReservation,
     async reserveOriginalApplicationSuccessor(selector, originalCustody, signal) {
       if (!runtimeApplicationOwner || !(signal instanceof AbortSignal)) return fail();
+      const identity = captureCurrentOciSelector(selector);
       assertCurrentOriginalLinuxOciLiveInitCustody(originalCustody, result, signal);
       const schema = await sql.query(
         "SELECT 1 AS ready WHERE " + applicationSuccessorStore.sql,
         applicationSuccessorStore.params,
       );
       if (schema.length !== 1 || schema[0]?.ready !== 1) return fail();
-      const { selected, guard } = await selectCurrentOciInit(selector, signal);
+      const { selected, guard } = await selectCurrentOciInit(identity, signal);
       const current = await prepareCurrentOciInit(
         selected,
         originalCustody,
@@ -5039,7 +5120,7 @@ export function createDockerContainerCoreOwner(
         "application-successor",
       );
       try {
-        const { captured, coordinates, raw } = current;
+        const { captured, coordinates, raw, assertControlKey } = current;
         const scope = "resource_uid=? AND generation=? AND claim_id=? AND native_id=?";
         const unclaimed =
           " AND NOT EXISTS (SELECT 1 FROM main.tf_v2_container_application_successors WHERE resource_uid=? AND generation=?)";
@@ -5085,26 +5166,27 @@ export function createDockerContainerCoreOwner(
         if (inserted.changes !== 1) return fail();
         current.assertLocal();
         predecessorCurrent();
-        const confirmed = await sql.query(
-          "SELECT epoch,owner_token,predecessor_close_document,close_document FROM main.tf_v2_container_application_successors WHERE " +
-            scope +
-            " AND epoch=1 AND owner_token=? AND " +
-            live,
-          [...coordinates, ownerToken, ...liveParams],
-        );
-        const row = confirmed[0];
-        const reservation = new LinuxOciApplicationSuccessorReservation(
-          applicationSuccessorMint,
+        const reservation = new LinuxOciApplicationSuccessorReservation(applicationSuccessorMint, {
+          core: result,
+          sql,
+          originalCustody,
+          signal,
+          record: captured,
           ownerToken,
+          predecessor,
+          liveSql: live,
+          liveParams: Object.freeze(liveParams),
+          assertKeys() {
+            assertControlKey();
+            predecessorCurrent();
+          },
+        });
+        await assertOriginalApplicationSuccessorReservation(
+          reservation,
+          identity,
+          originalCustody,
+          signal,
         );
-        if (
-          confirmed.length !== 1 ||
-          row?.epoch !== 1 ||
-          !LinuxOciApplicationSuccessorReservation.matches(reservation, row.owner_token) ||
-          row.predecessor_close_document !== predecessor ||
-          row.close_document !== null
-        )
-          return fail();
         current.assertLocal();
         predecessorCurrent();
         return reservation;
