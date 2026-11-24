@@ -8,6 +8,7 @@ import {
 } from "./providers/linux-oci-container-binding-broker.ts";
 import {
   type SelfhostLinuxContainerNodeSelection,
+  type SelfhostLinuxContainerNodeSelectionSource,
   validateSelfhostLinuxOciNodeConfiguration,
 } from "./selfhost-linux-container-node-selection.ts";
 import { createSelfhostLinuxDockerContainerBackend } from "./selfhost-linux-docker-container-backend.ts";
@@ -19,7 +20,13 @@ import {
   type V2PrivateInputCustody,
   validatePrivateInputCustody,
 } from "./takoform-v2/private-inputs.ts";
-import type { V2Action, V2BackendResult, V2Execution, V2Form } from "./takoform-v2/types.ts";
+import type {
+  V2Action,
+  V2BackendResult,
+  V2Execution,
+  V2Form,
+  V2RetainedExecutionActions,
+} from "./takoform-v2/types.ts";
 import { WORKER_VERSION_UNIFIED_BACKEND_ID } from "./takoform-v2/worker-lifecycle-backend.ts";
 
 export async function assertSelfhostLinuxContainerNodeSchema(
@@ -36,7 +43,7 @@ export async function assertSelfhostLinuxContainerNodeSchema(
 
 /** Capture the existing code-only action selection, without widening it. The
  * engine still performs its original pre-claim retained-adapter binding. */
-function captureActions(input: Readonly<Record<string, readonly V2Action[]>> | undefined) {
+function captureActions(input: V2RetainedExecutionActions | undefined) {
   const captured: Record<string, readonly V2Action[]> = Object.create(null);
   if (input !== undefined) {
     if (
@@ -75,11 +82,29 @@ function captureActions(input: Readonly<Record<string, readonly V2Action[]>> | u
       captured[key] = Object.freeze(actions);
     }
   }
-  // Retained-only Node composition defaults to retirement, not fresh dispatch.
-  // Explicit existing operator-code rules may select accepted CREATE/UPDATE.
-  if (!Object.hasOwn(captured, V2_CONTAINER_F2_FORM))
-    captured[V2_CONTAINER_F2_FORM] = Object.freeze<V2Action[]>(["delete"]);
-  return Object.freeze(captured);
+  return captured;
+}
+
+export type SelfhostLinuxContainerRetainedExecutionActions = Pick<
+  V2RetainedExecutionActions,
+  typeof V2_CONTAINER_F2_FORM
+>;
+
+/** Snapshot only the one retained Form owned by the selected Linux backend. */
+export function captureSelfhostLinuxContainerRetainedExecutionActions(
+  selection: SelfhostLinuxContainerNodeSelectionSource | undefined,
+  input: SelfhostLinuxContainerRetainedExecutionActions | undefined,
+): SelfhostLinuxContainerRetainedExecutionActions | undefined {
+  if (input === undefined) return undefined;
+  if (selection === undefined) {
+    throw new TypeError("retained execution actions require a Linux Container selection");
+  }
+  const captured = captureActions(input);
+  const actions = captured[V2_CONTAINER_F2_FORM];
+  if (Object.keys(captured).length !== 1 || actions === undefined) {
+    throw new TypeError("retained execution actions require the selected Linux Container F2 Form");
+  }
+  return Object.freeze({ [V2_CONTAINER_F2_FORM]: actions });
 }
 
 /** Wire one genuine backend into the existing Node application options. This
@@ -130,6 +155,10 @@ export function createSelfhostLinuxContainerNodeComposition(input: {
   if (!custody) throw new TypeError(`${prefix}_private_input_custody_required`);
   validatePrivateInputCustody(custody);
   const retainedExecutionActions = captureActions(input.retainedExecutionActions);
+  // Retirement is the default. Operator code can select other already accepted actions.
+  if (!Object.hasOwn(retainedExecutionActions, V2_CONTAINER_F2_FORM))
+    retainedExecutionActions[V2_CONTAINER_F2_FORM] = Object.freeze<V2Action[]>(["delete"]);
+  Object.freeze(retainedExecutionActions);
   const allowed: readonly V2Action[] = retainedExecutionActions[V2_CONTAINER_F2_FORM] ?? [];
   const oci =
     selected.kind === "oci"

@@ -114,7 +114,9 @@ import {
 } from "./selfhost-health-signals.ts";
 import {
   assertSelfhostLinuxContainerNodeSchema,
+  captureSelfhostLinuxContainerRetainedExecutionActions,
   createSelfhostLinuxContainerNodeComposition,
+  type SelfhostLinuxContainerRetainedExecutionActions,
 } from "./selfhost-linux-container-node-composition.ts";
 import {
   createSelfhostLinuxContainerNodeSelection,
@@ -206,13 +208,17 @@ const SELFHOST_BUN_HOST_STARTUP_SENTINEL = Symbol.for("takoserver.selfhost-bun-h
 
 /**
  * Run the ordinary Bun Host with an optional explicit, code-owned Linux
- * Container backend selection. Omitting it preserves the existing disabled
- * default. This is the same initialization used by direct `bun src/entry-bun.ts`.
+ * Container backend selection. The optional F2 action selection applies to
+ * already accepted operations. This is the same initialization used by direct
+ * `bun src/entry-bun.ts`, which leaves Linux Container disabled by default.
  * This process-owned startup is single-use: preflight failures reject before
  * state opens, while failures after resource initialization terminate the process.
  */
 export async function startSelfhostBunHost(
-  options: { readonly linuxContainerSelection?: SelfhostLinuxContainerNodeSelectionSource } = {},
+  options: {
+    readonly linuxContainerSelection?: SelfhostLinuxContainerNodeSelectionSource;
+    readonly v2RetainedExecutionActions?: SelfhostLinuxContainerRetainedExecutionActions;
+  } = {},
 ): Promise<void> {
   /**
    * A Bun Host owns process-global listeners, timers, signal handlers and one
@@ -233,6 +239,7 @@ export async function startSelfhostBunHost(
   });
 
   let selectionSource: SelfhostLinuxContainerNodeSelectionSource | undefined;
+  let retainedExecutionActions: SelfhostLinuxContainerRetainedExecutionActions | undefined;
   try {
     if (
       options === null ||
@@ -242,7 +249,9 @@ export async function startSelfhostBunHost(
     )
       throw new TypeError("invalid self-host Bun startup options");
     const keys = Reflect.ownKeys(options);
-    if (keys.some((key) => key !== "linuxContainerSelection") || keys.length > 1) {
+    if (
+      keys.some((key) => key !== "linuxContainerSelection" && key !== "v2RetainedExecutionActions")
+    ) {
       throw new TypeError("invalid self-host Bun startup options");
     }
     const descriptor = Object.getOwnPropertyDescriptor(options, "linuxContainerSelection");
@@ -254,12 +263,20 @@ export async function startSelfhostBunHost(
       throw new TypeError("invalid self-host Linux Container selection");
     }
     selectionSource = value as SelfhostLinuxContainerNodeSelectionSource | undefined;
+    const actions = Object.getOwnPropertyDescriptor(options, "v2RetainedExecutionActions");
+    if (actions && (!actions.enumerable || !("value" in actions))) {
+      throw new TypeError("invalid self-host Bun startup options");
+    }
+    retainedExecutionActions = captureSelfhostLinuxContainerRetainedExecutionActions(
+      selectionSource,
+      actions?.value,
+    );
   } catch (cause) {
     return Promise.reject(cause);
   }
 
   let processResourcesStarted = false;
-  return runSelfhostBunHost(selectionSource, () => {
+  return runSelfhostBunHost(selectionSource, retainedExecutionActions, () => {
     processResourcesStarted = true;
   }).catch((cause: unknown) => {
     if (!processResourcesStarted) throw cause;
@@ -276,6 +293,7 @@ export async function startSelfhostBunHost(
 
 async function runSelfhostBunHost(
   selectionSource: SelfhostLinuxContainerNodeSelectionSource | undefined,
+  retainedExecutionActions: SelfhostLinuxContainerRetainedExecutionActions | undefined,
   markProcessResourcesStarted: () => void,
 ): Promise<void> {
   /**
@@ -1246,6 +1264,7 @@ async function runSelfhostBunHost(
         sql,
         clock,
         selection: selfhostLinuxContainerSelection,
+        retainedExecutionActions,
         privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
         formSelectionFactory(context) {
           if (!workers || !completeV2WorkerForms) return { forms: {}, retainedForms: {} };
@@ -1728,6 +1747,7 @@ async function runSelfhostBunHost(
       sql,
       clock,
       selection: selfhostLinuxContainerSelection,
+      retainedExecutionActions,
       formSelectionFactory: v2FormSelectionFactory,
       privateInputCustody: runtimeInputKeyAuthority?.privateInputCustody,
     });
