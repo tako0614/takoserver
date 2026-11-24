@@ -16,6 +16,9 @@ async function fixture(
     qualifiedProducer?: boolean;
     producerRevision?: "missing" | "wrong";
     producerDigest?: "missing" | "wrong";
+    nativeStopWriteObserver?: NonNullable<
+      Parameters<typeof originalOwnedOciFixture>[1]
+    >["nativeStopWriteObserver"];
     localCleanup?: boolean;
     applicationOwner?: boolean;
     runtimeApplicationOwner?: boolean;
@@ -80,6 +83,9 @@ async function fixture(
         ? {}
         : { producerRevision: options.producerRevision }),
       ...(options.producerDigest === undefined ? {} : { producerDigest: options.producerDigest }),
+      ...(options.nativeStopWriteObserver === undefined
+        ? {}
+        : { nativeStopWriteObserver: options.nativeStopWriteObserver }),
       ...(options.localCleanup ? { parentPeerLocal: true } : {}),
       ...(options.applicationOwner ? { parentPeerApplicationOwner: true } : {}),
       ...(options.runtimeApplicationOwner ? { parentPeerRuntimeApplicationOwner: true } : {}),

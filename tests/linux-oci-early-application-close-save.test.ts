@@ -1,9 +1,11 @@
 import { expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { canonicalJson, isJsonObject } from "../src/json.ts";
 import {
   decodeContainerSecretBytes,
   decryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
+import type { LinuxOciDeleteStopWrite } from "../src/providers/docker-container-core-owner.ts";
 import * as originalBundle from "../src/providers/linux-oci-owned-bundle.ts";
 import {
   v2ConfiguredUpdateDiscardTransition,
@@ -195,7 +197,13 @@ for (const fault of trackedCloseCases) {
 }
 
 async function trackedOwnerForClose(
-  options: { incompleteStart?: boolean; shutdownSchema?: boolean } = {},
+  options: {
+    incompleteStart?: boolean;
+    shutdownSchema?: boolean;
+    nativeStopWriteObserver?: NonNullable<
+      Parameters<typeof originalPeerDeleteFixture>[0]
+    >["nativeStopWriteObserver"];
+  } = {},
 ) {
   const f = await originalPeerDeleteFixture({
     normal: true,
@@ -204,6 +212,9 @@ async function trackedOwnerForClose(
     runtimeApplicationOwner: true,
     allocationSchema: true,
     ...(options.incompleteStart ? { managementFault: "incomplete" as const } : {}),
+    ...(options.nativeStopWriteObserver === undefined
+      ? {}
+      : { nativeStopWriteObserver: options.nativeStopWriteObserver }),
   });
   const health = acceptedRawHttp();
   health.onEnd(() => {
@@ -229,6 +240,132 @@ async function trackedOwnerForClose(
     health.restore();
   }
 }
+
+for (const fault of ["none", "lease", "observer"] as const) {
+  test(fault === "lease"
+    ? "native-stop-write normal DELETE emits nothing after its SQL lease is replaced"
+    : fault === "observer"
+      ? "native-stop-write normal DELETE completes even when its local observer throws"
+      : "native-stop-write normal DELETE emits once for the bound original STOP and never for JOIN", async () => {
+    const observed: LinuxOciDeleteStopWrite[] = [];
+    const { f, accepted } = await trackedOwnerForClose({
+      nativeStopWriteObserver: {
+        record(observation) {
+          observed.push(observation);
+          if (fault === "observer") throw Error("NONSECRET observer write failed");
+          return undefined;
+        },
+      },
+    });
+    const io = ownedRawHttp();
+    const stop = "linux-oci-stop-init@1";
+    const join = "linux-oci-join-init@1";
+    const count = (kind: string) => f.nativeCounts().requests.filter((k) => k === kind).length;
+    let running:
+      | ReturnType<typeof observeRawPromise<Awaited<ReturnType<typeof f.engine.runNext>>>>
+      | undefined;
+    let fresh: ReturnType<typeof f.reconstructNormal> | undefined;
+    try {
+      const response = f.composition.fetchServingHttp(
+        f.recordedCreate(),
+        new Request("http://ignored.invalid/NONSECRET-stop-write"),
+      );
+      await waitFor(() => io.counts().calls === 1);
+      io.head();
+      const serving = await response;
+      expect(serving.status).toBe(200);
+      io.incoming.end("NONSECRET observed close");
+      expect(await serving.text()).toBe("NONSECRET observed close");
+      io.closeResponse();
+      io.closeRequest();
+
+      const removal = await f.engine.acceptDelete({
+        principal: "synthetic-oci-parent",
+        key: crypto.randomUUID(),
+        uid: accepted.resourceUid,
+        expectedGeneration: 1,
+      });
+      f.holdPeerManagementReply(stop);
+      running = observeRawPromise(f.engine.runNext());
+      await waitFor(() => count(stop) === 1);
+      expect(running.state()).toBe("pending");
+      expect(observed).toEqual([]);
+      if (fault === "lease") {
+        const replaced = await f.sql.run(
+          "UPDATE tf_v2_operations SET lease_token=? WHERE id=? AND lease_token IS NOT NULL",
+          ["NONSECRET-stop-write-replaced-lease", removal.id],
+        );
+        expect(replaced.changes).toBe(1);
+      }
+      f.releasePeerManagementReply();
+      const first = await running.value;
+      if ("error" in first) throw first.error;
+      expect(first.result).toMatchObject({ id: removal.id, effect: "unknown" });
+      expect(count(stop)).toBe(1);
+      expect(count(join)).toBe(0);
+      if (fault === "lease") {
+        expect(observed).toEqual([]);
+        expect(
+          await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
+        ).toEqual([{ state: "bound", allocation_cleanup: "untouched" }]);
+        return;
+      }
+
+      const original = f.recordedCreate();
+      const helperBytes = new Uint8Array(await Bun.file(f.physicalBinary).arrayBuffer());
+      expect(observed).toEqual([
+        {
+          kind: "linux-oci-delete-stop-write@1",
+          operationId: removal.id,
+          resourceUid: accepted.resourceUid,
+          incarnationId: original.incarnationId,
+          deleteGeneration: 2,
+          originalGeneration: original.generation,
+          claimId: original.claimId,
+          nativeId: original.claimId,
+          producerDigest: `sha256:${createHash("sha256").update(helperBytes).digest("hex")}`,
+          preMonotonicNs: "23",
+          postMonotonicNs: "29",
+          barrier: "unproven",
+        },
+      ]);
+      fresh = f.reconstructNormal();
+      f.advanceNormalClock(61_000);
+      let state = await fresh.engine.runNext();
+      expect(state).toMatchObject({ id: removal.id, effect: "unknown" });
+      expect(count(join)).toBe(1);
+      for (let phase = 0; phase < 20 && state?.status !== "succeeded"; phase++) {
+        f.advanceNormalClock(61_000);
+        state = await fresh.engine.runNext();
+      }
+      expect(state).toMatchObject({ id: removal.id, status: "succeeded", effect: "complete" });
+      expect(count(stop)).toBe(1);
+      expect(observed).toHaveLength(1);
+      expect(f.network).not.toHaveBeenCalled();
+    } finally {
+      f.releasePeerManagementReply();
+      io.closeResponse();
+      io.closeRequest();
+      await running?.value;
+      await fresh?.close().catch(() => undefined);
+      io.restore();
+      await f.cleanup();
+    }
+  }, 20000);
+}
+
+test("native-stop-write normal Host selection rejects an observer bound to another digest", async () => {
+  await expect(
+    trackedOwnerForClose({
+      nativeStopWriteObserver: {
+        producerDigest: `sha256:${"0".repeat(64)}`,
+        record() {
+          throw Error("NONSECRET foreign digest observer called");
+        },
+      },
+    }),
+  ).rejects.toThrow("Docker Core owner authority refused");
+});
 
 async function trackedPreStopClose(fault: (typeof trackedCloseCases)[number]) {
   const { f, accepted } = await trackedOwnerForClose({

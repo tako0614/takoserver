@@ -114,7 +114,7 @@ static inline int oci_uplink_read_close(struct oci_uplink_read *r) {
     if (oci_uplink_read_wait(r, left < 0 ? 0 : left) < 0) return -1;
   }
   (void)oci_uplink_close_fd(s, &s->child_pidfd);
-  r->close_unknown = s->close_unknown;
+  r->close_unknown = s->close_unknown != 0;
   free(s);
   r->scratch = NULL;
   if (r->close_unknown) { errno = EUCLEAN; return -1; }

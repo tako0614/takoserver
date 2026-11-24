@@ -95,6 +95,10 @@ async function fixture(
     readonly qualifiedProducer?: boolean;
     readonly producerRevision?: "missing" | "wrong";
     readonly producerDigest?: "missing" | "wrong";
+    readonly nativeStopWriteObserver?: {
+      readonly producerDigest?: string;
+      readonly record: NonNullable<LinuxOciOwnedBundleOptions["nativeStopWriteObserver"]>["record"];
+    };
     readonly parentPeerLocal?: boolean;
     readonly parentPeerApplicationOwner?: boolean;
     readonly parentPeerRuntimeApplicationOwner?: boolean;
@@ -322,6 +326,15 @@ async function fixture(
   };
   let composition: ReturnType<typeof createLinuxOciOwnedBundle>;
   try {
+    const qualifiedPhysicalDigest =
+      adversarial.qualifiedProducer && adversarial.producerDigest !== "missing"
+        ? adversarial.producerDigest === "wrong"
+          ? `sha256:${"0".repeat(64)}`
+          : digest(await readFile(physicalBinary))
+        : undefined;
+    const observer = adversarial.nativeStopWriteObserver;
+    const producerDigest = observer?.producerDigest ?? qualifiedPhysicalDigest;
+    if (observer && !producerDigest) throw Error("NONSECRET observer digest absent");
     composition = compose({
       sql,
       clock: adversarial.normalBackend ? normalClock : () => new Date(),
@@ -349,13 +362,9 @@ async function fixture(
       ...(adversarial.nativeMode !== undefined && !adversarial.noPhysicalBinary
         ? { physicalBinary }
         : {}),
-      ...(adversarial.qualifiedProducer && adversarial.producerDigest !== "missing"
-        ? {
-            qualifiedPhysicalDigest:
-              adversarial.producerDigest === "wrong"
-                ? `sha256:${"0".repeat(64)}`
-                : digest(await readFile(physicalBinary)),
-          }
+      ...(qualifiedPhysicalDigest === undefined ? {} : { qualifiedPhysicalDigest }),
+      ...(observer && producerDigest
+        ? { nativeStopWriteObserver: { producerDigest, record: observer.record } }
         : {}),
       memoryBytes: 268435456,
       nanoCpus: 500000000,
@@ -452,7 +461,11 @@ async function fixture(
     options: childProcess.SpawnOptions,
   ) => {
     if (file === physicalBinary) {
-      const managing = adversarial.parentPeer && args[0] === "--parent-peer-manage-init";
+      const observingStop =
+        adversarial.nativeStopWriteObserver !== undefined &&
+        args[0] === "--parent-peer-manage-init-observe-stop";
+      const managing =
+        adversarial.parentPeer && (args[0] === "--parent-peer-manage-init" || observingStop);
       const applicationReader =
         peerProfile.revision >= 5 && args[0] === "--parent-peer-read-application-owner";
       const connector =
@@ -461,11 +474,13 @@ async function fixture(
       expect(args).toEqual(
         connector
           ? [
-              managing
-                ? "--parent-peer-manage-init"
-                : applicationReader
-                  ? "--parent-peer-read-application-owner"
-                  : "--parent-peer-read-result",
+              observingStop
+                ? "--parent-peer-manage-init-observe-stop"
+                : managing
+                  ? "--parent-peer-manage-init"
+                  : applicationReader
+                    ? "--parent-peer-read-application-owner"
+                    : "--parent-peer-read-result",
             ]
           : adversarial.parentPeer
             ? [peerProfile.helper]
@@ -700,11 +715,21 @@ async function fixture(
               const lost =
                 (stop && adversarial.peerManagementFault === "lost-reply") ||
                 (!stop && adversarial.peerJoinFault === "unknown");
+              const sendInitReply = (value: unknown) => {
+                reply(value);
+                if (stop && observingStop)
+                  reply({
+                    kind: "linux-oci-parent-stop-write@1",
+                    preMonotonicNs: "23",
+                    postMonotonicNs: "29",
+                    barrier: "unproven",
+                  });
+              };
               if (heldPeerCommand === command.kind) {
                 heldPeerCommand = undefined;
                 const originalReply = peer.peerReply;
                 heldPeerReply = () => {
-                  if (!lost) reply(originalReply);
+                  if (!lost) sendInitReply(originalReply);
                   queueMicrotask(() => {
                     stdout.end();
                     stderr.end();
@@ -715,7 +740,7 @@ async function fixture(
                 done();
                 return;
               }
-              if (!lost) reply(peer.peerReply);
+              if (!lost) sendInitReply(peer.peerReply);
               done();
               queueMicrotask(() => {
                 stdout.end();

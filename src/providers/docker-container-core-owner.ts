@@ -96,6 +96,7 @@ import type {
   LinuxOciPeerInitProgress,
   LinuxOciRetirementObservation,
   LinuxOciStartedObservation,
+  LinuxOciStopWriteObservation,
 } from "./linux-oci-physical-session.ts";
 
 /** Original native progress only; no member supplies full lifetime coverage
@@ -179,6 +180,22 @@ interface LinuxOciPendingServingTarget {
   readonly successor: { readonly epoch: number; readonly ownerToken: string } | null;
 }
 
+/** Operator-local diagnostic from the exact DELETE lease. It grants no retirement. */
+export interface LinuxOciDeleteStopWrite {
+  readonly kind: "linux-oci-delete-stop-write@1";
+  readonly operationId: string;
+  readonly resourceUid: string;
+  readonly incarnationId: string;
+  readonly deleteGeneration: number;
+  readonly originalGeneration: number;
+  readonly claimId: string;
+  readonly nativeId: string;
+  readonly producerDigest: string;
+  readonly preMonotonicNs: string;
+  readonly postMonotonicNs: string;
+  readonly barrier: "unproven";
+}
+
 export interface DockerContainerCoreOwnerOptions {
   readonly hostTopology?: LinuxOciHostTopology;
   readonly alternateHostTopology?: LinuxOciHostTopology;
@@ -190,6 +207,11 @@ export interface DockerContainerCoreOwnerOptions {
   /** Explicit qualified Native build output, independent of OCI image digests.
    * Selects a producer; it never supplies a termination observation. */
   readonly qualifiedPhysicalDigest?: string;
+  /** Selects an explicitly reviewed helper build and a synchronous local sink. */
+  readonly nativeStopWriteObserver?: {
+    readonly producerDigest: string;
+    readonly record: (observation: LinuxOciDeleteStopWrite) => undefined;
+  };
   /** Explicit private mode, never selected by a request or old claim. */
   readonly ociParentControl?:
     | "sealed-original@1"
@@ -840,6 +862,9 @@ export function createDockerContainerCoreOwner(
   const { sql, clock, installationId, backendId, targetKey } = options;
   const parentMode = options.ociParentControl;
   const qualifiedPhysicalDigest = options.qualifiedPhysicalDigest;
+  const stopWriteObserver = options.nativeStopWriteObserver;
+  const stopWriteProducerDigest = stopWriteObserver?.producerDigest;
+  const recordStopWrite = stopWriteObserver?.record;
   const runtimeApplicationOwner = parentMode === "sealed-peer-runtime-application-owner@1";
   const trackedPeer = parentMode === "sealed-peer-runtime@1" || runtimeApplicationOwner;
   const applicationOwnerPeer =
@@ -857,6 +882,14 @@ export function createDockerContainerCoreOwner(
     (runtimeApplicationOwner && qualifiedPhysicalDigest === undefined) ||
     (qualifiedPhysicalDigest !== undefined &&
       !/^sha256:[a-f0-9]{64}$/u.test(qualifiedPhysicalDigest))
+  )
+    return fail();
+  if (
+    stopWriteObserver !== undefined &&
+    (!runtimeApplicationOwner ||
+      !qualifiedPhysicalDigest ||
+      stopWriteProducerDigest !== qualifiedPhysicalDigest ||
+      typeof recordStopWrite !== "function")
   )
     return fail();
   const peerMode =
@@ -1460,8 +1493,18 @@ export function createDockerContainerCoreOwner(
       return fail();
     return scope;
   }
-  async function assertExecution(execution: V2Execution): Promise<void> {
+  async function assertExecution(
+    execution: V2Execution,
+    originalStop?: { readonly record: DockerContainerCreateRecord; readonly sealedControl: string },
+  ): Promise<void> {
     executionScope(execution);
+    if (originalStop && execution.action !== "delete") return fail();
+    const originalStopFence = originalStop
+      ? ` AND EXISTS (SELECT 1 FROM tf_v2_container_create_claims original
+            WHERE original.resource_uid = op.resource_uid AND original.generation = ?
+              AND original.claim_id = ? AND original.installation_id = ?
+              AND original.state = 'bound' AND original.native_id = ? AND original.native_control = ?)`
+      : "";
     const rows = await sql.query(
       execution.action === "delete"
         ? `SELECT op.accepted_spec_json FROM tf_v2_operations op
@@ -1473,7 +1516,7 @@ export function createDockerContainerCoreOwner(
               AND resource.principal = op.principal AND resource.form_url = ? AND resource.space = ?
               AND resource.name = ? AND resource.backend_id = op.backend_id AND resource.target_key = op.target_key
               AND resource.generation = op.generation AND resource.last_operation = op.id AND resource.busy_operation = op.id
-              AND resource.phase='deleting' AND resource.deleted_at IS NULL AND resource.spec_json = op.accepted_spec_json LIMIT 2`
+              AND resource.phase='deleting' AND resource.deleted_at IS NULL AND resource.spec_json = op.accepted_spec_json${originalStopFence} LIMIT 2`
         : `SELECT op.accepted_spec_json FROM tf_v2_operations op
             JOIN tf_v2_resources resource ON resource.uid = op.resource_uid
             WHERE op.id = ? AND op.resource_uid = ? AND op.principal = ? AND op.action = ?
@@ -1497,6 +1540,15 @@ export function createDockerContainerCoreOwner(
         execution.form,
         execution.space,
         execution.name,
+        ...(originalStop
+          ? [
+              originalStop.record.intent.policy.generation,
+              originalStop.record.claimId,
+              installationId,
+              originalStop.record.nativeId,
+              originalStop.sealedControl,
+            ]
+          : []),
       ],
     );
     executionScope(execution);
@@ -3901,6 +3953,11 @@ export function createDockerContainerCoreOwner(
         return observation; // nonconsuming original process exit; no H/I/O/removed grant
       }
       let observation: LinuxOciParentHResult | LinuxOciPeerInitProgress | undefined;
+      const stopProducer =
+        management && phase === "remove" && execution.action === "delete" && finalProducer
+          ? stopWriteProducerDigest
+          : undefined;
+      let readStopWrite: (() => LinuxOciStopWriteObservation | undefined) | undefined;
       if (peerMode) {
         const read = management
           ? await prepareOriginalLinuxOciPeerInit(
@@ -3911,6 +3968,7 @@ export function createDockerContainerCoreOwner(
               binding,
               signal,
               sealedCloseResume,
+              stopProducer,
             )
           : await prepareOriginalLinuxOciPeerRead(
               originalCustody,
@@ -4201,6 +4259,12 @@ export function createDockerContainerCoreOwner(
                         : "linux-oci-started-observation@1"
                       : undefined,
                   ));
+              if (
+                stopProducer &&
+                observation.operation === "stop-init" &&
+                observation.reply.kind === "linux-oci-init-reaped@1"
+              )
+                readStopWrite = () => read.observeStopWrite(signal);
               if (observation.operation === "read-helper-result") {
                 // Exact original P's H join/EOF record only; no removed CAS or
                 // allocation cleanup is authorized by this private handoff.
@@ -4411,6 +4475,42 @@ export function createDockerContainerCoreOwner(
       if (signal.aborted || !lease.active || lease.controller.signal.aborted || !leases.has(lease))
         return fail();
       executionScope(execution);
+      if (readStopWrite && recordStopWrite && stopProducer && input.nativeId) {
+        // This is a local observation of the accepted action, outside every
+        // cleanup/grant decision. Lost diagnostic delivery cannot retry STOP.
+        try {
+          await assertExecution(execution, { record: input, sealedControl: raw });
+          if (
+            controlDecryptionKey(originalControlKeyId) !== key ||
+            signal.aborted ||
+            !lease.active ||
+            lease.controller.signal.aborted ||
+            !leases.has(lease)
+          )
+            return observation;
+          const acceptedScope = executionScope(execution);
+          const timing = readStopWrite();
+          if (timing)
+            recordStopWrite(
+              Object.freeze({
+                kind: "linux-oci-delete-stop-write@1",
+                operationId: acceptedScope.operationId,
+                resourceUid: input.intent.resourceUid,
+                incarnationId: input.intent.incarnationId,
+                deleteGeneration: acceptedScope.generation,
+                originalGeneration: input.intent.policy.generation,
+                claimId: input.claimId,
+                nativeId: input.nativeId,
+                producerDigest: stopProducer,
+                preMonotonicNs: timing.preMonotonicNs,
+                postMonotonicNs: timing.postMonotonicNs,
+                barrier: timing.barrier,
+              }),
+            );
+        } catch {
+          // The local observer supplies no proof when it cannot read or record.
+        }
+      }
       return observation;
     });
   }

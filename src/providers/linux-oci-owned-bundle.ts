@@ -1111,6 +1111,7 @@ export async function prepareOriginalLinuxOciPeerInit(
   binding: unknown,
   signal: AbortSignal,
   sealedCloseResume?: LinuxOciSealedApplicationCloseResume,
+  stopWriteProducerDigest?: string,
 ) {
   if (sealedCloseResume) {
     const token = sealedCloseResumeTokens.get(sealedCloseResume);
@@ -1154,9 +1155,14 @@ export async function prepareOriginalLinuxOciPeerInit(
     custody.signal.aborted
   )
     return fail("parent_custody");
-  const control = prepareAuthenticatedLinuxOciPeerInit(binary, binding, custody.signal);
+  const control = prepareAuthenticatedLinuxOciPeerInit(
+    binary,
+    binding,
+    custody.signal,
+    stopWriteProducerDigest,
+  );
   let preparedHelper: LinuxOciParentHResult | undefined;
-  const peerAllocationCurrent = (actualSignal: AbortSignal) => {
+  const assertPeerCurrent = (actualSignal: AbortSignal) => {
     const held = custody.peerReads.get(record.claimId);
     if (
       signal !== actualSignal ||
@@ -1167,12 +1173,19 @@ export async function prepareOriginalLinuxOciPeerInit(
       held.settlement !== control.settlement
     )
       return fail("parent_custody");
+  };
+  const peerAllocationCurrent = (actualSignal: AbortSignal) => {
+    assertPeerCurrent(actualSignal);
     const helper = control.observeHelperExited(actualSignal);
     if (preparedHelper && preparedHelper !== helper) return fail("parent_custody");
     return helper;
   };
   return Object.freeze({
     ...control,
+    observeStopWrite(actualSignal: AbortSignal) {
+      assertPeerCurrent(actualSignal);
+      return control.observeStopWrite(actualSignal);
+    },
     advanceNamespace(nativeId: string, actualSignal: AbortSignal) {
       const held = custody.peerReads.get(record.claimId);
       if (

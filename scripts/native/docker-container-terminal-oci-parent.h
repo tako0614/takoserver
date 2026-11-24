@@ -60,6 +60,8 @@ struct ocipp_owner {
   int live_init[2];
   enum tns_ocip_kind request_kind;
   size_t request_size, issued_size, last_reply_start, last_reply_end;
+  /* Original STOP write only. A later request cannot replace this interval. */
+  uint64_t stop_write_pre_ns, stop_write_post_ns;
   unsigned char *frontend_input, *management_output;
   size_t frontend_used, frontend_need, management_size, management_sent;
   unsigned int frontend_live_init, frontend_live_init_attempt;
@@ -955,6 +957,8 @@ static int ocipp_queue(struct ocipp_owner *o, const unsigned char *body, uint32_
   o->incoming_size = o->incoming_need = (size_t)size + 4; o->incoming_sent = 0; o->pending = 1;
   return 0;
 }
+static const char ocipp_stop_write_command[] = "{\"kind\":\"linux-oci-parent-read-stop-write@1\"}";
+static const char ocipp_stop_write_unavailable[] = "{\"kind\":\"linux-oci-parent-stop-write-unavailable@1\",\"barrier\":\"unproven\"}";
 static int ocipp_management(struct ocipp_owner *o, const unsigned char *body, size_t size) {
   static const char result[] = "{\"kind\":\"linux-oci-parent-read-result@1\"}";
   static const char outcome[] = "{\"kind\":\"linux-oci-parent-read-outcome@1\"}";
@@ -962,6 +966,14 @@ static int ocipp_management(struct ocipp_owner *o, const unsigned char *body, si
   static const char application[] = "{\"kind\":\"linux-oci-parent-read-application-owner@1\"}";
   if (ocipp_binding_current(o) < 0 || o->frontend < 0) return -1;
   char text[900]; int n;
+  if (size == sizeof(ocipp_stop_write_command) - 1 && !memcmp(body, ocipp_stop_write_command, size)) {
+    if (!o->stop_write_post_ns)
+      return ocipp_management_text(o, ocipp_stop_write_unavailable);
+    n = snprintf(text, sizeof(text), "{\"kind\":\"linux-oci-parent-stop-write@1\",\"preMonotonicNs\":\"%llu\",\"postMonotonicNs\":\"%llu\",\"barrier\":\"unproven\"}",
+      (unsigned long long)o->stop_write_pre_ns, (unsigned long long)o->stop_write_post_ns);
+    if (n < 0 || (size_t)n >= sizeof(text)) return -1;
+    return ocipp_management_text(o, text);
+  }
   if (size == sizeof(application)-1 && !memcmp(body,application,size)) {
     int state=ocipp_application_state(o);
     if (state!=1) return ocipp_management_text(o,"{\"kind\":\"linux-oci-parent-application-owner-refused@1\",\"barrier\":\"unproven\"}");
@@ -1072,15 +1084,31 @@ static void ocipp_host_lost(struct ocipp_owner *o) {
     (void)ocipp_frontend_close(o, &o->frontend);
   } else if (!o->pending && o->incoming_size) o->reply_unknown = 1;
 }
+static uint64_t ocipp_stop_monotonic_ns(void) {
+  const uint64_t billion = UINT64_C(1000000000);
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) < 0 || now.tv_sec < 0 ||
+      now.tv_nsec < 0 || (uint64_t)now.tv_nsec >= billion) return 0;
+  uint64_t seconds = (uint64_t)now.tv_sec, nanos = (uint64_t)now.tv_nsec;
+  if (seconds > (UINT64_MAX - nanos) / billion) return 0;
+  return seconds * billion + nanos;
+}
 static int ocipp_flush_input(struct ocipp_owner *o) {
   if (ocipp_controller(o) < 0 || o->joined || o->wait_unknown || o->identity_unknown || o->reply_unknown) return -1;
   if (!o->pending || o->input_paused || (o->host_lost && !o->incoming_sent)) return 0;
+  int observing_stop = o->request_kind == TNS_OCIP_STOP_INIT && !o->stop_write_post_ns;
+  uint64_t before = observing_stop && !o->incoming_sent ? ocipp_stop_monotonic_ns() : 0;
   ssize_t n = write(o->input[1], o->incoming + o->incoming_sent, o->incoming_size - o->incoming_sent);
   if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return 0;
   if (n <= 0) { ocipp_host_lost(o); o->reply_unknown = 1; return -1; }
+  if (observing_stop && !o->incoming_sent) o->stop_write_pre_ns = before;
   o->incoming_sent += (size_t)n;
   o->issued_size = o->incoming_sent;
   if (o->incoming_sent == o->incoming_size) {
+    if (observing_stop && o->stop_write_pre_ns) {
+      uint64_t after = ocipp_stop_monotonic_ns();
+      if (after >= o->stop_write_pre_ns) o->stop_write_post_ns = after;
+    }
     /* The original CREATE bytes are never replayed after full delivery.
      * Keep its allocation/size as the one-use birth sentinel, not env data.
      * This is no H acknowledgement or process/I/O completion observation. */
@@ -1434,9 +1462,9 @@ static int ocipp_connector_outcome(struct ocipp_connector *c, int64_t until) {
   if (ocipp_connector_current(c) < 0) return -1;
   c->outcome_phase = 2; return 0;
 }
+static const char ocipp_stop_init_command[] = "{\"kind\":\"linux-oci-stop-init@1\"}";
 static int ocipp_connector_init(struct ocipp_connector *c, const unsigned char *body, size_t size,
                                  unsigned char reply[512], size_t *reply_size) {
-  static const char stop[] = "{\"kind\":\"linux-oci-stop-init@1\"}";
   static const char join[] = "{\"kind\":\"linux-oci-join-init@1\"}";
   static const char release[] = "{\"kind\":\"linux-oci-release-namespace@1\"}";
   static const char resume[] = "{\"kind\":\"linux-oci-continue-namespace-release@1\"}";
@@ -1447,7 +1475,7 @@ static int ocipp_connector_init(struct ocipp_connector *c, const unsigned char *
   static const char step4[] = "{\"kind\":\"linux-oci-dispose-born@1\"}";
   static const char step5[] = "{\"kind\":\"linux-oci-continue-born-disposal@1\"}";
   static const char step6[] = "{\"kind\":\"linux-oci-parent-read-result@1\"}";
-  const char *command = size == sizeof(stop)-1 && !memcmp(body,stop,size) ? stop :
+  const char *command = size == sizeof(ocipp_stop_init_command) - 1 && !memcmp(body, ocipp_stop_init_command, size) ? ocipp_stop_init_command :
     size == sizeof(join)-1 && !memcmp(body,join,size) ? join :
     size == sizeof(release)-1 && !memcmp(body,release,size) ? release :
     size == sizeof(resume)-1 && !memcmp(body,resume,size) ? resume :
@@ -1465,6 +1493,33 @@ static int ocipp_connector_init(struct ocipp_connector *c, const unsigned char *
       ocipp_connector_frame(c->socket,reply,reply_size,now+20000) < 0 || ocipp_connector_current(c) < 0) return -1;
   struct pollfd trailing = {.fd=c->socket,.events=POLLIN};
   return poll(&trailing,1,0) || trailing.revents ? -1 : 0;
+}
+static int ocipp_connector_stop_write_reply(const unsigned char *body, size_t size) {
+  if (size == sizeof(ocipp_stop_write_unavailable) - 1 &&
+      !memcmp(body, ocipp_stop_write_unavailable, size)) return 0;
+  const unsigned char *at = body, *end = body + size;
+  uint64_t pre, post;
+  if (ocipp_outcome_literal(&at, end, "{\"kind\":\"linux-oci-parent-stop-write@1\",\"preMonotonicNs\":\"") < 0 ||
+      ocipp_outcome_decimal(&at, end, UINT64_MAX, &pre) < 0 || !pre ||
+      ocipp_outcome_literal(&at, end, "\",\"postMonotonicNs\":\"") < 0 ||
+      ocipp_outcome_decimal(&at, end, UINT64_MAX, &post) < 0 || post < pre ||
+      ocipp_outcome_literal(&at, end, "\",\"barrier\":\"unproven\"}") < 0 || at != end) return -1;
+  return 0;
+}
+static int ocipp_connector_init_exchange(struct ocipp_connector *c, const unsigned char *body, size_t size,
+                                          unsigned char reply[512], size_t *reply_size,
+                                          unsigned char stop_write[512], size_t *stop_write_size) {
+  if (ocipp_connector_init(c, body, size, reply, reply_size) < 0) return -1;
+  if (!stop_write || size != sizeof(ocipp_stop_init_command) - 1 || memcmp(body, ocipp_stop_init_command, size))
+    return 0;
+  /* Only the exact STOP sent by THIS connector gets an appended observation.
+   * JOIN after a lost ACK must not relay the preceding attempt's interval. */
+  int64_t now = ocip_now();
+  if (now < 0 || ocipp_connector_command(c, ocipp_stop_write_command, now + 4000) < 0 ||
+      ocipp_connector_frame(c->socket, stop_write, stop_write_size, now + 4000) < 0 ||
+      ocipp_connector_stop_write_reply(stop_write, *stop_write_size) < 0 || ocipp_connector_current(c) < 0) return -1;
+  struct pollfd trailing = {.fd = c->socket, .events = POLLIN};
+  return poll(&trailing, 1, 0) || trailing.revents ? -1 : 0;
 }
 static int ocipp_connector_close(struct ocipp_connector *c) {
   if (ocipp_controller(&c->custody) < 0) return -1;
@@ -1761,22 +1816,25 @@ static int ocipp_connector_mode_main(int reading) {
 static int ocipp_connector_main(void) { return ocipp_connector_mode_main(0); }
 static int ocipp_application_connector_main(void) { return ocipp_connector_mode_main(1); }
 static int ocipp_live_init_connector_main(void) { return ocipp_connector_mode_main(2); }
-static int ocipp_connector_management_main(void) {
+static int ocipp_connector_management_main(int observe_stop) {
   if (geteuid() || ocip_private_channel(0) < 0 || ocip_private_channel(1) < 0) return 77;
   unsigned char *body = NULL; uint32_t size = 0;
   if (ocip_read(&body,&size)) { if (body) { explicit_bzero(body,size); free(body); } return 77; }
   struct ocipp_connector c; memset(&c,0,sizeof(c)); c.socket=c.peer_pidfd=c.custody.executable=-1;
   int result=ocipp_connector_open(&c,body,size); explicit_bzero(body,size); free(body); body=NULL;
   if (!result) result=ocipp_connector_outcome(&c,c.deadline);
-  unsigned char reply[512]; size_t reply_size=0;
+  unsigned char reply[512], stop_write[512];
+  size_t reply_size = 0, stop_write_size = 0;
   /* This wait is the source window for the owning fresh Sql guard. No command
    * or EOF before it authorises H IO; closing only this connector preserves P. */
   if (!result) { if (ocip_read(&body,&size)) result=-1;
-    else result=ocipp_connector_init(&c,body,size,reply,&reply_size); }
+    else result=ocipp_connector_init_exchange(&c,body,size,reply,&reply_size,
+      observe_stop ? stop_write : NULL,&stop_write_size); }
   if (body) { explicit_bzero(body,size); free(body); }
   if (ocipp_connector_close(&c)<0) result=-1;
   ocipp_connector_free(&c);
-  return result<0 || ocip_reply((const char *)reply)<0 ? 77 : 0;
+  if (result < 0 || ocip_reply((const char *)reply) < 0) return 77;
+  return stop_write_size && ocip_reply((const char *)stop_write) < 0 ? 77 : 0;
 }
 static int ocipp_peer_main(void) { ocipp_peer_mode = 1; return ocipp_main(); }
 static int ocipp_runtime_peer_main(void) { ocipp_peer_mode = 2; return ocipp_main(); }

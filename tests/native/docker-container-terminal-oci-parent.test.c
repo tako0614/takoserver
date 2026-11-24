@@ -58,7 +58,8 @@ static struct {
   unsigned int frontend_reads; int frontend_oversize;
   unsigned int executable_stats; int tamper_after;
   int manage_mode, retirement_refusal; struct ocipp_owner *manage_owner;
-  unsigned int manage_writes; unsigned char manage_output[4096], manage_h_reply[512]; size_t manage_output_size;
+  unsigned int manage_writes, stop_write_reads, stop_write_fault;
+  unsigned char manage_output[4096], manage_h_reply[512]; size_t manage_output_size;
   int connector, pidfd_unsupported, pidfd_short, old_pidfs, peer_dead, boot_other, boot_short;
   unsigned int self_opens, peer_gets, peer_checks, cap_writes, readonly_writes, connects;
   uint64_t self_inode, peer_inode; size_t boot_at;
@@ -1216,6 +1217,70 @@ static void prepare_live_parent(struct ocipp_owner *o) {
   live_parent_reply(o,"{\"kind\":\"linux-oci-started@1\"}");
   ocipp_host_lost(o);
 }
+static void stop_write_evidence(void) {
+  static const char read_stop[] = "{\"kind\":\"linux-oci-parent-read-stop-write@1\"}";
+  static const char unavailable[] = "{\"kind\":\"linux-oci-parent-stop-write-unavailable@1\",\"barrier\":\"unproven\"}";
+  static const char completed[] = "{\"kind\":\"linux-oci-parent-stop-write@1\",\"preMonotonicNs\":\"11000000\",\"postMonotonicNs\":\"13000000\",\"barrier\":\"unproven\"}";
+  struct ocipp_owner o;
+  prepare_live_parent(&o);
+  authenticate_frontend(&o, 3);
+  CHECK(ocipp_management(&o, (const unsigned char *)read_stop, sizeof(read_stop) - 1) < 0);
+  authenticate_frontend(&o, 0);
+  CHECK(frontend_command(&o, read_stop) == 0 && o.replay_required && !o.management_resume);
+  CHECK(pm.frontend_sent_size == sizeof(unavailable) + 3 &&
+    !memcmp(pm.frontend_sent + 4, unavailable, sizeof(unavailable) - 1));
+  CHECK(frontend_command(&o, live_outcome) == 0 && !o.replay_required);
+  CHECK(frontend_command(&o, live_stop) == 0 && o.pending);
+  pm.chunk = 3;
+  pm.writes_again = 1;
+  pm.clock = 10;
+  CHECK(ocipp_flush_input(&o) == 0 && !o.incoming_sent && !o.stop_write_pre_ns);
+  pm.clock = 11;
+  CHECK(ocipp_flush_input(&o) == 0 && o.incoming_sent == 3 && o.stop_write_pre_ns == UINT64_C(11000000));
+  size_t issued = o.issued_size;
+  unsigned int writes = pm.writes, effects = o.effects;
+  pm.frontend_sent_size = 0;
+  CHECK(frontend_command(&o, read_stop) == 0 && o.pending && !o.awaiting);
+  CHECK(o.issued_size == issued && pm.writes == writes && o.effects == effects);
+  CHECK(pm.frontend_sent_size == sizeof(unavailable) + 3 &&
+    !memcmp(pm.frontend_sent + 4, unavailable, sizeof(unavailable) - 1));
+  pm.clock = 13;
+  pm.chunk = pm.writes_again = 0;
+  CHECK(ocipp_flush_input(&o) == 0 && !o.pending && o.awaiting);
+  CHECK(o.stop_write_post_ns == UINT64_C(13000000));
+  pm.frontend_sent_size = 0;
+  CHECK(frontend_command(&o, read_stop) == 0 && o.awaiting && !o.reply_ready);
+  CHECK(pm.frontend_sent_size == sizeof(completed) + 3 &&
+    !memcmp(pm.frontend_sent + 4, completed, sizeof(completed) - 1));
+  live_parent_reply(&o, "{\"kind\":\"linux-oci-init-reaped@1\"}");
+  CHECK(frontend_command(&o, "{\"kind\":\"linux-oci-join-init@1\"}") == 0 && o.pending);
+  CHECK(ocipp_flush_input(&o) == 0 && o.request_kind == TNS_OCIP_JOIN_INIT);
+  ocipp_host_lost(&o);
+  authenticate_frontend(&o, 0);
+  writes = pm.writes;
+  CHECK(frontend_command(&o, read_stop) == 0 && o.replay_required && o.awaiting && !o.management_resume);
+  CHECK(pm.writes == writes && o.effects == effects && pm.frontend_sent_size == sizeof(completed) + 3 &&
+    !memcmp(pm.frontend_sent + 4, completed, sizeof(completed) - 1));
+  dispose_fixture(&o);
+
+  for (unsigned int invalid_pre = 0; invalid_pre <= 1; ++invalid_pre) {
+    prepare_live_parent(&o);
+    authenticate_frontend(&o, 0);
+    CHECK(frontend_command(&o, live_outcome) == 0);
+    CHECK(frontend_command(&o, live_stop) == 0 && o.pending);
+    pm.chunk = 3;
+    pm.clock = invalid_pre ? -1 : 20;
+    CHECK(ocipp_flush_input(&o) == 0 && o.incoming_sent == 3);
+    pm.chunk = 0;
+    pm.clock = 19;
+    CHECK(ocipp_flush_input(&o) == 0 && !o.pending && o.awaiting && !o.stop_write_post_ns);
+    pm.frontend_sent_size = 0;
+    CHECK(frontend_command(&o, read_stop) == 0);
+    CHECK(pm.frontend_sent_size == sizeof(unavailable) + 3 &&
+      !memcmp(pm.frontend_sent + 4, unavailable, sizeof(unavailable) - 1));
+    dispose_fixture(&o);
+  }
+}
 static void live_connector_round(struct ocipp_owner *o, int foreign, int legacy) {
   unsigned char request[172], reply[512];size_t size=0;
   peer_request(o,request);
@@ -1663,11 +1728,18 @@ static int model_management_send(const void *bytes,size_t size) {
     !strcmp(command,"{\"kind\":\"linux-oci-join-born-delete@1\"}") ||
     !strcmp(command,"{\"kind\":\"linux-oci-dispose-born@1\"}") ||
     !strcmp(command,"{\"kind\":\"linux-oci-continue-born-disposal@1\"}") ||
-    !strcmp(command,"{\"kind\":\"linux-oci-parent-read-result@1\"}"));
+    !strcmp(command,"{\"kind\":\"linux-oci-parent-read-result@1\"}") ||
+    !strcmp(command, ocipp_stop_write_command));
   pm.manage_writes++;pm.frontend_sent_size=0;
   /* Raw process switch: original P has its own controller, not connector PID. */
   pm.connector=0;
   CHECK(frontend_command(pm.manage_owner,command)==0);
+  if (!strcmp(command, ocipp_stop_write_command)) {
+    CHECK(pm.manage_owner->request_kind == TNS_OCIP_STOP_INIT && !pm.manage_owner->awaiting);
+    pm.stop_write_reads++;
+    if (pm.stop_write_fault)
+      pm.frontend_sent_size = frame_bytes(pm.frontend_sent, "{\"kind\":\"linux-oci-parent-stop-write@1\",\"preMonotonicNs\":\"2\",\"postMonotonicNs\":\"1\",\"barrier\":\"unproven\"}");
+  }
   if(pm.manage_owner->pending){
     CHECK(ocipp_step(pm.manage_owner)<0 && !pm.manage_owner->pending);
     const char *reply=pm.manage_owner->request_kind==TNS_OCIP_STOP_INIT ?
@@ -1706,7 +1778,7 @@ static int model_management_send(const void *bytes,size_t size) {
   pm.connector=1;
   return (int)size;
 }
-static void peer_management_only(void) {
+static void peer_management_only(unsigned int observe_stop) {
   struct ocipp_owner o;prepare_peer_parent(&o);unsigned char request[172];peer_request(&o,request);
   CHECK(ocipp_first_create(&o,(const unsigned char*)valid,(uint32_t)strlen(valid))==0);
   CHECK(ocipp_spawn(&o)==0 && ocipp_flush_input(&o)==0);pm.delivered_size=0;
@@ -1724,14 +1796,51 @@ static void peer_management_only(void) {
   CHECK(memmem(pm.manage_output,pm.manage_output_size,"linux-oci-parent-outcome@1",25));
   CHECK(ocipp_connector_outcome(&c,c.deadline)<0 && pm.manage_writes==1);
   static const char stop[]="{\"kind\":\"linux-oci-stop-init@1\"}";
-  CHECK(ocipp_connector_init(&c,(const unsigned char*)stop,strlen(stop),reply,&size)==0 && c.init_attempt);
+  unsigned char timing[512]; size_t timing_size = 0;
+  pm.stop_write_fault = observe_stop == 2;
+  CHECK(ocipp_connector_init_exchange(&c, (const unsigned char *)stop, sizeof(stop) - 1, reply, &size,
+    observe_stop ? timing : NULL, &timing_size) == (pm.stop_write_fault ? -1 : 0));
+  CHECK(c.init_attempt && pm.connects == 1 && pm.cap_writes == 1);
+  unsigned int reads = (unsigned int)(observe_stop != 0);
+  CHECK(pm.stop_write_reads == reads && pm.manage_writes == 2u + reads);
+  CHECK(memmem(reply, size, "linux-oci-init-reaped@1", sizeof("linux-oci-init-reaped@1") - 1));
+  if (observe_stop == 1) CHECK(timing_size && ocipp_connector_stop_write_reply(timing,timing_size) == 0 &&
+    memmem(timing, timing_size, "preMonotonicNs", sizeof("preMonotonicNs") - 1) && o.stop_write_post_ns);
+  if (!observe_stop) CHECK(!timing_size);
   CHECK(o.effects&(1u<<TNS_OCIP_STOP_INIT));CHECK(pm.writes==writes+1 && pm.clones==clones);
   CHECK(ocipp_connector_init(&c,(const unsigned char*)stop,strlen(stop),reply,&size)<0 && pm.writes==writes+1);
   CHECK(ocipp_queue(&o,(const unsigned char*)stop,(uint32_t)strlen(stop))<0);
   CHECK(ocipp_connector_close(&c)==0);ocipp_connector_free(&c);pm.connector=0;
+  if (observe_stop == 1) {
+    static const char join[] = "{\"kind\":\"linux-oci-join-init@1\"}";
+    uint64_t original_post = o.stop_write_post_ns;
+    ocipp_host_lost(&o);authenticate_frontend(&o,0);
+    pm.connector_at=pm.connector_auth_at=0;pm.connector_size=o.management_size;
+    memcpy(pm.connector_reply,o.management_output,o.management_size);
+    pm.connector=1;
+    struct ocipp_connector next={0};
+    CHECK(ocipp_connector_open(&next,request,sizeof(request))==0 && pm.connects==2 && pm.cap_writes==2);
+    CHECK(ocipp_connector_outcome(&next,next.deadline)==0);
+    timing_size=0;
+    CHECK(ocipp_connector_init_exchange(&next,(const unsigned char *)join,sizeof(join)-1,
+      reply,&size,timing,&timing_size)==0 && !timing_size);
+    CHECK(pm.stop_write_reads==1 && pm.writes==writes+2 && o.stop_write_post_ns==original_post);
+    CHECK(ocipp_connector_close(&next)==0);ocipp_connector_free(&next);pm.connector=0;
+  }
   CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
   const char *bad[]={"{}","{\"kind\":\"linux-oci-parent-outcome@1\",\"requestKind\":00}","{\"kind\":\"linux-oci-parent-outcome@1\",\"requestKind\":999999999999999999999999999999}"};
   for(size_t i=0;i<sizeof(bad)/sizeof(bad[0]);++i){size_t amount=0;CHECK(ocipp_connector_outcome_size((const unsigned char*)bad[i],strlen(bad[i]),&amount)<0);}
+}
+static void peer_stop_write_connector(void) {
+  peer_management_only(1);
+  peer_management_only(2);
+  CHECK(ocipp_connector_stop_write_reply((const unsigned char *)ocipp_stop_write_unavailable,
+    sizeof(ocipp_stop_write_unavailable) - 1) == 0);
+  static const char equal[] = "{\"kind\":\"linux-oci-parent-stop-write@1\",\"preMonotonicNs\":\"18446744073709551615\",\"postMonotonicNs\":\"18446744073709551615\",\"barrier\":\"unproven\"}";
+  CHECK(ocipp_connector_stop_write_reply((const unsigned char *)equal, sizeof(equal) - 1) == 0);
+  CHECK(ocipp_connector_stop_write_reply((const unsigned char *)equal, sizeof(equal)) < 0);
+  static const char overflow[] = "{\"kind\":\"linux-oci-parent-stop-write@1\",\"preMonotonicNs\":\"1\",\"postMonotonicNs\":\"18446744073709551616\",\"barrier\":\"unproven\"}";
+  CHECK(ocipp_connector_stop_write_reply((const unsigned char *)overflow, sizeof(overflow) - 1) < 0);
 }
 /* New selector only: actual parent bootstrap/queue/loop/auth and connector
  * bodies; fixed raw H replies do not stand in for actual namespace syscalls. */
@@ -1869,6 +1978,10 @@ static void peer_instance_only(void) {
   pm.connector=0;CHECK(ocipp_close(&o,&o.self_pidfd)==0);dispose_fixture(&o);
 }
 int main(int argc,char **argv) {
+  if(argc==2 && !strcmp(argv[1],"stop-write-evidence")) {
+    stop_write_evidence();
+    printf("original STOP write observation: %lu checks\n",checks);return 0;
+  }
   if(argc==2 && !strcmp(argv[1],"peer-held-admission")) {
     held_admission_h_wire();held_admission_p_wire();held_admission_connector_wire();
     printf("authenticated held-admission wire boundaries: %lu checks\n",checks);return 0;
@@ -1891,12 +2004,18 @@ int main(int argc,char **argv) {
   }
   if(argc==2 && !strcmp(argv[1],"peer-retirement")){peer_retirement_only();printf("new peer retirement only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"peer-namespace")){peer_namespace_only();printf("new peer namespace only: %lu checks\n",checks);return 0;}
-  if(argc==2 && !strcmp(argv[1],"peer-management")){peer_management_only();printf("new peer management only: %lu checks\n",checks);return 0;}
+  if(argc==2 && !strcmp(argv[1],"peer-management")){peer_management_only(0);printf("new peer management only: %lu checks\n",checks);return 0;}
+  if(argc==2 && !strcmp(argv[1],"peer-stop-write")) {
+    peer_stop_write_connector();
+    printf("same-attachment STOP write timing: %lu checks\n",checks);return 0;
+  }
   if(argc==2 && !strcmp(argv[1],"peer-instance")){peer_instance_only();printf("new peer-instance only: %lu checks\n",checks);return 0;}
   if(argc==2 && !strcmp(argv[1],"authentication-bounds")) {
     authentication_bounds_only();printf("new authentication bounds only: %lu checks\n",checks);return 0;
   }
   wait_and_eof();refusal_cases();host_loss_and_delivery();readiness_and_child();
   bootstrap_and_authentication();reconnect_outcome_and_effects();authenticated_result_reader();replay_delivery_loss();unsent_resume_is_explicit();partial_loss_and_readonly();actual_frontend_loop();
+  stop_write_evidence();
+  peer_stop_write_connector();
   printf("new actual authenticated-parent raw boundary: %lu checks\n",checks);return 0;
 }

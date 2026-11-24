@@ -2228,7 +2228,12 @@ function positiveU64String(value: unknown): value is string {
  * constructs only a one-use read-only connector, never a Parent or H session.
  * Its input is data, not authority; the original same-Sql creator owns the
  * authenticated callsite and must recheck that scope around this interval. */
-function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortSignal) {
+function authenticatedPeerState(
+  binary: string,
+  value: unknown,
+  lifetime: AbortSignal,
+  expectedStopWriteProducerDigest?: string,
+) {
   const purpose = record(value) ? value.purpose : undefined;
   const runtimeApplicationOwner = purpose === RUNTIME_APPLICATION_RECONSTRUCTION_PURPOSE;
   const localApplicationOwner =
@@ -2303,6 +2308,11 @@ function authenticatedPeerState(binary: string, value: unknown, lifetime: AbortS
     originalBinary();
   };
   assertBinary();
+  if (
+    expectedStopWriteProducerDigest !== undefined &&
+    (!runtimeApplicationOwner || producerDigest !== expectedStopWriteProducerDigest)
+  )
+    throw failure("parent_stop_write_producer");
   if (
     executable.path !== binary ||
     executable.dev !== stat.dev ||
@@ -2888,6 +2898,36 @@ export interface LinuxOciPeerInitProgress {
   readonly reply: Reply | LinuxOciParentHResult;
   readonly barrier: "unproven";
 }
+export interface LinuxOciStopWriteObservation {
+  readonly kind: "linux-oci-parent-stop-write@1";
+  readonly preMonotonicNs: string;
+  readonly postMonotonicNs: string;
+  readonly barrier: "unproven";
+}
+function parseParentStopWrite(body: Buffer): LinuxOciStopWriteObservation | null {
+  const value = parseStrictJson(body, 512);
+  const original = decoder.decode(body);
+  if (!record(value) || value.barrier !== "unproven") throw failure();
+  if (value.kind === "linux-oci-parent-stop-write-unavailable@1") {
+    if (JSON.stringify({ kind: value.kind, barrier: value.barrier }) !== original) throw failure();
+    return null;
+  }
+  if (
+    value.kind !== "linux-oci-parent-stop-write@1" ||
+    !uint64(value.preMonotonicNs, true) ||
+    !uint64(value.postMonotonicNs, true) ||
+    BigInt(value.preMonotonicNs) > BigInt(value.postMonotonicNs)
+  )
+    throw failure();
+  const observation: LinuxOciStopWriteObservation = {
+    kind: value.kind,
+    preMonotonicNs: value.preMonotonicNs,
+    postMonotonicNs: value.postMonotonicNs,
+    barrier: value.barrier,
+  };
+  if (JSON.stringify(observation) !== original) throw failure();
+  return Object.freeze(observation);
+}
 /** Owning internal two-stage connector. No caller-selected target or command;
  * The owning Core selects init or namespace routing after its fresh SQL guard.
  * Each route selects a fixed command from this connection's original past facts. */
@@ -2895,8 +2935,10 @@ export function prepareAuthenticatedLinuxOciPeerInit(
   binary: string,
   binding: unknown,
   lifetime: AbortSignal,
+  expectedStopWriteProducerDigest?: string,
 ) {
-  const state = authenticatedPeerState(binary, binding, lifetime);
+  const state = authenticatedPeerState(binary, binding, lifetime, expectedStopWriteProducerDigest);
+  const observeStop = expectedStopWriteProducerDigest !== undefined;
   let started = false,
     sent = false,
     signal: AbortSignal | undefined,
@@ -2905,8 +2947,9 @@ export function prepareAuthenticatedLinuxOciPeerInit(
     outcome: LinuxOciPeerInitOutcome | undefined,
     captured: Reply | undefined;
   let reply: Reply | LinuxOciParentHResult | undefined,
+    stopWrite: LinuxOciStopWriteObservation | null | undefined,
     operation: LinuxOciPeerInitProgress["operation"] | undefined,
-    phase: "outcome" | "paused" | "reply" | "done" = "outcome";
+    phase: "outcome" | "paused" | "reply" | "stop-write" | "done" = "outcome";
   let commandWritten = false,
     written = false,
     exited = false,
@@ -2973,7 +3016,14 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       return;
     try {
       current();
-      if (!reply || code !== 0 || exitSignal !== null || buffer.length) throw failure();
+      if (
+        !reply ||
+        (phase === "stop-write" && stopWrite === undefined) ||
+        code !== 0 ||
+        exitSignal !== null ||
+        buffer.length
+      )
+        throw failure();
       finished = true;
       if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", stop);
@@ -2992,10 +3042,10 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       stop();
     }
   };
-  const frame = (): Buffer | undefined => {
+  const frame = (maximum = LIMIT): Buffer | undefined => {
     if (buffer.length < 4) return;
     const n = buffer.readUInt32BE(0);
-    if (!n || n > LIMIT) throw failure();
+    if (!n || n > maximum) throw failure();
     if (buffer.length < n + 4) return;
     const body = buffer.subarray(4, n + 4);
     buffer = buffer.subarray(n + 4);
@@ -3067,7 +3117,7 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       if (phase === "reply") {
         const body = frame();
         if (!body) return;
-        if (reply || buffer.length) throw failure();
+        if (reply) throw failure();
         reply =
           operation === "read-helper-result" ? parseOriginalPeerHResult(body) : parseReply(body);
         if (operation !== "read-helper-result") {
@@ -3109,6 +3159,18 @@ export function prepareAuthenticatedLinuxOciPeerInit(
             reply.poisoned < captured.poisoned)
         )
           throw failure();
+        if (observeStop && operation === "stop-init") phase = "stop-write";
+        else {
+          if (buffer.length) throw failure();
+          check();
+          return;
+        }
+      }
+      if (phase === "stop-write") {
+        const body = frame(512);
+        if (!body) return;
+        if (stopWrite !== undefined || buffer.length) throw failure();
+        stopWrite = parseParentStopWrite(body);
         check();
         return;
       }
@@ -3275,7 +3337,10 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       started = true;
       signal = actualSignal;
       state.assertBinary();
-      const child = spawn(binary, ["--parent-peer-manage-init"], {
+      const connectorMode = observeStop
+        ? "--parent-peer-manage-init-observe-stop"
+        : "--parent-peer-manage-init";
+      const child = spawn(binary, [connectorMode], {
         env: Object.create(null),
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
@@ -3443,6 +3508,13 @@ export function prepareAuthenticatedLinuxOciPeerInit(
       return send(nativeId);
     },
     advanceRetirement,
+    /** Original STOP pipe-write timing, without any claim about retirement. */
+    observeStopWrite(actualSignal: AbortSignal): LinuxOciStopWriteObservation | undefined {
+      current();
+      if (signal !== actualSignal || phase !== "done" || !finished || operation !== "stop-init")
+        throw failure("parent_peer_phase");
+      return reply?.kind === "linux-oci-init-reaped@1" ? (stopWrite ?? undefined) : undefined;
+    },
     /** This exact private connector has read THIS authenticated P's original
      * consuming H wait + two output EOF result; its own exit is only transport. */
     observeHelperExited(actualSignal: AbortSignal): LinuxOciParentHResult {

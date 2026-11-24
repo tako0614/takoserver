@@ -16,6 +16,7 @@ export type SelfhostLinuxOciCoreSelection = Pick<
   | "umociBinary"
   | "physicalBinary"
   | "qualifiedPhysicalDigest"
+  | "nativeStopWriteObserver"
   | "images"
   | "memoryBytes"
   | "nanoCpus"
@@ -84,6 +85,7 @@ export function createSelfhostLinuxOciCore(input: {
       ...required,
       "physicalBinary",
       "qualifiedPhysicalDigest",
+      "nativeStopWriteObserver",
       "egressLimits",
       "hostTopology",
       "alternateHostTopology",
@@ -91,6 +93,8 @@ export function createSelfhostLinuxOciCore(input: {
     ],
     required,
   );
+  if (selection.nativeStopWriteObserver !== undefined)
+    dataKeys(selection.nativeStopWriteObserver, ["producerDigest", "record"]);
   dataKeys(selection.configuredInputs, ["keyring", "maxSecretBytes"]);
   dataKeys(selection.configuredInputs.keyring, ["current", "keyForDecryption"]);
   dataKeys(selection.configuredInputs.keyring.current, ["id", "key"]);
@@ -130,6 +134,9 @@ export function createSelfhostLinuxOciCore(input: {
     selection.qualifiedPhysicalDigest !== undefined
       ? { qualifiedPhysicalDigest: selection.qualifiedPhysicalDigest }
       : {}),
+    ...(selection.nativeStopWriteObserver === undefined
+      ? {}
+      : { nativeStopWriteObserver: selection.nativeStopWriteObserver }),
     images: {
       source: images.source,
       limits: {

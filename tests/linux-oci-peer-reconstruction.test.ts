@@ -1,6 +1,9 @@
 import { expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
-import { rm as importedRm, lstat, mkdir, rename, writeFile } from "node:fs/promises";
+import { rm as importedRm, lstat, mkdir, mkdtemp, rename, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import {
   decodeContainerSecretBytes,
@@ -8,7 +11,10 @@ import {
   encodeContainerSecretBytes,
   encryptContainerSecretBytes,
 } from "../src/providers/container-secret-codec.ts";
-import { LinuxOciPhysicalSession } from "../src/providers/linux-oci-physical-session.ts";
+import {
+  LinuxOciPhysicalSession,
+  prepareAuthenticatedLinuxOciPeerInit,
+} from "../src/providers/linux-oci-physical-session.ts";
 import { V2_CONTAINER_OWNER_ALLOCATION_EXPAND } from "../src/takoform-v2/container-owner-schema.ts";
 import { acceptedRawHttp } from "./helpers/linux-oci-owned-bundle-fixture.ts";
 import {
@@ -386,6 +392,229 @@ test("peer reconstruction refuses midawait cancellation and original execution m
 function stopCount(f: Fixture) {
   return f.nativeCounts().requests.filter((k) => k === "linux-oci-stop-init@1").length;
 }
+
+const stopWriteNative = "a".repeat(64);
+const stopWrite = {
+  kind: "linux-oci-parent-stop-write@1",
+  preMonotonicNs: "4",
+  postMonotonicNs: "18446744073709551615",
+  barrier: "unproven",
+} as const;
+const stopWriteUnavailable = {
+  kind: "linux-oci-parent-stop-write-unavailable@1",
+  barrier: "unproven",
+};
+async function stopWriteFixture(
+  root: string,
+  name: string,
+  {
+    legacy = false,
+    joinOnly = false,
+    refused = false,
+    replies = [stopWrite],
+    fragment = false,
+  }: {
+    legacy?: boolean;
+    joinOnly?: boolean;
+    refused?: boolean;
+    replies?: object[];
+    fragment?: boolean;
+  } = {},
+) {
+  const binary = join(root, name);
+  const native = {
+    nativeId: stopWriteNative,
+    namespaceDevice: 4,
+    namespaceInode: 55,
+  };
+  const reaped = {
+    kind: "linux-oci-init-reaped@1",
+    ...native,
+    pidNamespaceDevice: 6,
+    pidNamespaceInode: 77,
+    barrier: "unproven",
+  };
+  const reply = refused
+    ? {
+        kind: "linux-oci-refused@1",
+        stage: "stop-init",
+        errno: 11,
+        custody: "retained",
+        barrier: "unproven",
+      }
+    : joinOnly
+      ? { ...reaped, kind: "linux-oci-init-reaped-observation@1" }
+      : reaped;
+  const cfg = {
+    argv: legacy ? "--parent-peer-manage-init" : "--parent-peer-manage-init-observe-stop",
+    action: joinOnly ? "linux-oci-join-init@1" : "linux-oci-stop-init@1",
+    capture: joinOnly ? reaped : { kind: "linux-oci-started@1", ...native, barrier: "unproven" },
+    requestKind: joinOnly ? 6 : 4,
+    effects: (1 << 1) | (1 << 4) | (joinOnly ? 1 << 6 : 0),
+    replies: [reply, ...replies],
+    fragment,
+  };
+  const source = [
+    `#!${process.execPath}`,
+    `const cfg = ${JSON.stringify(cfg)};`,
+    `if (process.argv.at(-1) !== cfg.argv) process.exit(71);
+function frame(value) {
+  const body = Buffer.from(JSON.stringify(value));
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(body.length);
+  return Buffer.concat([prefix, body]);
+}
+const captured = frame(cfg.capture);
+let pending = Buffer.alloc(0), paired = false;
+process.stdin.on("data", (part) => {
+  pending = Buffer.concat([pending, part]);
+  while (pending.length >= 4 && pending.length >= pending.readUInt32BE(0) + 4) {
+    const length = pending.readUInt32BE(0);
+    const body = pending.subarray(4, 4 + length);
+    pending = pending.subarray(4 + length);
+    if (!paired) {
+      if (length !== 172 || body.subarray(0, 8).toString() !== "TKOPEER2") process.exit(72);
+      paired = true;
+      process.stdout.write(Buffer.concat([frame({
+        kind: "linux-oci-parent-outcome@1", requestKind: cfg.requestKind, effects: cfg.effects,
+        requestBytes: "100", issuedBytes: "100", deliveryUnknown: 1,
+        replyBytes: String(captured.length), barrier: "unproven",
+      }), captured]));
+      continue;
+    }
+    if (JSON.parse(body.toString()).kind !== cfg.action || pending.length) process.exit(73);
+    process.stdin.pause();
+    const replies = Buffer.concat(cfg.replies.map(frame));
+    const close = () => process.exit(0);
+    if (!cfg.fragment) process.stdout.write(replies, close);
+    else {
+      const cutoff = frame(cfg.replies[0]).length + 2;
+      process.stdout.write(replies.subarray(0, cutoff), () =>
+        setTimeout(() => process.stdout.write(replies.subarray(cutoff), close), 20));
+    }
+  }
+});`,
+  ].join("\n");
+  await writeFile(binary, source, { mode: 0o700 });
+  const digest = `sha256:${createHash("sha256").update(source).digest("hex")}`;
+  const { dev, ino, uid, mode } = await lstat(binary);
+  const bootId = "12345678-1234-1234-1234-123456789abc";
+  const binding = {
+    kind: "linux-oci-original-peer-control@1",
+    purpose: "takoserver.linux-oci-peer-runtime-application-owner-reconstruction@1",
+    claimId: stopWriteNative,
+    generation: 1,
+    createDigest: `sha256:${"b".repeat(64)}`,
+    listenerCookie: "1",
+    capability: encodeContainerSecretBytes(new Uint8Array(32).fill(1)),
+    executable: { path: binary, dev, ino, uid, mode },
+    peer: { kind: "linux-oci-parent-peer@1", device: "1", inode: "2", bootId },
+    applicationOwner: { kind: "linux-oci-application-owner@1", device: "1", inode: "3", bootId },
+    retirementProducer: { revision: "NCLOSE01", digest },
+    allocation: {},
+  };
+  return { binary, binding, digest };
+}
+
+test("peer STOP timing requires the selected producer and stays private to the same completed STOP", async () => {
+  const root = await mkdtemp(join(tmpdir(), "stop-write-"));
+  const lifetime = new AbortController();
+  try {
+    const foreign = `sha256:${"c".repeat(64)}`;
+    for (const fragment of [false, true]) {
+      const { binary, binding, digest } = await stopWriteFixture(root, String(fragment), {
+        fragment,
+      });
+      expect(() =>
+        prepareAuthenticatedLinuxOciPeerInit(binary, binding, lifetime.signal, foreign),
+      ).toThrow("linux_oci_physical_session_parent_stop_write_producer");
+      expect(() =>
+        prepareAuthenticatedLinuxOciPeerInit(
+          binary,
+          { ...binding, retirementProducer: { revision: "NCLOSE01", digest: foreign } },
+          lifetime.signal,
+          foreign,
+        ),
+      ).toThrow("linux_oci_physical_session_parent_binary");
+      const operation = new AbortController();
+      const control = prepareAuthenticatedLinuxOciPeerInit(
+        binary,
+        binding,
+        lifetime.signal,
+        digest,
+      );
+      await control.begin(operation.signal);
+      expect(() => control.observeStopWrite(operation.signal)).toThrow("parent_peer_phase");
+      const progress = await control.advance(stopWriteNative, operation.signal);
+      expect(progress.operation).toBe("stop-init");
+      expect(progress).not.toHaveProperty("stopWrite");
+      const evidence = control.observeStopWrite(operation.signal);
+      expect(evidence).toEqual(stopWrite);
+      expect(Object.isFrozen(evidence)).toBe(true);
+      expect(() => control.observeStopWrite(lifetime.signal)).toThrow("parent_peer_phase");
+      operation.abort();
+      expect(() => control.observeStopWrite(operation.signal)).toThrow("parent_peer_retained");
+    }
+  } finally {
+    lifetime.abort();
+    await importedRm(root, { recursive: true, force: true });
+  }
+});
+
+test("peer STOP timing rejects invalid frames and keeps one-frame legacy and JOIN paths", async () => {
+  const root = await mkdtemp(join(tmpdir(), "stop-write-"));
+  const lifetime = new AbortController();
+  const request = new AbortController();
+  try {
+    const cases = [
+      { options: { replies: [stopWriteUnavailable] }, succeeds: true },
+      { options: { refused: true }, succeeds: true },
+      { options: { legacy: true, replies: [] }, succeeds: true },
+      { options: { joinOnly: true, replies: [] }, succeeds: true },
+      { options: { replies: [] }, succeeds: false },
+      { options: { refused: true, replies: [] }, succeeds: false },
+      { options: { replies: [{ ...stopWrite, preMonotonicNs: "04" }] }, succeeds: false },
+      { options: { replies: [{ ...stopWrite, postMonotonicNs: "3" }] }, succeeds: false },
+      {
+        options: { replies: [{ ...stopWrite, postMonotonicNs: "18446744073709551616" }] },
+        succeeds: false,
+      },
+      { options: { replies: [{ ...stopWrite, barrier: "proved" }] }, succeeds: false },
+      {
+        options: { replies: [{ barrier: "unproven", kind: stopWriteUnavailable.kind }] },
+        succeeds: false,
+      },
+      { options: { replies: [{ ...stopWriteUnavailable, preMonotonicNs: "1" }] }, succeeds: false },
+      { options: { replies: [stopWrite, stopWrite] }, succeeds: false },
+      { options: { joinOnly: true }, succeeds: false },
+    ];
+    for (const [idx, { options, succeeds }] of cases.entries()) {
+      const { binary, binding, digest } = await stopWriteFixture(root, String(idx), options);
+      const control = prepareAuthenticatedLinuxOciPeerInit(
+        binary,
+        binding,
+        lifetime.signal,
+        options.legacy ? undefined : digest,
+      );
+      await control.begin(request.signal);
+      const result = control.advance(stopWriteNative, request.signal);
+      if (!succeeds) {
+        await expect(result).rejects.toThrow("parent_peer_retained");
+        expect(() => control.observeStopWrite(request.signal)).toThrow("parent_peer_retained");
+      } else if (options.joinOnly) {
+        expect((await result).operation).toBe("join-init");
+        expect(() => control.observeStopWrite(request.signal)).toThrow("parent_peer_phase");
+      } else {
+        expect((await result).operation).toBe("stop-init");
+        expect(control.observeStopWrite(request.signal)).toBeUndefined();
+      }
+    }
+  } finally {
+    request.abort();
+    lifetime.abort();
+    await importedRm(root, { recursive: true, force: true });
+  }
+});
 
 test("peer management ordinary fresh retained DELETE sends STOP then original JOIN only without P replacement or removed CAS", async () => {
   const f = await fixture({ normal: false });
