@@ -270,7 +270,7 @@ test("OCI HTTP ordinary DELETE closes the original managed peer socket", async (
       const attempt = observeRawPromise(x.f.engine.runNext());
 
       expect(await peerClosed.value).toHaveProperty("result");
-      expect(originalPeer.destroyed).toBe(true);
+      expect(originalPeer.destroyed).toBeTrue();
       expect(await pending.value).toHaveProperty("error");
       const outcome = await attempt.value;
       expect("result" in outcome && outcome.result).toMatchObject({
