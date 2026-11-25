@@ -116,6 +116,8 @@ async function fixture(
       | "regress";
     readonly peerRetirementFault?:
       | "begin-retained"
+      | "read-pending"
+      | "read-inconsistent"
       | "delete-retained"
       | "dispose-retained"
       | "begin-lost"
@@ -576,6 +578,15 @@ async function fixture(
                   });
                   expect(nativeRequests.includes("linux-oci-read-tracked-join@1")).toBe(false);
                 }
+                const fault = adversarial.peerRetirementFault;
+                const firstRead = kind === 12 && peer.peerKind !== 12;
+                const readErrno = firstRead
+                  ? fault === "read-pending"
+                    ? 11
+                    : fault === "read-inconsistent"
+                      ? 117
+                      : undefined
+                  : undefined;
                 nativeRequests.push(command.kind);
                 peer.peerKind = kind;
                 peer.peerBytes = frame.length;
@@ -588,16 +599,15 @@ async function fixture(
                   "linux-oci-local-disposal@1",
                   "linux-oci-local-disposal-continuation@1",
                 ];
-                const fault = adversarial.peerRetirementFault;
                 const selected =
                   kind === 11 ? "begin" : kind === 13 ? "delete" : kind === 15 ? "dispose" : "none";
-                const retained = fault === `${selected}-retained`,
+                const retained = fault === `${selected}-retained` || readErrno !== undefined,
                   lost = fault === `${selected}-lost` || (fault === "missing" && kind === 11);
                 peer.peerReply = retained
                   ? {
                       kind: "linux-oci-refused@1",
                       stage: op,
-                      errno: 11,
+                      errno: readErrno ?? 11,
                       custody: "retained",
                       barrier: "unproven",
                     }

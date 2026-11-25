@@ -38,6 +38,8 @@ async function fixture(
       | "regress";
     retirementFault?:
       | "begin-retained"
+      | "read-pending"
+      | "read-inconsistent"
       | "delete-retained"
       | "dispose-retained"
       | "begin-lost"

@@ -166,6 +166,58 @@ test("normal-delete-consumer runtime application owner keeps lost STOP unconfirm
   }
 });
 
+for (const retirementFault of ["read-pending", "read-inconsistent"] as const) {
+  test(`normal-delete-consumer runtime application owner distinguishes ${retirementFault} on original READ`, async () => {
+    const { f, accepted } = await live({ runtimeApplicationOwner: true, retirementFault });
+    try {
+      const removal = await deleting(f, accepted.resourceUid);
+      const read = "linux-oci-read-tracked-join@1";
+      const last = await through(f, async () => f.nativeCounts().requests.includes(read));
+      expect(last).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+      const [checkpoint] = await f.sql.query(
+        "SELECT dispatch_possible,error_code,next_attempt_at_ms,updated_at FROM tf_v2_operations WHERE id=?",
+        [removal.id],
+      );
+      const pending = retirementFault === "read-pending";
+      expect(checkpoint).toMatchObject({
+        dispatch_possible: 1,
+        error_code: pending ? null : "outcome_unconfirmed",
+      });
+      expect(
+        Number(checkpoint?.next_attempt_at_ms) - Date.parse(String(checkpoint?.updated_at)),
+      ).toBe(pending ? 1_000 : 60_000);
+      expect(
+        await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
+      ).toEqual([{ state: "bound", allocation_cleanup: "untouched" }]);
+      const count = f.nativeCounts().requests.length;
+      f.advanceNormalClock(1_000);
+      const next = await f.engine.runNext();
+      if (pending) {
+        expect(next).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+        expect(f.nativeCounts().requests.slice(count)).toEqual([
+          "linux-oci-parent-read-outcome@2",
+          read,
+        ]);
+        const final = await through(
+          f,
+          async () =>
+            (await f.sql.query("SELECT state FROM tf_v2_container_create_claims"))[0]?.state ===
+            "removed",
+        );
+        expect(final).toMatchObject({ id: removal.id, status: "succeeded", effect: "complete" });
+        expect(
+          f.nativeCounts().requests.filter((command) => command === "linux-oci-dispose-born@1"),
+        ).toHaveLength(1);
+      } else {
+        expect(next).toBeNull();
+        expect(f.nativeCounts().requests).toHaveLength(count);
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
+
 for (const namespaceFault of ["retained", "lost", "unreleased"] as const) {
   test(`normal-delete-consumer runtime application owner keeps namespace ${namespaceFault} outcomes unconfirmed`, async () => {
     const { f, accepted } = await live({ runtimeApplicationOwner: true, namespaceFault });

@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { type BigIntStats, constants, lstatSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { constants as osConstants } from "node:os";
 import { dirname, isAbsolute, join, parse } from "node:path";
 import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "../container-contract.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
@@ -2962,16 +2963,26 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
           // only the final owning cleanup can make a claim ready for finalization.
           if (
             runtimeApplicationOwner &&
-            progress.every(
-              (item) =>
-                item.kind === "linux-oci-peer-init-progress@1" &&
-                item.reply.kind !== "linux-oci-refused@1" &&
+            progress.every((item) => {
+              if (item.kind !== "linux-oci-peer-init-progress@1") return false;
+              if (item.reply.kind === "linux-oci-refused@1") {
+                // The original parent can recheck this READ without repeating
+                // the BEGIN handoff. An EAGAIN reply is not retirement proof.
+                return (
+                  item.operation === "read-tracked-join" &&
+                  item.reply.stage === item.operation &&
+                  item.reply.custody === "retained" &&
+                  item.reply.errno === osConstants.errno.EAGAIN
+                );
+              }
+              return (
                 (item.operation !== "stop-init" || item.reply.kind === "linux-oci-init-reaped@1") &&
                 (item.operation !== "read-helper-result" ||
                   (item.reply.kind === "linux-oci-parent-h-exited@1" && item.reply.error === 0)) &&
                 (!("poisoned" in item.reply) ||
-                  (item.reply.poisoned === 0 && item.reply.referenceReleased === 1)),
-            ) &&
+                  (item.reply.poisoned === 0 && item.reply.referenceReleased === 1))
+              );
+            }) &&
             progress.some(
               (item) =>
                 item.kind === "linux-oci-peer-init-progress@1" &&

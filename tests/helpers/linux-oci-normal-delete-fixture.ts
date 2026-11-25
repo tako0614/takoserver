@@ -20,6 +20,7 @@ async function live(
     localCleanup?: boolean;
     runtimeApplicationOwner?: boolean;
     managementFault?: "lost-reply";
+    retirementFault?: "read-pending" | "read-inconsistent";
     namespaceFault?: NonNullable<
       NonNullable<Parameters<typeof originalPeerDeleteFixture>[0]>["namespaceFault"]
     >;
