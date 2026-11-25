@@ -86,17 +86,17 @@ async function through(f: Fixture, predicate: () => Promise<boolean>) {
   throw Error("NONSECRET retirement boundary not reached");
 }
 
-test("normal-delete-consumer runtime application owner settles the same DELETE after verified JOIN", async () => {
+test("normal-delete-consumer runtime application owner settles the same DELETE after verified STOP", async () => {
   const { f, accepted } = await live({ runtimeApplicationOwner: true });
   try {
     const removal = await deleting(f, accepted.resourceUid);
-    const joined = await through(
-      f,
-      async () =>
-        (await f.sql.query("SELECT state FROM tf_v2_container_start_attempts"))[0]?.state ===
-        "exited",
-    );
-    expect(joined).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+    let final = await f.engine.runNext();
+    expect(final).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+    expect(await f.sql.query("SELECT state FROM tf_v2_container_start_attempts")).toEqual([
+      { state: "running" },
+    ]);
+    expect(f.nativeCounts().requests).toContain("linux-oci-stop-init@1");
+    expect(f.nativeCounts().requests).not.toContain("linux-oci-join-init@1");
     const expectContinuation = async () => {
       const [checkpoint] = await f.sql.query(
         "SELECT dispatch_possible,error_code,next_attempt_at_ms,updated_at FROM tf_v2_operations WHERE id=?",
@@ -111,7 +111,6 @@ test("normal-delete-consumer runtime application owner settles the same DELETE a
     const claim = async () =>
       (await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"))[0];
     expect(await claim()).toMatchObject({ state: "bound", allocation_cleanup: "untouched" });
-    let final = joined;
     for (let phase = 0; phase < 16 && final?.status !== "succeeded"; phase++) {
       f.advanceNormalClock(1_000);
       final = await f.engine.runNext();
@@ -123,6 +122,45 @@ test("normal-delete-consumer runtime application owner settles the same DELETE a
     expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-stop-init@1")).toHaveLength(1);
     expect(f.nativeCounts().requests.filter((k) => k === "linux-oci-join-init@1")).toHaveLength(1);
     expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("normal-delete-consumer runtime application owner keeps lost STOP unconfirmed and never resends it", async () => {
+  const { f, accepted } = await live({
+    runtimeApplicationOwner: true,
+    managementFault: "lost-reply",
+  });
+  try {
+    const removal = await deleting(f, accepted.resourceUid);
+    expect(await f.engine.runNext()).toMatchObject({
+      id: removal.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    const [checkpoint] = await f.sql.query(
+      "SELECT dispatch_possible,error_code,next_attempt_at_ms,updated_at FROM tf_v2_operations WHERE id=?",
+      [removal.id],
+    );
+    expect(checkpoint).toMatchObject({ dispatch_possible: 1, error_code: "outcome_unconfirmed" });
+    expect(
+      Number(checkpoint?.next_attempt_at_ms) - Date.parse(String(checkpoint?.updated_at)),
+    ).toBe(60_000);
+    f.advanceNormalClock(1_000);
+    expect(await f.engine.runNext()).toBeNull();
+    expect(f.nativeCounts().requests).not.toContain("linux-oci-join-init@1");
+    f.advanceNormalClock(59_000);
+    expect(await f.engine.runNext()).toMatchObject({
+      id: removal.id,
+      status: "reconciling",
+      effect: "unknown",
+    });
+    const requests = f.nativeCounts().requests;
+    expect(requests.filter((kind) => kind === "linux-oci-stop-init@1")).toHaveLength(1);
+    expect(
+      await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
+    ).toEqual([{ state: "bound", allocation_cleanup: "untouched" }]);
   } finally {
     await f.cleanup();
   }

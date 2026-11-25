@@ -2966,6 +2966,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               (item) =>
                 item.kind === "linux-oci-peer-init-progress@1" &&
                 item.reply.kind !== "linux-oci-refused@1" &&
+                (item.operation !== "stop-init" || item.reply.kind === "linux-oci-init-reaped@1") &&
                 (item.operation !== "read-helper-result" ||
                   (item.reply.kind === "linux-oci-parent-h-exited@1" && item.reply.error === 0)) &&
                 (!("poisoned" in item.reply) ||
@@ -2974,7 +2975,6 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             progress.some(
               (item) =>
                 item.kind === "linux-oci-peer-init-progress@1" &&
-                item.operation !== "stop-init" &&
                 item.operation !== "read-helper-result",
             )
           )

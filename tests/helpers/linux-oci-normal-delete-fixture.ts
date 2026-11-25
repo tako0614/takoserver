@@ -19,6 +19,7 @@ async function live(
     producerDigest?: "missing" | "wrong";
     localCleanup?: boolean;
     runtimeApplicationOwner?: boolean;
+    managementFault?: "lost-reply";
     namespaceFault?: NonNullable<
       NonNullable<Parameters<typeof originalPeerDeleteFixture>[0]>["namespaceFault"]
     >;
