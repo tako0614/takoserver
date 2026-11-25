@@ -2090,8 +2090,26 @@ have occurred, the executor reconciles that same operation.
 To exercise fresh Container CREATE and UPDATE on an isolated Host, pass
 `linuxContainerFormRegistration: "complete"` from the same private launcher.
 Select the OCI runtime application owner with two disjoint topology slots and
-prepare the exact application successor schema on the isolated control
-database. Omit `v2RetainedExecutionActions` when selecting the complete Form.
+prepare a separate copy of the stopped control database with the application
+successor and final DELETE discard schemas. If your backup has the exact
+shutdown evidence schema or an earlier application-successor schema without
+the final DELETE discard schema, set `SHUTDOWN_BACKUP` to its operator-owned
+private copy and `OCI_PREP` to a private directory for the output. For a
+final-delete backup,
+use the shutdown preparation above first and set
+`SHUTDOWN_BACKUP="$OCI_PREP/control-with-oci-shutdown.sqlite"`.
+
+```sh
+bun --no-env-file scripts/selfhost-oci-shutdown-schema.ts prepare-successor \
+  "$SHUTDOWN_BACKUP" "$OCI_PREP/control-with-oci-successor.sqlite"
+```
+
+The command verifies the predecessor and advances the existing configured
+UPDATE custody schema on the output copy. It checks the application successor,
+final DELETE discard schema, and SQLite integrity before publishing the copy.
+The complete Form checks both schemas at startup. Use the new copy for the
+isolated Host.
+Omit `v2RetainedExecutionActions` when selecting the complete Form.
 The existing Host authentication and resource ownership checks apply to each
 request. Physical readiness still requires validating the actual runtime,
 topology, and image on that Host.

@@ -4,16 +4,58 @@ import { link, lstat, mkdtemp, open, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import type { Sql, SqlStatement } from "../src/ports.ts";
 import { privateDirectoryChainProblem } from "../src/selfhost-data-root.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { inspectV2ConfiguredUpdateDiscardSchema } from "../src/takoform-v2/configured-private-inputs.ts";
 import {
+  v2ConfiguredUpdateDiscardTransition,
+  v2FinalDeleteConfiguredUpdateDiscardTransition,
+} from "../src/takoform-v2/configured-update-inputs-schema.ts";
+import {
+  inspectV2ContainerOwnerApplicationSuccessorSchema,
   inspectV2ContainerOwnerFinalDeleteSchema,
   inspectV2ContainerOwnerShutdownIoSchema,
+  V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND,
   V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
 
 const usage =
-  "Usage: bun --no-env-file scripts/selfhost-oci-shutdown-schema.ts prepare <stopped-backup.sqlite> <new-output.sqlite>";
+  "Usage: bun --no-env-file scripts/selfhost-oci-shutdown-schema.ts <prepare|prepare-successor> <stopped-backup.sqlite> <new-output.sqlite>";
+
+async function prepareSuccessorStatements(sql: Sql): Promise<readonly SqlStatement[]> {
+  const statements: SqlStatement[] = [];
+  if (!(await inspectV2ContainerOwnerApplicationSuccessorSchema(sql)))
+    statements.push(...V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
+  if (!(await inspectV2ConfiguredUpdateDiscardSchema(sql, "final-delete"))) {
+    if (!(await inspectV2ConfiguredUpdateDiscardSchema(sql, "retired-update")))
+      statements.push(...v2ConfiguredUpdateDiscardTransition());
+    statements.push(...v2FinalDeleteConfiguredUpdateDiscardTransition());
+  }
+  return statements;
+}
+
+const preparations = {
+  prepare: {
+    inspectSource: inspectV2ContainerOwnerFinalDeleteSchema,
+    sourceSchema: "Container final-delete",
+    statements: () => V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements,
+    inspectOutput: inspectV2ContainerOwnerShutdownIoSchema,
+    outputSchema: "shutdown",
+  },
+  "prepare-successor": {
+    inspectSource: async (sql: Sql) =>
+      (await inspectV2ContainerOwnerShutdownIoSchema(sql)) ||
+      ((await inspectV2ContainerOwnerApplicationSuccessorSchema(sql)) &&
+        !(await inspectV2ConfiguredUpdateDiscardSchema(sql, "final-delete"))),
+    sourceSchema: "Container shutdown evidence or incomplete application successor",
+    statements: prepareSuccessorStatements,
+    inspectOutput: async (sql: Sql) =>
+      (await inspectV2ContainerOwnerApplicationSuccessorSchema(sql)) &&
+      (await inspectV2ConfiguredUpdateDiscardSchema(sql, "final-delete")),
+    outputSchema: "complete application successor",
+  },
+} as const;
 
 function privatePath(path: string, label: string): void {
   if (!isAbsolute(path) || resolve(path) !== path)
@@ -48,7 +90,11 @@ function sameFile(before: BigIntStats, after: BigIntStats): boolean {
   );
 }
 
-async function prepare(source: string, output: string): Promise<void> {
+async function prepare(
+  source: string,
+  output: string,
+  preparation: (typeof preparations)[keyof typeof preparations],
+): Promise<void> {
   privatePath(source, "backup");
   privatePath(output, "output");
   await requireAbsent(output, "output already exists");
@@ -93,9 +139,9 @@ async function prepare(source: string, output: string): Promise<void> {
         applied.some((row, index) => row.name !== MIGRATIONS[index]?.name)
       )
         throw new Error("backup does not have the exact stock SQLite migration lineage");
-      if (!(await inspectV2ContainerOwnerFinalDeleteSchema(sql)))
-        throw new Error("backup does not have the exact Container final-delete schema");
-      await sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+      if (!(await preparation.inspectSource(sql)))
+        throw new Error(`backup does not have the exact ${preparation.sourceSchema} schema`);
+      await sql.batch(await preparation.statements(sql));
     } finally {
       db.close();
     }
@@ -105,8 +151,10 @@ async function prepare(source: string, output: string): Promise<void> {
       const integrity = reopened.query<{ quick_check: string }, []>("PRAGMA quick_check").all();
       if (integrity.length !== 1 || integrity[0]?.quick_check !== "ok")
         throw new Error("prepared copy did not pass the SQLite integrity check");
-      if (!(await inspectV2ContainerOwnerShutdownIoSchema(createSqliteSql(reopened))))
-        throw new Error("prepared copy does not retain the exact shutdown schema");
+      if (!(await preparation.inspectOutput(createSqliteSql(reopened))))
+        throw new Error(
+          `prepared copy does not retain the exact ${preparation.outputSchema} schema`,
+        );
     } finally {
       reopened.close();
     }
@@ -124,15 +172,23 @@ async function prepare(source: string, output: string): Promise<void> {
 
 if (import.meta.main) {
   const [action, source, output, ...rest] = Bun.argv.slice(2);
-  if (action !== "prepare" || !source || !output || rest.length > 0) {
+  if (
+    (action !== "prepare" && action !== "prepare-successor") ||
+    !source ||
+    !output ||
+    rest.length > 0
+  ) {
     process.stderr.write(`${usage}\n`);
     process.exitCode = 1;
   } else {
+    const preparation = preparations[action];
     try {
-      await prepare(source, output);
+      await prepare(source, output, preparation);
       process.stdout.write(`${JSON.stringify({ status: "prepared", output })}\n`);
     } catch (error) {
-      process.stderr.write(`Unable to prepare an OCI shutdown schema copy. ${String(error)}\n`);
+      process.stderr.write(
+        `Unable to prepare an OCI ${preparation.outputSchema} schema copy. ${String(error)}\n`,
+      );
       process.exitCode = 1;
     }
   }

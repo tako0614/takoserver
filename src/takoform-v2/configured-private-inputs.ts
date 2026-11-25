@@ -226,6 +226,18 @@ function schemaReady(
   );
 }
 
+export async function inspectV2ConfiguredUpdateDiscardSchema(
+  sql: Sql,
+  purpose: "retired-update" | "final-delete",
+): Promise<boolean> {
+  const schema = purpose === "final-delete" ? FINAL_DISCARD_SCHEMA : DISCARD_SCHEMA;
+  const rows = await sql.query(
+    schemaReadySql,
+    schema.map(([name]) => name),
+  );
+  return schemaReady(rows, schema);
+}
+
 /**
  * Backend-only exact-row discard. The required trusted owner callback must
  * re-read the physical coordinator/native retirement original and throw for

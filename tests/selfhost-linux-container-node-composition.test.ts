@@ -23,7 +23,11 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import type { V2OperatorFormSelectionFactory } from "../src/takoform-v2/application.ts";
 import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
-import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
+import {
+  additiveV2ConfiguredUpdateInputsDDL,
+  v2ConfiguredUpdateDiscardTransition,
+  v2FinalDeleteConfiguredUpdateDiscardTransition,
+} from "../src/takoform-v2/configured-update-inputs-schema.ts";
 import {
   V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
   V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
@@ -532,6 +536,14 @@ test("explicit OCI profile6 on exact H1 registers complete F2 and queues origina
     ).rejects.toThrow(schemaRequired);
     await f.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
     expect(composeComplete).toThrow(schemaRequired);
+    await expect(
+      assertSelfhostLinuxContainerNodeSchema(f.sql, selected, "complete"),
+    ).rejects.toThrow(schemaRequired);
+    await f.sql.batch(v2ConfiguredUpdateDiscardTransition());
+    await expect(
+      assertSelfhostLinuxContainerNodeSchema(f.sql, selected, "complete"),
+    ).rejects.toThrow(schemaRequired);
+    await f.sql.batch(v2FinalDeleteConfiguredUpdateDiscardTransition());
     const preflightQuery = spyOn(f.sql, "query");
     try {
       for (const mutable of [

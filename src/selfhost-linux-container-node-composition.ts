@@ -14,6 +14,7 @@ import {
 import { createSelfhostLinuxDockerContainerBackend } from "./selfhost-linux-docker-container-backend.ts";
 import { createSelfhostLinuxOciContainerBackend } from "./selfhost-linux-oci-container-backend.ts";
 import type { V2OperatorFormSelectionFactory } from "./takoform-v2/application.ts";
+import { inspectV2ConfiguredUpdateDiscardSchema } from "./takoform-v2/configured-private-inputs.ts";
 import {
   inspectV2ContainerOwnerApplicationSuccessorSchema,
   inspectV2ContainerOwnerShutdownIoSchema,
@@ -50,7 +51,10 @@ export async function assertSelfhostLinuxContainerNodeSchema(
     )
       throw new TypeError("selfhost_linux_oci_complete_form_fixed_selection_required");
     completeFormSql.delete(selected);
-    if (!(await inspectV2ContainerOwnerApplicationSuccessorSchema(sql)))
+    if (
+      !(await inspectV2ContainerOwnerApplicationSuccessorSchema(sql)) ||
+      !(await inspectV2ConfiguredUpdateDiscardSchema(sql, "final-delete"))
+    )
       throw new Error("selfhost_linux_oci_complete_form_schema_required");
     completeFormSql.set(selected, sql);
     return;
