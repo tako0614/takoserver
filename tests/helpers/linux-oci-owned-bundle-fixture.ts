@@ -108,6 +108,7 @@ async function fixture(
     readonly peerNamespaceFault?:
       | "retained"
       | "lost"
+      | "unreleased"
       | "foreign"
       | "malformed"
       | "unknown"
@@ -653,7 +654,10 @@ async function fixture(
                   packetGroups: "3",
                   born: 1,
                   releaseAttempted: 1,
-                  referenceReleased: !release && fault === "regress" ? 0 : 1,
+                  referenceReleased:
+                    (release && fault === "unreleased") || (!release && fault === "regress")
+                      ? 0
+                      : 1,
                   netGone: 0,
                   poisoned: 0,
                   barrier: "unproven",

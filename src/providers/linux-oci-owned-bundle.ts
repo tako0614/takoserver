@@ -2957,16 +2957,25 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
         const progress = await creator.manageRetainedPeerInit(execution, cancel.signal);
         local();
         if (trackedPeer && accepted.action === "delete") {
-          // The owning JOIN has already fenced and persisted each original exit.
-          // Namespace retirement is still pending and needs the next reconcile.
+          // Each runtime-owner management call advances at most one stage per
+          // retained claim. Confirmed intermediate steps need another reconcile;
+          // only the final owning cleanup can make a claim ready for finalization.
           if (
             runtimeApplicationOwner &&
-            progress.length > 0 &&
             progress.every(
               (item) =>
                 item.kind === "linux-oci-peer-init-progress@1" &&
-                item.operation === "join-init" &&
-                item.reply.kind === "linux-oci-init-reaped-observation@1",
+                item.reply.kind !== "linux-oci-refused@1" &&
+                (item.operation !== "read-helper-result" ||
+                  (item.reply.kind === "linux-oci-parent-h-exited@1" && item.reply.error === 0)) &&
+                (!("poisoned" in item.reply) ||
+                  (item.reply.poisoned === 0 && item.reply.referenceReleased === 1)),
+            ) &&
+            progress.some(
+              (item) =>
+                item.kind === "linux-oci-peer-init-progress@1" &&
+                item.operation !== "stop-init" &&
+                item.operation !== "read-helper-result",
             )
           )
             return { kind: "continue" };

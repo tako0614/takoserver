@@ -30,6 +30,7 @@ async function fixture(
     namespaceFault?:
       | "retained"
       | "lost"
+      | "unreleased"
       | "foreign"
       | "malformed"
       | "unknown"
