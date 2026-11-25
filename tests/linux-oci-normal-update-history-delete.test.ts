@@ -181,6 +181,97 @@ test("normal-update-history failed new health preserves old serving and original
   }
 }, 10000);
 
+for (const scenario of ["continuation-retained", "lost", "foreign", "unhealthy"] as const) {
+  test(`normal-update-history runtime cadence for ${scenario}`, async () => {
+    const { f, accepted } = await qualifiedNormalDeleteFixture({
+      runtimeApplicationOwner: true,
+      alternateHostTopology: alternate(),
+      ...(scenario === "unhealthy" ? {} : { namespaceFault: scenario }),
+    });
+    const health = acceptedRawHttp();
+    if (scenario === "unhealthy") Reflect.set(health.response, "statusCode", 503);
+    health.onEnd(() => {
+      health.reply();
+      health.join();
+    });
+    try {
+      const changed = await update(f, accepted.resourceUid);
+      const checkpoint = async () => {
+        const [row] = await f.sql.query(
+          "SELECT next_attempt_at_ms,updated_at,error_code,dispatch_possible FROM tf_v2_operations WHERE id=?",
+          [changed.id],
+        );
+        const delay = Number(row?.next_attempt_at_ms) - Date.parse(String(row?.updated_at));
+        expect(row?.dispatch_possible).toBe(1);
+        return { delay, error: row?.error_code };
+      };
+      const expectUnknownLater = async () => {
+        expect(await checkpoint()).toEqual({ delay: 60_000, error: "outcome_unconfirmed" });
+        const requests = f.nativeCounts().requests;
+        f.advanceNormalClock(1_000);
+        expect(await f.engine.runNext()).toBeNull();
+        expect(f.nativeCounts().requests).toEqual(requests);
+      };
+      const serving = () => f.sql.query("SELECT serving_generation FROM tf_v2_container_instances");
+      const claims = () =>
+        f.sql.query(
+          "SELECT generation,state,allocation_cleanup FROM tf_v2_container_create_claims ORDER BY generation",
+        );
+      const stop = "linux-oci-stop-init@1";
+      const release = "linux-oci-release-namespace@1";
+      const continueRelease = "linux-oci-continue-namespace-release@1";
+      const first = await f.engine.runNext();
+      expect(first).toMatchObject({ id: changed.id, status: "reconciling", effect: "unknown" });
+      expect(f.nativeCounts().requests).not.toContain(stop);
+      if (scenario === "unhealthy") {
+        expect(await serving()).toEqual([{ serving_generation: 1 }]);
+        await expectUnknownLater();
+        return;
+      }
+      expect(await serving()).toEqual([{ serving_generation: 2 }]);
+      expect(await checkpoint()).toEqual({ delay: 1_000, error: null });
+      let final = first;
+      let pendingRelease = 0;
+      for (let phase = 0; phase < 20; phase++) {
+        const before = f.nativeCounts().requests.length;
+        f.advanceNormalClock(1_000);
+        final = await f.engine.runNext();
+        expect(final?.id).toBe(changed.id);
+        const requests = f.nativeCounts().requests.slice(before);
+        if (scenario !== "continuation-retained" && requests.includes(release)) {
+          expect(await claims()).toEqual([
+            { generation: 1, state: "bound", allocation_cleanup: "untouched" },
+            { generation: 2, state: "bound", allocation_cleanup: "untouched" },
+          ]);
+          await expectUnknownLater();
+          return;
+        }
+        if (final?.status === "succeeded") break;
+        expect(final).toMatchObject({ status: "reconciling", effect: "unknown" });
+        expect(await checkpoint()).toEqual({ delay: 1_000, error: null });
+        if (requests.includes(release) || requests.includes(continueRelease)) pendingRelease++;
+      }
+      expect(final).toMatchObject({ status: "succeeded", effect: "complete" });
+      expect(pendingRelease).toBe(3);
+      expect(await serving()).toEqual([{ serving_generation: 2 }]);
+      expect(await claims()).toEqual([
+        { generation: 1, state: "removed", allocation_cleanup: "closed" },
+        { generation: 2, state: "bound", allocation_cleanup: "untouched" },
+      ]);
+      const requests = f.nativeCounts().requests;
+      expect(requests.filter((kind) => kind === "linux-oci-create-stopped@1")).toHaveLength(2);
+      expect(requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(2);
+      expect(requests.filter((kind) => kind === stop)).toHaveLength(1);
+      expect(requests.filter((kind) => kind === release)).toHaveLength(1);
+      expect(requests.filter((kind) => kind === continueRelease)).toHaveLength(2);
+      expect(f.network).not.toHaveBeenCalled();
+    } finally {
+      health.restore();
+      await f.cleanup();
+    }
+  }, 15_000);
+}
+
 test("normal-update-history absent alternate retains original singleton refusal without old STOP", async () => {
   const { f, accepted } = await qualifiedNormalDeleteFixture();
   try {

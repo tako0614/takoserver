@@ -2934,7 +2934,7 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       local();
       // Do not nest a second active execution around original creator methods.
       // Each stage enters its own original scope and rereads actual acceptance.
-      const accepted = await core.withExecution(execution, () =>
+      let accepted = await core.withExecution(execution, () =>
         core.readAcceptedExecution(
           execution,
           execution.action === "delete"
@@ -2957,42 +2957,41 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
       ) {
         const progress = await creator.manageRetainedPeerInit(execution, cancel.signal);
         local();
-        if (trackedPeer && accepted.action === "delete") {
-          // Each runtime-owner management call advances at most one stage per
-          // retained claim. Confirmed intermediate steps need another reconcile;
-          // only the final owning cleanup can make a claim ready for finalization.
-          if (
-            runtimeApplicationOwner &&
-            progress.every((item) => {
-              if (item.kind !== "linux-oci-peer-init-progress@1") return false;
-              if (item.reply.kind === "linux-oci-refused@1") {
-                // The same parent can recheck the tracked READ or continue the
-                // original release without resending an attempted effect.
-                // EAGAIN remains pending, not retirement proof.
-                return (
-                  (item.operation === "read-tracked-join" ||
-                    item.operation === "release-namespace" ||
-                    item.operation === "continue-namespace-release") &&
-                  item.reply.stage === item.operation &&
-                  item.reply.custody === "retained" &&
-                  item.reply.errno === osConstants.errno.EAGAIN
-                );
-              }
+        // Each call advances at most one stage per original retained claim.
+        // Completion still requires the corresponding owning cleanup.
+        const continueRetirement =
+          trackedPeer &&
+          runtimeApplicationOwner &&
+          progress.every((item) => {
+            if (item.kind !== "linux-oci-peer-init-progress@1") return false;
+            if (item.reply.kind === "linux-oci-refused@1") {
+              // The same parent can recheck the tracked READ or continue the
+              // original release without resending an attempted effect.
+              // EAGAIN remains pending, not retirement proof.
               return (
-                (item.operation !== "stop-init" || item.reply.kind === "linux-oci-init-reaped@1") &&
-                (item.operation !== "read-helper-result" ||
-                  (item.reply.kind === "linux-oci-parent-h-exited@1" && item.reply.error === 0)) &&
-                (!("poisoned" in item.reply) ||
-                  (item.reply.poisoned === 0 && item.reply.referenceReleased === 1))
+                (item.operation === "read-tracked-join" ||
+                  item.operation === "release-namespace" ||
+                  item.operation === "continue-namespace-release") &&
+                item.reply.stage === item.operation &&
+                item.reply.custody === "retained" &&
+                item.reply.errno === osConstants.errno.EAGAIN
               );
-            }) &&
-            progress.some(
-              (item) =>
-                item.kind === "linux-oci-peer-init-progress@1" &&
-                item.operation !== "read-helper-result",
-            )
-          )
-            return { kind: "continue" };
+            }
+            return (
+              (item.operation !== "stop-init" || item.reply.kind === "linux-oci-init-reaped@1") &&
+              (item.operation !== "read-helper-result" ||
+                (item.reply.kind === "linux-oci-parent-h-exited@1" && item.reply.error === 0)) &&
+              (!("poisoned" in item.reply) ||
+                (item.reply.poisoned === 0 && item.reply.referenceReleased === 1))
+            );
+          }) &&
+          progress.some(
+            (item) =>
+              item.kind === "linux-oci-peer-init-progress@1" &&
+              item.operation !== "read-helper-result",
+          );
+        if (trackedPeer && accepted.action === "delete") {
+          if (continueRetirement) return { kind: "continue" };
           await core.withExecution(execution, () =>
             core.finalizeAcceptedDelete(execution, originalNativeCustody, cancel.signal),
           );
@@ -3011,7 +3010,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
               item.record.state !== "removed",
           )
         )
-          return unknown();
+          return continueRetirement && after.servingConfirmedAtMs !== null
+            ? { kind: "continue" }
+            : unknown();
+        if (runtimeApplicationOwner) {
+          if (after.servingConfirmedAtMs === null) return unknown();
+          accepted = after;
+        }
       }
       if (accepted.action === "delete") {
         await creator.disposeRetainedBornOwners(execution, cancel.signal);
@@ -3058,8 +3063,18 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             item.record.intent.policy.generation < accepted.generation &&
             item.record.state !== "removed",
         )
-      )
+      ) {
+        if (runtimeApplicationOwner && accepted.servingConfirmedAtMs === null) {
+          // Success here is the original serving CAS, checked again with the
+          // current execution before scheduling retirement of older claims.
+          const fresh = await core.withExecution(execution, () =>
+            core.readAcceptedExecution(execution),
+          );
+          local();
+          if (fresh.servingConfirmedAtMs !== null) return { kind: "continue" };
+        }
         return unknown();
+      }
       const result = await core.withExecution(execution, async (): Promise<V2BackendResult> => {
         const fresh = await core.readAcceptedExecution(execution);
         const serving = fresh.retained.find(
