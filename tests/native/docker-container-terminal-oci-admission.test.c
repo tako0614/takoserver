@@ -754,7 +754,7 @@ static void policy_raw_readback(void){
   }
   pol.readback[pol.readback_size]=0;
 }
-static void policy_prepare(struct tns_oci_owner *o,struct tns_owner *b){memset(&pol,0,sizeof(pol));prepare(o,b);CHECK(oci_uplink_install(o,o->uplink)==0);int n=snprintf(pol.file,sizeof(pol.file),"{\"kind\":\"linux-oci-owned-service@1\",\"artifact\":%s,\"service\":{\"httpPort\":8080,\"healthPath\":\"/health/%%E3%%81%%82\"}}",eg.artifact);CHECK(n>0 && (size_t)n<sizeof(pol.file));pol.file_size=(size_t)n;CHECK(oci_policy_select(o,&o->policy)==0 && o->policy);policy_subject=o->policy;}
+static void policy_prepare(struct tns_oci_owner *o,struct tns_owner *b){memset(&pol,0,sizeof(pol));prepare(o,b);up.bounded_read_fixture=1;CHECK(oci_uplink_install(o,o->uplink)==0);int n=snprintf(pol.file,sizeof(pol.file),"{\"kind\":\"linux-oci-owned-service@1\",\"artifact\":%s,\"service\":{\"httpPort\":8080,\"healthPath\":\"/health/%%E3%%81%%82\"}}",eg.artifact);CHECK(n>0 && (size_t)n<sizeof(pol.file));pol.file_size=(size_t)n;CHECK(oci_policy_select(o,&o->policy)==0 && o->policy);policy_subject=o->policy;}
 static void policy_discard(struct tns_oci_owner *o){free(o->policy);o->policy=NULL;policy_subject=NULL;discard(o);}
 static void policy_change(char *bytes,size_t *size,const char *from,const char *to){char *at=strstr(bytes,from);CHECK(at);size_t a=strlen(from),b=strlen(to),before=(size_t)(at-bytes);CHECK(*size-a+b<OCI_POLICY_JSON_MAX);memmove(at+b,at+a,*size-before-a+1);memcpy(at,to,b);*size=*size-a+b;}
 
