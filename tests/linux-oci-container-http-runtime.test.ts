@@ -1,8 +1,10 @@
 import { expect, spyOn, test } from "bun:test";
 import * as childProcess from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as files from "node:fs/promises";
+import * as http from "node:http";
 import * as net from "node:net";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -56,7 +58,7 @@ import {
 import { originalPeerDeleteFixture } from "./helpers/linux-oci-peer-delete-fixture.ts";
 
 // Original signed Core/acceptance/Engine/creator, memorySQLite and intercepted
-// P/H/HTTP streams only. Imported prior cases are filtered, never invoked.
+// P/H/health streams intercepted. Imported prior cases are filtered, never invoked.
 async function liveOriginal() {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -219,6 +221,75 @@ test("OCI HTTP ordinary DELETE starts original stream close before same creator 
     io.closeRequest();
     io.closeResponse();
     io.restore();
+    await x.cleanup();
+  }
+});
+
+test("OCI HTTP ordinary DELETE closes the original managed peer socket", async () => {
+  const connectLoopback = net.createConnection;
+  const x = await liveOriginal();
+  let originalPeer: net.Socket | undefined;
+  const server = http.createServer((request, response) => {
+    expect(originalPeer).toBeUndefined();
+    expect(request.url).toBe("/active?x=1");
+    expect(request.headers.host).toBe("10.240.0.3:8080");
+    originalPeer = request.socket;
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.write("first chunk");
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw Error("missing loopback listener");
+    // Keep the selected HTTP authority intact and substitute only the final test dial.
+    const dial = spyOn(http.Agent.prototype, "createConnection").mockImplementation((options) => {
+      expect(options.host).toBe("10.240.0.3");
+      expect(Number(options.port)).toBe(8080);
+      return connectLoopback({ host: "127.0.0.1", port: address.port });
+    });
+    try {
+      const response = await x.f.composition.fetchServingHttp(
+        x.identity,
+        new Request("http://caller.invalid/active?x=1"),
+      );
+      expect(response.status).toBe(200);
+      if (!response.body) throw Error("missing managed response body");
+      const reader = response.body.getReader();
+      const first = await reader.read();
+      expect(first.done).toBe(false);
+      expect(new TextDecoder().decode(first.value)).toBe("first chunk");
+      if (!originalPeer || originalPeer.destroyed) throw Error("missing open managed peer");
+      const peerClosed = observeRawPromise(
+        once(originalPeer, "close", { signal: AbortSignal.timeout(2_500) }),
+      );
+      const pending = observeRawPromise(reader.read());
+      const deleting = await acceptDelete(x);
+      const attempt = observeRawPromise(x.f.engine.runNext());
+
+      expect(await peerClosed.value).toHaveProperty("result");
+      expect(originalPeer.destroyed).toBe(true);
+      expect(await pending.value).toHaveProperty("error");
+      const outcome = await attempt.value;
+      expect("result" in outcome && outcome.result).toMatchObject({
+        id: deleting.id,
+        status: "reconciling",
+        effect: "unknown",
+      });
+      expect(stops(x.f)).toBe(1);
+      await expect(
+        x.f.composition.fetchServingHttp(x.identity, new Request("http://caller.invalid/late")),
+      ).rejects.toThrow();
+      expect(dial).toHaveBeenCalledTimes(1);
+      expect(x.network).not.toHaveBeenCalled();
+    } finally {
+      dial.mockRestore();
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
     await x.cleanup();
   }
 });
