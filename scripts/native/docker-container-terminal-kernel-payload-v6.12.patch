@@ -1,10 +1,27 @@
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1292,6 +1292,10 @@
+ #endif
+ 
+ void __consume_stateless_skb(struct sk_buff *skb);
++#ifdef CONFIG_TAKO_TERMINAL
++/* Consume the final skb after the caller has passed skb_unref(). */
++void tako_terminal_consume_skb(struct sk_buff *skb);
++#endif
+ void  __kfree_skb(struct sk_buff *skb);
+ 
+ void kfree_skb_partial(struct sk_buff *skb, bool head_stolen);
 diff --git a/net/core/skbuff.c b/net/core/skbuff.c
 --- a/net/core/skbuff.c
 +++ b/net/core/skbuff.c
-@@ -1221,8 +1221,20 @@
+@@ -1210,6 +1210,25 @@
+ 		skb_release_data(skb, reason);
+ }
  
- void __kfree_skb(struct sk_buff *skb)
- {
++static void skb_free_last_reference(struct sk_buff *skb,
++				    enum skb_drop_reason reason)
++{
 +#ifdef CONFIG_TAKO_TERMINAL
 +	struct tako_terminal_skb_refs held = {0};
 +
@@ -13,12 +30,59 @@ diff --git a/net/core/skbuff.c b/net/core/skbuff.c
 +	 */
 +	tako_skb_snapshot(skb, &held);
 +#endif
- 	skb_release_all(skb, SKB_DROP_REASON_NOT_SPECIFIED);
- 	kfree_skbmem(skb);
++	skb_release_all(skb, reason);
++	kfree_skbmem(skb);
 +#ifdef CONFIG_TAKO_TERMINAL
 +	/* skb may be freed: only the saved genuine refs may be accessed here. */
 +	tako_terminal_skb_refs_put(&held);
 +#endif
++}
++
+ /**
+  *	__kfree_skb - private function
+  *	@skb: buffer
+@@ -1221,8 +1240,7 @@
+ 
+ void __kfree_skb(struct sk_buff *skb)
+ {
+-	skb_release_all(skb, SKB_DROP_REASON_NOT_SPECIFIED);
+-	kfree_skbmem(skb);
++	skb_free_last_reference(skb, SKB_DROP_REASON_NOT_SPECIFIED);
  }
  EXPORT_SYMBOL(__kfree_skb);
  
+@@ -1494,6 +1512,14 @@
+ 	skb_release_data(skb, SKB_CONSUMED);
+ 	kfree_skbmem(skb);
+ }
++
++#ifdef CONFIG_TAKO_TERMINAL
++void tako_terminal_consume_skb(struct sk_buff *skb)
++{
++	trace_consume_skb(skb, __builtin_return_address(0));
++	skb_free_last_reference(skb, SKB_CONSUMED);
++}
++#endif
+ 
+ static void napi_skb_cache_put(struct sk_buff *skb)
+ {
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1621,6 +1621,16 @@
+ 	if (!skb_unref(skb))
+ 		return;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* skb_ext_reset() preserves our packet origin even when UDP marked
++	 * the rest of the skb stateless. Keep it through final data release.
++	 */
++	if (unlikely(skb_ext_exist(skb, SKB_EXT_TAKO_TERMINAL))) {
++		tako_terminal_consume_skb(skb);
++		return;
++	}
++#endif
++
+ 	/* In the more common cases we cleared the head states previously,
+ 	 * see __udp_queue_rcv_skb().
+ 	 */
