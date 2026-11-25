@@ -107,6 +107,7 @@ async function fixture(
     readonly peerJoinFault?: "foreign" | "refused" | "unknown" | "pidns";
     readonly peerNamespaceFault?:
       | "retained"
+      | "continuation-retained"
       | "lost"
       | "unreleased"
       | "foreign"
@@ -644,6 +645,7 @@ async function fixture(
                 if (release ? peer.peerEffects & (1 << 8) : !(peer.peerEffects & (1 << 8)))
                   throw Error("namespace effect replay or missing RELEASE");
                 nativeRequests.push(command.kind);
+                const followsRelease = peer.peerKind === 8;
                 peer.peerKind = release ? 8 : 9;
                 peer.peerEffects |= 1 << 8;
                 peer.peerBytes = frame.length;
@@ -672,10 +674,13 @@ async function fixture(
                   poisoned: 0,
                   barrier: "unproven",
                 };
-                if (release && fault === "retained")
+                if (
+                  (release && fault === "retained") ||
+                  (fault === "continuation-retained" && (release || followsRelease))
+                )
                   peer.peerReply = {
                     kind: "linux-oci-refused@1",
-                    stage: "release-namespace",
+                    stage: release ? "release-namespace" : "continue-namespace-release",
                     errno: 11,
                     custody: "retained",
                     barrier: "unproven",

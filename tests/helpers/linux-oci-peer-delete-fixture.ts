@@ -29,6 +29,7 @@ async function fixture(
     joinFault?: "foreign" | "refused" | "unknown" | "pidns";
     namespaceFault?:
       | "retained"
+      | "continuation-retained"
       | "lost"
       | "unreleased"
       | "foreign"

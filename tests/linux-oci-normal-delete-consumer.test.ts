@@ -218,38 +218,78 @@ for (const retirementFault of ["read-pending", "read-inconsistent"] as const) {
   });
 }
 
-for (const namespaceFault of ["retained", "lost", "unreleased"] as const) {
-  test(`normal-delete-consumer runtime application owner keeps namespace ${namespaceFault} outcomes unconfirmed`, async () => {
+for (const namespaceFault of ["retained", "continuation-retained", "lost", "unreleased"] as const) {
+  test(`normal-delete-consumer runtime application owner distinguishes namespace cadence for ${namespaceFault}`, async () => {
     const { f, accepted } = await live({ runtimeApplicationOwner: true, namespaceFault });
     try {
       const removal = await deleting(f, accepted.resourceUid);
-      await through(
+      const stopped = await through(
         f,
         async () =>
           (await f.sql.query("SELECT state FROM tf_v2_container_start_attempts"))[0]?.state ===
           "exited",
       );
+      expect(stopped).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+      const pending = namespaceFault === "retained" || namespaceFault === "continuation-retained";
+      const claim = async () =>
+        (
+          await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims")
+        )[0];
+      const expectCheckpoint = async () => {
+        const [checkpoint] = await f.sql.query(
+          "SELECT dispatch_possible,error_code,next_attempt_at_ms,updated_at FROM tf_v2_operations WHERE id=?",
+          [removal.id],
+        );
+        expect(checkpoint).toMatchObject({
+          dispatch_possible: 1,
+          error_code: pending ? null : "outcome_unconfirmed",
+        });
+        expect(
+          Number(checkpoint?.next_attempt_at_ms) - Date.parse(String(checkpoint?.updated_at)),
+        ).toBe(pending ? 1_000 : 60_000);
+        expect(await claim()).toEqual({ state: "bound", allocation_cleanup: "untouched" });
+      };
+      const release = "linux-oci-release-namespace@1";
+      const continueRelease = "linux-oci-continue-namespace-release@1";
       f.advanceNormalClock(1_000);
       expect(await f.engine.runNext()).toMatchObject({
         id: removal.id,
         status: "reconciling",
         effect: "unknown",
       });
-      const [checkpoint] = await f.sql.query(
-        "SELECT dispatch_possible,error_code,next_attempt_at_ms,updated_at FROM tf_v2_operations WHERE id=?",
-        [removal.id],
+      await expectCheckpoint();
+      const nativeRequests = f.nativeCounts().requests;
+      expect(nativeRequests.filter((kind) => kind === release)).toHaveLength(1);
+      expect(nativeRequests).not.toContain("linux-oci-delete-born@1");
+      expect(nativeRequests).not.toContain("linux-oci-parent-read-result@1");
+
+      f.advanceNormalClock(1_000);
+      if (!pending) {
+        expect(await f.engine.runNext()).toBeNull();
+        expect(f.nativeCounts().requests).toEqual(nativeRequests);
+        return;
+      }
+      let final = await f.engine.runNext();
+      expect(final).toMatchObject({ id: removal.id, status: "reconciling", effect: "unknown" });
+      expect(f.nativeCounts().requests.slice(nativeRequests.length)).toEqual([
+        "linux-oci-parent-read-outcome@2",
+        continueRelease,
+      ]);
+      if (namespaceFault === "continuation-retained") await expectCheckpoint();
+      for (let phase = 0; phase < 12 && final?.status !== "succeeded"; phase++) {
+        f.advanceNormalClock(1_000);
+        final = await f.engine.runNext();
+        expect(final?.id).toBe(removal.id);
+      }
+      expect(final).toMatchObject({ id: removal.id, status: "succeeded", effect: "complete" });
+      expect(await claim()).toEqual({ state: "removed", allocation_cleanup: "closed" });
+      const completedRequests = f.nativeCounts().requests;
+      expect(completedRequests.filter((kind) => kind === release)).toHaveLength(1);
+      expect(completedRequests.filter((kind) => kind === continueRelease)).toHaveLength(
+        namespaceFault === "continuation-retained" ? 2 : 1,
       );
-      expect(checkpoint).toMatchObject({ dispatch_possible: 1, error_code: "outcome_unconfirmed" });
-      expect(
-        Number(checkpoint?.next_attempt_at_ms) - Date.parse(String(checkpoint?.updated_at)),
-      ).toBe(60_000);
-      expect(
-        await f.sql.query("SELECT state,allocation_cleanup FROM tf_v2_container_create_claims"),
-      ).toEqual([{ state: "bound", allocation_cleanup: "untouched" }]);
-      const requests = f.nativeCounts().requests;
-      expect(requests.filter((kind) => kind === "linux-oci-release-namespace@1")).toHaveLength(1);
-      expect(requests).not.toContain("linux-oci-delete-born@1");
-      expect(requests).not.toContain("linux-oci-parent-read-result@1");
+      expect(completedRequests.filter((kind) => kind === "linux-oci-stop-init@1")).toHaveLength(1);
+      expect(f.network).not.toHaveBeenCalled();
     } finally {
       await f.cleanup();
     }

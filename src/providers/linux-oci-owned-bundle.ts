@@ -2966,10 +2966,13 @@ export function createLinuxOciOwnedBundle(options: LinuxOciOwnedBundleOptions) {
             progress.every((item) => {
               if (item.kind !== "linux-oci-peer-init-progress@1") return false;
               if (item.reply.kind === "linux-oci-refused@1") {
-                // The original parent can recheck this READ without repeating
-                // the BEGIN handoff. An EAGAIN reply is not retirement proof.
+                // The same parent can recheck the tracked READ or continue the
+                // original release without resending an attempted effect.
+                // EAGAIN remains pending, not retirement proof.
                 return (
-                  item.operation === "read-tracked-join" &&
+                  (item.operation === "read-tracked-join" ||
+                    item.operation === "release-namespace" ||
+                    item.operation === "continue-namespace-release") &&
                   item.reply.stage === item.operation &&
                   item.reply.custody === "retained" &&
                   item.reply.errno === osConstants.errno.EAGAIN
