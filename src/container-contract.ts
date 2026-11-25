@@ -51,6 +51,11 @@ export const CONTAINER_CONTRACT = Object.freeze({
 export const V2_CONTAINER_F2_FORM =
   "https://edge.forms.takoform.com/forms/Container/0.2.0/" as const;
 
+/** Workload token admitted by both frozen Container Forms. */
+export function isContainerWorkloadRevision(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value);
+}
+
 export interface ContainerBindingClaim {
   readonly principal: string;
   readonly space: string;

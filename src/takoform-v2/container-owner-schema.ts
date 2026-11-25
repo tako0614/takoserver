@@ -1,4 +1,8 @@
-import { CONTAINER_CONTRACT as C, V2_CONTAINER_F2_FORM } from "../container-contract.ts";
+import {
+  CONTAINER_CONTRACT as C,
+  isContainerWorkloadRevision,
+  V2_CONTAINER_F2_FORM,
+} from "../container-contract.ts";
 import type { Sql, SqlStatement } from "../ports.ts";
 import { parseStrictJson } from "../strict-json.ts";
 import {
@@ -1530,7 +1534,7 @@ function createContainerHostAcceptance(
 
       const workload = record[C.fields.workloadRevision];
       const names = f2Names(record);
-      if (typeof workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload))
+      if (!isContainerWorkloadRevision(workload))
         throw new TypeError("invalid Container F2 workload revision");
       const configuredJson = serializeV2ContainerConfiguredPrivateInputs(c.configuredPrivateInputs);
       // A void UPDATE hook after an empty CREATE has no stable CREATE envelope
@@ -1733,7 +1737,7 @@ function createContainerHostAcceptance(
 
       const workload = record[C.fields.workloadRevision];
       f2Names(record);
-      if (typeof workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload))
+      if (!isContainerWorkloadRevision(workload))
         throw new TypeError("invalid Container F2 workload revision");
       return (async () => {
         const successor =
@@ -1853,8 +1857,7 @@ function createContainerHostAcceptance(
       const workload = record[C.fields.workloadRevision];
       if (
         (sensitive !== undefined && (!Array.isArray(sensitive) || sensitive.length !== 0)) ||
-        typeof workload !== "string" ||
-        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload)
+        !isContainerWorkloadRevision(workload)
       )
         throw new TypeError("frozen Container Form cannot accept sensitive inputs");
       const incarnation =
@@ -1967,8 +1970,7 @@ function createContainerHostAcceptance(
       const workload = record[C.fields.workloadRevision];
       if (
         (sensitive !== undefined && (!Array.isArray(sensitive) || sensitive.length !== 0)) ||
-        typeof workload !== "string" ||
-        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload)
+        !isContainerWorkloadRevision(workload)
       )
         throw new TypeError("frozen Container Form cannot accept sensitive inputs");
       const guard: SqlStatement = {

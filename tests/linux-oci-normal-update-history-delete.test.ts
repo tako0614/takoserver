@@ -1,11 +1,12 @@
 import { expect, spyOn, test } from "bun:test";
-import { V2_CONTAINER_F2_FORM } from "../src/container-contract.ts";
+import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "../src/container-contract.ts";
 import {
   linuxOciGenerationTopology,
   linuxOciPeerNetworksDisjoint,
   snapshotLinuxOciTopologyPair,
 } from "../src/providers/linux-oci-host-topology.ts";
 import * as originalBundle from "../src/providers/linux-oci-owned-bundle.ts";
+import { createTakoformV2Routes } from "../src/takoform-v2/routes.ts";
 import {
   observeRawPromise,
   ownedRawHttp,
@@ -441,3 +442,96 @@ test("normal-update-history lease lost during original coordinate read refuses n
     await f.cleanup();
   }
 });
+
+test("normal-update-history accepts named workload revisions through the ordinary PUT", async () => {
+  const workload = CONTAINER_CONTRACT.fields.workloadRevision;
+  const initial = "Revision_1.stable";
+  const next = "Release-2.".padEnd(128, "x");
+  const { f, accepted } = await qualifiedNormalDeleteFixture({
+    createWorkloadRevision: initial,
+    runtimeApplicationOwner: true,
+    alternateHostTopology: alternate(),
+  });
+  const health = acceptedRawHttp();
+  health.onEnd(() => {
+    health.reply();
+    health.join();
+  });
+  try {
+    const baseUrl = "https://host.example/takoform-v2";
+    const router = createTakoformV2Routes(f.engine, {
+      baseUrl,
+      documentation: "https://docs.example/forms",
+      authenticationDocumentation: "https://docs.example/auth",
+      authenticationSchemes: ["Bearer"],
+      maxRequestBytes: 4096,
+      maxPageSize: 10,
+      replayWindowSeconds: 3600,
+      cursorSigningKey: new Uint8Array(32).fill(17),
+      authenticate: async () => ({ principal: "synthetic-oci-parent", access: "write" }),
+    });
+    const resource = baseUrl + "/resources/" + accepted.resourceUid;
+    const spec = await specOf(f, accepted.resourceUid);
+    expect(spec[workload]).toBe(initial);
+    const put = (revision: string) =>
+      router.fetch(
+        new Request(resource, {
+          method: "PUT",
+          headers: {
+            "content-type": "application/json",
+            "idempotency-key": crypto.randomUUID(),
+            "takoform-expected-generation": "1",
+          },
+          body: JSON.stringify({ spec: { ...spec, [workload]: revision } }),
+        }),
+      );
+    const prior = f.nativeCounts();
+    expect((await put(next + "x"))?.status).toBe(422);
+    expect((await put("invalid/revision"))?.status).toBe(422);
+    expect(f.nativeCounts()).toEqual(prior);
+    expect(
+      await f.sql.query(
+        "SELECT generation FROM tf_v2_operations WHERE resource_uid=? ORDER BY generation",
+        [accepted.resourceUid],
+      ),
+    ).toEqual([{ generation: 1 }]);
+    const submitted = await put(next);
+    expect(submitted?.status).toBe(202);
+    const operation = await submitted?.json();
+    expect(operation).toMatchObject({
+      resourceUid: accepted.resourceUid,
+      generation: 2,
+      action: "update",
+    });
+    let result: Awaited<ReturnType<typeof step>> = null;
+    for (let phase = 0; phase < 20 && result?.status !== "succeeded"; phase++) {
+      result = await step(f);
+    }
+    expect(result).toMatchObject({ id: operation.id, status: "succeeded", effect: "complete" });
+    expect((await specOf(f, accepted.resourceUid))[workload]).toBe(next);
+    expect(
+      await f.sql.query(
+        "SELECT generation,revision FROM tf_v2_container_revisions ORDER BY generation",
+      ),
+    ).toEqual([
+      { generation: 1, revision: "1-" + initial },
+      { generation: 2, revision: "2-" + next },
+    ]);
+    expect(
+      await f.sql.query(
+        "SELECT generation,state,allocation_cleanup FROM tf_v2_container_create_claims ORDER BY generation",
+      ),
+    ).toEqual([
+      { generation: 1, state: "removed", allocation_cleanup: "closed" },
+      { generation: 2, state: "bound", allocation_cleanup: "untouched" },
+    ]);
+    const requests = f.nativeCounts().requests;
+    expect(requests.filter((kind) => kind === "linux-oci-create-stopped@1")).toHaveLength(2);
+    expect(requests.filter((kind) => kind === "linux-oci-start@1")).toHaveLength(2);
+    expect(requests.filter((kind) => kind === "linux-oci-stop-init@1")).toHaveLength(1);
+    expect(f.network).not.toHaveBeenCalled();
+  } finally {
+    health.restore();
+    await f.cleanup();
+  }
+}, 15_000);

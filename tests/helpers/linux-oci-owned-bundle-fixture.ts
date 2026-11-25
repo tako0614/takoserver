@@ -1561,7 +1561,7 @@ async function fixture(
     onLoan(callback: typeof duringLoan) {
       duringLoan = callback;
     },
-    create: () =>
+    create: (workloadRevision = "1".repeat(64)) =>
       engine.acceptCreate({
         principal: "synthetic-oci-parent",
         key: crypto.randomUUID(),
@@ -1573,7 +1573,7 @@ async function fixture(
             [fields.image]: `registry.example/app@${sourceDigest}`,
             [fields.httpPort]: 8080,
             [fields.healthPath]: "/health",
-            [fields.workloadRevision]: "1".repeat(64),
+            [fields.workloadRevision]: workloadRevision,
             [fields.environment]: { MODE: "synthetic-public" },
             [fields.requiredSensitiveVars]: ["SECRET"],
             [fields.outboundInternet]: adversarial.outboundInternet ?? true,

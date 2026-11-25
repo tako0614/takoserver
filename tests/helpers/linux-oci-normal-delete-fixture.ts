@@ -18,6 +18,7 @@ async function live(
     producerRevision?: "missing";
     producerDigest?: "missing" | "wrong";
     localCleanup?: boolean;
+    createWorkloadRevision?: string;
     runtimeApplicationOwner?: boolean;
     managementFault?: "lost-reply";
     retirementFault?: "read-pending" | "read-inconsistent";
@@ -47,7 +48,7 @@ async function live(
     await f.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
     await f.sql.batch(v2ConfiguredUpdateDiscardTransition());
     await f.sql.batch(v2FinalDeleteConfiguredUpdateDiscardTransition());
-    const accepted = await f.create();
+    const accepted = await f.create(options.createWorkloadRevision);
     expect(await f.engine.runNext()).toMatchObject({ status: "succeeded", effect: "complete" });
     return { f, accepted };
   } catch (error) {

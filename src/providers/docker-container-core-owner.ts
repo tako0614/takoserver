@@ -1,4 +1,4 @@
-import { CONTAINER_CONTRACT as C } from "../container-contract.ts";
+import { CONTAINER_CONTRACT as C, isContainerWorkloadRevision } from "../container-contract.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
 import type { Row, Sql, SqlParam, SqlStatement } from "../ports.ts";
 import { parseStrictJson } from "../strict-json.ts";
@@ -699,7 +699,7 @@ const encodedRevision = (value: unknown, generation: unknown): value is string =
   Number.isSafeInteger(generation) &&
   Number(generation) > 0 &&
   value.startsWith(`${generation}-`) &&
-  hex(value.slice(String(generation).length + 1));
+  isContainerWorkloadRevision(value.slice(String(generation).length + 1));
 
 const intentKeys = [
   "installationId",
@@ -1071,7 +1071,7 @@ export function createDockerContainerCoreOwner(
     );
     if (
       !isJsonObject(spec) ||
-      !hex(spec[C.fields.workloadRevision]) ||
+      !isContainerWorkloadRevision(spec[C.fields.workloadRevision]) ||
       (a("action") !== "delete" &&
         `${a("generation")}-${spec[C.fields.workloadRevision]}` !== a("revision")) ||
       (spec[C.fields.requiredSensitiveVars] !== undefined &&
@@ -1211,7 +1211,7 @@ export function createDockerContainerCoreOwner(
     );
     if (
       !isJsonObject(spec) ||
-      !hex(spec[C.fields.workloadRevision]) ||
+      !isContainerWorkloadRevision(spec[C.fields.workloadRevision]) ||
       (a("action") !== "delete" &&
         `${a("generation")}-${spec[C.fields.workloadRevision]}` !== a("revision"))
     )
