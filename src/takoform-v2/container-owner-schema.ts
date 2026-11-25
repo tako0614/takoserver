@@ -531,19 +531,34 @@ const expectedRows = Object.freeze(
     Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
   ),
 );
-const readyPredicate = (
-  encodeValue: (value: string, rowIndex: number, columnIndex: number) => string,
-  selectedRows = expectedRows,
-  selectedNames = names,
-  selectedTableNames = tableNames,
+const selectedCatalogReady = (
+  expectedObjects: string,
+  selectedNames: string,
+  selectedTableNames: string,
 ): string => `(
-  ${selectedRows.map((row, rowIndex) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`).join("\n  AND ")}
+  ${expectedObjects}
   AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE sql IS NOT NULL
     AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${selectedTableNames})) AND name NOT IN (${selectedNames}))
   AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata')  AND source.sql IS NOT NULL AND instr(upper(source.sql), 'REFERENCES') = 0 THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
      WHERE  source.type = 'table' AND lower(fk."table") IN (${selectedTableNames}) AND source.name NOT IN (${selectedTableNames})) END)
   AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" IN (${selectedTableNames}))
 )`;
+const readyPredicate = (
+  encodeValue: (value: string, rowIndex: number, columnIndex: number) => string,
+  selectedRows = expectedRows,
+  selectedNames = names,
+  selectedTableNames = tableNames,
+): string =>
+  selectedCatalogReady(
+    selectedRows
+      .map(
+        (row, rowIndex) =>
+          `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`,
+      )
+      .join("\n  AND "),
+    selectedNames,
+    selectedTableNames,
+  );
 export const V2_CONTAINER_OWNER_READY = readyPredicate(literal);
 const runtimeReadyParams = Object.freeze([JSON.stringify(expectedRows)]);
 const runtimeReady =
@@ -1342,12 +1357,24 @@ function buildApplicationSuccessorSchema() {
     ),
   );
   const applicationSuccessorReadyParams = Object.freeze([JSON.stringify(applicationSuccessorRows)]);
+  const expectedPositions = applicationSuccessorRows.map((_, index) => `(${index})`).join(", ");
+  // Extract each expected object's fields once per SQLite statement, then compare
+  // the same exact catalog rows and run the live inventory and foreign-key guards.
   const applicationSuccessorReady =
-    "(WITH container_owner_application_successor_values(document) AS (VALUES (?)) SELECT " +
-    readyPredicate(
-      (_value, row, column) =>
-        `json_extract((SELECT document FROM container_owner_application_successor_values), '$[${row}][${column}]')`,
-      applicationSuccessorRows,
+    `(WITH owner_catalog_document(document) AS (VALUES (?)),
+      owner_catalog_positions(position) AS (VALUES ${expectedPositions}),
+      owner_catalog_tuples(tuple) AS MATERIALIZED (
+        SELECT json_extract(document, '$[' || position || ']')
+        FROM owner_catalog_document CROSS JOIN owner_catalog_positions
+      ),
+      expected_owner_objects(type, name, tbl_name, definition) AS MATERIALIZED (
+        SELECT json_extract(tuple, '$[0]'), json_extract(tuple, '$[1]'),
+          json_extract(tuple, '$[2]'), json_extract(tuple, '$[3]') FROM owner_catalog_tuples
+    ) SELECT ` +
+    selectedCatalogReady(
+      `NOT EXISTS (SELECT 1 FROM expected_owner_objects e WHERE (SELECT count(*) FROM main.sqlite_schema s
+        WHERE s.type = e.type AND s.name = e.name AND s.tbl_name = e.tbl_name
+          AND s.sql = e.definition) <> 1)`,
       applicationSuccessorSelectedObjects.map((item) => literal(item.name)).join(", "),
       `${tableNames}, ${literal(shutdownIoTable)}, ${literal(applicationSuccessorTable)}`,
     ) +

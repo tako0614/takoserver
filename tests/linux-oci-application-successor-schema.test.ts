@@ -489,7 +489,13 @@ test("selected OCI Host starts its first accepted CREATE on the exact successor 
     );
     await fixture.sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
     await fixture.sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+    // Unrelated catalog names do not participate in the owning schema proof.
+    await fixture.sql.run("CREATE TABLE main.json_each (id INTEGER)");
+    await fixture.sql.run("CREATE TEMP TABLE json_each (id INTEGER)");
     await fixture.sql.batch(V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND.statements);
+    expect(await inspectV2ContainerOwnerApplicationSuccessorSchema(fixture.sql)).toBe(true);
+    await fixture.sql.run("DROP TABLE temp.json_each");
+    await fixture.sql.run("DROP TABLE main.json_each");
     const created = await fixture.create();
     expect(created).toMatchObject({ status: "queued", effect: "none", generation: 1 });
     expect(
