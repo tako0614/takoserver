@@ -115,14 +115,16 @@ describe("Takoserver public site", () => {
     );
   });
 
-  test("the README lists the same composed Form versions, not retained ones", () => {
-    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-    const section = readme.slice(
-      readme.indexOf("## What you can deploy"),
-      readme.indexOf("## How it works"),
-    );
-    for (const form of COMPOSED_FORMS) expect(section).toContain(`\`${form}\``);
-    for (const form of RETAINED_ONLY_FORMS) expect(section).not.toContain(`\`${form}\``);
+  test("the README and README.ja.md list the same composed Form versions, not retained ones", () => {
+    for (const [file, startHeading, endHeading] of [
+      ["../README.md", "## What you can deploy", "## How it works"],
+      ["../README.ja.md", "## デプロイできるもの", "## どちらから始めるか"],
+    ] as const) {
+      const readme = readFileSync(new URL(file, import.meta.url), "utf8");
+      const section = readme.slice(readme.indexOf(startHeading), readme.indexOf(endHeading));
+      for (const form of COMPOSED_FORMS) expect(section).toContain(`\`${form}\``);
+      for (const form of RETAINED_ONLY_FORMS) expect(section).not.toContain(`\`${form}\``);
+    }
   });
 
   test("links each group of Forms to the guide step that uses it", () => {
@@ -356,6 +358,7 @@ describe("Takoserver public site", () => {
     const html = notFoundHtml();
     expect(html).toContain("<title>404 | Takoserver</title>");
     expect(html).toContain('<meta name="robots" content="noindex">');
+    expect(html).toContain('rel="icon"');
     expect(html).toContain('href="/"');
     // The same page reads in Japanese under /ja/, or for a Japanese browser.
     expect(html).toContain('ja={title:"ページが見つかりません"');
@@ -363,5 +366,32 @@ describe("Takoserver public site", () => {
     expect(html).toContain(
       'for(const link of document.querySelectorAll(\'[data-404="back"],.brand\'))link.href="/ja/"',
     );
+  });
+
+  test("provides top navigation, cross-product guidance, and mobile wrap protections", () => {
+    const english = landingHtml(site);
+    const japanese = landingHtml({ ...site, locale: "ja" });
+    for (const href of ["#forms", "#start", "#deploy", "#after"]) {
+      expect(english).toContain(`<a class="top-link" href="${href}"`);
+    }
+    expect(english).toContain('<a class="brand" href="/"');
+    expect(japanese).toContain('<a class="brand" href="/ja/"');
+    expect(english).toContain("README.md");
+    expect(japanese).toContain(
+      'href="https://github.com/tako0614/takoserver/blob/main/README.ja.md"',
+    );
+    expect(english).toContain("V2=$HOST/apis/forms.takoform.com/v2");
+    expect(english).toContain("F=https://edge.forms.takoform.com/forms");
+    expect(english).toContain('id="ecosystem"');
+    expect(english).toContain('href="https://takoform.com/spec/host-api/v2/"');
+    expect(english).toContain('href="https://takosumi.com"');
+    expect(english).toContain("Host-owned supply, not BYOC");
+    expect(japanese).toContain("運用者が所有する環境（BYOCではありません）");
+    expect(japanese).toContain("Takosumiは不要です");
+    // Mobile wrap safeguards so narrow 320px viewports never clip links or chips.
+    expect(english).toContain(".more a { display: inline-flex;");
+    expect(english).toContain("white-space: normal;");
+    expect(english).toContain(".steps > li > pre, .steps > li > .chips { grid-column: 1 / -1; }");
+    expect(english).toContain("@media (max-width: 360px) { .forms code { white-space: normal; } }");
   });
 });
