@@ -1,5 +1,17 @@
 # Docker and Compose self-host
 
+> **At a glance**
+>
+> - **Time:** about 5 minutes.
+> - **What you get:** a local Takoserver Host listening on `127.0.0.1:8787` with
+>   Host API v2, operator sign-in, organizations, API keys, and the artifact
+>   Forms (`WorkerBundle`, `StaticAssetBundle`, `SQLiteMigrationSet`), backed by
+>   a persistent Docker volume.
+> - **What it does not include:** running Workers (`workerd`), the Workflow
+>   execution guard, or TCP 443 Worker Endpoints. Those require the native Linux
+>   x86-64 setup in
+>   [First install and first use](self-host-operations.md#first-install-and-first-use).
+
 This runs the Host's API, operator sign-in, organizations and API keys in one
 container on `127.0.0.1:8787`, with its SQLite state in a Docker volume. It also
 serves the artifact Forms that keep Worker code, static files and SQL

@@ -25,6 +25,8 @@ export interface LandingOptions {
 }
 
 const REPOSITORY = "https://github.com/tako0614/takoserver";
+const README_EN = `${REPOSITORY}/blob/main/README.md`;
+const README_JA = `${REPOSITORY}/blob/main/README.ja.md`;
 const GUIDE = `${REPOSITORY}/blob/main/docs/self-host-operations.md`;
 const INSTALL_GUIDE = `${GUIDE}#first-install-and-first-use`;
 const DEPLOY_STEPS = `${GUIDE}#6-seed-held-artifacts`;
@@ -43,12 +45,18 @@ const PREREQUISITES = `${GUIDE}#1-prerequisites`;
 /** The release that attaches the pinned workerd; 1.0.0, marked Latest, has none. */
 const WORKERD_RELEASE = `${REPOSITORY}/releases/tag/v2.0.0-rc.1`;
 const TAKOFORM = "https://takoform.com";
+const TAKOFORM_V2_SPEC = "https://takoform.com/spec/host-api/v2/";
+const TAKOSUMI = "https://takosumi.com";
 
 const landingMessages = {
   en: {
     description:
       "Takoserver is an open-source cloud you host yourself. Deploy Workers and their SQLite, KV, object storage and queues to your own machine from Takoform definitions.",
     skip: "Skip to content",
+    navForms: "Forms",
+    navStart: "Self-host",
+    navDeploy: "Deploy",
+    navAfter: "Operate",
     lead: "Deploy Takoform.\nRun your own cloud.",
     lede: "Takoserver is an open-source cloud that runs on your own Linux machine. Deploy Workers and their SQLite, KV, object storage and queues from Takoform definitions, and operate them yourself.",
     install: "Read the install guide",
@@ -62,6 +70,7 @@ const landingMessages = {
     formsNeeds:
       "Artifacts need only Bun and a short block in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3. A running Host answers, for each Form URL, whether it serves that Form.",
     takoform: "About Takoform",
+    takoformSpec: "Host API v2 spec",
     artifactsTitle: "Artifacts",
     artifactsBody: "Worker code, static files and SQL migrations, pinned by URL and SHA-256.",
     workersTitle: "Workers and HTTPS",
@@ -85,12 +94,14 @@ const landingMessages = {
     hostNote:
       "Without the Worker runtime and port 443, the Host still keeps artifacts and serves the API, sign-in, organizations and keys. To try that much quickly, use Docker.",
     releases: "Takoserver 2.0.0-rc.1 (pre-release)",
+    overview: "Overview (README)",
     prerequisites: "Prerequisites",
     docker: "Try it in Docker",
     security: "Self-host security",
     deployTitle: "Deploy one Worker",
     deployBody:
       "Five Resources, created in this order with curl over Host API v2. Each create is accepted as an Operation that you poll until it succeeds. $V2, $F, $ORG and $KEY come from step 5 of the install guide, and step 8 runs the whole chain with a small create function. No released Takoform client speaks Host API v2 yet, so today you deploy with requests like these or in the console.",
+    endpointBaseLabel: "Host API v2 base and Form URL prefix:",
     createLabel:
       "Each create is one POST. Sent again with the same idempotency-key within 24 hours, it returns the same Operation instead of a second Worker.",
     workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
@@ -132,6 +143,19 @@ const landingMessages = {
     backup: "Cold snapshot",
     update: "Update",
     reference: "Host API v2 reference",
+    ecosystemTitle: "How it fits with Takoform and Takosumi",
+    ecosystemIntro:
+      "Takoserver runs on capacity the Host operator owns, and works on its own without other products.",
+    ecoTakoformTitle: "Takoform",
+    ecoTakoformBody:
+      "Defines the portable Forms and Host API v2 contract. Takoserver implements that contract so your resource definitions stay portable.",
+    ecoHostTitle: "Host-owned supply, not BYOC",
+    ecoHostBody:
+      "As the operator, you provide the Linux machine and runtime. Organizations manage Resources with API keys or the console — Takoserver never takes tenant cloud-account credentials.",
+    ecoTakosumiTitle: "Takosumi (optional, separate)",
+    ecoTakosumiBody:
+      "A separate OpenTofu control plane for installing apps and managing your own cloud accounts (BYOC). You do not need Takosumi to run or use Takoserver.",
+    takosumi: "About Takosumi",
     openapi: "OpenAPI description",
     discovery: "Takoform Host discovery",
     product: "Product discovery",
@@ -140,6 +164,10 @@ const landingMessages = {
     description:
       "Takoserverは、自分でホストするオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義から自分のマシンへデプロイできます。",
     skip: "本文へ移動",
+    navForms: "対応Form",
+    navStart: "導入",
+    navDeploy: "デプロイ",
+    navAfter: "運用",
     lead: "Takoformを、\n自分のクラウドへ。",
     lede: "Takoserverは、自分のLinuxマシンで動かすオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義からデプロイして運用できます。",
     install: "導入手順を読む（英語）",
@@ -153,6 +181,7 @@ const landingMessages = {
     formsNeeds:
       "成果物は、Bunと設定への短い記述の追加だけで使えます。それ以外には下の手順2のWorker実行環境が必要で、ホスト名で公開するには手順3も必要です。動いているHostには、Form URLごとに対応しているかを問い合わせられます。",
     takoform: "Takoformについて",
+    takoformSpec: "Host API v2 仕様",
     artifactsTitle: "成果物",
     artifactsBody:
       "Workerのコード・静的ファイル・SQLのマイグレーションを、URLとSHA-256で固定して保持します。",
@@ -175,12 +204,14 @@ const landingMessages = {
     hostNote:
       "Worker実行環境と443番がなくても、Hostは成果物を保持し、API・サインイン・組織・APIキーを提供します。そこまでを手早く試すならDockerを使えます。",
     releases: "Takoserver 2.0.0-rc.1（プレリリース）",
-    prerequisites: "前提条件",
-    docker: "Dockerで試す",
-    security: "セルフホストのセキュリティ",
+    overview: "日本語ガイド（README.ja.md）",
+    prerequisites: "前提条件（英語）",
+    docker: "Dockerで試す（英語）",
+    security: "セルフホストのセキュリティ（英語）",
     deployTitle: "Workerを1つデプロイする",
     deployBody:
       "5つのリソースを、この順にcurlとHost API v2で作成します。作成はOperationとして受け付けられ、成功するまで状態を確認します。$V2・$F・$ORG・$KEYは導入手順書の手順5で用意します。手順書では、小さなcreate関数でこの流れ全体を実行します。Host API v2に対応したTakoformのクライアントはまだリリースされていないため、現在はこのようなリクエストかコンソールでデプロイします。",
+    endpointBaseLabel: "Host API v2のエンドポイントとForm URLのプレフィックス：",
     createLabel:
       "作成は1回のPOSTです。24時間以内に同じidempotency-keyで送り直すと、2つ目のWorkerは作らず同じOperationを返します。",
     workerStep: "Workerそのものです。版・配信・公開先はこれを参照します。",
@@ -221,7 +252,20 @@ const landingMessages = {
     monitoring: "監視（英語）",
     backup: "コールドスナップショット（英語）",
     update: "更新（英語）",
-    reference: "Host API v2 リファレンス",
+    reference: "Host API v2 リファレンス（英語）",
+    ecosystemTitle: "Takoform・Takosumiとの関係",
+    ecosystemIntro:
+      "Takoserverはホスト運用者が所有する環境で動き、他製品なしでも単独で利用できます。",
+    ecoTakoformTitle: "Takoform",
+    ecoTakoformBody:
+      "ポータブルなFormとHost API v2の仕様を定義します。Takoserverはこの仕様を実装しており、定義を特定の事業者に縛りません。",
+    ecoHostTitle: "運用者が所有する環境（BYOCではありません）",
+    ecoHostBody:
+      "Linuxマシンと実行環境を用意するのはホスト運用者です。組織はAPIキーやコンソールでリソースを管理し、利用者のクラウドアカウント資格情報は受け取りません。",
+    ecoTakosumiTitle: "Takosumi（別の任意製品）",
+    ecoTakosumiBody:
+      "アプリ導入や自身のクラウドアカウント連携（BYOC）を扱う別のOpenTofu管理基盤です。Takoserverの構築・利用にTakosumiは不要です。",
+    takosumi: "Takosumiについて",
     openapi: "OpenAPI仕様",
     discovery: "Takoform Hostディスカバリー",
     product: "製品ディスカバリー",
@@ -290,6 +334,9 @@ const TAKO_RECTS =
   '<rect x="9" y="0" width="17" height="8" fill="var(--accent)"/><rect x="8" y="1" width="1" height="30" fill="var(--accent)"/><rect x="26" y="1" width="1" height="33" fill="var(--accent)"/><rect x="7" y="2" width="1" height="30" fill="var(--accent)"/><rect x="27" y="2" width="1" height="30" fill="var(--accent)"/><rect x="6" y="3" width="1" height="31" fill="var(--accent)"/><rect x="28" y="3" width="1" height="22" fill="var(--accent)"/><rect x="29" y="4" width="1" height="20" fill="var(--accent)"/><rect x="5" y="5" width="1" height="29" fill="var(--accent)"/><rect x="4" y="6" width="1" height="15" fill="var(--accent)"/><rect x="30" y="6" width="1" height="17" fill="var(--accent)"/><rect x="3" y="7" width="1" height="13" fill="var(--accent)"/><rect x="31" y="7" width="1" height="15" fill="var(--accent)"/><rect x="2" y="8" width="1" height="9" fill="var(--accent)"/><rect x="9" y="8" width="4" height="23" fill="var(--accent)"/><rect x="15" y="8" width="5" height="3" fill="var(--accent)"/><rect x="22" y="8" width="4" height="23" fill="var(--accent)"/><rect x="32" y="8" width="1" height="13" fill="var(--accent)"/><rect x="1" y="10" width="1" height="4" fill="var(--accent)"/><rect x="13" y="10" width="2" height="21" fill="var(--accent)"/><rect x="20" y="10" width="2" height="24" fill="var(--accent)"/><rect x="33" y="10" width="1" height="10" fill="var(--accent)"/><rect x="17" y="11" width="3" height="20" fill="var(--accent)"/><rect x="16" y="12" width="1" height="1" fill="var(--accent)"/><rect x="15" y="14" width="1" height="20" fill="var(--accent)"/><rect x="16" y="16" width="1" height="18" fill="var(--accent)"/><rect x="0" y="20" width="3" height="2" fill="var(--accent)"/><rect x="1" y="22" width="2" height="2" fill="var(--accent)"/><rect x="3" y="23" width="2" height="8" fill="var(--accent)"/><rect x="2" y="24" width="1" height="2" fill="var(--accent)"/><rect x="28" y="27" width="1" height="4" fill="var(--accent)"/><rect x="29" y="28" width="1" height="3" fill="var(--accent)"/><rect x="2" y="29" width="1" height="2" fill="var(--accent)"/><rect x="30" y="29" width="1" height="2" fill="var(--accent)"/><rect x="1" y="30" width="1" height="1" fill="var(--accent)"/><rect x="31" y="30" width="1" height="1" fill="var(--accent)"/><rect x="10" y="31" width="3" height="1" fill="var(--accent)"/><rect x="17" y="31" width="1" height="1" fill="var(--accent)"/><rect x="22" y="31" width="1" height="1" fill="var(--accent)"/><rect x="25" y="31" width="1" height="3" fill="var(--accent)"/><rect x="10" y="32" width="2" height="2" fill="var(--accent)"/><rect x="13" y="8" width="2" height="2" fill="var(--mark-face)"/><rect x="20" y="8" width="2" height="2" fill="var(--mark-face)"/><rect x="15" y="11" width="2" height="1" fill="var(--mark-face)"/><rect x="15" y="12" width="1" height="2" fill="var(--mark-face)"/><rect x="16" y="13" width="1" height="3" fill="var(--mark-face)"/>';
 const takoMark = (size: number, cls = "") =>
   `<svg viewBox="0 0 34 34" width="${size}" height="${size}" shape-rendering="crispEdges" class="${cls}" aria-hidden="true">${TAKO_RECTS}</svg>`;
+const FAVICON_HREF = `data:image/svg+xml,${encodeURIComponent(
+  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 34 34" shape-rendering="crispEdges">${TAKO_RECTS.replaceAll("var(--accent)", "#b0301f").replaceAll("var(--mark-face)", "#17100f")}</svg>`,
+)}`;
 
 /*
  * The product site's neutral surfaces: white and a near-black dark scheme
@@ -323,10 +370,11 @@ a { color: inherit; }
 .shell { width: min(1160px, calc(100% - 80px)); margin: 0 auto; }
 .skip { position: absolute; top: -100px; left: 16px; padding: 8px 12px; background: var(--surface-0); z-index: 2; }
 .skip:focus { top: 12px; }
-.top { height: 88px; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
-.brand { display: inline-flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 550; letter-spacing: -0.035em; text-decoration: none; }
+.top { min-height: 88px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 24px; padding: 12px 0; }
+.brand { display: inline-flex; align-items: center; gap: 10px; min-height: 44px; font-size: 17px; font-weight: 550; letter-spacing: -0.035em; text-decoration: none; }
 .brand svg { flex: none; }
-.top-link { font-size: 13px; color: var(--ink-2); text-decoration: none; white-space: nowrap; }
+.top-nav { display: flex; align-items: center; flex-wrap: wrap; gap: 0 20px; }
+.top-link { display: inline-flex; align-items: center; min-height: 44px; font-size: 13px; color: var(--ink-2); text-decoration: none; white-space: nowrap; }
 .top-link:hover { color: var(--ink-1); }
 
 .hero { padding: 72px 0 48px; text-align: center; }
@@ -355,7 +403,7 @@ h1 { margin: 0; font-family: var(--display); font-size: clamp(42px, 5.5vw, 68px)
 .frame img { display: block; width: 100%; height: auto; }
 .preview figcaption { margin-top: 16px; color: var(--ink-3); font-size: 12px; text-align: center; word-break: auto-phrase; }
 
-section.block { padding: 96px 0 0; }
+section.block { padding: 96px 0 0; scroll-margin-top: 24px; }
 h2 { margin: 0; font-family: var(--display); font-size: clamp(28px, 3.2vw, 40px); font-weight: 500; line-height: 1.3; letter-spacing: -0.045em; text-wrap: balance; word-break: auto-phrase; }
 .intro { margin: 16px 0 0; max-width: 44em; color: var(--ink-2); font-size: 15px; }
 h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.02em; }
@@ -365,9 +413,8 @@ h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.02em; }
 .forms dt { margin: 0; }
 .forms dt p { margin: 8px 0 0; color: var(--ink-2); font-size: 14px; max-width: 28em; }
 .forms dt .more { margin-top: 12px; }
-.forms dt .more a { white-space: normal; }
 .forms dd { margin: 0; display: flex; flex-wrap: wrap; gap: 8px; align-content: start; }
-.forms code { padding: 4px 10px; border: 1px solid var(--line-1); border-radius: 999px; background: var(--surface-2); font: 13px/1.6 var(--mono); white-space: nowrap; }
+.forms code { max-width: 100%; padding: 4px 10px; border: 1px solid var(--line-1); border-radius: 999px; background: var(--surface-2); font: 13px/1.6 var(--mono); white-space: nowrap; overflow-wrap: anywhere; }
 
 .deploy { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 48px; margin-top: 40px; align-items: start; }
 .chain { margin: 0; padding: 0; list-style: none; counter-reset: step; }
@@ -383,7 +430,7 @@ pre { margin: 0; padding: 16px 20px; border: 1px solid var(--line-1); border-rad
 pre .file { display: block; margin-bottom: 8px; color: var(--ink-3); }
 pre .out { color: var(--accent); }
 .more { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 24px 0 0; }
-.more a { font-size: 14px; font-weight: 500; text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 4px; white-space: nowrap; }
+.more a { display: inline-flex; align-items: center; min-height: 36px; font-size: 14px; font-weight: 500; line-height: 1.5; text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 4px; white-space: normal; }
 .more a:hover { text-decoration-color: var(--ink-1); }
 
 .host { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 48px; margin-top: 40px; align-items: start; }
@@ -410,6 +457,10 @@ pre .out { color: var(--accent); }
 .actions.start { justify-content: flex-start; }
 .after .actions { margin-top: 20px; }
 .after .keep { margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--line-1); }
+.fit { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; margin-top: 32px; }
+.fit > div { min-width: 0; padding-top: 20px; border-top: 1px solid var(--line-1); }
+.fit p { margin: 10px 0 0; color: var(--ink-2); font-size: 14px; }
+.fit .more { margin-top: 14px; }
 
 footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; margin-top: 120px; padding: 24px 0 32px; border-top: 1px solid var(--line-1); color: var(--ink-3); font-size: 13px; }
 .footer-brand { color: var(--ink-1); font-weight: 550; }
@@ -427,9 +478,11 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
 /* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
 @media (max-width: 1216px) { .deploy, .host, .after { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
+@media (max-width: 960px) { .fit { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
-  .top { height: 72px; }
+  .top { min-height: 72px; gap: 4px 16px; }
+  .top-nav { gap: 0 14px; }
   .hero { padding: 48px 0 32px; }
   .hero-title { gap: 12px; }
   .here { margin-top: 28px; padding: 22px 20px; }
@@ -437,7 +490,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
   h1 { font-size: clamp(34px, 8.7vw, 56px); }
   .lead { font-size: 19px; margin-top: 20px; }
   .actions { margin-top: 28px; gap: 8px; }
-  .pill { min-height: 44px; padding: 10px 18px; font-size: 13px; }
+  .pill { min-height: 44px; max-width: 100%; padding: 10px 18px; font-size: 13px; white-space: normal; text-align: center; }
   .preview { margin-top: 40px; }
   .frame { padding: 6px; border-radius: 16px; }
   .frame picture { border-radius: 10px; }
@@ -445,9 +498,10 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
   .preview .frame { max-width: 406px; margin-inline: auto; }
   section.block { padding-top: 64px; }
   .forms > div, .deploy, .after, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; }
-  .steps > li > pre { grid-column: 1 / -1; }
+  .steps > li > pre, .steps > li > .chips { grid-column: 1 / -1; }
   footer { margin-top: 80px; }
 }
+@media (max-width: 360px) { .forms code { white-space: normal; } }
 @media (prefers-reduced-motion: reduce) { .pill { transition: none; } }
 `;
 
@@ -470,9 +524,14 @@ export function landingHtml(options: LandingOptions): string {
   // the API's own root fills in the origin it was read from.
   // On the public site the request uses the guide's $V2; a Host's own root
   // page fills in the origin it was read from.
+  const deployV2Base = siteAssets
+    ? "$HOST/apis/forms.takoform.com/v2"
+    : `${hostAddress}/apis/forms.takoform.com/v2`;
   const shipTarget = siteAssets
     ? "$V2/resources"
     : `${hostAddress}/apis/forms.takoform.com/v2/resources`;
+  const brandHref = siteAssets && locale === "ja" ? "/ja/" : "/";
+  const overviewHref = locale === "ja" ? README_JA : README_EN;
   const text = (key: keyof typeof copy, tag = "span", attributes = "") =>
     `<${tag}${attributes} data-i18n="${key}">${copy[key]}</${tag}>`;
   const screen = (shape: "desktop" | "tablet" | "mobile", theme: "light" | "dark") =>
@@ -559,7 +618,7 @@ ${siteAssets ? `<link rel="canonical" href="${pageUrl}">` : '<meta name="robots"
 <meta name="color-scheme" content="light dark">
 ${siteAssets ? locales : ""}
 ${rootLanguage}
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 34 34'%3E%3Crect width='34' height='34' fill='%23b0301f'/%3E%3C/svg%3E">
+<link rel="icon" href="${FAVICON_HREF}">
 ${siteAssets ? '<link rel="preload" href="/fonts/bricolage-grotesque-latin.woff2" as="font" type="font/woff2" crossorigin>' : ""}
 <style>${pageStyles}
 ${siteAssets ? '@font-face { font-family: "Bricolage Grotesque"; font-style: normal; font-display: swap; font-weight: 200 800; src: url("/fonts/bricolage-grotesque-latin.woff2") format("woff2"); }' : ""}
@@ -569,8 +628,14 @@ ${siteAssets ? '@font-face { font-family: "Bricolage Grotesque"; font-style: nor
 <a class="skip" href="#main" data-i18n="skip">${copy.skip}</a>
 <div class="shell">
 <header class="top">
-<a class="brand" href="/" aria-label="Takoserver">${takoMark(26)}<span>takoserver</span></a>
+<a class="brand" href="${brandHref}" aria-label="Takoserver">${takoMark(26)}<span>takoserver</span></a>
+<nav class="top-nav" aria-label="Takoserver">
+<a class="top-link" href="#forms" data-i18n="navForms">${copy.navForms}</a>
+<a class="top-link" href="#start" data-i18n="navStart">${copy.navStart}</a>
+<a class="top-link" href="#deploy" data-i18n="navDeploy">${copy.navDeploy}</a>
+<a class="top-link" href="#after" data-i18n="navAfter">${copy.navAfter}</a>
 <a class="top-link" href="${REPOSITORY}">GitHub</a>
+</nav>
 </header>
 <main id="main">
 <section class="hero" aria-labelledby="headline">
@@ -589,7 +654,7 @@ ${text("formsNeeds", "p", ' class="intro"')}
 <dl class="forms">
 ${formGroups}
 </dl>
-<p class="more"><a href="${TAKOFORM}" data-i18n="takoform">${copy.takoform}</a></p>
+<p class="more"><a href="${TAKOFORM}" data-i18n="takoform">${copy.takoform}</a><a href="${TAKOFORM_V2_SPEC}" data-i18n="takoformSpec">${copy.takoformSpec}</a></p>
 </section>
 
 
@@ -609,7 +674,7 @@ bun install --frozen-lockfile</pre></li>
 <aside>
 ${text("hostNote", "p", ' class="note"')}
 <div class="actions start"><a class="pill primary external" href="${INSTALL_GUIDE}" data-i18n="install">${copy.install}</a></div>
-<p class="more"><a href="${PREREQUISITES}" data-i18n="prerequisites">${copy.prerequisites}</a><a href="${DOCKER_GUIDE}" data-i18n="docker">${copy.docker}</a><a href="${SECURITY_GUIDE}" data-i18n="security">${copy.security}</a></p>
+<p class="more"><a href="${overviewHref}" data-locale-href-en="${README_EN}" data-locale-href-ja="${README_JA}" data-i18n="overview">${copy.overview}</a><a href="${PREREQUISITES}" data-i18n="prerequisites">${copy.prerequisites}</a><a href="${DOCKER_GUIDE}" data-i18n="docker">${copy.docker}</a><a href="${SECURITY_GUIDE}" data-i18n="security">${copy.security}</a></p>
 </aside>
 </div>
 </section>
@@ -622,6 +687,9 @@ ${text("deployBody", "p", ' class="intro"')}
 ${chain}
 </ol>
 <div class="code">
+${text("endpointBaseLabel", "p")}
+<pre>V2=${deployV2Base}
+F=https://edge.forms.takoform.com/forms</pre>
 ${text("createLabel", "p")}
 <pre>jq -n --arg form "$F/ModuleWorker/0.3.0/" --arg space "$ORG" \\
   '{$form, $space, name: "hello", spec: {}}' |
@@ -667,6 +735,16 @@ takoform-expected-generation: &lt;the generation it read&gt;
 <p class="more"><a href="${SHIP_STEPS}" data-i18n="shipMore">${copy.shipMore}</a><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
 </div>
 </section>
+
+<section class="block" id="ecosystem" aria-labelledby="ecosystem-title">
+${text("ecosystemTitle", "h2", ' id="ecosystem-title"')}
+${text("ecosystemIntro", "p", ' class="intro"')}
+<div class="fit">
+<div>${text("ecoTakoformTitle", "h3")}${text("ecoTakoformBody", "p")}<p class="more"><a href="${TAKOFORM}" data-i18n="takoform">${copy.takoform}</a><a href="${TAKOFORM_V2_SPEC}" data-i18n="takoformSpec">${copy.takoformSpec}</a></p></div>
+<div>${text("ecoHostTitle", "h3")}${text("ecoHostBody", "p")}<p class="more"><a href="${SECURITY_GUIDE}" data-i18n="security">${copy.security}</a></p></div>
+<div>${text("ecoTakosumiTitle", "h3")}${text("ecoTakosumiBody", "p")}<p class="more"><a href="${TAKOSUMI}" data-i18n="takosumi">${copy.takosumi}</a></p></div>
+</div>
+</section>
 </main>
 <footer>
 <span class="footer-brand">takoserver</span>
@@ -674,6 +752,8 @@ takoform-expected-generation: &lt;the generation it read&gt;
 <a href="${base}/openapi.json" data-i18n="openapi">${copy.openapi}</a>
 <a href="${base}/.well-known/takoform/v2" data-i18n="discovery">${copy.discovery}</a>
 <a href="${base}/.well-known/takoserver" data-i18n="product">${copy.product}</a>
+<a href="${TAKOFORM}">Takoform</a>
+<a href="${TAKOSUMI}">Takosumi</a>
 <a href="${REPOSITORY}" data-i18n="source">${copy.source}</a>
 </nav>
 </footer>
@@ -681,7 +761,7 @@ takoform-expected-generation: &lt;the generation it read&gt;
 <script>
 const messages=${JSON.stringify(landingMessages)};
 const pathLocale=location.pathname.split("/")[1];
-const setLocale=(locale)=>{const lang=locale==="ja"?"ja":"en";document.documentElement.lang=lang;for(const selector of['meta[name="description"]','meta[property="og:description"]','meta[name="twitter:description"]'])document.querySelector(selector).content=messages[lang].description;for(const node of document.querySelectorAll("[data-i18n]"))node.textContent=messages[lang][node.dataset.i18n];for(const node of document.querySelectorAll("[data-i18n-alt]"))node.alt=messages[lang][node.dataset.i18nAlt];for(const node of document.querySelectorAll("[data-locale-srcset]"))node.srcset=node.dataset.localeSrcset.replace("{lang}",lang);for(const node of document.querySelectorAll("[data-locale-src]"))node.src=node.dataset.localeSrc.replace("{lang}",lang)};
+const setLocale=(locale)=>{const lang=locale==="ja"?"ja":"en";document.documentElement.lang=lang;for(const selector of['meta[name="description"]','meta[property="og:description"]','meta[name="twitter:description"]'])document.querySelector(selector).content=messages[lang].description;for(const node of document.querySelectorAll("[data-i18n]"))node.textContent=messages[lang][node.dataset.i18n];for(const node of document.querySelectorAll("[data-i18n-alt]"))node.alt=messages[lang][node.dataset.i18nAlt];for(const node of document.querySelectorAll("[data-locale-srcset]"))node.srcset=node.dataset.localeSrcset.replace("{lang}",lang);for(const node of document.querySelectorAll("[data-locale-src]"))node.src=node.dataset.localeSrc.replace("{lang}",lang);for(const node of document.querySelectorAll("[data-locale-href-en]"))node.href=lang==="ja"?node.dataset.localeHrefJa:node.dataset.localeHrefEn};
 const browserLocale=(navigator.languages??[navigator.language]).map(language=>String(language).toLowerCase().split("-")[0]).find(language=>language==="ja"||language==="en")??"en";
 setLocale(pathLocale==="ja"||pathLocale==="en"?pathLocale:browserLocale);
 ${siteAssets ? "" : 'for(const node of document.querySelectorAll("[data-origin]"))node.textContent=location.origin;'}
@@ -706,6 +786,7 @@ export function notFoundHtml(): string {
 <title>404 | Takoserver</title>
 <meta name="robots" content="noindex">
 <meta name="color-scheme" content="light dark">
+<link rel="icon" href="${FAVICON_HREF}">
 <style>${pageStyles}</style>
 </head>
 <body class="error">

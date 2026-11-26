@@ -22,6 +22,15 @@ publisher-set admission: the v1 admission command in the
 not part of this path. The steps deploy with curl over Host API v2, or in the
 console: no released Takoform client speaks Host API v2 yet.
 
+**Step map**
+
+| Stage | Steps | What you finish with |
+| --- | --- | --- |
+| **Host setup** | [1. Prerequisites](#1-prerequisites) → [2. Data root](#2-data-root) → [3. Configuration](#3-configuration) → [4. HTTPS and TCP 443](#4-https-and-tcp-443) → [5. First boot and operator sign-in](#5-first-boot-and-operator-sign-in) | Running Host, signed-in operator session, organization (`$ORG`), API key (`$KEY`), and optional [console](#the-console-optional) |
+| **First Worker** | [6. Seed held artifacts](#6-seed-held-artifacts) → [7. Check Form support](#7-check-form-support) → [8. Create and serve a Worker](#8-create-and-serve-a-worker) → [9. Verify](#9-verify) | `hello` Worker answering over HTTPS on your wildcard domain |
+| **Updates & data** | [10. Ship a new version](#10-ship-a-new-version) · [11. Bind a SQLite database](#11-bind-a-sqlite-database) · [12. Bind KV, a bucket and a queue](#12-bind-kv-a-bucket-and-a-queue) · [13. Delete Resources](#13-delete-resources) | Code rollouts, rollbacks, data Bindings, and reference-order cleanup |
+| **Operations** | [Monitoring](#monitoring) · [Cold snapshot](#cold-snapshot) · [Update and code rollback](#update-and-code-rollback) · [Upgrading from v1.0.0](#upgrading-from-v100) | Health checks, backups, safe commit updates, and recovery |
+
 A self-host runs one of two profiles, selected by configuration:
 
 - **Artifact profile.** The v2 Host API, operator sign-in, organizations, API

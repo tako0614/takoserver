@@ -1,5 +1,7 @@
 # Takoserver
 
+日本語: [README.ja.md](README.ja.md)
+
 Takoserver is an open-source cloud you run on your own Linux machine. You deploy
 Workers, with their SQLite databases, KV namespaces, object buckets and queues,
 from [Takoform](https://takoform.com) definitions, and it serves each Worker at
@@ -29,9 +31,20 @@ To serve Workers:
 - an HTTPS front end such as Caddy for the API, on its own name and another
   port, such as `api.example.com:8443`, and TCP 80 for its certificate.
 
-For a look without Workers, Docker with Compose is enough.
+For a quick local look without Workers (~5 minutes), Docker with Compose 2.30+ is enough.
 
 ## Get started
+
+Choose one of two starting paths depending on what you want to try first:
+
+- **Try the API in ~5 minutes (Docker, no Workers):** Start with
+  [Docker and Compose self-host](docs/self-host-docker.md). It brings up the
+  Host API v2, operator sign-in, organizations, API keys, and artifact Forms on
+  `127.0.0.1:8787`.
+- **Deploy and serve your first Worker over HTTPS (Linux x86-64):** Start with
+  [First install and first use](docs/self-host-operations.md#first-install-and-first-use),
+  steps 1 to 9. A Docker installation does not later convert into a native
+  Worker Host; start natively when you want to serve Workers.
 
 | To | Follow |
 | --- | --- |
@@ -140,6 +153,16 @@ serves them from this machine.
 
 - **This repository is the Host and its self-host plugin**: everything needed
   to build and run a Takoserver on your own machine.
+- **Host-owned supply only (no tenant BYOC).** Takoserver runs Resources on
+  machines and capacity owned by the Host operator. Organizations manage
+  Resources through API keys or the console; Takoserver never onboards customer
+  vendor cloud credentials.
+- **Standalone with Takoform, independent of Takosumi.**
+  [Takoform](https://takoform.com) defines the portable Forms and
+  [Host API v2](https://takoform.com/spec/host-api/v2/) contract that
+  Takoserver implements. [Takosumi](https://takosumi.com) is a separate,
+  optional OpenTofu control plane for installing apps and managing your own
+  cloud accounts (BYOC); Takoserver works standalone without Takosumi.
 - **It serves Takoform Host API v2 only.** Host-side code implements each Form
   it composes; the Host does not install Form packages, check their
   signatures, or translate requests into Takoform Host API v1. Its own `/v1`
