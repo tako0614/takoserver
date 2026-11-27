@@ -3,7 +3,7 @@ import { type Child, h, live } from "../dom.ts";
 import { beginGoogleSignIn } from "../google.ts";
 import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
 import { mark } from "../mark.ts";
-import { type Resource, resource, signal } from "../reactive.ts";
+import { type Resource, resource, signal, untrack } from "../reactive.ts";
 import { route } from "../router.ts";
 import {
   api,
@@ -37,9 +37,11 @@ import { explain, ICON, icon, toast } from "../ui.ts";
 
 export function signInPage(): Child {
   const providers = resource(() => api.identityProviders());
-  if (sharedAuthAvailable() === null && sharedAuthProbeState() === "idle") {
-    void refreshSharedAuthAvailability();
-  }
+  untrack(() => {
+    if (sharedAuthAvailable() === null && sharedAuthProbeState() === "idle") {
+      void refreshSharedAuthAvailability();
+    }
+  });
 
   return h(
     "div",
