@@ -49,6 +49,17 @@ export function signal<Value>(initial: Value): Signal<Value> {
   return read;
 }
 
+/** Runs `read` without registering any signal reads on an enclosing effect. */
+export function untrack<Value>(read: () => Value): Value {
+  const previous = listening;
+  listening = null;
+  try {
+    return read();
+  } finally {
+    listening = previous;
+  }
+}
+
 /**
  * Runs `body` now, and again whenever a signal it read has changed.
  *

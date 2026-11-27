@@ -83,6 +83,31 @@ export function hostV2Base(discovery: HostDiscovery | null): string {
   return discovery?.takoform ?? `${apiOrigin()}/apis/forms.takoform.com/v2`;
 }
 
+/**
+ * Validates and normalizes an API origin entered by a person.
+ * Only bare HTTP(S) origins (no credentials, path, query, or hash) are accepted.
+ */
+export function normalizeApiOrigin(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/u, "");
+  if (trimmed === "") return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+  if (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    (parsed.pathname !== "" && parsed.pathname !== "/") ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  )
+    return null;
+  return parsed.origin;
+}
+
 export function setApiOrigin(origin: string): void {
   const trimmed = origin.replace(/\/+$/u, "");
   if (trimmed === apiOrigin()) return;

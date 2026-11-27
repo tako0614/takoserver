@@ -62,6 +62,7 @@ export function resourcesPage(organizationId: string): Child {
   // Host again.
   const note = once(() => firstRunNote(organizationId));
   const filter = signal("");
+  const filterToolbar = toolbar(filter);
   const onlyForm = route().query.get("form");
   const additional = signal<readonly ResourceSummary[]>([]);
   const continuation = signal<{ readonly cursor?: string } | null>(null);
@@ -407,10 +408,13 @@ export function resourcesPage(organizationId: string): Child {
               ),
             );
           }
+          const scoped = onlyForm
+            ? allResources.filter((entry) => entry.form === onlyForm)
+            : allResources;
           return h(
             "div",
             { style: { display: "grid", gap: "14px" } },
-            toolbar(filter),
+            filterToolbar,
             onlyForm ? formNote(onlyForm) : null,
             nextCursor
               ? h(
@@ -427,14 +431,7 @@ export function resourcesPage(organizationId: string): Child {
               h(
                 "div",
                 { class: "table-scroll" },
-                table(
-                  matchingResources(
-                    onlyForm
-                      ? allResources.filter((entry) => entry.form === onlyForm)
-                      : allResources,
-                    filter(),
-                  ),
-                ),
+                live(() => table(matchingResources(scoped, filter()))),
               ),
             ),
             pagingError(),
@@ -448,18 +445,40 @@ export function resourcesPage(organizationId: string): Child {
 }
 
 function toolbar(filter: ReturnType<typeof signal<string>>): Child {
+  const input = h("input", {
+    class: "input",
+    id: "resources-filter",
+    name: "filter",
+    autocomplete: "off",
+    style: { maxWidth: "300px" },
+    type: "search",
+    placeholder: tr("名前またはFormで絞り込み", "Filter by name or Form"),
+    "aria-label": tr("名前またはFormで絞り込み", "Filter by name or Form"),
+    value: "",
+    onInput: (event: Event) => filter.set((event.target as HTMLInputElement).value),
+  });
   return h(
     "div",
     { class: "toolbar" },
-    h("input", {
-      class: "input",
-      style: { maxWidth: "300px" },
-      type: "search",
-      placeholder: tr("名前またはFormで絞り込み", "Filter by name or Form"),
-      "aria-label": tr("名前またはFormで絞り込み", "Filter by name or Form"),
-      value: filter(),
-      onInput: (event: Event) => filter.set((event.target as HTMLInputElement).value),
-    }),
+    input,
+    live(() =>
+      filter() === ""
+        ? null
+        : h(
+            "button",
+            {
+              class: "btn btn--ghost btn--sm",
+              type: "button",
+              "aria-label": tr("絞り込みをクリア", "Clear filter"),
+              onClick: () => {
+                input.value = "";
+                filter.set("");
+                input.focus?.();
+              },
+            },
+            tr("クリア", "Clear"),
+          ),
+    ),
   );
 }
 

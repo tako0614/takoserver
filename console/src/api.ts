@@ -965,6 +965,7 @@ export function createApi(options: ApiOptions) {
     clearSessionOnUnauthorized = true,
     includeAuthorization = true,
     cache?: RequestCache,
+    signal?: AbortSignal,
   ): Promise<{ readonly status: number; readonly payload: Result }> => {
     const origin = options.origin;
     const sessionRevision = options.sessionRevision?.();
@@ -975,6 +976,7 @@ export function createApi(options: ApiOptions) {
         method,
         credentials: "include",
         ...(cache === undefined ? {} : { cache }),
+        ...(signal === undefined ? {} : { signal }),
         headers: {
           ...(token ? { authorization: `Bearer ${token}` } : {}),
           ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -1699,13 +1701,21 @@ export function createApi(options: ApiOptions) {
         `/v1/catalog?organizationId=${encodeURIComponent(organizationId)}`,
       ),
 
-    async formSupport(organizationId: string, form: string): Promise<boolean> {
+    async formSupport(
+      organizationId: string,
+      form: string,
+      signal?: AbortSignal,
+    ): Promise<boolean> {
       const path = `${LANE}/support?form=${encodeURIComponent(form)}`;
       const { payload, status } = await request<unknown>(
         "GET",
         path,
         undefined,
         organizationHeader(organizationId),
+        true,
+        true,
+        undefined,
+        signal,
       );
       if (
         status !== 200 ||

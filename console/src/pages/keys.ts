@@ -270,6 +270,7 @@ function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () =>
               {
                 class: "btn btn--sm btn--danger",
                 type: "button",
+                "aria-label": tr(`${key.name}を失効`, `Revoke ${key.name}`),
                 onClick: () => revoke(organizationId, key, reload),
               },
               tr("失効", "Revoke"),
@@ -327,6 +328,7 @@ function createKey(
   const name = h("input", {
     class: "input",
     id: "create-key-name",
+    name: "name",
     placeholder: "deploy pipeline",
     autocomplete: "off",
   });
@@ -335,7 +337,7 @@ function createKey(
   const aiBoxes: HTMLInputElement[] = [];
   const lifetime = h(
     "select",
-    { class: "select", id: "create-key-lifetime" },
+    { class: "select", id: "create-key-lifetime", name: "lifetime", autocomplete: "off" },
     ...LIFETIMES.map((option, index) =>
       h(
         "option",
@@ -377,6 +379,8 @@ function createKey(
             ...group.scopes.map((scope) => {
               const box = h("input", {
                 type: "checkbox",
+                name: "scope",
+                value: scope.id,
                 ...(chosen.has(scope.id) ? { checked: true } : {}),
                 onChange: (event: Event) => {
                   if ((event.target as HTMLInputElement).checked) chosen.add(scope.id);
@@ -527,7 +531,7 @@ function revealSecret(
       h(
         "div",
         { class: "field" },
-        h("label", null, key.name),
+        h("span", { class: "field__label" }, key.name),
         h(
           "div",
           {

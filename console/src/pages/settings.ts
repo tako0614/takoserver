@@ -9,6 +9,7 @@ import {
   apiOrigin,
   applyTheme,
   hostV2Base,
+  normalizeApiOrigin,
   principal,
   setApiOrigin,
   signOut,
@@ -121,6 +122,7 @@ export function settingsPage(organization: Organization): Child {
                 {
                   class: theme() === option ? "btn btn--primary" : "btn",
                   type: "button",
+                  "aria-pressed": theme() === option ? "true" : "false",
                   onClick: () => applyTheme(option as Theme),
                 },
                 themeLabel(option),
@@ -145,6 +147,7 @@ export function settingsPage(organization: Organization): Child {
                 {
                   class: consoleLocale() === option ? "btn btn--primary" : "btn",
                   type: "button",
+                  "aria-pressed": consoleLocale() === option ? "true" : "false",
                   onClick: () => setConsoleLocale(option),
                 },
                 option === "ja" ? "日本語" : "English",
@@ -155,7 +158,37 @@ export function settingsPage(organization: Organization): Child {
       ),
     ),
     live(() => {
-      const input = h("input", { class: "input", id: "settings-api-origin", value: apiOrigin() });
+      const save = (): void => {
+        const normalized = normalizeApiOrigin(input.value);
+        if (!normalized) {
+          toast(
+            tr(
+              "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
+              "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
+            ),
+            "bad",
+          );
+          return;
+        }
+        input.value = normalized;
+        setApiOrigin(normalized);
+        toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
+      };
+      const input = h("input", {
+        class: "input",
+        id: "settings-api-origin",
+        name: "apiOrigin",
+        type: "url",
+        autocomplete: "off",
+        spellcheck: "false",
+        value: apiOrigin(),
+        onKeydown: (event: KeyboardEvent) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            save();
+          }
+        },
+      });
       return card(
         tr("API接続先", "API endpoint"),
         h(
@@ -174,10 +207,7 @@ export function settingsPage(organization: Organization): Child {
                 {
                   class: "btn",
                   type: "button",
-                  onClick: () => {
-                    setApiOrigin(input.value.trim());
-                    toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
-                  },
+                  onClick: save,
                 },
                 tr("保存", "Save"),
               ),
@@ -242,63 +272,65 @@ export function hostCard(organizationId: string): Child {
     );
   };
 
-  return card(
-    tr("このHost", "This Host"),
-    h(
-      "div",
-      { class: "card__body" },
-      // One region for every row, so each row but the last keeps its rule.
-      live(() => {
-        const state = support.get();
-        const [worker, endpoint] = state.state === "ready" ? state.value : [null, null];
-        const rows = [row("Host API v2", address())];
-        rows.push(
-          row(
-            tr("Worker", "Workers"),
-            state.state === "loading"
-              ? checking()
-              : worker === true
-                ? tr("実行します", "Runs Workers")
-                : worker === false
-                  ? h(
-                      "span",
-                      null,
-                      tr(
-                        "実行しません。保持できるのは成果物だけです。Workerを動かすには、",
-                        "Does not run Workers; it keeps artifacts only. Running them needs the Worker runtime and its settings from ",
-                      ),
-                      guideStep("3-configuration", "手順3", "step 3"),
-                      tr("にあるWorker実行環境とその設定が必要です。", "."),
-                    )
-                  : unchecked(),
-          ),
-        );
-        // Publishing is a question only for a Host that runs Workers.
-        if (worker === true)
+  return live(() =>
+    card(
+      tr("このHost", "This Host"),
+      h(
+        "div",
+        { class: "card__body" },
+        // One region for every row, so each row but the last keeps its rule.
+        live(() => {
+          const state = support.get();
+          const [worker, endpoint] = state.state === "ready" ? state.value : [null, null];
+          const rows = [row("Host API v2", address())];
           rows.push(
             row(
-              tr("HTTPSでの公開", "HTTPS publishing"),
-              endpoint === true
-                ? tr(
-                    "WorkerEndpointで、WorkerをHTTPSのホスト名に公開できます",
-                    "WorkerEndpoint publishes Workers at HTTPS hostnames",
-                  )
-                : endpoint === false
-                  ? h(
-                      "span",
-                      null,
-                      tr(
-                        "まだ公開できません。",
-                        "Not yet: it needs the HTTPS listener on TCP 443 from ",
-                      ),
-                      guideStep("4-https-and-tcp-443", "手順4", "step 4"),
-                      tr("にあるHTTPS（TCP 443）の待ち受け設定が必要です。", "."),
-                    )
-                  : unchecked(),
+              tr("Worker", "Workers"),
+              state.state === "loading"
+                ? checking()
+                : worker === true
+                  ? tr("実行します", "Runs Workers")
+                  : worker === false
+                    ? h(
+                        "span",
+                        null,
+                        tr(
+                          "実行しません。保持できるのは成果物だけです。Workerを動かすには、",
+                          "Does not run Workers; it keeps artifacts only. Running them needs the Worker runtime and its settings from ",
+                        ),
+                        guideStep("3-configuration", "手順3", "step 3"),
+                        tr("にあるWorker実行環境とその設定が必要です。", "."),
+                      )
+                    : unchecked(),
             ),
           );
-        return h("div", { class: "rows" }, ...rows);
-      }),
+          // Publishing is a question only for a Host that runs Workers.
+          if (worker === true)
+            rows.push(
+              row(
+                tr("HTTPSでの公開", "HTTPS publishing"),
+                endpoint === true
+                  ? tr(
+                      "WorkerEndpointで、WorkerをHTTPSのホスト名に公開できます",
+                      "WorkerEndpoint publishes Workers at HTTPS hostnames",
+                    )
+                  : endpoint === false
+                    ? h(
+                        "span",
+                        null,
+                        tr(
+                          "まだ公開できません。",
+                          "Not yet: it needs the HTTPS listener on TCP 443 from ",
+                        ),
+                        guideStep("4-https-and-tcp-443", "手順4", "step 4"),
+                        tr("にあるHTTPS（TCP 443）の待ち受け設定が必要です。", "."),
+                      )
+                    : unchecked(),
+              ),
+            );
+          return h("div", { class: "rows" }, ...rows);
+        }),
+      ),
     ),
   );
 }

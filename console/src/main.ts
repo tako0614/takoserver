@@ -16,7 +16,7 @@ import { resourceDetailPage } from "./pages/resource-detail.ts";
 import { resourcesPage } from "./pages/resources.ts";
 import { settingsPage } from "./pages/settings.ts";
 import { signInPage } from "./pages/signin.ts";
-import { effect, signal } from "./reactive.ts";
+import { effect, signal, untrack } from "./reactive.ts";
 import { linkProps, navigate, route } from "./router.ts";
 import {
   api,
@@ -140,6 +140,21 @@ function shell(): Child {
   return h(
     "div",
     { class: "shell" },
+    live(() =>
+      h(
+        "a",
+        {
+          class: "skip-link",
+          href: "#main-content",
+          onClick: (event: MouseEvent) => {
+            event.preventDefault();
+            const target = document.getElementById("main-content");
+            target?.focus?.();
+          },
+        },
+        tr("本文へ移動", "Skip to content"),
+      ),
+    ),
     h("div", { class: "brand" }, h("a", { ...linkProps("/") }, wordmark(22))),
     topbar(),
     live(() =>
@@ -155,7 +170,7 @@ function shell(): Child {
         ]),
       ),
     ),
-    h("main", { class: "main" }, live(page)),
+    h("main", { class: "main", id: "main-content", tabindex: "-1" }, live(page)),
   );
 }
 
@@ -180,11 +195,28 @@ function railLink(href: string, label: string, glyph: string): Child {
   );
 }
 
+function themeName(value: ReturnType<typeof theme>): string {
+  if (value === "system") return tr("システム", "System");
+  if (value === "light") return tr("ライト", "Light");
+  return tr("ダーク", "Dark");
+}
+
 function topbar(): Child {
+  let activeSelect: HTMLSelectElement | null = null;
+  effect(() => {
+    const selected = currentOrganization()?.id ?? "";
+    if (activeSelect && activeSelect.value !== selected) {
+      activeSelect.value = selected;
+    }
+  });
   return h(
     "div",
     { class: "topbar" },
-    live(organizationPicker),
+    live(() =>
+      organizationPicker((node) => {
+        activeSelect = node;
+      }),
+    ),
     h("div", { class: "topbar__spacer" }),
     live(() =>
       h(
@@ -205,19 +237,20 @@ function topbar(): Child {
         ),
       ),
     ),
-    live(() =>
-      h(
+    live(() => {
+      const label = `${tr("テーマ", "Theme")}: ${themeName(theme())}`;
+      return h(
         "button",
         {
           class: "btn btn--ghost btn--sm",
           type: "button",
-          title: `${tr("テーマ", "Theme")}: ${theme()}`,
-          "aria-label": `${tr("テーマ", "Theme")}: ${theme()}`,
+          title: label,
+          "aria-label": label,
           onClick: () => applyTheme(theme() === "dark" ? "light" : "dark"),
         },
         icon(theme() === "dark" ? ICON.sun : ICON.moon, 16),
-      ),
-    ),
+      );
+    }),
     live(() => {
       const who = principal();
       const label = who
@@ -248,10 +281,11 @@ function canCreateLocalOrganization(): boolean {
   return sessionKind() === "legacy" && identity !== null && identity.provider !== "takos-id";
 }
 
-function organizationPicker(): Child {
+function organizationPicker(bindSelect?: (select: HTMLSelectElement | null) => void): Child {
   const all = organizations();
-  const current = currentOrganization();
+  const initialCurrent = untrack(currentOrganization);
   if (all.length === 0) {
+    bindSelect?.(null);
     if (!canCreateLocalOrganization()) return null;
     return h(
       "button",
@@ -260,28 +294,34 @@ function organizationPicker(): Child {
       text(tr("組織を作成", "Create organization")),
     );
   }
+  const select = h(
+    "select",
+    {
+      class: "select topbar__org",
+      id: "topbar-organization",
+      name: "organization",
+      autocomplete: "off",
+      style: { width: "auto", padding: "5px 9px" },
+      "aria-label": tr("組織", "Organization"),
+      onChange: (event: Event) => selectOrganization((event.target as HTMLSelectElement).value),
+    },
+    ...all.map((organization) =>
+      h(
+        "option",
+        {
+          value: organization.id,
+          ...(organization.id === initialCurrent?.id ? { selected: true } : {}),
+        },
+        organization.name,
+      ),
+    ),
+  );
+  if (initialCurrent) select.value = initialCurrent.id;
+  bindSelect?.(select);
   return h(
     "div",
     { class: "topbar__picker", style: { display: "flex", alignItems: "center", gap: "8px" } },
-    h(
-      "select",
-      {
-        class: "select topbar__org",
-        style: { width: "auto", padding: "5px 9px" },
-        "aria-label": tr("組織", "Organization"),
-        onChange: (event: Event) => selectOrganization((event.target as HTMLSelectElement).value),
-      },
-      ...all.map((organization) =>
-        h(
-          "option",
-          {
-            value: organization.id,
-            ...(organization.id === current?.id ? { selected: true } : {}),
-          },
-          organization.name,
-        ),
-      ),
-    ),
+    select,
     canCreateLocalOrganization()
       ? h(
           "button",
@@ -302,7 +342,43 @@ function createOrganization(): void {
   if (!canCreateLocalOrganization()) return;
   const isCurrent = captureSessionScope();
   let open = true;
-  const name = h("input", { class: "input", placeholder: tr("本番環境", "Acme production") });
+  const submit = async (): Promise<void> => {
+    if (!open || !isCurrent() || !canCreateLocalOrganization()) {
+      close();
+      return;
+    }
+    if (name.value.trim() === "") {
+      toast(tr("組織名を入力してください", "Give the organization a name"), "bad");
+      return;
+    }
+    try {
+      const { organization } = await api.createOrganization(name.value.trim());
+      if (!open || !isCurrent()) {
+        close();
+        return;
+      }
+      recordCreatedOrganization(organization);
+      selectOrganization(organization.id);
+      toast(tr("組織を作成しました", "Organization created"), "ok");
+      close();
+    } catch (error) {
+      if (open && isCurrent()) toast(explain(error as Error), "bad");
+      else close();
+    }
+  };
+  const name = h("input", {
+    class: "input",
+    id: "create-organization-name",
+    name: "name",
+    autocomplete: "off",
+    placeholder: tr("本番環境", "Acme production"),
+    onKeydown: (event: KeyboardEvent) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        void submit();
+      }
+    },
+  });
   const close = openModal({
     title: tr("組織を作成", "Create organization"),
     confirmLabel: tr("作成", "Create"),
@@ -312,7 +388,7 @@ function createOrganization(): void {
     body: h(
       "div",
       { class: "field" },
-      h("label", null, tr("名前", "Name")),
+      h("label", { for: "create-organization-name" }, tr("名前", "Name")),
       name,
       h(
         "small",
@@ -323,30 +399,7 @@ function createOrganization(): void {
         ),
       ),
     ),
-    onConfirm: async () => {
-      if (!open || !isCurrent() || !canCreateLocalOrganization()) {
-        close();
-        return;
-      }
-      if (name.value.trim() === "") {
-        toast(tr("組織名を入力してください", "Give the organization a name"), "bad");
-        return;
-      }
-      try {
-        const { organization } = await api.createOrganization(name.value.trim());
-        if (!open || !isCurrent()) {
-          close();
-          return;
-        }
-        recordCreatedOrganization(organization);
-        selectOrganization(organization.id);
-        toast(tr("組織を作成しました", "Organization created"), "ok");
-        close();
-      } catch (error) {
-        if (open && isCurrent()) toast(explain(error as Error), "bad");
-        else close();
-      }
-    },
+    onConfirm: submit,
   });
 }
 
@@ -367,7 +420,7 @@ function page(): Child {
           empty(
             tr("続行情報が無効です", "Invalid continuation"),
             tr("このリンクから続行できません。", "This continuation link is invalid."),
-            h("a", { class: "btn", ...linkProps("/") }, tr("概要へ戻る", "Return to overview")),
+            h("a", { class: "btn", ...linkProps("/") }, tr("ホームへ戻る", "Return home")),
           ),
         );
   }
@@ -429,7 +482,7 @@ function page(): Child {
         empty(
           tr("ページがありません", "No such page"),
           tr(`${here.path} にはページがありません。`, `Nothing is served at ${here.path}.`),
-          h("a", { class: "btn", ...linkProps("/") }, tr("概要へ戻る", "Go to overview")),
+          h("a", { class: "btn", ...linkProps("/") }, tr("ホームへ戻る", "Return home")),
         ),
       );
   }
