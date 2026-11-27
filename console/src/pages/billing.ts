@@ -43,6 +43,7 @@ import {
   icon,
   type ModalOptions,
   openModal,
+  refreshButton,
   skeletonRows,
   stat,
   toast,
@@ -282,14 +283,26 @@ export function billingPage(organizationId: string): Child {
         ),
       ),
       h(
-        "button",
-        {
-          class: "btn btn--primary",
-          type: "button",
-          onClick: openAddFunds,
-        },
-        icon(ICON.plus, 14),
-        text(tr("残高を追加", "Add funds")),
+        "div",
+        { class: "toolbar" },
+        refreshButton({
+          idleLabel: () => tr("更新", "Refresh"),
+          busyLabel: () => tr("更新中…", "Refreshing…"),
+          isActive: isPageCurrent,
+          isBusy: () =>
+            wallet.get().state === "loading" || hostedSubscription.get().state === "loading",
+          onRefresh: reloadSubscription,
+        }),
+        h(
+          "button",
+          {
+            class: "btn btn--primary",
+            type: "button",
+            onClick: openAddFunds,
+          },
+          icon(ICON.plus, 14),
+          text(tr("残高を追加", "Add funds")),
+        ),
       ),
     ),
     live(() => (billingMode() === "hosted" ? topUpStatus(topUp) : null)),
@@ -499,30 +512,30 @@ function workspaceUsageBody(
       { class: "table-scroll" },
       h(
         "table",
-        null,
+        { class: "usage-table", role: "table" },
         h(
           "thead",
-          null,
+          { role: "rowgroup" },
           h(
             "tr",
-            null,
-            h("th", null, tr("ワークスペース", "Workspace")),
-            h("th", { class: "num" }, tr("使用済み", "Used")),
-            h("th", { class: "num" }, tr("確保中", "Held")),
-            h("th", { class: "num" }, tr("未払い", "Pending")),
+            { role: "row" },
+            h("th", { role: "columnheader" }, tr("ワークスペース", "Workspace")),
+            h("th", { class: "num", role: "columnheader" }, tr("使用済み", "Used")),
+            h("th", { class: "num", role: "columnheader" }, tr("確保中", "Held")),
+            h("th", { class: "num", role: "columnheader" }, tr("未払い", "Pending")),
           ),
         ),
         h(
           "tbody",
-          null,
+          { role: "rowgroup" },
           ...(state.rows.length === 0
             ? [
                 h(
                   "tr",
-                  null,
+                  { role: "row" },
                   h(
                     "td",
-                    { class: "dim", colspan: 4 },
+                    { class: "dim usage-label", role: "cell", colspan: 4 },
                     tr(
                       "この期間にワークスペースへ帰属する使用量はありません。",
                       "No Workspace-attributed usage in this period.",
@@ -573,11 +586,23 @@ function workspaceUsageBody(
 function workspaceUsageRow(label: Child, amounts: WorkspaceUsageAmounts): HTMLElement {
   return h(
     "tr",
-    null,
-    h("td", null, label),
-    h("td", { class: "num mono" }, usageAmount(amounts.usedMicros)),
-    h("td", { class: "num mono" }, usageAmount(amounts.heldMicros)),
-    h("td", { class: "num mono" }, usageAmount(amounts.pendingMicros)),
+    { role: "row" },
+    h("td", { class: "usage-label", role: "cell" }, label),
+    h(
+      "td",
+      { class: "num mono", role: "cell", "data-label": tr("使用済み", "Used") },
+      usageAmount(amounts.usedMicros),
+    ),
+    h(
+      "td",
+      { class: "num mono", role: "cell", "data-label": tr("確保中", "Held") },
+      usageAmount(amounts.heldMicros),
+    ),
+    h(
+      "td",
+      { class: "num mono", role: "cell", "data-label": tr("未払い", "Pending") },
+      usageAmount(amounts.pendingMicros),
+    ),
   );
 }
 
@@ -588,32 +613,52 @@ function usageAmount(micros: string): string {
 function ledgerTable(entries: readonly LedgerEntry[], currency: string): Child {
   return h(
     "table",
-    null,
+    { class: "ledger-table", role: "table" },
     h(
       "thead",
-      null,
+      { role: "rowgroup" },
       h(
         "tr",
-        null,
-        h("th", null, tr("種類", "Type")),
-        h("th", null, tr("参照", "Reference")),
-        h("th", { class: "num" }, tr("確定", "Settled")),
-        h("th", { class: "num" }, tr("確保", "Held")),
-        h("th", null, tr("日時", "When")),
+        { role: "row" },
+        h("th", { role: "columnheader" }, tr("種類", "Type")),
+        h("th", { role: "columnheader" }, tr("参照", "Reference")),
+        h("th", { class: "num", role: "columnheader" }, tr("確定", "Settled")),
+        h("th", { class: "num", role: "columnheader" }, tr("確保", "Held")),
+        h("th", { role: "columnheader" }, tr("日時", "When")),
       ),
     ),
     h(
       "tbody",
-      null,
+      { role: "rowgroup" },
       ...entries.map((entry) =>
         h(
           "tr",
-          null,
-          h("td", null, badge(entryTypeLabel(entry.type), tone(entry.type))),
-          h("td", null, copyable(entry.reference)),
-          h("td", { class: "num mono" }, delta(entry.settledDeltaMicros, currency)),
-          h("td", { class: "num mono" }, delta(entry.heldDeltaMicros, currency)),
-          h("td", { class: "dim" }, when(entry.createdAt)),
+          { role: "row" },
+          h(
+            "td",
+            { class: "ledger-type", role: "cell" },
+            badge(entryTypeLabel(entry.type), tone(entry.type)),
+          ),
+          h(
+            "td",
+            { class: "ledger-ref", role: "cell", "data-label": tr("参照", "Reference") },
+            copyable(entry.reference),
+          ),
+          h(
+            "td",
+            { class: "num mono", role: "cell", "data-label": tr("確定", "Settled") },
+            delta(entry.settledDeltaMicros, currency),
+          ),
+          h(
+            "td",
+            { class: "num mono", role: "cell", "data-label": tr("確保", "Held") },
+            delta(entry.heldDeltaMicros, currency),
+          ),
+          h(
+            "td",
+            { class: "dim", role: "cell", "data-label": tr("日時", "When") },
+            when(entry.createdAt),
+          ),
         ),
       ),
     ),

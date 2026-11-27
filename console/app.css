@@ -15,7 +15,7 @@
 
   --ink-1: #0e0e10;
   --ink-2: #45464b;
-  --ink-3: #6e7076;
+  --ink-3: #65676d;
   --ink-4: #96989f;
 
   --surface-0: #ffffff;
@@ -733,9 +733,20 @@ tbody tr.is-clickable:hover {
   background: var(--surface-2);
 }
 
-.btn[disabled] {
+.btn[disabled],
+.btn[aria-disabled="true"] {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.icon--spin {
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .btn--primary {
@@ -853,6 +864,67 @@ tbody tr.is-clickable:hover {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
   border-color: var(--accent);
+}
+
+.input[aria-invalid="true"],
+.select[aria-invalid="true"],
+.textarea[aria-invalid="true"] {
+  border-color: var(--bad);
+}
+
+.input[aria-invalid="true"]:focus,
+.select[aria-invalid="true"]:focus,
+.textarea[aria-invalid="true"]:focus {
+  outline-color: var(--bad);
+  border-color: var(--bad);
+}
+
+.field__error {
+  color: var(--bad);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.search-box {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  flex: 1 1 220px;
+  max-width: 320px;
+}
+
+.search-box .input {
+  padding-right: 34px;
+}
+
+.kbd-hint {
+  position: absolute;
+  right: 8px;
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 5px;
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  background: var(--surface-2);
+  color: var(--ink-3);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1;
+}
+
+.search-box:focus-within .kbd-hint {
+  opacity: 0;
+}
+
+.filter-count {
+  color: var(--ink-3);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 .field__label {
@@ -1049,7 +1121,8 @@ tbody tr.is-clickable:hover {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .skeleton {
+  .skeleton,
+  .icon--spin {
     animation: none;
   }
 }
@@ -1157,26 +1230,63 @@ tbody tr.is-clickable:hover {
   position: fixed;
   right: 16px;
   bottom: 16px;
+  left: 16px;
   z-index: 60;
   display: flex;
   flex-direction: column;
+  align-items: flex-end;
   gap: 8px;
 }
 
 .toast {
+  pointer-events: auto;
   display: flex;
   align-items: center;
   gap: 9px;
-  padding: 9px 13px;
+  padding: 9px 10px 9px 13px;
   border: 1px solid var(--line-2);
   border-radius: var(--radius);
   background: var(--surface-1);
   font-size: 13px;
-  max-width: 380px;
+  max-width: min(380px, 100%);
+}
+
+.toast > svg:first-child {
+  flex: none;
+}
+
+.toast__text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.toast__dismiss {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+
+.toast__dismiss:hover {
+  background: var(--surface-2);
+  color: var(--ink-1);
 }
 
 .toast--bad {
   border-color: var(--bad);
+  color: var(--bad);
+}
+
+.toast--bad .toast__dismiss {
   color: var(--bad);
 }
 
@@ -1546,8 +1656,137 @@ tbody tr.is-clickable:hover {
 
 @media (width < 620px) {
   .topbar .btn--sm {
-    min-height: 40px;
-    min-width: 40px;
+    min-height: 44px;
+    min-width: 44px;
     padding: 6px 8px;
+  }
+
+  .rail__link {
+    min-height: 44px;
+  }
+
+  .btn {
+    min-height: 44px;
+  }
+
+  .btn--sm {
+    min-height: 40px;
+  }
+
+  .toast__dismiss {
+    width: 40px;
+    height: 40px;
+  }
+
+  .segmented__item {
+    min-width: 40px;
+    min-height: 40px;
+  }
+
+  .search-box {
+    flex: 1 1 100%;
+    max-width: none;
+  }
+
+  .kbd-hint {
+    display: none;
+  }
+
+  /* Responsive stacked cards for Keys, Ledger, Workspace usage, and Attention tables */
+  .keys-table thead,
+  .ledger-table thead,
+  .usage-table thead,
+  .attention-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .keys-table,
+  .keys-table tbody,
+  .ledger-table,
+  .ledger-table tbody,
+  .usage-table,
+  .usage-table tbody,
+  .attention-table,
+  .attention-table tbody {
+    display: block;
+  }
+
+  .keys-table tbody tr,
+  .ledger-table tbody tr,
+  .usage-table tbody tr,
+  .attention-table tbody tr {
+    display: grid;
+    gap: 8px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line-1);
+  }
+
+  .keys-table tbody tr:last-child,
+  .ledger-table tbody tr:last-child,
+  .usage-table tbody tr:last-child,
+  .attention-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .keys-table td,
+  .ledger-table td,
+  .usage-table td,
+  .attention-table td {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 0;
+    border: 0;
+    text-align: left;
+    min-width: 0;
+  }
+
+  .keys-table td[data-label]::before,
+  .ledger-table td[data-label]::before,
+  .usage-table td[data-label]::before,
+  .attention-table td[data-label]::before {
+    content: attr(data-label);
+    flex: none;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  .keys-table .keys-name,
+  .ledger-table .ledger-type,
+  .usage-table .usage-label,
+  .attention-table .attention-name {
+    display: block;
+  }
+
+  .keys-table .keys-scopes {
+    align-items: flex-start;
+  }
+
+  .keys-table .keys-actions {
+    display: flex;
+    justify-content: flex-end;
+    padding-top: 4px;
+  }
+
+  .keys-table .keys-actions .btn {
+    min-height: 44px;
+    min-width: 88px;
+  }
+
+  .ledger-table .ledger-ref {
+    align-items: center;
+  }
+
+  .ledger-table .ledger-ref .copy,
+  .usage-table .usage-label .copy {
+    min-width: 0;
   }
 }

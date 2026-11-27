@@ -17,7 +17,7 @@ import {
   type Theme,
   theme,
 } from "../state.ts";
-import { card, copyable, explain, ICON, icon, toast, when } from "../ui.ts";
+import { card, copyable, explain, ICON, icon, setFieldError, toast, when } from "../ui.ts";
 
 /**
  * The account, the organization, and where this console is pointed.
@@ -159,18 +159,24 @@ export function settingsPage(organization: Organization): Child {
       ),
     ),
     live(() => {
+      const originError = h("div", {
+        class: "field__error",
+        id: "settings-api-origin-error",
+        hidden: true,
+      });
       const save = (): void => {
         const normalized = normalizeApiOrigin(input.value);
         if (!normalized) {
-          toast(
-            tr(
-              "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
-              "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
-            ),
-            "bad",
+          const message = tr(
+            "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
+            "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
           );
+          setFieldError(input, originError, message, ["settings-api-origin-hint"]);
+          input.focus?.();
+          toast(message, "bad");
           return;
         }
+        setFieldError(input, originError, null, ["settings-api-origin-hint"]);
         input.value = normalized;
         setApiOrigin(normalized);
         void refreshSharedAuthAvailability(true);
@@ -183,7 +189,13 @@ export function settingsPage(organization: Organization): Child {
         type: "url",
         autocomplete: "off",
         spellcheck: "false",
+        "aria-describedby": "settings-api-origin-hint",
         value: apiOrigin(),
+        onInput: () => {
+          if (normalizeApiOrigin(input.value)) {
+            setFieldError(input, originError, null, ["settings-api-origin-hint"]);
+          }
+        },
         onKeydown: (event: KeyboardEvent) => {
           if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
             event.preventDefault();
@@ -214,9 +226,10 @@ export function settingsPage(organization: Organization): Child {
                 tr("保存", "Save"),
               ),
             ),
+            originError,
             h(
               "small",
-              null,
+              { id: "settings-api-origin-hint" },
               tr(
                 "このコンソールのすべてのリクエストがここへ送られます。変更してもデータは移動しません。",
                 "Every request from this console goes here. Changing it does not move any data.",

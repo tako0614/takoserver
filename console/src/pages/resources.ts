@@ -13,7 +13,19 @@ import {
 import { health, matchingResources, phaseLabel } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, captureSelectedOrganizationScope, currentOrganization } from "../state.ts";
-import { ago, badge, card, copyable, empty, explain, ICON, icon, whenReady } from "../ui.ts";
+import {
+  ago,
+  badge,
+  bindSearchShortcut,
+  card,
+  copyable,
+  empty,
+  explain,
+  ICON,
+  icon,
+  refreshButton,
+  whenReady,
+} from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
 /** How an operation still in progress is followed: every 1.5 s for up to two minutes. */
@@ -54,6 +66,9 @@ function operationSettled(operation: { readonly status: string }): boolean {
  * overview can link to one Form's Resources; the text filter still applies.
  */
 export function resourcesPage(organizationId: string): Child {
+  // Each build of this page follows on its own token. A rebuild (a language
+  // switch, say) takes a new one, so the replaced page stops checking.
+  const followToken = ++followGeneration;
   const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
   const pageRoute = route();
   const isCurrentPage = (): boolean =>
@@ -62,7 +77,9 @@ export function resourcesPage(organizationId: string): Child {
   // Host again.
   const note = once(() => firstRunNote(organizationId));
   const filter = signal("");
-  const filterToolbar = toolbar(filter);
+  const totalScoped = signal(0);
+  const matchedCount = signal(0);
+  const filterControls = createFilterToolbar(filter, totalScoped, matchedCount, isCurrentPage);
   const onlyForm = route().query.get("form");
   const additional = signal<readonly ResourceSummary[]>([]);
   const continuation = signal<{ readonly cursor?: string } | null>(null);
@@ -111,9 +128,6 @@ export function resourcesPage(organizationId: string): Child {
   // card does not blink back to its loading state every 1.5 s.
   const latest = signal<ResourceOperation | null>(null);
   let followTimer: ReturnType<typeof setTimeout> | undefined;
-  // Each build of this page follows on its own token. A rebuild (a language
-  // switch, say) takes a new one, so the replaced page stops checking.
-  const followToken = ++followGeneration;
   // Stop once this page has gone: rebuilt, another route, another
   // organization, or no document at all (a test that has finished).
   const stillShown = (): boolean =>
@@ -288,12 +302,18 @@ export function resourcesPage(organizationId: string): Child {
       h(
         "div",
         { class: "toolbar" },
-        h(
-          "button",
-          { class: "btn", type: "button", onClick: reload },
-          icon(ICON.refresh, 14),
-          text(tr("再読み込み", "Reload")),
-        ),
+        refreshButton({
+          idleLabel: () => tr("再読み込み", "Reload"),
+          busyLabel: () => tr("読み込み中…", "Reloading…"),
+          isActive: isCurrentPage,
+          isBusy: () =>
+            page.get().state === "loading" ||
+            (operation !== null &&
+              stillShown() &&
+              operation.get().state === "loading" &&
+              !latest()),
+          onRefresh: reload,
+        }),
         h(
           "button",
           {
@@ -411,10 +431,11 @@ export function resourcesPage(organizationId: string): Child {
           const scoped = onlyForm
             ? allResources.filter((entry) => entry.form === onlyForm)
             : allResources;
+          totalScoped.set(scoped.length);
           return h(
             "div",
             { style: { display: "grid", gap: "14px" } },
-            filterToolbar,
+            filterControls.element,
             onlyForm ? formNote(onlyForm) : null,
             nextCursor
               ? h(
@@ -431,7 +452,11 @@ export function resourcesPage(organizationId: string): Child {
               h(
                 "div",
                 { class: "table-scroll" },
-                live(() => table(matchingResources(scoped, filter()))),
+                live(() => {
+                  const matched = matchingResources(scoped, filter());
+                  matchedCount.set(matched.length);
+                  return table(matched, filter() !== "" ? filterControls.clear : undefined);
+                }),
               ),
             ),
             pagingError(),
@@ -444,42 +469,63 @@ export function resourcesPage(organizationId: string): Child {
   );
 }
 
-function toolbar(filter: ReturnType<typeof signal<string>>): Child {
+function createFilterToolbar(
+  filter: ReturnType<typeof signal<string>>,
+  total: ReturnType<typeof signal<number>>,
+  matched: ReturnType<typeof signal<number>>,
+  isActive: () => boolean,
+): { readonly element: Child; readonly clear: () => void } {
   const input = h("input", {
     class: "input",
     id: "resources-filter",
     name: "filter",
     autocomplete: "off",
-    style: { maxWidth: "300px" },
     type: "search",
     placeholder: tr("名前またはFormで絞り込み", "Filter by name or Form"),
     "aria-label": tr("名前またはFormで絞り込み", "Filter by name or Form"),
     value: "",
     onInput: (event: Event) => filter.set((event.target as HTMLInputElement).value),
   });
-  return h(
-    "div",
-    { class: "toolbar" },
-    input,
-    live(() =>
-      filter() === ""
-        ? null
-        : h(
-            "button",
-            {
-              class: "btn btn--ghost btn--sm",
-              type: "button",
-              "aria-label": tr("絞り込みをクリア", "Clear filter"),
-              onClick: () => {
-                input.value = "";
-                filter.set("");
-                input.focus?.();
-              },
-            },
-            tr("クリア", "Clear"),
-          ),
+  const clear = (): void => {
+    input.value = "";
+    filter.set("");
+    input.focus?.();
+  };
+  bindSearchShortcut(input, () => filter.set(""), isActive);
+  return {
+    clear,
+    element: h(
+      "div",
+      { class: "toolbar" },
+      h(
+        "div",
+        { class: "search-box" },
+        input,
+        h("kbd", { class: "kbd-hint", "aria-hidden": "true" }, "/"),
+      ),
+      live(() =>
+        filter() === ""
+          ? null
+          : [
+              h(
+                "span",
+                { class: "filter-count", role: "status" },
+                tr(`${matched()} / ${total()} 件`, `${matched()} of ${total()}`),
+              ),
+              h(
+                "button",
+                {
+                  class: "btn btn--ghost btn--sm",
+                  type: "button",
+                  "aria-label": tr("絞り込みをクリア", "Clear filter"),
+                  onClick: clear,
+                },
+                tr("クリア", "Clear"),
+              ),
+            ],
+      ),
     ),
-  );
+  };
 }
 
 /** Says which Form the list is narrowed to, with the way back to all of them. */
@@ -494,11 +540,18 @@ function formNote(form: string): Child {
   );
 }
 
-function table(resources: readonly ResourceSummary[]): Child {
+function table(resources: readonly ResourceSummary[], onClearFilter?: () => void): Child {
   if (resources.length === 0) {
     return empty(
       tr("一致するリソースがありません", "No match"),
       tr("この条件に一致するリソースはありません。", "Nothing here matches that filter."),
+      onClearFilter
+        ? h(
+            "button",
+            { class: "btn btn--sm", type: "button", onClick: onClearFilter },
+            tr("絞り込みをクリア", "Clear filter"),
+          )
+        : null,
     );
   }
   return h(

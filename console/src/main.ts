@@ -37,7 +37,17 @@ import {
   theme,
 } from "./state.ts";
 import { readTakosIdReturn } from "./takos-id.ts";
-import { card, empty, explain, ICON, icon, mountToasts, openModal, toast } from "./ui.ts";
+import {
+  card,
+  empty,
+  explain,
+  ICON,
+  icon,
+  mountToasts,
+  openModal,
+  setFieldError,
+  toast,
+} from "./ui.ts";
 
 /**
  * The console.
@@ -81,6 +91,47 @@ function boot(): void {
         ? shell()
         : signInPage();
     view.replaceChildren(screen instanceof Node ? screen : document.createTextNode(""));
+  });
+
+  effect(() => {
+    if (typeof document === "undefined") return;
+    consoleLocale();
+    if (!sessionReady()) {
+      document.title = "Takoserver Console";
+      return;
+    }
+    if (!session()) {
+      document.title = tr("サインイン — Takoserver Console", "Sign in — Takoserver Console");
+      return;
+    }
+    const here = route();
+    const [first, ...rest] = here.segments;
+    const org = currentOrganization();
+    let section: string;
+    switch (first) {
+      case undefined:
+        section = org ? org.name : tr("概要", "Overview");
+        break;
+      case "resources":
+        section = rest.length === 1 ? tr("リソース詳細", "Resource") : tr("リソース", "Resources");
+        break;
+      case "billing":
+        section =
+          rest[0] === "hosted-continuations"
+            ? tr("請求の続行", "Billing continuation")
+            : tr("使用量と請求", "Usage & billing");
+        break;
+      case "keys":
+        section = tr("APIキー", "API keys");
+        break;
+      case "settings":
+        section = tr("設定", "Settings");
+        break;
+      default:
+        section = tr("ページがありません", "Not found");
+        break;
+    }
+    document.title = `${section} — Takoserver Console`;
   });
 
   void resolveInitialSession(returned, sessionReady);
@@ -343,6 +394,11 @@ function createOrganization(): void {
   const isCurrent = captureSessionScope();
   let open = true;
   const submitting = signal(false);
+  const nameError = h("div", {
+    class: "field__error",
+    id: "create-organization-name-error",
+    hidden: true,
+  });
   const submit = async (): Promise<void> => {
     if (submitting()) return;
     if (!open || !isCurrent() || !canCreateLocalOrganization()) {
@@ -350,9 +406,13 @@ function createOrganization(): void {
       return;
     }
     if (name.value.trim() === "") {
-      toast(tr("組織名を入力してください", "Give the organization a name"), "bad");
+      const message = tr("組織名を入力してください", "Give the organization a name");
+      setFieldError(name, nameError, message, ["create-organization-name-hint"]);
+      name.focus?.();
+      toast(message, "bad");
       return;
     }
+    setFieldError(name, nameError, null, ["create-organization-name-hint"]);
     submitting.set(true);
     try {
       const { organization } = await api.createOrganization(name.value.trim());
@@ -376,7 +436,13 @@ function createOrganization(): void {
     id: "create-organization-name",
     name: "name",
     autocomplete: "off",
+    "aria-describedby": "create-organization-name-hint",
     placeholder: tr("本番環境", "Acme production"),
+    onInput: () => {
+      if (name.value.trim() !== "") {
+        setFieldError(name, nameError, null, ["create-organization-name-hint"]);
+      }
+    },
     onKeydown: (event: KeyboardEvent) => {
       if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
         event.preventDefault();
@@ -396,9 +462,10 @@ function createOrganization(): void {
       { class: "field" },
       h("label", { for: "create-organization-name" }, tr("名前", "Name")),
       name,
+      nameError,
       h(
         "small",
-        null,
+        { id: "create-organization-name-hint" },
         tr(
           "リソース、APIキー、残高を組織ごとに所有し、ほかの組織とは共有されません。",
           "An organization owns its own resources, API keys and wallet. Nothing is shared between them.",
