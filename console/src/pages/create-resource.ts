@@ -223,27 +223,50 @@ async function submit(
 const OTHER_FORM = "other";
 /** A Host that has not answered about one Form by now is not waited for. */
 const PROBE_TIMEOUT_MS = 5_000;
+/** Bound concurrent support probes so cold-start Hosts are not flooded. */
+const PROBE_CONCURRENCY = 4;
 
 interface FormChoice {
   readonly element: HTMLElement;
   /** The exact Form URL chosen or typed, trimmed; empty when none is. */
   value(): string;
+  /** True when all known Forms answered unsupported and the person has not switched to a custom URL. */
+  allKnownUnsupported(): boolean;
   setDisabled(disabled: boolean): void;
   /** Chooses an exact Form URL, as a person would. */
   choose(form: string): void;
+  /** Aborts any in-flight support probes when the dialog closes. */
+  dispose(): void;
 }
 
 /** One Form's support answer, or null when the Host did not give one in time. */
-function probeSupport(organizationId: string, form: string): Promise<boolean | null> {
+function probeSupport(
+  organizationId: string,
+  form: string,
+  signal: AbortSignal,
+): Promise<boolean | null> {
+  if (signal.aborted) return Promise.resolve(null);
   return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), PROBE_TIMEOUT_MS);
-    api.formSupport(organizationId, form).then(
+    const controller = new AbortController();
+    const onParentAbort = (): void => {
+      clearTimeout(timer);
+      controller.abort();
+      resolve(null);
+    };
+    const timer = setTimeout(() => {
+      controller.abort();
+      resolve(null);
+    }, PROBE_TIMEOUT_MS);
+    signal.addEventListener("abort", onParentAbort, { once: true });
+    api.formSupport(organizationId, form, controller.signal).then(
       (supported) => {
         clearTimeout(timer);
+        signal.removeEventListener("abort", onParentAbort);
         resolve(supported);
       },
       () => {
         clearTimeout(timer);
+        signal.removeEventListener("abort", onParentAbort);
         resolve(null);
       },
     );
@@ -253,16 +276,18 @@ function probeSupport(organizationId: string, form: string): Promise<boolean | n
 /**
  * A choice among the Forms this Host supports, so nobody has to know a Form
  * URL by heart. The list is usable at once; each known Form is asked about
- * when the dialog opens, and its option is marked as the answer arrives: a
- * Form the Host does not support stays visible but cannot be chosen, and one
- * the Host did not answer for says so. "Another exact Form URL" keeps any URL
- * possible. If the Host answered for none, the URL field is the whole
- * control. The create itself still asks about the exact URL before sending.
+ * when the dialog opens (with bounded concurrency), and its option is marked as
+ * the answer arrives: a Form the Host does not support stays visible but cannot
+ * be chosen, and one the Host did not answer for says so. "Another exact Form
+ * URL" keeps any URL possible. If the Host answered for none, the URL field is
+ * the whole control. The create itself still asks about the exact URL before
+ * sending.
  */
 function formChoice(organizationId: string, onChange: () => void): FormChoice {
   const url = h("input", {
     class: "input",
     id: "create-resource-form-url",
+    name: "formUrl",
     placeholder: "https://…/forms/Kind/1.0.0/",
     autocomplete: "off",
     spellcheck: "false",
@@ -272,7 +297,7 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   const options = new Map<string, HTMLOptionElement>();
   const select = h(
     "select",
-    { class: "select", id: "create-resource-form" },
+    { class: "select", id: "create-resource-form", name: "form", autocomplete: "off" },
     h(
       "option",
       { value: "", disabled: true, selected: true },
@@ -297,12 +322,20 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   const migrations = h("small");
   let pending = options.size;
   let answered = 0;
+  let supportedCount = 0;
+  const allUnsupported = signal(false);
+  let probeController = new AbortController();
+  let probeRun = 0;
 
   const typed = (): boolean => select.hidden || select.value === OTHER_FORM;
   const value = (): string =>
     typed() ? url.value.trim() : select.value.startsWith("https://") ? select.value : "";
+  const updateBlocked = (): void => {
+    allUnsupported.set(pending === 0 && answered > 0 && supportedCount === 0 && !typed());
+  };
   const render = (): void => {
     url.hidden = !typed();
+    updateBlocked();
     if (!typed() && select.value.startsWith("https://")) {
       hint.replaceChildren(
         tr(
@@ -319,6 +352,21 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
             { class: "visually-hidden" },
             tr("（新しいタブで開きます）", " (opens in a new tab)"),
           ),
+        ),
+      );
+      return;
+    }
+    if (pending === 0 && answered > 0 && supportedCount === 0 && !typed()) {
+      hint.replaceChildren(
+        tr(
+          "このHostで利用できる既知のFormが見つかりませんでした。別のForm URLを入力するか、再確認してください。",
+          "None of the known Forms are enabled on this Host. Enter another exact Form URL or check again.",
+        ),
+        " ",
+        h(
+          "button",
+          { class: "btn btn--sm", type: "button", onClick: () => runProbes() },
+          tr("再確認", "Check again"),
         ),
       );
       return;
@@ -352,7 +400,8 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   select.addEventListener("change", sync);
   url.addEventListener("input", sync);
 
-  const settle = (form: string, supported: boolean | null): void => {
+  const settle = (runId: number, form: string, supported: boolean | null): void => {
+    if (runId !== probeRun) return;
     pending -= 1;
     const option = options.get(form);
     if (supported === false) {
@@ -384,6 +433,7 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
       );
     } else {
       answered += 1;
+      supportedCount += 1;
     }
     // Once the create is being sent the choice is fixed; a late answer only
     // marks its option, and the create's own check decides what is sent.
@@ -397,14 +447,40 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
     }
     sync();
   };
-  for (const form of options.keys()) {
-    void probeSupport(organizationId, form).then((supported) => settle(form, supported));
-  }
-  render();
+
+  const runProbes = (): void => {
+    probeController.abort();
+    probeController = new AbortController();
+    const currentRun = ++probeRun;
+    const signal = probeController.signal;
+    pending = options.size;
+    answered = 0;
+    supportedCount = 0;
+    migrations.replaceChildren();
+    for (const [form, option] of options) {
+      option.disabled = false;
+      option.replaceChildren(formLabel(form));
+    }
+    render();
+    const queue = [...options.keys()];
+    const worker = async (): Promise<void> => {
+      while (!signal.aborted && currentRun === probeRun) {
+        const next = queue.shift();
+        if (!next) break;
+        const supported = await probeSupport(organizationId, next, signal);
+        if (signal.aborted || currentRun !== probeRun) break;
+        settle(currentRun, next, supported);
+      }
+    };
+    const concurrency = Math.min(PROBE_CONCURRENCY, queue.length);
+    for (let i = 0; i < concurrency; i += 1) void worker();
+  };
+  runProbes();
 
   return {
     element: h("div", { class: "field" }, label, select, url, hint, migrations),
     value,
+    allKnownUnsupported: () => allUnsupported(),
     setDisabled(disabled) {
       url.disabled = disabled;
       select.disabled = disabled;
@@ -417,6 +493,10 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
         url.value = form;
       }
       sync();
+    },
+    dispose() {
+      probeRun += 1;
+      probeController.abort();
     },
   };
 }
@@ -451,7 +531,7 @@ function referencePicker(
     const offered: string[] = [];
     const select = h(
       "select",
-      { class: "select", id },
+      { class: "select", id, name: `ref-${index}`, autocomplete: "off" },
       h("option", { value: "" }, tr("読み込み中…", "Loading…")),
     );
     select.disabled = true;
@@ -566,6 +646,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   const name = h("input", {
     class: "input",
     id: "create-resource-name",
+    name: "name",
     placeholder: "my-resource",
     autocomplete: "off",
     "aria-describedby": "create-resource-name-rule",
@@ -573,6 +654,8 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   const spec = h("textarea", {
     class: "textarea",
     id: "create-resource-spec",
+    name: "spec",
+    autocomplete: "off",
     spellcheck: "false",
     ...(preset?.note ? { "aria-describedby": "create-resource-note" } : {}),
   });
@@ -790,6 +873,8 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
     {
       title: tr("リソースを作成", "New resource"),
       confirmLabel: tr("作成する", "Create"),
+      confirmBlocked: () => form.allKnownUnsupported(),
+      onClose: () => form.dispose(),
       body: h(
         "div",
         { style: { display: "grid", gap: "14px" } },
@@ -814,7 +899,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
         h(
           "div",
           { class: "field" },
-          h("label", null, tr("スペース", "Space")),
+          h("span", { class: "field__label" }, tr("スペース", "Space")),
           h("span", { class: "field__value" }, organizationId),
         ),
         references,
@@ -960,6 +1045,8 @@ export function updateResource(
   const spec = h("textarea", {
     class: "textarea",
     id: "update-resource-spec",
+    name: "spec",
+    autocomplete: "off",
     spellcheck: "false",
     // The proposal's note is read out with the spec it explains.
     ...(proposal ? { "aria-describedby": "update-resource-note" } : {}),

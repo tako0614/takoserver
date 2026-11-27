@@ -1,4 +1,5 @@
 import {
+  ApiError,
   formatMicrosCurrency,
   formatUsagePercent,
   type HostedPlanTable,
@@ -349,9 +350,21 @@ export function billingPage(organizationId: string): Child {
                     )
                   : tr("利用可能残高に含まれない債務", "debt, separate from spendable credit"),
               ),
-              live(() =>
-                whenReady(
-                  usageSummary.get(),
+              live(() => {
+                const summaryState = usageSummary.get();
+                if (
+                  summaryState.state === "error" &&
+                  summaryState.error instanceof ApiError &&
+                  (summaryState.error.status === 404 || summaryState.error.code === "not_found")
+                ) {
+                  return stat(
+                    tr("利用枠の使用率", "Included usage"),
+                    "—",
+                    tr("このHostでは提供されていません", "Not enabled on this Host"),
+                  );
+                }
+                return whenReady(
+                  summaryState,
                   ({ usageSummary: summary }) =>
                     stat(
                       tr("利用枠の使用率", "Included usage"),
@@ -364,8 +377,8 @@ export function billingPage(organizationId: string): Child {
                         : tr("使用済み＋確保中／利用枠", "used + held / included allowance"),
                     ),
                   { retry: usageSummary.reload },
-                ),
-              ),
+                );
+              }),
             ),
             held.refundReceivableMicros === undefined
               ? h(
@@ -682,6 +695,8 @@ function addFunds(organizationId: string, reload: () => void, isScopeCurrent: ()
   const amountId = `funding-amount-${++nextFundingInputId}`;
   const amount = h("input", {
     id: amountId,
+    name: "amount",
+    autocomplete: "off",
     class: "input",
     type: "number",
     value: "50",
@@ -794,6 +809,8 @@ function hostedAddFunds(
   const amountId = `top-up-amount-${++nextFundingInputId}`;
   const amount = h("input", {
     id: amountId,
+    name: "amount",
+    autocomplete: "off",
     class: "input",
     type: "number",
     value: String(pending === null ? 50 : pending / 100),
@@ -1015,6 +1032,8 @@ function operatorFunding(
   const inputId = `operator-funding-${++nextFundingInputId}`;
   const input = h("textarea", {
     id: inputId,
+    name: "settlementProof",
+    autocomplete: "off",
     class: "textarea",
     placeholder: tr(
       "この組織に発行された入金証明を貼り付けてください",
@@ -1144,8 +1163,27 @@ function hostedSubscriptionCard(
     tr("サブスクリプション", "Subscription"),
     live(() => {
       const checkoutState = checkout.state();
+      const subscriptionState = subscription.get();
+      if (
+        subscriptionState.state === "error" &&
+        subscriptionState.error instanceof ApiError &&
+        (subscriptionState.error.status === 404 || subscriptionState.error.code === "not_found")
+      ) {
+        return h(
+          "div",
+          { class: "card__body" },
+          h(
+            "p",
+            { class: "dim", style: { margin: "0" } },
+            tr(
+              "このHostではサブスクリプション管理を利用できません。",
+              "Subscription management is not enabled on this Host.",
+            ),
+          ),
+        );
+      }
       return whenReady(
-        subscription.get(),
+        subscriptionState,
         (loaded) => {
           const configuredPlans = subscriptionPlanOptions(
             loaded.planTable,

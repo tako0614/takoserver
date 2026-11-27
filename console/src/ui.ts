@@ -358,19 +358,99 @@ export interface ModalOptions {
   readonly onClose?: () => void;
 }
 
+const FOCUSABLE_SELECTOR = [
+  "a[href]",
+  "button:not([disabled]):not([hidden])",
+  "input:not([disabled]):not([hidden]):not([type='hidden'])",
+  "select:not([disabled]):not([hidden])",
+  "textarea:not([disabled]):not([hidden])",
+  "summary",
+  "[tabindex]:not([tabindex='-1'])",
+].join(", ");
+
+function isVisibleFocusable(node: HTMLElement): boolean {
+  if (node.hidden) return false;
+  if (typeof node.closest === "function") {
+    if (node.closest("[hidden], [inert]")) return false;
+    const closedDetails = node.closest("details:not([open])");
+    if (closedDetails && node.closest("summary")?.parentElement !== closedDetails) return false;
+  }
+  return true;
+}
+
+let nextModalTitleId = 0;
+const modalStack: HTMLElement[] = [];
+const inertCounts = new WeakMap<HTMLElement, number>();
+
 export function openModal(options: ModalOptions): () => void {
   let stopBlocking: (() => void) | null = null;
   let closed = false;
+  const opener =
+    typeof document !== "undefined" &&
+    "activeElement" in document &&
+    document.activeElement &&
+    typeof (document.activeElement as HTMLElement).focus === "function"
+      ? (document.activeElement as HTMLElement)
+      : null;
+  const inerted: HTMLElement[] = [];
+
   const close = (): void => {
     if (closed) return;
     closed = true;
     stopBlocking?.();
+    const stackIndex = modalStack.lastIndexOf(scrim);
+    if (stackIndex >= 0) modalStack.splice(stackIndex, 1);
     scrim.remove();
+    for (const element of inerted) {
+      const next = (inertCounts.get(element) ?? 1) - 1;
+      if (next <= 0) {
+        inertCounts.delete(element);
+        element.inert = false;
+      } else {
+        inertCounts.set(element, next);
+      }
+    }
     document.removeEventListener("keydown", onKey);
     options.onClose?.();
+    if (
+      opener &&
+      (typeof opener.isConnected !== "boolean" || opener.isConnected) &&
+      !(typeof opener.closest === "function" && opener.closest("[inert]"))
+    ) {
+      opener.focus();
+    }
   };
   const onKey = (event: KeyboardEvent): void => {
-    if (event.key === "Escape") close();
+    if (modalStack[modalStack.length - 1] !== scrim) return;
+    if (event.key === "Escape") {
+      event.preventDefault?.();
+      close();
+      return;
+    }
+    if (event.key === "Tab" && typeof dialog.querySelectorAll === "function") {
+      const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        isVisibleFocusable,
+      );
+      if (focusable.length === 0) {
+        event.preventDefault?.();
+        dialog.focus?.();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      const inside =
+        typeof dialog.contains === "function" && active ? dialog.contains(active) : false;
+      if (event.shiftKey) {
+        if (!inside || active === first) {
+          event.preventDefault?.();
+          last?.focus();
+        }
+      } else if (!inside || active === last) {
+        event.preventDefault?.();
+        first?.focus();
+      }
+    }
   };
 
   let confirm: HTMLButtonElement | null = null;
@@ -402,6 +482,31 @@ export function openModal(options: ModalOptions): () => void {
     confirm = button;
   }
 
+  const titleId = `modal-title-${++nextModalTitleId}`;
+  const dialog = h(
+    "div",
+    {
+      class: "modal",
+      role: "dialog",
+      "aria-modal": "true",
+      "aria-label": options.title,
+      "aria-labelledby": titleId,
+      tabindex: "-1",
+    },
+    h("header", { class: "modal__head", id: titleId }, options.title),
+    h("div", { class: "modal__body" }, options.body),
+    h(
+      "footer",
+      { class: "modal__foot" },
+      h(
+        "button",
+        { class: "btn", type: "button", onClick: close },
+        options.dismissLabel ?? tr("キャンセル", "Cancel"),
+      ),
+      confirm,
+    ),
+  );
+
   const scrim = h(
     "div",
     {
@@ -410,34 +515,32 @@ export function openModal(options: ModalOptions): () => void {
         if (event.target === scrim) close();
       },
     },
-    h(
-      "div",
-      { class: "modal", role: "dialog", "aria-modal": "true", "aria-label": options.title },
-      h("header", { class: "modal__head" }, options.title),
-      h("div", { class: "modal__body" }, options.body),
-      h(
-        "footer",
-        { class: "modal__foot" },
-        h(
-          "button",
-          { class: "btn", type: "button", onClick: close },
-          options.dismissLabel ?? tr("キャンセル", "Cancel"),
-        ),
-        confirm,
-      ),
-    ),
+    dialog,
   );
 
+  // Prevent keyboard and pointer interaction with background siblings while open,
+  // keeping the toast live region active and ref-counting stacked modals.
+  const toasts = toastHost();
+  const siblings = Array.from(document.body.children ?? []) as HTMLElement[];
+  for (const sibling of siblings) {
+    if (sibling === scrim || sibling === toasts) continue;
+    const count = inertCounts.get(sibling) ?? 0;
+    if (count === 0 && sibling.inert === true) continue;
+    inertCounts.set(sibling, count + 1);
+    sibling.inert = true;
+    inerted.push(sibling);
+  }
+  modalStack.push(scrim);
   document.body.append(scrim);
   document.addEventListener("keydown", onKey);
-  // The first control a person can use, not one still disabled or hidden.
-  scrim
-    .querySelector<HTMLElement>(
-      ["input", "textarea", "select", "button"]
-        .map((tag) => `${tag}:not([disabled]):not([hidden])`)
-        .join(", "),
-    )
-    ?.focus();
+  // The first visible focusable control, falling back to the dialog itself.
+  const initialFocus =
+    typeof dialog.querySelectorAll === "function"
+      ? Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).find(
+          isVisibleFocusable,
+        )
+      : dialog.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
+  (initialFocus ?? dialog).focus?.();
   return close;
 }
 

@@ -27,6 +27,7 @@ const HOSTED_CONTINUATION_VALUE = /^hosted-continuation:([0-9a-f]{64})$/u;
 
 export type Theme = "system" | "light" | "dark";
 export type SessionKind = "shared-auth" | "legacy";
+export type SharedAuthProbeState = "idle" | "loading" | "settled" | "error";
 
 export const session = signal<string | null>(localStorage.getItem(SESSION_KEY));
 // The cookie marker is constant across logins; it cannot identify an async request's session.
@@ -39,6 +40,7 @@ export const sessionKind = signal<SessionKind | null>(
       : "legacy",
 );
 export const sharedAuthAvailable = signal<boolean | null>(null);
+export const sharedAuthProbeState = signal<SharedAuthProbeState>("idle");
 let latestSharedAuthAvailabilityProbe = 0;
 export const principal = signal<Principal | null>(null);
 export const organizations = signal<readonly Organization[]>([]);
@@ -83,6 +85,31 @@ export function hostV2Base(discovery: HostDiscovery | null): string {
   return discovery?.takoform ?? `${apiOrigin()}/apis/forms.takoform.com/v2`;
 }
 
+/**
+ * Validates and normalizes an API origin entered by a person.
+ * Only bare HTTP(S) origins (no credentials, path, query, or hash) are accepted.
+ */
+export function normalizeApiOrigin(raw: string): string | null {
+  const trimmed = raw.trim().replace(/\/+$/u, "");
+  if (trimmed === "") return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+  if (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    (parsed.pathname !== "" && parsed.pathname !== "/") ||
+    parsed.search !== "" ||
+    parsed.hash !== ""
+  )
+    return null;
+  return parsed.origin;
+}
+
 export function setApiOrigin(origin: string): void {
   const trimmed = origin.replace(/\/+$/u, "");
   if (trimmed === apiOrigin()) return;
@@ -90,6 +117,7 @@ export function setApiOrigin(origin: string): void {
   latestSharedAuthAvailabilityProbe += 1;
   clearSession();
   sharedAuthAvailable.set(null);
+  sharedAuthProbeState.set("idle");
   apiOrigin.set(trimmed);
 }
 
@@ -114,18 +142,24 @@ export async function refreshSharedAuthAvailability(clearImmediately = false): P
   const origin = apiOrigin();
   const isCurrent = captureSessionScope();
   if (clearImmediately) sharedAuthAvailable.set(null);
+  sharedAuthProbeState.set("loading");
   try {
     const available = (await api.sharedAuthSession()).available;
-    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin && isCurrent())
+    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin && isCurrent()) {
       sharedAuthAvailable.set(available);
+      sharedAuthProbeState.set("settled");
+    }
   } catch {
-    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin && isCurrent())
+    if (probe === latestSharedAuthAvailabilityProbe && apiOrigin() === origin && isCurrent()) {
       sharedAuthAvailable.set(null);
+      sharedAuthProbeState.set("error");
+    }
   }
 }
 
 function clearSession(): void {
   sessionRevision.update((revision) => revision + 1);
+  if (sharedAuthProbeState() === "loading") sharedAuthProbeState.set("idle");
   organizationCreationRevision = 0;
   createdOrganizations.clear();
   identityReadSequence = 0;
@@ -168,6 +202,7 @@ export async function signOut(): Promise<void> {
 
 export function adoptSession(kind: SessionKind = "legacy"): void {
   sessionRevision.update((revision) => revision + 1);
+  if (sharedAuthProbeState() === "loading") sharedAuthProbeState.set("idle");
   organizationCreationRevision = 0;
   createdOrganizations.clear();
   identityReadSequence = 0;
@@ -202,10 +237,23 @@ export async function signInSession(...args: Parameters<Api["signIn"]>): Promise
  * the Console identity and organizations.
  */
 export async function bootstrapSharedSession(): Promise<boolean> {
+  const probe = ++latestSharedAuthAvailabilityProbe;
   const isCurrent = captureSessionScope();
-  const status: SharedAuthSessionStatus = await api.sharedAuthSession();
+  sharedAuthProbeState.set("loading");
+  let status: SharedAuthSessionStatus;
+  try {
+    status = await api.sharedAuthSession();
+  } catch (error) {
+    if (probe === latestSharedAuthAvailabilityProbe && isCurrent()) {
+      sharedAuthProbeState.set("error");
+    }
+    throw error;
+  }
   if (!isCurrent()) return false;
-  sharedAuthAvailable.set(status.available);
+  if (probe === latestSharedAuthAvailabilityProbe) {
+    sharedAuthAvailable.set(status.available);
+    sharedAuthProbeState.set("settled");
+  }
   if (!status.available || !status.authenticated) return false;
   const me = await api.me();
   if (!isCurrent()) return false;

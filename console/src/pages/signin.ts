@@ -3,16 +3,18 @@ import { type Child, h, live } from "../dom.ts";
 import { beginGoogleSignIn } from "../google.ts";
 import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
 import { mark } from "../mark.ts";
-import { type Resource, resource, signal } from "../reactive.ts";
+import { type Resource, resource, signal, untrack } from "../reactive.ts";
 import { route } from "../router.ts";
 import {
   api,
   apiOrigin,
   applyTheme,
   captureSessionScope,
+  normalizeApiOrigin,
   refreshSharedAuthAvailability,
   setApiOrigin,
   sharedAuthAvailable,
+  sharedAuthProbeState,
   signInSession,
   storeSharedSessionReturnPath,
   theme,
@@ -35,6 +37,11 @@ import { explain, ICON, icon, toast } from "../ui.ts";
 
 export function signInPage(): Child {
   const providers = resource(() => api.identityProviders());
+  untrack(() => {
+    if (sharedAuthAvailable() === null && sharedAuthProbeState() === "idle") {
+      void refreshSharedAuthAvailability();
+    }
+  });
 
   return h(
     "div",
@@ -197,7 +204,26 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
     return h("div", { class: "skeleton", style: { height: "50px" } });
   }
   if (state.state === "error") {
-    return h("div", { class: "notice notice--bad" }, explain(state.error));
+    return h(
+      "div",
+      {
+        class: "notice notice--bad",
+        style: { display: "grid", gap: "10px", justifyItems: "start" },
+      },
+      h("span", null, explain(state.error)),
+      h(
+        "button",
+        {
+          class: "btn btn--sm",
+          type: "button",
+          onClick: () => {
+            void refreshSharedAuthAvailability(true);
+            providers.reload();
+          },
+        },
+        tr("再試行", "Retry"),
+      ),
+    );
   }
   const takosId = state.value.providers.find(
     (entry) => entry.id === "takos-id" && entry.method === "oidc",
@@ -209,6 +235,39 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
   if (takosId?.clientId && takosId.issuer) return takosIdRow(takosId.issuer, takosId.clientId);
   if (google?.clientId) return googleRow(google.clientId);
   if (operators.length > 0) return operatorForm(operators);
+  if (sharedAuthAvailable() === true) return null;
+  if (sharedAuthAvailable() === null && sharedAuthProbeState() === "loading") {
+    return h("div", { class: "skeleton", style: { height: "50px" } });
+  }
+  if (sharedAuthAvailable() === null && sharedAuthProbeState() === "error") {
+    return h(
+      "div",
+      {
+        class: "notice notice--warn",
+        style: { display: "grid", gap: "10px", justifyItems: "start" },
+      },
+      h(
+        "span",
+        null,
+        tr(
+          "サインイン方法を確認できませんでした。接続を確認して再試行してください。",
+          "Couldn't check sign-in availability. Check your connection and try again.",
+        ),
+      ),
+      h(
+        "button",
+        {
+          class: "btn btn--sm",
+          type: "button",
+          onClick: () => {
+            void refreshSharedAuthAvailability(true);
+            providers.reload();
+          },
+        },
+        tr("再試行", "Retry"),
+      ),
+    );
+  }
   return h(
     "div",
     { class: "notice notice--warn" },
@@ -332,6 +391,7 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
   const busy = signal(false);
   const assertion = h("textarea", {
     id: "assertion",
+    name: "assertion",
     class: "textarea",
     placeholder: tr(
       "運営者が署名したassertionを貼り付けてください",
@@ -357,7 +417,17 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
         assertion.value.trim(),
       );
     } catch (error) {
-      if (isCurrent()) toast(explain(error as Error), "bad");
+      if (isCurrent()) {
+        const message =
+          error instanceof Error &&
+          error.message === "operator assertion does not name an advertised provider"
+            ? tr(
+                "assertionの形式が正しくないか、この環境で有効なプロバイダーと一致しません。",
+                "The assertion format is invalid or does not match an advertised provider for this environment.",
+              )
+            : explain(error as Error);
+        toast(message, "bad");
+      }
     } finally {
       busy.set(false);
     }
@@ -456,28 +526,64 @@ function languageSwitch(): Child {
  * static bundle that may be served from a laptop against a local server.
  */
 function endpointField(reload: () => void): Child {
-  const input = h("input", { class: "input", value: apiOrigin() });
+  const save = (): void => {
+    const normalized = normalizeApiOrigin(input.value);
+    if (!normalized) {
+      toast(
+        tr(
+          "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
+          "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
+        ),
+        "bad",
+      );
+      return;
+    }
+    input.value = normalized;
+    setApiOrigin(normalized);
+    void refreshSharedAuthAvailability(true);
+    reload();
+    toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
+  };
+  const input = h("input", {
+    class: "input",
+    id: "signin-api-origin",
+    name: "apiOrigin",
+    type: "url",
+    autocomplete: "off",
+    spellcheck: "false",
+    value: apiOrigin(),
+    onKeydown: (event: KeyboardEvent) => {
+      if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
+        event.preventDefault();
+        save();
+      }
+    },
+  });
   return h(
     "details",
     { class: "signin__endpoint" },
     h("summary", null, tr("API接続先", "API endpoint")),
     h(
       "div",
-      { style: { display: "flex", gap: "8px", marginTop: "8px" } },
-      input,
+      { class: "field", style: { marginTop: "8px" } },
       h(
-        "button",
-        {
-          class: "btn",
-          type: "button",
-          onClick: () => {
-            setApiOrigin(input.value.trim());
-            void refreshSharedAuthAvailability(true);
-            reload();
-            toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
+        "label",
+        { for: "signin-api-origin", class: "visually-hidden" },
+        tr("API接続先", "API endpoint"),
+      ),
+      h(
+        "div",
+        { style: { display: "flex", gap: "8px" } },
+        input,
+        h(
+          "button",
+          {
+            class: "btn",
+            type: "button",
+            onClick: save,
           },
-        },
-        tr("保存", "Save"),
+          tr("保存", "Save"),
+        ),
       ),
     ),
   );
