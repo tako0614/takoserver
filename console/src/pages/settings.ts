@@ -11,6 +11,7 @@ import {
   hostV2Base,
   normalizeApiOrigin,
   principal,
+  refreshSharedAuthAvailability,
   setApiOrigin,
   signOut,
   type Theme,
@@ -172,6 +173,7 @@ export function settingsPage(organization: Organization): Child {
         }
         input.value = normalized;
         setApiOrigin(normalized);
+        void refreshSharedAuthAvailability(true);
         toast(tr("接続先を更新しました", "Endpoint updated"), "ok");
       };
       const input = h("input", {
@@ -183,7 +185,7 @@ export function settingsPage(organization: Organization): Child {
         spellcheck: "false",
         value: apiOrigin(),
         onKeydown: (event: KeyboardEvent) => {
-          if (event.key === "Enter") {
+          if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
             event.preventDefault();
             save();
           }

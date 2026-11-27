@@ -14,6 +14,7 @@ import {
   refreshSharedAuthAvailability,
   setApiOrigin,
   sharedAuthAvailable,
+  sharedAuthProbeState,
   signInSession,
   storeSharedSessionReturnPath,
   theme,
@@ -36,6 +37,9 @@ import { explain, ICON, icon, toast } from "../ui.ts";
 
 export function signInPage(): Child {
   const providers = resource(() => api.identityProviders());
+  if (sharedAuthAvailable() === null && sharedAuthProbeState() === "idle") {
+    void refreshSharedAuthAvailability();
+  }
 
   return h(
     "div",
@@ -230,8 +234,37 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
   if (google?.clientId) return googleRow(google.clientId);
   if (operators.length > 0) return operatorForm(operators);
   if (sharedAuthAvailable() === true) return null;
-  if (sharedAuthAvailable() === null) {
+  if (sharedAuthAvailable() === null && sharedAuthProbeState() === "loading") {
     return h("div", { class: "skeleton", style: { height: "50px" } });
+  }
+  if (sharedAuthAvailable() === null && sharedAuthProbeState() === "error") {
+    return h(
+      "div",
+      {
+        class: "notice notice--warn",
+        style: { display: "grid", gap: "10px", justifyItems: "start" },
+      },
+      h(
+        "span",
+        null,
+        tr(
+          "サインイン方法を確認できませんでした。接続を確認して再試行してください。",
+          "Couldn't check sign-in availability. Check your connection and try again.",
+        ),
+      ),
+      h(
+        "button",
+        {
+          class: "btn btn--sm",
+          type: "button",
+          onClick: () => {
+            void refreshSharedAuthAvailability(true);
+            providers.reload();
+          },
+        },
+        tr("再試行", "Retry"),
+      ),
+    );
   }
   return h(
     "div",
@@ -518,7 +551,7 @@ function endpointField(reload: () => void): Child {
     spellcheck: "false",
     value: apiOrigin(),
     onKeydown: (event: KeyboardEvent) => {
-      if (event.key === "Enter") {
+      if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
         event.preventDefault();
         save();
       }

@@ -45,6 +45,10 @@ class FakeNode {
     return this.attributes.get("id") ?? "";
   }
 
+  get parentElement(): FakeNode | null {
+    return this.parent;
+  }
+
   get isConnected(): boolean {
     let cur: FakeNode | null = this;
     while (cur) {
@@ -68,10 +72,16 @@ class FakeNode {
   }
 
   closest(selector: string): FakeNode | null {
+    const parts = selector.split(",").map((part) => part.trim());
     let cur: FakeNode | null = this;
     while (cur) {
-      if (selector.includes("[hidden]") && cur.hidden) return cur;
-      if (selector.includes("[inert]") && cur.inert) return cur;
+      for (const part of parts) {
+        if (part === "[hidden]" && cur.hidden) return cur;
+        if (part === "[inert]" && cur.inert) return cur;
+        if (part === "summary" && cur.tag === "summary") return cur;
+        if (part === "details:not([open])" && cur.tag === "details" && !cur.attributes.has("open"))
+          return cur;
+      }
       cur = cur.parent;
     }
     return null;
@@ -693,5 +703,444 @@ describe("Console Wave 1 UI/UX improvements", () => {
       .all()
       .find((node) => node.tag === "button" && node.textContent === "Revoke");
     expect(revoke?.getAttribute("aria-label")).toBe("Revoke ci-runner");
+  });
+
+  test("signInPage probes shared auth on mount after expiry/origin change and never sticks on skeleton on 5xx", async () => {
+    const { root } = installFakeDom("/signin");
+    const state = await import("../console/src/state.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { settingsPage } = await import("../console/src/pages/settings.ts");
+    const { signInPage } = await import("../console/src/pages/signin.ts");
+    consoleLocale.set("en");
+
+    // 1) Session expiry / unprobed state with 5xx shared-auth probe + empty providers:
+    // must show loading skeleton only while probing, then settle to error notice with Retry.
+    state.setApiOrigin("https://expiry.example.test");
+    state.sharedAuthAvailable.set(null);
+    state.sharedAuthProbeState.set("idle");
+
+    let resolveProbe!: (response: Response) => void;
+    let probeStatus = 503;
+    const requested: string[] = [];
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        requested.push(`${url.origin}${url.pathname}`);
+        if (url.pathname === "/v1/identity/providers") {
+          return Response.json({ providers: [] });
+        }
+        if (url.pathname === "/auth/oidc/session") {
+          if (probeStatus === 0) {
+            return new Promise<Response>((resolve) => {
+              resolveProbe = resolve;
+            });
+          }
+          return probeStatus === 404
+            ? Response.json({ error: { code: "not_found" } }, { status: 404 })
+            : Response.json({ error: { code: "unavailable" } }, { status: probeStatus });
+        }
+        return Response.json({ error: { code: "not_found" } }, { status: 404 });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    probeStatus = 0;
+    const page = signInPage() as unknown as FakeNode;
+    root.append(page);
+    await flush();
+    expect(requested).toContain("https://expiry.example.test/auth/oidc/session");
+    expect(page.all().some((node) => node.className === "skeleton")).toBe(true);
+
+    // Probe returns 503 -> skeleton clears and Retry notice appears.
+    resolveProbe(Response.json({ error: { code: "unavailable" } }, { status: 503 }));
+    await flush();
+    expect(page.all().some((node) => node.className === "skeleton")).toBe(false);
+    expect(page.textContent).toContain("Couldn't check sign-in availability");
+    const retryBtn = page
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Retry");
+    expect(retryBtn).toBeDefined();
+
+    // Retry when shared auth is unavailable (404) -> settles to unconfigured warning (no skeleton).
+    probeStatus = 404;
+    retryBtn?.click();
+    await flush();
+    expect(page.all().some((node) => node.className === "skeleton")).toBe(false);
+    expect(page.textContent).toContain("No identity provider is configured");
+
+    // 2) Settings origin change triggers shared-auth re-probe cleanly and ignores IME Enter.
+    requested.length = 0;
+    const settings = settingsPage({
+      id: "org-1",
+      name: "Alpha",
+      ownerPrincipalId: "pri-1",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    }) as unknown as FakeNode;
+    root.replaceChildren(settings);
+    const settingsInput = settings.all().find((node) => node.id === "settings-api-origin");
+    expect(settingsInput).toBeDefined();
+    if (settingsInput) {
+      settingsInput.value = "https://other.example.test";
+      settingsInput.dispatch("keydown", { key: "Enter", isComposing: true });
+      settingsInput.dispatch("keydown", { key: "Enter", keyCode: 229 });
+      expect(state.apiOrigin()).toBe("https://expiry.example.test");
+      settingsInput.dispatch("keydown", { key: "Enter", isComposing: false, keyCode: 13 });
+      await flush();
+      expect(state.apiOrigin()).toBe("https://other.example.test");
+      expect(requested).toContain("https://other.example.test/auth/oidc/session");
+      expect(state.sharedAuthAvailable()).toBe(false);
+    }
+  });
+
+  test("openModal keeps toast host non-inert, ref-counts stacked modals, and skips closed <details> in focus trap", async () => {
+    const { doc, body, root } = installFakeDom("/");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { mountToasts, openModal, toast } = await import("../console/src/ui.ts");
+    consoleLocale.set("en");
+
+    const toasts = mountToasts() as unknown as FakeNode;
+    body.append(toasts);
+    const preInert = doc.createElement("div");
+    preInert.inert = true;
+    body.append(preInert);
+
+    const trigger = doc.createElement("button");
+    trigger.append("Open A");
+    root.append(trigger);
+    trigger.focus();
+
+    const bodyA = doc.createElement("div");
+    const closedDetails = doc.createElement("details");
+    const summary = doc.createElement("summary");
+    summary.append("More");
+    const hiddenBtn = doc.createElement("button");
+    hiddenBtn.append("Hidden inside details");
+    closedDetails.append(summary, hiddenBtn);
+    const inputA = doc.createElement("input");
+    bodyA.append(closedDetails, inputA);
+
+    openModal({
+      title: "Modal A",
+      body: bodyA as unknown as HTMLElement,
+      confirmLabel: "Save A",
+      onConfirm: () => undefined,
+    });
+
+    const scrimA = body.children.find((node) => node.className === "scrim");
+    expect(scrimA).toBeDefined();
+    expect(root.inert).toBe(true);
+    expect(preInert.inert).toBe(true);
+    expect(toasts.inert).toBe(false);
+    toast("Modal error notice", "bad");
+    expect(toasts.textContent).toContain("Modal error notice");
+
+    // Initial focus skips hiddenBtn inside closed <details> and lands on summary (first visible focusable).
+    expect(doc.activeElement).toBe(summary);
+    // Focus trap never lands on hiddenBtn inside closed <details>.
+    const seenFocused = new Set<FakeNode | null>();
+    for (let i = 0; i < 6; i += 1) {
+      seenFocused.add(doc.activeElement);
+      doc.dispatchKey("Tab", { shiftKey: false });
+    }
+    expect(seenFocused.has(hiddenBtn)).toBe(false);
+
+    // Open stacked Modal B on top of Modal A.
+    const inputB = doc.createElement("input");
+    openModal({
+      title: "Modal B",
+      body: inputB as unknown as HTMLElement,
+      confirmLabel: "Save B",
+      onConfirm: () => undefined,
+    });
+    expect(scrimA?.inert).toBe(true);
+    expect(root.inert).toBe(true);
+    expect(preInert.inert).toBe(true);
+    expect(toasts.inert).toBe(false);
+    expect(doc.activeElement).toBe(inputB);
+
+    // First Escape closes only Modal B; Modal A becomes active again while root stays inert.
+    doc.dispatchKey("Escape");
+    expect(body.all().filter((node) => node.getAttribute("role") === "dialog")).toHaveLength(1);
+    expect(scrimA?.inert).toBe(false);
+    expect(root.inert).toBe(true);
+    expect(preInert.inert).toBe(true);
+    expect(toasts.inert).toBe(false);
+
+    // Second Escape closes Modal A; root restores inert=false, preInert stays inert=true.
+    doc.dispatchKey("Escape");
+    expect(body.all().filter((node) => node.getAttribute("role") === "dialog")).toHaveLength(0);
+    expect(root.inert).toBe(false);
+    expect(preInert.inert).toBe(true);
+    expect(toasts.inert).toBe(false);
+    expect(doc.activeElement).toBe(trigger);
+  });
+
+  test("createResource re-enables Confirm for custom URL, clears stale migration note on retry, and aborts probes on close", async () => {
+    const { doc, body } = installFakeDom("/resources");
+    const state = await import("../console/src/state.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { createResource } = await import("../console/src/pages/create-resource.ts");
+    consoleLocale.set("en");
+    state.setApiOrigin("https://api.example.test");
+    state.adoptSession("shared-auth");
+    state.organizations.set([
+      {
+        id: "org-1",
+        name: "Alpha",
+        ownerPrincipalId: "pri-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    state.selectOrganization("org-1");
+
+    let supportedAnswer = false;
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/apis/forms.takoform.com/v2/support") {
+          const form = url.searchParams.get("form") ?? "";
+          return Response.json({
+            form,
+            supported: supportedAnswer,
+            operations: supportedAnswer ? ["create"] : [],
+          });
+        }
+        return Response.json({ error: { code: "not_found" } }, { status: 404 });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    createResource("org-1");
+    await flush(12);
+
+    const createBtn = body
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Create");
+    const formSelect = body.all().find((node) => node.id === "create-resource-form");
+    const formUrlInput = body.all().find((node) => node.id === "create-resource-form-url");
+    expect(createBtn?.disabled).toBe(true);
+    expect(body.textContent).toContain("SQLiteMigrationSet");
+
+    // Switching to "other" immediately re-enables Confirm and reveals URL input.
+    if (formSelect) {
+      formSelect.value = "other";
+      formSelect.dispatch("change");
+      await flush(2);
+    }
+    expect(createBtn?.disabled).toBe(false);
+    expect(formUrlInput?.hidden).toBe(false);
+
+    // Switching back to empty and clicking "Check again" when supported clears stale migration note.
+    if (formSelect) {
+      formSelect.value = "";
+      formSelect.dispatch("change");
+      await flush(2);
+    }
+    const checkAgain = body
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Check again");
+    expect(checkAgain).toBeDefined();
+    supportedAnswer = true;
+    checkAgain?.click();
+    await flush(12);
+    expect(createBtn?.disabled).toBe(false);
+    expect(body.textContent).not.toContain("SQLiteMigrationSet, and on a Host that runs Workers");
+    doc.dispatchKey("Escape");
+
+    // Closing mid-probe aborts in-flight probe signals cleanly.
+    const signals: AbortSignal[] = [];
+    globalThis.fetch = Object.assign(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.signal) signals.push(init.signal);
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(new DOMException("Aborted", "AbortError")),
+          );
+        });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    createResource("org-1");
+    await flush(2);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every((sig) => !sig.aborted)).toBe(true);
+    doc.dispatchKey("Escape");
+    await flush(2);
+    expect(signals.every((sig) => sig.aborted)).toBe(true);
+  });
+
+  test("billing still shows Try again notice on 500 errors for optional routes", async () => {
+    const { root } = installFakeDom("/billing");
+    const state = await import("../console/src/state.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { billingPage } = await import("../console/src/pages/billing.ts");
+    consoleLocale.set("en");
+    state.setApiOrigin("https://api.example.test");
+    state.adoptSession("shared-auth");
+    state.organizations.set([
+      {
+        id: "org-1",
+        name: "Alpha",
+        ownerPrincipalId: "pri-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    state.selectOrganization("org-1");
+
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname === "/v1/organizations/org-1/wallet") {
+          return Response.json({
+            wallet: {
+              organizationId: "org-1",
+              currency: "USD",
+              settledMicros: "1000000",
+              heldMicros: "0",
+              availableMicros: "1000000",
+              entries: [],
+            },
+          });
+        }
+        return Response.json({ error: { code: "temporarily_unavailable" } }, { status: 500 });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    const page = billingPage("org-1") as unknown as FakeNode;
+    root.append(page);
+    await flush(10);
+
+    expect(page.textContent).not.toContain("Not enabled on this Host");
+    const retryButtons = page
+      .all()
+      .filter((node) => node.tag === "button" && node.textContent === "Try again");
+    expect(retryButtons.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("shell mounts toasts on body, keeps #topbar-organization focus stable, and guards createOrganization Enter against IME and duplicate POSTs", async () => {
+    const { doc, body, root } = installFakeDom("/");
+    const state = await import("../console/src/state.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    consoleLocale.set("en");
+    state.setApiOrigin("https://api.example.test");
+    state.sharedAuthAvailable.set(false);
+    state.adoptSession("legacy");
+
+    let postCount = 0;
+    let resolveCreate!: (response: Response) => void;
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        const method = (init?.method ?? "GET").toUpperCase();
+        if (url.pathname === "/v1/me") {
+          return Response.json({
+            principal: {
+              id: "pri-1",
+              provider: "local",
+              email: "owner@example.test",
+              displayName: "Owner",
+            },
+            organizations: [
+              {
+                id: "org-1",
+                name: "Alpha",
+                ownerPrincipalId: "pri-1",
+                createdAt: "2026-01-01T00:00:00.000Z",
+              },
+              {
+                id: "org-2",
+                name: "Beta",
+                ownerPrincipalId: "pri-1",
+                createdAt: "2026-01-02T00:00:00.000Z",
+              },
+            ],
+          });
+        }
+        if (url.pathname === "/v1/organizations" && method === "POST") {
+          postCount += 1;
+          return new Promise<Response>((resolve) => {
+            resolveCreate = resolve;
+          });
+        }
+        return Response.json({ items: [], nextCursor: null });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    await import("../console/src/main.ts");
+    await flush(10);
+
+    // Toasts are mounted on document.body outside #root.
+    const toasts = body.children.find((node) => node.className === "toasts");
+    expect(toasts).toBeDefined();
+    expect(root.contains(toasts ?? null)).toBe(false);
+
+    // Switching organization keeps the exact #topbar-organization node focused.
+    const select = root.all().find((node) => node.id === "topbar-organization");
+    expect(select).toBeDefined();
+    if (!select) throw new Error("#topbar-organization missing");
+    select.focus();
+    select.value = "org-2";
+    select.dispatch("change");
+    await flush(4);
+    expect(root.all().find((node) => node.id === "topbar-organization")).toBe(select);
+    expect(doc.activeElement).toBe(select);
+    expect(state.currentOrganizationId()).toBe("org-2");
+
+    // Open Create Organization modal.
+    const openCreateBtn = root
+      .all()
+      .find(
+        (node) =>
+          node.tag === "button" && node.getAttribute("aria-label") === "Create organization",
+      );
+    expect(openCreateBtn).toBeDefined();
+    openCreateBtn?.click();
+    await flush(2);
+    expect(toasts?.inert).toBe(false);
+    expect(root.inert).toBe(true);
+
+    const orgInput = body.all().find((node) => node.id === "create-organization-name");
+    const confirmBtn = body
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Create");
+    expect(orgInput).toBeDefined();
+    expect(confirmBtn).toBeDefined();
+    if (!orgInput || !confirmBtn) throw new Error("create organization modal controls missing");
+
+    orgInput.value = "Gamma";
+    // Enter during IME composition must be ignored.
+    orgInput.dispatch("keydown", { key: "Enter", isComposing: true });
+    orgInput.dispatch("keydown", { key: "Enter", keyCode: 229 });
+    await flush(2);
+    expect(postCount).toBe(0);
+
+    // Rapid double-Enter + immediate Confirm click issues only a single POST,
+    // and Confirm becomes disabled on the reactive flush.
+    orgInput.dispatch("keydown", { key: "Enter", isComposing: false, keyCode: 13 });
+    orgInput.dispatch("keydown", { key: "Enter", isComposing: false, keyCode: 13 });
+    confirmBtn.click();
+    await flush(2);
+    expect(confirmBtn.disabled).toBe(true);
+    expect(postCount).toBe(1);
+
+    resolveCreate(
+      Response.json(
+        {
+          organization: {
+            id: "org-3",
+            name: "Gamma",
+            ownerPrincipalId: "pri-1",
+            createdAt: "2026-01-03T00:00:00.000Z",
+          },
+        },
+        { status: 201 },
+      ),
+    );
+    await flush(6);
+    expect(state.currentOrganizationId()).toBe("org-3");
+    expect(body.all().filter((node) => node.getAttribute("role") === "dialog")).toHaveLength(0);
+    expect(root.inert).toBe(false);
   });
 });

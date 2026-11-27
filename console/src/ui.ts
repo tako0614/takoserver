@@ -370,11 +370,17 @@ const FOCUSABLE_SELECTOR = [
 
 function isVisibleFocusable(node: HTMLElement): boolean {
   if (node.hidden) return false;
-  if (typeof node.closest === "function" && node.closest("[hidden], [inert]")) return false;
+  if (typeof node.closest === "function") {
+    if (node.closest("[hidden], [inert]")) return false;
+    const closedDetails = node.closest("details:not([open])");
+    if (closedDetails && node.closest("summary")?.parentElement !== closedDetails) return false;
+  }
   return true;
 }
 
 let nextModalTitleId = 0;
+const modalStack: HTMLElement[] = [];
+const inertCounts = new WeakMap<HTMLElement, number>();
 
 export function openModal(options: ModalOptions): () => void {
   let stopBlocking: (() => void) | null = null;
@@ -392,15 +398,30 @@ export function openModal(options: ModalOptions): () => void {
     if (closed) return;
     closed = true;
     stopBlocking?.();
+    const stackIndex = modalStack.lastIndexOf(scrim);
+    if (stackIndex >= 0) modalStack.splice(stackIndex, 1);
     scrim.remove();
-    for (const element of inerted) element.inert = false;
+    for (const element of inerted) {
+      const next = (inertCounts.get(element) ?? 1) - 1;
+      if (next <= 0) {
+        inertCounts.delete(element);
+        element.inert = false;
+      } else {
+        inertCounts.set(element, next);
+      }
+    }
     document.removeEventListener("keydown", onKey);
     options.onClose?.();
-    if (opener && (typeof opener.isConnected !== "boolean" || opener.isConnected)) {
+    if (
+      opener &&
+      (typeof opener.isConnected !== "boolean" || opener.isConnected) &&
+      !(typeof opener.closest === "function" && opener.closest("[inert]"))
+    ) {
       opener.focus();
     }
   };
   const onKey = (event: KeyboardEvent): void => {
+    if (modalStack[modalStack.length - 1] !== scrim) return;
     if (event.key === "Escape") {
       event.preventDefault?.();
       close();
@@ -497,24 +518,29 @@ export function openModal(options: ModalOptions): () => void {
     dialog,
   );
 
-  // Prevent keyboard and pointer interaction with background siblings while open.
+  // Prevent keyboard and pointer interaction with background siblings while open,
+  // keeping the toast live region active and ref-counting stacked modals.
+  const toasts = toastHost();
   const siblings = Array.from(document.body.children ?? []) as HTMLElement[];
   for (const sibling of siblings) {
-    if (sibling !== scrim && sibling.inert !== true) {
-      sibling.inert = true;
-      inerted.push(sibling);
-    }
+    if (sibling === scrim || sibling === toasts) continue;
+    const count = inertCounts.get(sibling) ?? 0;
+    if (count === 0 && sibling.inert === true) continue;
+    inertCounts.set(sibling, count + 1);
+    sibling.inert = true;
+    inerted.push(sibling);
   }
+  modalStack.push(scrim);
   document.body.append(scrim);
   document.addEventListener("keydown", onKey);
-  // The first control a person can use, not one still disabled or hidden.
-  scrim
-    .querySelector<HTMLElement>(
-      ["input", "textarea", "select", "button"]
-        .map((tag) => `${tag}:not([disabled]):not([hidden])`)
-        .join(", "),
-    )
-    ?.focus();
+  // The first visible focusable control, falling back to the dialog itself.
+  const initialFocus =
+    typeof dialog.querySelectorAll === "function"
+      ? Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).find(
+          isVisibleFocusable,
+        )
+      : dialog.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
+  (initialFocus ?? dialog).focus?.();
   return close;
 }
 

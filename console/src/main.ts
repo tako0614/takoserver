@@ -54,7 +54,7 @@ function boot(): void {
   syncConsoleLocale();
   const root = document.getElementById("root");
   if (!root) throw new Error("console root is missing");
-  root.append(mountToasts());
+  document.body.append(mountToasts());
 
   // Google may have just sent this browser back with a token in the fragment.
   // It is read and cleared before anything renders, so a reload cannot replay
@@ -342,7 +342,9 @@ function createOrganization(): void {
   if (!canCreateLocalOrganization()) return;
   const isCurrent = captureSessionScope();
   let open = true;
+  const submitting = signal(false);
   const submit = async (): Promise<void> => {
+    if (submitting()) return;
     if (!open || !isCurrent() || !canCreateLocalOrganization()) {
       close();
       return;
@@ -351,6 +353,7 @@ function createOrganization(): void {
       toast(tr("組織名を入力してください", "Give the organization a name"), "bad");
       return;
     }
+    submitting.set(true);
     try {
       const { organization } = await api.createOrganization(name.value.trim());
       if (!open || !isCurrent()) {
@@ -364,6 +367,8 @@ function createOrganization(): void {
     } catch (error) {
       if (open && isCurrent()) toast(explain(error as Error), "bad");
       else close();
+    } finally {
+      submitting.set(false);
     }
   };
   const name = h("input", {
@@ -373,7 +378,7 @@ function createOrganization(): void {
     autocomplete: "off",
     placeholder: tr("本番環境", "Acme production"),
     onKeydown: (event: KeyboardEvent) => {
-      if (event.key === "Enter") {
+      if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
         event.preventDefault();
         void submit();
       }
@@ -382,6 +387,7 @@ function createOrganization(): void {
   const close = openModal({
     title: tr("組織を作成", "Create organization"),
     confirmLabel: tr("作成", "Create"),
+    confirmBlocked: () => submitting(),
     onClose: () => {
       open = false;
     },

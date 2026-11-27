@@ -456,6 +456,7 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
     pending = options.size;
     answered = 0;
     supportedCount = 0;
+    migrations.replaceChildren();
     for (const [form, option] of options) {
       option.disabled = false;
       option.replaceChildren(formLabel(form));
