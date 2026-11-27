@@ -640,22 +640,22 @@ describe("Console Wave 2 UI/UX improvements", () => {
     state.selectOrganization("org-1");
 
     let keyCalls = 0;
-    let resolveKeys: ((response: Response) => void) | null = null;
+    const keyResolvers: Array<(response: Response) => void> = [];
     let resourceCalls = 0;
-    let resolveResources: ((response: Response) => void) | null = null;
+    const resourceResolvers: Array<(response: Response) => void> = [];
     globalThis.fetch = Object.assign(
       async (input: RequestInfo | URL) => {
         const url = new URL(String(input));
         if (url.pathname.endsWith("/api-keys")) {
           keyCalls += 1;
           return await new Promise<Response>((resolve) => {
-            resolveKeys = resolve;
+            keyResolvers.push(resolve);
           });
         }
         if (url.pathname.endsWith("/resources")) {
           resourceCalls += 1;
           return await new Promise<Response>((resolve) => {
-            resolveResources = resolve;
+            resourceResolvers.push(resolve);
           });
         }
         return Response.json({ capabilities: {} });
@@ -684,8 +684,7 @@ describe("Console Wave 2 UI/UX improvements", () => {
     expect(doc.dispatchKey("j", { target: body })).toBe(false);
     expect(windowKeydownCount()).toBe(1);
 
-    resolveKeys?.(Response.json(keyPayload));
-    resolveKeys = null;
+    keyResolvers.shift()?.(Response.json(keyPayload));
     await flush();
 
     const refreshBtn = page
@@ -711,8 +710,7 @@ describe("Console Wave 2 UI/UX improvements", () => {
     expect(doc.dispatchKey("k", { target: body })).toBe(false);
     expect(windowKeydownCount()).toBe(1);
 
-    resolveKeys?.(Response.json(keyPayload));
-    resolveKeys = null;
+    keyResolvers.shift()?.(Response.json(keyPayload));
     await flush();
 
     expect(page.all().includes(refreshBtn)).toBe(true);
@@ -760,8 +758,7 @@ describe("Console Wave 2 UI/UX improvements", () => {
         },
       ],
     };
-    resolveResources?.(Response.json(resPayload));
-    resolveResources = null;
+    resourceResolvers.shift()?.(Response.json(resPayload));
     await flush();
 
     const reloadBtn = resPage
@@ -779,8 +776,7 @@ describe("Console Wave 2 UI/UX improvements", () => {
     expect(reloadBtn.getAttribute("aria-busy")).toBe("true");
     expect(reloadBtn.textContent).toBe("Reloading…");
 
-    resolveResources?.(Response.json(resPayload));
-    resolveResources = null;
+    resourceResolvers.shift()?.(Response.json(resPayload));
     await flush();
 
     expect(resPage.all().includes(reloadBtn)).toBe(true);
