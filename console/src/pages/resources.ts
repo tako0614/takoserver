@@ -23,6 +23,7 @@ import {
   explain,
   ICON,
   icon,
+  refreshButton,
   whenReady,
 } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
@@ -65,6 +66,9 @@ function operationSettled(operation: { readonly status: string }): boolean {
  * overview can link to one Form's Resources; the text filter still applies.
  */
 export function resourcesPage(organizationId: string): Child {
+  // Each build of this page follows on its own token. A rebuild (a language
+  // switch, say) takes a new one, so the replaced page stops checking.
+  const followToken = ++followGeneration;
   const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
   const pageRoute = route();
   const isCurrentPage = (): boolean =>
@@ -75,7 +79,7 @@ export function resourcesPage(organizationId: string): Child {
   const filter = signal("");
   const totalScoped = signal(0);
   const matchedCount = signal(0);
-  const filterControls = createFilterToolbar(filter, totalScoped, matchedCount);
+  const filterControls = createFilterToolbar(filter, totalScoped, matchedCount, isCurrentPage);
   const onlyForm = route().query.get("form");
   const additional = signal<readonly ResourceSummary[]>([]);
   const continuation = signal<{ readonly cursor?: string } | null>(null);
@@ -124,9 +128,6 @@ export function resourcesPage(organizationId: string): Child {
   // card does not blink back to its loading state every 1.5 s.
   const latest = signal<ResourceOperation | null>(null);
   let followTimer: ReturnType<typeof setTimeout> | undefined;
-  // Each build of this page follows on its own token. A rebuild (a language
-  // switch, say) takes a new one, so the replaced page stops checking.
-  const followToken = ++followGeneration;
   // Stop once this page has gone: rebuilt, another route, another
   // organization, or no document at all (a test that has finished).
   const stillShown = (): boolean =>
@@ -301,30 +302,17 @@ export function resourcesPage(organizationId: string): Child {
       h(
         "div",
         { class: "toolbar" },
-        live(() => {
-          const current = isCurrentPage();
-          const busy =
-            current &&
-            (page.get().state === "loading" ||
-              (operation !== null &&
-                stillShown() &&
-                operation.get().state === "loading" &&
-                !latest()));
-          const glyph = icon(ICON.refresh, 14);
-          if (busy) glyph.setAttribute("class", "icon--spin");
-          return h(
-            "button",
-            {
-              class: "btn",
-              type: "button",
-              ...(busy ? { "aria-busy": "true", "aria-disabled": "true" } : {}),
-              onClick: () => {
-                if (!busy && isCurrentPage()) reload();
-              },
-            },
-            glyph,
-            text(busy ? tr("読み込み中…", "Reloading…") : tr("再読み込み", "Reload")),
-          );
+        refreshButton({
+          idleLabel: () => tr("再読み込み", "Reload"),
+          busyLabel: () => tr("読み込み中…", "Reloading…"),
+          isActive: isCurrentPage,
+          isBusy: () =>
+            page.get().state === "loading" ||
+            (operation !== null &&
+              stillShown() &&
+              operation.get().state === "loading" &&
+              !latest()),
+          onRefresh: reload,
         }),
         h(
           "button",
@@ -485,6 +473,7 @@ function createFilterToolbar(
   filter: ReturnType<typeof signal<string>>,
   total: ReturnType<typeof signal<number>>,
   matched: ReturnType<typeof signal<number>>,
+  isActive: () => boolean,
 ): { readonly element: Child; readonly clear: () => void } {
   const input = h("input", {
     class: "input",
@@ -502,7 +491,7 @@ function createFilterToolbar(
     filter.set("");
     input.focus?.();
   };
-  bindSearchShortcut(input, () => filter.set(""));
+  bindSearchShortcut(input, () => filter.set(""), isActive);
   return {
     clear,
     element: h(

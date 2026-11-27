@@ -408,13 +408,25 @@ let activeSearchShortcutCleanup: (() => void) | null = null;
 /**
  * Binds `/` to focus a page's filter input and IME-safe `Escape` to clear it.
  *
- * Replaces any previous page's global listener and auto-detaches once the
- * input leaves the document, so route transitions never leak listeners.
+ * Replaces any previous page's global listener. When `isActive` is supplied,
+ * the listener stays registered across temporary unmounts (such as initial
+ * loading or Reload/Refresh) and detaches once `isActive()` returns false.
+ * Without `isActive`, it falls back to detaching once `input` is disconnected.
  */
-export function bindSearchShortcut(input: HTMLInputElement, onClear?: () => void): void {
+export function bindSearchShortcut(
+  input: HTMLInputElement,
+  onClear?: () => void,
+  isActive?: () => boolean,
+): void {
   activeSearchShortcutCleanup?.();
   const onWindowKeyDown = (event: KeyboardEvent): void => {
-    if (typeof input.isConnected === "boolean" && !input.isConnected) {
+    if (isActive) {
+      if (!isActive()) {
+        cleanup();
+        return;
+      }
+      if (typeof input.isConnected === "boolean" && !input.isConnected) return;
+    } else if (typeof input.isConnected === "boolean" && !input.isConnected) {
       cleanup();
       return;
     }
@@ -446,6 +458,52 @@ export function bindSearchShortcut(input: HTMLInputElement, onClear?: () => void
       onClear?.();
     });
   }
+}
+
+/**
+ * Builds a stable refresh button whose busy state updates in place, so
+ * keyboard focus is preserved across `"ready" -> "loading" -> "ready"`
+ * transitions and retired pages stop reacting to late network updates.
+ */
+export function refreshButton(options: {
+  readonly idleLabel: () => string;
+  readonly busyLabel: () => string;
+  readonly isActive: () => boolean;
+  readonly isBusy: () => boolean;
+  readonly onRefresh: () => void;
+}): HTMLButtonElement {
+  const glyph = icon(ICON.refresh, 14);
+  const label = h("span");
+  let currentBusy = false;
+  const button = h(
+    "button",
+    {
+      class: "btn",
+      type: "button",
+      onClick: () => {
+        if (!currentBusy && options.isActive()) options.onRefresh();
+      },
+    },
+    glyph,
+    label,
+  );
+  const syncAttr = (el: Element, name: string, value: string | null): void => {
+    if (value !== null) {
+      el.setAttribute(name, value);
+    } else if (typeof el.removeAttribute === "function") {
+      el.removeAttribute(name);
+    }
+  };
+  effect(() => {
+    const active = options.isActive();
+    const busy = active && options.isBusy();
+    currentBusy = busy;
+    syncAttr(button, "aria-busy", busy ? "true" : null);
+    syncAttr(button, "aria-disabled", busy ? "true" : null);
+    syncAttr(glyph, "class", busy ? "icon--spin" : null);
+    label.replaceChildren(text(busy ? options.busyLabel() : options.idleLabel()));
+  });
+  return button;
 }
 
 /**

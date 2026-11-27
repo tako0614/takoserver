@@ -21,6 +21,7 @@ import {
   icon,
   type ModalOptions,
   openModal,
+  refreshButton,
   setFieldError,
   toast,
   when,
@@ -83,12 +84,14 @@ function rememberUnshownKey(
  * by a stray click, because "I'll copy it in a second" is how people lose keys.
  */
 export function keysPage(organizationId: string): Child {
-  const isPageCurrent = captureSelectedOrganizationScope(organizationId);
+  const openedRoute = route();
+  const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
+  const isPageCurrent = (): boolean => route() === openedRoute && isOrganizationCurrent();
   const keys = resource(() => api.apiKeys(organizationId));
   const filter = signal("");
   const totalCount = signal(0);
   const matchedCount = signal(0);
-  const filterControls = createKeysFilterToolbar(filter, totalCount, matchedCount);
+  const filterControls = createKeysFilterToolbar(filter, totalCount, matchedCount, isPageCurrent);
   // Asked once per page. An already-open dialog follows the answer without
   // replacing the person's inputs; an unreadable document never offers AI.
   const discovery = resource(() => api.hostDiscovery());
@@ -123,23 +126,12 @@ export function keysPage(organizationId: string): Child {
       h(
         "div",
         { class: "toolbar" },
-        live(() => {
-          const busy = isPageCurrent() && keys.get().state === "loading";
-          const glyph = icon(ICON.refresh, 14);
-          if (busy) glyph.setAttribute("class", "icon--spin");
-          return h(
-            "button",
-            {
-              class: "btn",
-              type: "button",
-              ...(busy ? { "aria-busy": "true", "aria-disabled": "true" } : {}),
-              onClick: () => {
-                if (!busy && isPageCurrent()) keys.reload();
-              },
-            },
-            glyph,
-            text(busy ? tr("更新中…", "Refreshing…") : tr("キー一覧を更新", "Refresh keys")),
-          );
+        refreshButton({
+          idleLabel: () => tr("キー一覧を更新", "Refresh keys"),
+          busyLabel: () => tr("更新中…", "Refreshing…"),
+          isActive: isPageCurrent,
+          isBusy: () => keys.get().state === "loading",
+          onRefresh: keys.reload,
         }),
         h(
           "button",
@@ -269,6 +261,7 @@ function createKeysFilterToolbar(
   filter: ReturnType<typeof signal<string>>,
   total: ReturnType<typeof signal<number>>,
   matched: ReturnType<typeof signal<number>>,
+  isActive: () => boolean,
 ): { readonly element: Child; readonly clear: () => void } {
   const input = h("input", {
     class: "input",
@@ -286,7 +279,7 @@ function createKeysFilterToolbar(
     filter.set("");
     input.focus?.();
   };
-  bindSearchShortcut(input, () => filter.set(""));
+  bindSearchShortcut(input, () => filter.set(""), isActive);
   return {
     clear,
     element: h(

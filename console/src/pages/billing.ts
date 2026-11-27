@@ -43,6 +43,7 @@ import {
   icon,
   type ModalOptions,
   openModal,
+  refreshButton,
   skeletonRows,
   stat,
   toast,
@@ -284,25 +285,13 @@ export function billingPage(organizationId: string): Child {
       h(
         "div",
         { class: "toolbar" },
-        live(() => {
-          const busy =
-            isPageCurrent() &&
-            (wallet.get().state === "loading" || hostedSubscription.get().state === "loading");
-          const glyph = icon(ICON.refresh, 14);
-          if (busy) glyph.setAttribute("class", "icon--spin");
-          return h(
-            "button",
-            {
-              class: "btn",
-              type: "button",
-              ...(busy ? { "aria-busy": "true", "aria-disabled": "true" } : {}),
-              onClick: () => {
-                if (!busy && isPageCurrent()) reloadSubscription();
-              },
-            },
-            glyph,
-            text(busy ? tr("更新中…", "Refreshing…") : tr("更新", "Refresh")),
-          );
+        refreshButton({
+          idleLabel: () => tr("更新", "Refresh"),
+          busyLabel: () => tr("更新中…", "Refreshing…"),
+          isActive: isPageCurrent,
+          isBusy: () =>
+            wallet.get().state === "loading" || hostedSubscription.get().state === "loading",
+          onRefresh: reloadSubscription,
         }),
         h(
           "button",

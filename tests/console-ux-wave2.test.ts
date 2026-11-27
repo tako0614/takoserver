@@ -121,6 +121,9 @@ class FakeNode {
       const index = this.parent.children.indexOf(this);
       if (index >= 0) this.parent.children.splice(index, 1);
       this.parent = null;
+      if (this.ownerDoc && this.contains(this.ownerDoc.activeElement)) {
+        this.ownerDoc.activeElement = this.ownerDoc.body;
+      }
     }
   }
 
@@ -215,6 +218,7 @@ function installFakeDom(pathname = "/"): {
   readonly doc: FakeDocument;
   readonly body: FakeNode;
   readonly root: FakeNode;
+  readonly windowKeydownCount: () => number;
 } {
   const storageValues = new Map<string, string>();
   const storage = {
@@ -252,6 +256,7 @@ function installFakeDom(pathname = "/"): {
   root.setAttribute("id", "root");
   doc.body.append(root);
 
+  const location = new URL(`https://console.example.test${pathname}`);
   Object.assign(globalThis, {
     Node: FakeNode,
     HTMLInputElement: FakeNode,
@@ -259,16 +264,26 @@ function installFakeDom(pathname = "/"): {
     sessionStorage: storage,
     document: doc,
     window: {
-      location: new URL(`https://console.example.test${pathname}`),
+      location,
       addEventListener: winEvents.addEventListener.bind(winEvents),
       removeEventListener: winEvents.removeEventListener.bind(winEvents),
+      scrollTo: () => undefined,
       history: {
-        pushState: () => undefined,
-        replaceState: () => undefined,
+        pushState: (_state: unknown, _title: string, next: string) => {
+          location.href = new URL(next, location).href;
+        },
+        replaceState: (_state: unknown, _title: string, next: string) => {
+          location.href = new URL(next, location).href;
+        },
       },
     },
   });
-  return { doc, body: doc.body, root };
+  return {
+    doc,
+    body: doc.body,
+    root,
+    windowKeydownCount: () => (winEvents.listeners.get("keydown") ?? []).length,
+  };
 }
 
 async function flush(ticks = 6): Promise<void> {
@@ -559,6 +574,219 @@ describe("Console Wave 2 UI/UX improvements", () => {
       expect(updateSpec.getAttribute("aria-describedby")).toBe("update-resource-note");
       expect(updateError?.hidden).toBe(true);
     }
+    const updateCancel = body
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Cancel");
+    updateCancel?.click();
+  });
+
+  test("bindSearchShortcut survives temporary disconnect while active and detaches once inactive", async () => {
+    const { doc, body, windowKeydownCount } = installFakeDom("/resources");
+    const { bindSearchShortcut } = await import("../console/src/ui.ts");
+    const input = doc.createElement("input");
+    let active = true;
+
+    bindSearchShortcut(input as unknown as HTMLInputElement, undefined, () => active);
+    expect(windowKeydownCount()).toBe(1);
+
+    // Keystrokes while input is temporarily unmounted (initial load / refresh) must NOT detach listener.
+    expect(input.isConnected).toBe(false);
+    expect(doc.dispatchKey("a", { target: body })).toBe(false);
+    expect(doc.dispatchKey("/", { target: body })).toBe(false);
+    expect(windowKeydownCount()).toBe(1);
+
+    // Once input mounts, `/` focuses it.
+    body.append(input);
+    expect(input.isConnected).toBe(true);
+    expect(doc.dispatchKey("/", { target: body })).toBe(true);
+    expect(doc.activeElement).toBe(input);
+
+    // Survives another unmount/remount cycle (e.g., manual Reload/Refresh).
+    input.remove();
+    expect(doc.dispatchKey("/", { target: body })).toBe(false);
+    expect(windowKeydownCount()).toBe(1);
+    body.append(input);
+    body.focus();
+    expect(doc.dispatchKey("/", { target: body })).toBe(true);
+    expect(doc.activeElement).toBe(input);
+
+    // Once scope becomes inactive, listener detaches cleanly and stops focusing.
+    active = false;
+    body.focus();
+    expect(doc.dispatchKey("/", { target: body })).toBe(false);
+    expect(doc.activeElement).toBe(body);
+    expect(windowKeydownCount()).toBe(0);
+  });
+
+  test("Refresh and Reload buttons preserve DOM identity and focus across loading, and keysPage scopes to route", async () => {
+    const { doc, body, windowKeydownCount } = installFakeDom("/keys");
+    const state = await import("../console/src/state.ts");
+    const { consoleLocale } = await import("../console/src/i18n.ts");
+    const { navigate } = await import("../console/src/router.ts");
+    const { keysPage } = await import("../console/src/pages/keys.ts");
+    const { resourcesPage } = await import("../console/src/pages/resources.ts");
+    consoleLocale.set("en");
+    navigate("/keys");
+    state.setApiOrigin("https://api.example.test");
+    state.adoptSession("shared-auth");
+    state.organizations.set([
+      {
+        id: "org-1",
+        name: "Alpha",
+        ownerPrincipalId: "pri-1",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    state.selectOrganization("org-1");
+
+    let keyCalls = 0;
+    let resolveKeys: ((response: Response) => void) | null = null;
+    let resourceCalls = 0;
+    let resolveResources: ((response: Response) => void) | null = null;
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/api-keys")) {
+          keyCalls += 1;
+          return await new Promise<Response>((resolve) => {
+            resolveKeys = resolve;
+          });
+        }
+        if (url.pathname.endsWith("/resources")) {
+          resourceCalls += 1;
+          return await new Promise<Response>((resolve) => {
+            resolveResources = resolve;
+          });
+        }
+        return Response.json({ capabilities: {} });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+
+    const keyPayload = {
+      apiKeys: [
+        {
+          id: "key-1",
+          organizationId: "org-1",
+          name: "deploy-prod",
+          scopes: ["resources:read"],
+          createdAt: "2026-11-20T00:00:00.000Z",
+          expiresAt: "2027-11-20T00:00:00.000Z",
+        },
+      ],
+    };
+
+    const page = keysPage("org-1") as unknown as FakeNode;
+    body.append(page);
+    await flush();
+
+    // Pressing keys during initial loading must NOT unregister `/`.
+    expect(doc.dispatchKey("j", { target: body })).toBe(false);
+    expect(windowKeydownCount()).toBe(1);
+
+    resolveKeys?.(Response.json(keyPayload));
+    resolveKeys = null;
+    await flush();
+
+    const refreshBtn = page
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Refresh keys");
+    expect(refreshBtn).toBeDefined();
+    if (!refreshBtn) throw new Error("Refresh keys button missing");
+
+    // Focus Refresh button and trigger reload: DOM node & focus must stay intact through loading -> ready.
+    refreshBtn.focus();
+    expect(doc.activeElement).toBe(refreshBtn);
+    refreshBtn.click();
+    await flush();
+
+    expect(keyCalls).toBe(2);
+    expect(page.all().includes(refreshBtn)).toBe(true);
+    expect(doc.activeElement).toBe(refreshBtn);
+    expect(refreshBtn.getAttribute("aria-busy")).toBe("true");
+    expect(refreshBtn.getAttribute("aria-disabled")).toBe("true");
+    expect(refreshBtn.textContent).toBe("Refreshing…");
+
+    // Keypress during Refresh (while #keys-filter is unmounted) keeps `/` active.
+    expect(doc.dispatchKey("k", { target: body })).toBe(false);
+    expect(windowKeydownCount()).toBe(1);
+
+    resolveKeys?.(Response.json(keyPayload));
+    resolveKeys = null;
+    await flush();
+
+    expect(page.all().includes(refreshBtn)).toBe(true);
+    expect(doc.activeElement).toBe(refreshBtn);
+    expect(refreshBtn.getAttribute("aria-busy")).toBeNull();
+    expect(refreshBtn.getAttribute("aria-disabled")).toBeNull();
+    expect(refreshBtn.textContent).toBe("Refresh keys");
+
+    // `/` still focuses `#keys-filter` after the refresh cycle completes.
+    const filterInput = page.all().find((node) => node.id === "keys-filter");
+    expect(filterInput).toBeDefined();
+    if (!filterInput) throw new Error("keys-filter missing after refresh");
+    expect(doc.dispatchKey("/", { target: body })).toBe(true);
+    expect(doc.activeElement).toBe(filterInput);
+
+    // Navigating away from `/keys` retires `isPageCurrent`: `/` detaches and retired Refresh button is inert.
+    navigate("/settings");
+    await flush();
+    body.focus();
+    expect(doc.dispatchKey("/", { target: body })).toBe(false);
+    expect(windowKeydownCount()).toBe(0);
+    refreshBtn.click();
+    await flush();
+    expect(keyCalls).toBe(2);
+
+    // Resources Reload button also preserves DOM identity & focus across ready -> loading -> ready.
+    navigate("/resources");
+    await flush();
+    body.replaceChildren();
+    const resPage = resourcesPage("org-1") as unknown as FakeNode;
+    body.append(resPage);
+    await flush();
+
+    const resPayload = {
+      resources: [
+        {
+          uid: "uid-1",
+          form: "https://takoform.com/forms/ModuleWorker/1.0.0/",
+          space: "org-1",
+          name: "edge-api",
+          generation: 1,
+          observedGeneration: 1,
+          observedAt: "2026-11-27T00:00:00.000Z",
+          phase: "idle",
+        },
+      ],
+    };
+    resolveResources?.(Response.json(resPayload));
+    resolveResources = null;
+    await flush();
+
+    const reloadBtn = resPage
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Reload");
+    expect(reloadBtn).toBeDefined();
+    if (!reloadBtn) throw new Error("Reload button missing");
+    reloadBtn.focus();
+    reloadBtn.click();
+    await flush();
+
+    expect(resourceCalls).toBe(2);
+    expect(resPage.all().includes(reloadBtn)).toBe(true);
+    expect(doc.activeElement).toBe(reloadBtn);
+    expect(reloadBtn.getAttribute("aria-busy")).toBe("true");
+    expect(reloadBtn.textContent).toBe("Reloading…");
+
+    resolveResources?.(Response.json(resPayload));
+    resolveResources = null;
+    await flush();
+
+    expect(resPage.all().includes(reloadBtn)).toBe(true);
+    expect(doc.activeElement).toBe(reloadBtn);
+    expect(reloadBtn.getAttribute("aria-busy")).toBeNull();
+    expect(reloadBtn.textContent).toBe("Reload");
   });
 
   test("console CSS tokens meet WCAG AA (>= 4.5:1) across all light and dark surfaces", () => {
