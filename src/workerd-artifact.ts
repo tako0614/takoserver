@@ -185,7 +185,15 @@ async function isExactArtifact(path: string): Promise<boolean> {
   }
 }
 
-async function closedGraphCapability(binary: string, privateRoot: string): Promise<boolean> {
+/** Host-private executable proof; ordinary selection calls this only after digest verification. */
+export async function closedGraphCapability(
+  binary: string,
+  privateRoot: string,
+  timeoutMillis = 60_000,
+): Promise<boolean> {
+  if (!Number.isSafeInteger(timeoutMillis) || timeoutMillis < 1 || timeoutMillis > 60_000) {
+    throw new TypeError("closed-graph probe timeout must be between 1 and 60000 milliseconds");
+  }
   let root: string | undefined;
   try {
     await mkdir(privateRoot, { recursive: true, mode: 0o700 });
@@ -240,7 +248,9 @@ export default { identity: "application" };`,
     const result = await Promise.race([
       child.exited.then((exitCode) => ({ exitCode, timedOut: false as const })),
       new Promise<{ readonly exitCode: null; readonly timedOut: true }>((done) => {
-        timer = setTimeout(() => done({ exitCode: null, timedOut: true }), 5_000);
+        // The accepted binary's V8 startup exceeds five seconds on a loaded
+        // Linux TCG VM. Keep the complete proof and a finite child lifetime.
+        timer = setTimeout(() => done({ exitCode: null, timedOut: true }), timeoutMillis);
       }),
     ]);
     if (timer !== undefined) clearTimeout(timer);
