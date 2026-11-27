@@ -20,7 +20,7 @@ import {
   theme,
 } from "../state.ts";
 import { beginTakosIdSignIn } from "../takos-id.ts";
-import { explain, ICON, icon, toast } from "../ui.ts";
+import { explain, ICON, icon, setFieldError, toast } from "../ui.ts";
 
 /**
  * Signing in.
@@ -526,18 +526,24 @@ function languageSwitch(): Child {
  * static bundle that may be served from a laptop against a local server.
  */
 function endpointField(reload: () => void): Child {
+  const originError = h("div", {
+    class: "field__error",
+    id: "signin-api-origin-error",
+    hidden: true,
+  });
   const save = (): void => {
     const normalized = normalizeApiOrigin(input.value);
     if (!normalized) {
-      toast(
-        tr(
-          "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
-          "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
-        ),
-        "bad",
+      const message = tr(
+        "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
+        "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
       );
+      setFieldError(input, originError, message);
+      input.focus?.();
+      toast(message, "bad");
       return;
     }
+    setFieldError(input, originError, null);
     input.value = normalized;
     setApiOrigin(normalized);
     void refreshSharedAuthAvailability(true);
@@ -552,6 +558,9 @@ function endpointField(reload: () => void): Child {
     autocomplete: "off",
     spellcheck: "false",
     value: apiOrigin(),
+    onInput: () => {
+      if (normalizeApiOrigin(input.value)) setFieldError(input, originError, null);
+    },
     onKeydown: (event: KeyboardEvent) => {
       if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
         event.preventDefault();
@@ -585,6 +594,7 @@ function endpointField(reload: () => void): Child {
           tr("保存", "Save"),
         ),
       ),
+      originError,
     ),
   );
 }

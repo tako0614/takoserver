@@ -25,6 +25,7 @@ export const ICON = {
   signOut: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9",
   alert:
     "M12 8v5m0 3h.01M10.3 3.9 2.6 17a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z",
+  close: "M18 6 6 18M6 6l12 12",
 } as const;
 
 export function icon(path: string, size = 16): SVGSVGElement {
@@ -160,7 +161,7 @@ export function whenReady<Value>(
       { class: "card__body" },
       h(
         "div",
-        { class: "notice notice--bad" },
+        { class: "notice notice--bad", role: "alert" },
         icon(ICON.alert),
         h("div", null, explain(async.error)),
       ),
@@ -382,6 +383,122 @@ let nextModalTitleId = 0;
 const modalStack: HTMLElement[] = [];
 const inertCounts = new WeakMap<HTMLElement, number>();
 
+export function hasOpenModal(): boolean {
+  return modalStack.length > 0;
+}
+
+function isImeComposing(event: KeyboardEvent): boolean {
+  return event.isComposing || event.keyCode === 229;
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  if (!target || typeof target !== "object") return false;
+  const node = target as {
+    readonly tagName?: string;
+    readonly tag?: string;
+    readonly isContentEditable?: boolean;
+  };
+  if (node.isContentEditable === true) return true;
+  const tag = (node.tagName ?? node.tag ?? "").toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+}
+
+let activeSearchShortcutCleanup: (() => void) | null = null;
+
+/**
+ * Binds `/` to focus a page's filter input and IME-safe `Escape` to clear it.
+ *
+ * Replaces any previous page's global listener and auto-detaches once the
+ * input leaves the document, so route transitions never leak listeners.
+ */
+export function bindSearchShortcut(input: HTMLInputElement, onClear?: () => void): void {
+  activeSearchShortcutCleanup?.();
+  const onWindowKeyDown = (event: KeyboardEvent): void => {
+    if (typeof input.isConnected === "boolean" && !input.isConnected) {
+      cleanup();
+      return;
+    }
+    if (isImeComposing(event)) return;
+    if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
+    if (hasOpenModal()) return;
+    if (isEditableTarget(event.target)) return;
+    event.preventDefault?.();
+    input.focus?.();
+    if (typeof input.select === "function") input.select();
+  };
+  const cleanup = (): void => {
+    if (typeof window !== "undefined" && typeof window.removeEventListener === "function") {
+      window.removeEventListener("keydown", onWindowKeyDown);
+    }
+    if (activeSearchShortcutCleanup === cleanup) activeSearchShortcutCleanup = null;
+  };
+  activeSearchShortcutCleanup = cleanup;
+  if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+    window.addEventListener("keydown", onWindowKeyDown);
+  }
+
+  if (typeof input.addEventListener === "function") {
+    input.addEventListener("keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || isImeComposing(event)) return;
+      if (input.value === "") return;
+      event.preventDefault?.();
+      input.value = "";
+      onClear?.();
+    });
+  }
+}
+
+/**
+ * Updates inline validation state (`aria-invalid`, `aria-describedby`, and
+ * visible error text) on a form control while preserving base helper IDs.
+ */
+export function setFieldError(
+  control: HTMLElement,
+  errorElement: HTMLElement,
+  message: string | null,
+  baseDescribedBy?: readonly string[],
+): void {
+  const base = (baseDescribedBy ?? []).filter((id) => id !== "");
+  const errorId =
+    errorElement.id ||
+    (typeof errorElement.getAttribute === "function" ? errorElement.getAttribute("id") : null) ||
+    "";
+  if (message) {
+    errorElement.hidden = false;
+    if (typeof errorElement.setAttribute === "function") {
+      errorElement.setAttribute("role", "alert");
+    }
+    if (typeof errorElement.replaceChildren === "function") {
+      errorElement.replaceChildren(text(message));
+    }
+    if (typeof control.setAttribute === "function") {
+      control.setAttribute("aria-invalid", "true");
+      const ids = errorId ? [...base, errorId] : base;
+      if (ids.length > 0) control.setAttribute("aria-describedby", ids.join(" "));
+    }
+  } else {
+    errorElement.hidden = true;
+    if (typeof errorElement.removeAttribute === "function") {
+      errorElement.removeAttribute("role");
+    }
+    if (typeof errorElement.replaceChildren === "function") {
+      errorElement.replaceChildren();
+    }
+    if (typeof control.removeAttribute === "function") {
+      control.removeAttribute("aria-invalid");
+    } else if (typeof control.setAttribute === "function") {
+      control.setAttribute("aria-invalid", "false");
+    }
+    if (base.length > 0) {
+      if (typeof control.setAttribute === "function") {
+        control.setAttribute("aria-describedby", base.join(" "));
+      }
+    } else if (typeof control.removeAttribute === "function") {
+      control.removeAttribute("aria-describedby");
+    }
+  }
+}
+
 export function openModal(options: ModalOptions): () => void {
   let stopBlocking: (() => void) | null = null;
   let closed = false;
@@ -418,10 +535,16 @@ export function openModal(options: ModalOptions): () => void {
       !(typeof opener.closest === "function" && opener.closest("[inert]"))
     ) {
       opener.focus();
+    } else if (typeof document.getElementById === "function") {
+      const main = document.getElementById("main-content") as HTMLElement | null;
+      if (main && !(typeof main.closest === "function" && main.closest("[inert]"))) {
+        main.focus?.();
+      }
     }
   };
   const onKey = (event: KeyboardEvent): void => {
     if (modalStack[modalStack.length - 1] !== scrim) return;
+    if (isImeComposing(event)) return;
     if (event.key === "Escape") {
       event.preventDefault?.();
       close();
@@ -442,7 +565,7 @@ export function openModal(options: ModalOptions): () => void {
       const inside =
         typeof dialog.contains === "function" && active ? dialog.contains(active) : false;
       if (event.shiftKey) {
-        if (!inside || active === first) {
+        if (!inside || active === dialog || active === first) {
           event.preventDefault?.();
           last?.focus();
         }
@@ -549,7 +672,9 @@ export function openModal(options: ModalOptions): () => void {
 const toastHost = signal<HTMLElement | null>(null);
 
 export function mountToasts(): HTMLElement {
-  const host = h("div", { class: "toasts", role: "status", "aria-live": "polite" });
+  // Plain container: each toast owns its own role ("alert" or "status") so
+  // live regions are never nested.
+  const host = h("div", { class: "toasts" });
   toastHost.set(host);
   return host;
 }
@@ -557,15 +682,78 @@ export function mountToasts(): HTMLElement {
 export function toast(message: string, tone: "ok" | "bad" | "plain" = "plain"): void {
   const host = toastHost();
   if (!host) return;
+  // A refusal is read to the end, so a long one stays longer.
+  let remaining = tone === "bad" ? Math.max(4_000, message.length * 70) : 4_000;
+  let startedAt = Date.now();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let pausedByPointer = false;
+  let pausedByFocus = false;
+  let dismissed = false;
+
+  const dismiss = (): void => {
+    if (dismissed) return;
+    dismissed = true;
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    node.remove();
+  };
+
+  const pause = (): void => {
+    if (dismissed || timer === null) return;
+    clearTimeout(timer);
+    timer = null;
+    remaining = Math.max(1_500, remaining - (Date.now() - startedAt));
+  };
+
+  const schedule = (): void => {
+    if (dismissed || timer !== null || pausedByPointer || pausedByFocus) return;
+    startedAt = Date.now();
+    timer = setTimeout(dismiss, remaining);
+  };
+
+  const dismissButton = h(
+    "button",
+    {
+      class: "toast__dismiss",
+      type: "button",
+      "aria-label": tr("通知を閉じる", "Dismiss notification"),
+      onClick: dismiss,
+    },
+    icon(ICON.close, 14),
+  );
+
   const node = h(
     "div",
-    { class: tone === "plain" ? "toast" : `toast toast--${tone}` },
+    {
+      class: tone === "plain" ? "toast" : `toast toast--${tone}`,
+      role: tone === "bad" ? "alert" : "status",
+      onPointerenter: () => {
+        pausedByPointer = true;
+        pause();
+      },
+      onPointerleave: () => {
+        pausedByPointer = false;
+        schedule();
+      },
+      onFocusin: () => {
+        pausedByFocus = true;
+        pause();
+      },
+      onFocusout: (event: FocusEvent) => {
+        const next = event.relatedTarget as Node | null;
+        if (next && typeof node.contains === "function" && node.contains(next)) return;
+        pausedByFocus = false;
+        schedule();
+      },
+    },
     tone === "bad" ? icon(ICON.alert, 15) : tone === "ok" ? icon(ICON.check, 15) : null,
-    text(message),
+    h("span", { class: "toast__text" }, message),
+    dismissButton,
   );
   host.append(node);
-  // A refusal is read to the end, so a long one stays longer.
-  setTimeout(() => node.remove(), tone === "bad" ? Math.max(4_000, message.length * 70) : 4_000);
+  schedule();
 }
 
 /* ------------------------------------------------------------- formatting -- */

@@ -77,6 +77,9 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
         page.get(),
         (found) => {
           if (!isCurrent()) return null;
+          if (found && typeof document !== "undefined") {
+            document.title = `${found.name} — Takoserver Console`;
+          }
           return found
             ? body(found, organizationId, page.reload, workerAction(found))
             : card(

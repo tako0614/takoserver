@@ -27,17 +27,38 @@ import {
 import { health } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, captureSelectedOrganizationScope } from "../state.ts";
-import { copyable, explain, type ModalOptions, openModal, toast } from "../ui.ts";
+import { copyable, explain, type ModalOptions, openModal, setFieldError, toast } from "../ui.ts";
+
+type JsonSpecValidation =
+  | { readonly ok: true; readonly value: Record<string, unknown> }
+  | { readonly ok: false; readonly message: string };
+
+function validateJsonSpec(input: string): JsonSpecValidation {
+  let value: unknown;
+  try {
+    value = JSON.parse(input);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      message: tr(`JSONの構文が正しくありません：${detail}`, `Invalid JSON: ${detail}`),
+    };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      ok: false,
+      message: tr(
+        "JSONオブジェクト（{ ... }）を入力してください。",
+        "Enter a JSON object ({ ... }).",
+      ),
+    };
+  }
+  return { ok: true, value: value as Record<string, unknown> };
+}
 
 function jsonSpec(text: string): Record<string, unknown> | null {
-  try {
-    const value: unknown = JSON.parse(text);
-    return value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : null;
-  } catch {
-    return null;
-  }
+  const checked = validateJsonSpec(text);
+  return checked.ok ? checked.value : null;
 }
 
 interface ResourceModal {
@@ -643,6 +664,52 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
   if (!isScopeCurrent()) return;
   let key = `console-create-${crypto.randomUUID()}`;
+  const nameError = h("div", {
+    class: "field__error",
+    id: "create-resource-name-error",
+    hidden: true,
+  });
+  const specError = h("div", {
+    class: "field__error",
+    id: "create-resource-spec-error",
+    hidden: true,
+  });
+  const specBaseDescribedBy = preset?.note ? ["create-resource-note"] : [];
+  const validateNameInline = (requireNonEmpty = false): boolean => {
+    const trimmed = name.value.trim();
+    if (trimmed === "") {
+      if (requireNonEmpty) {
+        setFieldError(
+          name,
+          nameError,
+          tr("リソース名を入力してください。", "Enter a resource name."),
+          ["create-resource-name-rule"],
+        );
+        return false;
+      }
+      setFieldError(name, nameError, null, ["create-resource-name-rule"]);
+      return true;
+    }
+    if (!RESOURCE_NAME.test(trimmed)) {
+      setFieldError(
+        name,
+        nameError,
+        tr(
+          "名前は、英数字と「.」「_」「-」で128文字までにし、先頭を英数字にしてください。",
+          "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
+        ),
+        ["create-resource-name-rule"],
+      );
+      return false;
+    }
+    setFieldError(name, nameError, null, ["create-resource-name-rule"]);
+    return true;
+  };
+  const validateSpecInline = (): JsonSpecValidation => {
+    const checked = validateJsonSpec(spec.value);
+    setFieldError(spec, specError, checked.ok ? null : checked.message, specBaseDescribedBy);
+    return checked;
+  };
   const name = h("input", {
     class: "input",
     id: "create-resource-name",
@@ -688,6 +755,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   const useStarter = (): void => {
     if (!starter) return;
     write(JSON.stringify(starter.spec, null, 2));
+    validateSpecInline();
     showDetails();
     picker?.sync();
     describeStarter();
@@ -852,8 +920,12 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
     applyStarter();
     showDetails();
   });
-  name.addEventListener("input", showDetails);
+  name.addEventListener("input", () => {
+    validateNameInline(false);
+    showDetails();
+  });
   spec.addEventListener("input", () => {
+    validateSpecInline();
     showDetails();
     picker?.sync();
     describeStarter();
@@ -887,6 +959,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           { class: "field" },
           h("label", { for: "create-resource-name" }, tr("名前", "Name")),
           name,
+          nameError,
           h(
             "small",
             { id: "create-resource-name-rule" },
@@ -908,6 +981,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           { class: "field" },
           h("label", { for: "create-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
           spec,
+          specError,
           specHint,
           artifactHint,
         ),
@@ -920,8 +994,12 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
         if (!intent) {
           const selectedForm = form.value();
           const selectedName = name.value.trim();
-          const parsed = jsonSpec(spec.value);
+          const specCheck = validateSpecInline();
+          const parsed = specCheck.ok ? specCheck.value : null;
           if (!selectedForm || !selectedName || !parsed) {
+            if (!selectedName) validateNameInline(true);
+            if (!selectedName) name.focus?.();
+            else if (!parsed) spec.focus?.();
             toast(
               tr(
                 "Formを選び、名前とJSONオブジェクトを入力してください",
@@ -932,7 +1010,8 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
             return;
           }
           // The Host's own name rule, so a refused name costs no round trip.
-          if (!RESOURCE_NAME.test(selectedName)) {
+          if (!validateNameInline(true)) {
+            name.focus?.();
             refusal.say(
               tr(
                 "名前は、英数字と「.」「_」「-」で128文字までにし、先頭を英数字にしてください。",
@@ -944,13 +1023,13 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           // A starter's empty values are the ones the Host would refuse; say which.
           const blanks = remainingBlanks(parsed);
           if (blanks.length > 0) {
-            toast(
-              tr(
-                `まだ空の値があります：${blanks.map(pathLabel).join("、")}`,
-                `Still empty: ${blanks.map(pathLabel).join(", ")}`,
-              ),
-              "bad",
+            const blankMessage = tr(
+              `まだ空の値があります：${blanks.map(pathLabel).join("、")}`,
+              `Still empty: ${blanks.map(pathLabel).join(", ")}`,
             );
+            setFieldError(spec, specError, blankMessage, specBaseDescribedBy);
+            spec.focus?.();
+            toast(blankMessage, "bad");
             return;
           }
           form.setDisabled(true);
@@ -1042,6 +1121,12 @@ export function updateResource(
   if (!isScopeCurrent()) return;
   let key = `console-update-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
+  const specError = h("div", {
+    class: "field__error",
+    id: "update-resource-spec-error",
+    hidden: true,
+  });
+  const specBaseDescribedBy = proposal ? ["update-resource-note"] : [];
   const spec = h("textarea", {
     class: "textarea",
     id: "update-resource-spec",
@@ -1053,6 +1138,11 @@ export function updateResource(
   });
   spec.value = JSON.stringify(proposal?.spec ?? resource.spec, null, 2);
   spec.rows = Math.min(12, spec.value.split("\n").length + 1);
+  const validateSpecInline = (): JsonSpecValidation => {
+    const checked = validateJsonSpec(spec.value);
+    setFieldError(spec, specError, checked.ok ? null : checked.message, specBaseDescribedBy);
+    return checked;
+  };
   const details = h("div");
   const showDetails = (): void => {
     const parsed = jsonSpec(spec.value);
@@ -1066,7 +1156,10 @@ export function updateResource(
       ),
     );
   };
-  spec.addEventListener("input", showDetails);
+  spec.addEventListener("input", () => {
+    validateSpecInline();
+    showDetails();
+  });
   showDetails();
   let intent: ResourceIntent | null = null;
   const refusal = refusalNotice();
@@ -1080,6 +1173,7 @@ export function updateResource(
         proposal ? h("div", { class: "notice", id: "update-resource-note" }, proposal.note) : null,
         h("label", { for: "update-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
         spec,
+        specError,
         requestDisclosure(details),
         refusal.element,
       ),
@@ -1087,11 +1181,13 @@ export function updateResource(
         if (!modal.isCurrent()) return;
         refusal.clear();
         if (!intent) {
-          const parsed = jsonSpec(spec.value);
-          if (!parsed) {
+          const checked = validateSpecInline();
+          if (!checked.ok) {
+            spec.focus?.();
             toast(tr("JSONオブジェクトを入力してください", "Enter a JSON object"), "bad");
             return;
           }
+          const parsed = checked.value;
           spec.disabled = true;
           showDetails();
           try {

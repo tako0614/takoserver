@@ -116,35 +116,39 @@ function attentionCard(all: readonly ResourceSummary[]): Child {
       { class: "table-scroll" },
       h(
         "table",
-        null,
+        { class: "attention-table", role: "table" },
         h(
           "thead",
-          null,
+          { role: "rowgroup" },
           h(
             "tr",
-            null,
-            h("th", null, tr("リソース", "Resource")),
-            h("th", null, tr("状態", "State")),
-            h("th", null, tr("理由", "Why")),
+            { role: "row" },
+            h("th", { role: "columnheader" }, tr("リソース", "Resource")),
+            h("th", { role: "columnheader" }, tr("状態", "State")),
+            h("th", { role: "columnheader" }, tr("理由", "Why")),
           ),
         ),
         h(
           "tbody",
-          null,
+          { role: "rowgroup" },
           ...attention.slice(0, 8).map((entry) => {
             const state = health(entry);
             return h(
               "tr",
-              null,
+              { role: "row" },
               h(
                 "td",
-                null,
+                { class: "attention-name", role: "cell" },
                 h("a", { class: "mono", ...linkProps(resourcePath(entry.uid)) }, entry.name),
               ),
-              h("td", null, badge(phaseLabel(state.phase), state.tone, true)),
               h(
                 "td",
-                { class: "dim" },
+                { role: "cell", "data-label": tr("状態", "State") },
+                badge(phaseLabel(state.phase), state.tone, true),
+              ),
+              h(
+                "td",
+                { class: "dim", role: "cell", "data-label": tr("理由", "Why") },
                 state.message ??
                   (state.stale
                     ? tr(

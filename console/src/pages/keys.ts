@@ -12,6 +12,7 @@ import {
 } from "../state.ts";
 import {
   badge,
+  bindSearchShortcut,
   card,
   copyable,
   empty,
@@ -20,6 +21,7 @@ import {
   icon,
   type ModalOptions,
   openModal,
+  setFieldError,
   toast,
   when,
   whenReady,
@@ -83,6 +85,10 @@ function rememberUnshownKey(
 export function keysPage(organizationId: string): Child {
   const isPageCurrent = captureSelectedOrganizationScope(organizationId);
   const keys = resource(() => api.apiKeys(organizationId));
+  const filter = signal("");
+  const totalCount = signal(0);
+  const matchedCount = signal(0);
+  const filterControls = createKeysFilterToolbar(filter, totalCount, matchedCount);
   // Asked once per page. An already-open dialog follows the answer without
   // replacing the person's inputs; an unreadable document never offers AI.
   const discovery = resource(() => api.hostDiscovery());
@@ -115,26 +121,36 @@ export function keysPage(organizationId: string): Child {
         ),
       ),
       h(
-        "button",
-        {
-          class: "btn",
-          type: "button",
-          onClick: () => {
-            if (isPageCurrent()) keys.reload();
+        "div",
+        { class: "toolbar" },
+        live(() => {
+          const busy = isPageCurrent() && keys.get().state === "loading";
+          const glyph = icon(ICON.refresh, 14);
+          if (busy) glyph.setAttribute("class", "icon--spin");
+          return h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              ...(busy ? { "aria-busy": "true", "aria-disabled": "true" } : {}),
+              onClick: () => {
+                if (!busy && isPageCurrent()) keys.reload();
+              },
+            },
+            glyph,
+            text(busy ? tr("更新中…", "Refreshing…") : tr("キー一覧を更新", "Refresh keys")),
+          );
+        }),
+        h(
+          "button",
+          {
+            class: "btn btn--primary",
+            type: "button",
+            onClick: () => createKey(organizationId, keys.reload, aiAvailable, v2Endpoint()),
           },
-        },
-        icon(ICON.refresh, 14),
-        text(tr("キー一覧を更新", "Refresh keys")),
-      ),
-      h(
-        "button",
-        {
-          class: "btn btn--primary",
-          type: "button",
-          onClick: () => createKey(organizationId, keys.reload, aiAvailable, v2Endpoint()),
-        },
-        icon(ICON.plus, 14),
-        text(tr("キーを作成", "Create key")),
+          icon(ICON.plus, 14),
+          text(tr("キーを作成", "Create key")),
+        ),
       ),
     ),
     live(() => {
@@ -195,76 +211,198 @@ export function keysPage(organizationId: string): Child {
     live(() =>
       whenReady(
         keys.get(),
-        ({ apiKeys }) =>
-          card(
-            null,
-            apiKeys.length === 0
-              ? empty(
-                  tr("APIキーがありません", "No keys"),
-                  tr(
-                    "curlや独自のコードから、Host API v2でこの組織のリソースを操作するためのキーを作成できます。",
-                    "Create one to manage this organization's Resources over Host API v2 with curl or your own code.",
-                  ),
-                )
-              : h("div", { class: "table-scroll" }, table(apiKeys, organizationId, keys.reload)),
-          ),
+        ({ apiKeys }) => {
+          totalCount.set(apiKeys.length);
+          if (apiKeys.length === 0) {
+            return card(
+              null,
+              empty(
+                tr("APIキーがありません", "No keys"),
+                tr(
+                  "curlや独自のコードから、Host API v2でこの組織のリソースを操作するためのキーを作成できます。",
+                  "Create one to manage this organization's Resources over Host API v2 with curl or your own code.",
+                ),
+              ),
+            );
+          }
+          return h(
+            "div",
+            { style: { display: "grid", gap: "14px" } },
+            filterControls.element,
+            card(
+              null,
+              h(
+                "div",
+                { class: "table-scroll" },
+                live(() => {
+                  const matched = matchingKeys(apiKeys, filter());
+                  matchedCount.set(matched.length);
+                  return table(
+                    matched,
+                    organizationId,
+                    keys.reload,
+                    filter() !== "" ? filterControls.clear : undefined,
+                  );
+                }),
+              ),
+            ),
+          );
+        },
         { retry: keys.reload },
       ),
     ),
   );
 }
 
-function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () => void): Child {
+function matchingKeys(apiKeys: readonly ApiKey[], query: string): readonly ApiKey[] {
+  const needle = query.trim().toLowerCase();
+  if (needle === "") return apiKeys;
+  return apiKeys.filter(
+    (key) =>
+      key.name.toLowerCase().includes(needle) ||
+      key.id.toLowerCase().includes(needle) ||
+      key.scopes.some((scope) => scope.toLowerCase().includes(needle)),
+  );
+}
+
+function createKeysFilterToolbar(
+  filter: ReturnType<typeof signal<string>>,
+  total: ReturnType<typeof signal<number>>,
+  matched: ReturnType<typeof signal<number>>,
+): { readonly element: Child; readonly clear: () => void } {
+  const input = h("input", {
+    class: "input",
+    id: "keys-filter",
+    name: "filter",
+    autocomplete: "off",
+    type: "search",
+    placeholder: tr("名前、ID、スコープで絞り込み", "Filter by name, ID, or scope"),
+    "aria-label": tr("名前、ID、スコープで絞り込み", "Filter by name, ID, or scope"),
+    value: "",
+    onInput: (event: Event) => filter.set((event.target as HTMLInputElement).value),
+  });
+  const clear = (): void => {
+    input.value = "";
+    filter.set("");
+    input.focus?.();
+  };
+  bindSearchShortcut(input, () => filter.set(""));
+  return {
+    clear,
+    element: h(
+      "div",
+      { class: "toolbar" },
+      h(
+        "div",
+        { class: "search-box" },
+        input,
+        h("kbd", { class: "kbd-hint", "aria-hidden": "true" }, "/"),
+      ),
+      live(() =>
+        filter() === ""
+          ? null
+          : [
+              h(
+                "span",
+                { class: "filter-count", role: "status" },
+                tr(`${matched()} / ${total()} 件`, `${matched()} of ${total()}`),
+              ),
+              h(
+                "button",
+                {
+                  class: "btn btn--ghost btn--sm",
+                  type: "button",
+                  "aria-label": tr("絞り込みをクリア", "Clear filter"),
+                  onClick: clear,
+                },
+                tr("クリア", "Clear"),
+              ),
+            ],
+      ),
+    ),
+  };
+}
+
+function table(
+  apiKeys: readonly ApiKey[],
+  organizationId: string,
+  reload: () => void,
+  onClearFilter?: () => void,
+): Child {
+  if (apiKeys.length === 0) {
+    return empty(
+      tr("一致するAPIキーがありません", "No matching keys"),
+      tr("この条件に一致するAPIキーはありません。", "Nothing here matches that filter."),
+      onClearFilter
+        ? h(
+            "button",
+            { class: "btn btn--sm", type: "button", onClick: onClearFilter },
+            tr("絞り込みをクリア", "Clear filter"),
+          )
+        : null,
+    );
+  }
   return h(
     "table",
-    null,
+    { class: "keys-table", role: "table" },
     h(
       "thead",
-      null,
+      { role: "rowgroup" },
       h(
         "tr",
-        null,
-        h("th", null, tr("名前", "Name")),
-        h("th", null, tr("スコープ", "Scopes")),
-        h("th", null, tr("作成日時", "Created")),
-        h("th", null, tr("有効期限", "Expires")),
-        h("th", null, ""),
+        { role: "row" },
+        h("th", { role: "columnheader" }, tr("名前", "Name")),
+        h("th", { role: "columnheader" }, tr("スコープ", "Scopes")),
+        h("th", { role: "columnheader" }, tr("作成日時", "Created")),
+        h("th", { role: "columnheader" }, tr("有効期限", "Expires")),
+        h("th", { role: "columnheader" }, ""),
       ),
     ),
     h(
       "tbody",
-      null,
+      { role: "rowgroup" },
       ...apiKeys.map((key) => {
         const expired = new Date(key.expiresAt).getTime() < Date.now();
         return h(
           "tr",
-          null,
+          { role: "row" },
           h(
             "td",
-            null,
+            { class: "keys-name", role: "cell" },
             h("div", null, key.name),
             h("div", { style: { marginTop: "3px" } }, copyable(key.id)),
           ),
           h(
             "td",
-            null,
+            { class: "keys-scopes", role: "cell", "data-label": tr("スコープ", "Scopes") },
             h(
               "div",
-              { style: { display: "flex", gap: "4px", flexWrap: "wrap" } },
+              {
+                style: {
+                  display: "flex",
+                  gap: "4px",
+                  flexWrap: "wrap",
+                  justifyContent: "flex-end",
+                },
+              },
               ...key.scopes.map((scope) => badge(scope)),
             ),
           ),
-          h("td", { class: "dim" }, when(key.createdAt)),
           h(
             "td",
-            null,
+            { class: "dim", role: "cell", "data-label": tr("作成日時", "Created") },
+            when(key.createdAt),
+          ),
+          h(
+            "td",
+            { role: "cell", "data-label": tr("有効期限", "Expires") },
             expired
               ? badge(tr("期限切れ", "expired"), "bad")
               : h("span", { class: "dim" }, when(key.expiresAt)),
           ),
           h(
             "td",
-            { style: { textAlign: "right" } },
+            { class: "keys-actions", role: "cell", style: { textAlign: "right" } },
             h(
               "button",
               {
@@ -325,12 +463,28 @@ function createKey(
 ): void {
   const isScopeCurrent = captureSelectedOrganizationScope(organizationId);
   const isSessionCurrent = captureSessionScope();
+  const nameError = h("div", {
+    class: "field__error",
+    id: "create-key-name-error",
+    hidden: true,
+  });
+  const scopesError = h("div", {
+    class: "field__error",
+    id: "create-key-scopes-error",
+    hidden: true,
+  });
   const name = h("input", {
     class: "input",
     id: "create-key-name",
     name: "name",
     placeholder: "deploy pipeline",
     autocomplete: "off",
+    "aria-describedby": "create-key-name-hint",
+    onInput: () => {
+      if (name.value.trim() !== "") {
+        setFieldError(name, nameError, null, ["create-key-name-hint"]);
+      }
+    },
   });
   const chosen = new Set<string>(DEFAULT_KEY_SCOPES);
   const aiFields: HTMLFieldSetElement[] = [];
@@ -358,9 +512,10 @@ function createKey(
         { class: "field" },
         h("label", { for: "create-key-name" }, tr("名前", "Name")),
         name,
+        nameError,
         h(
           "small",
-          null,
+          { id: "create-key-name-hint" },
           tr(
             "キーの用途を入力します。この名前は一覧だけに表示されます。",
             "What this key is for. It appears in the list and nowhere else.",
@@ -385,6 +540,13 @@ function createKey(
                 onChange: (event: Event) => {
                   if ((event.target as HTMLInputElement).checked) chosen.add(scope.id);
                   else chosen.delete(scope.id);
+                  if (chosen.size > 0) {
+                    scopesError.hidden = true;
+                    if (typeof scopesError.removeAttribute === "function") {
+                      scopesError.removeAttribute("role");
+                    }
+                    scopesError.replaceChildren();
+                  }
                 },
               });
               if (scope.id === "ai:invoke") aiBoxes.push(box);
@@ -404,6 +566,7 @@ function createKey(
           if (group.scopes.some((scope) => scope.id === "ai:invoke")) aiFields.push(field);
           return field;
         }),
+        scopesError,
         h(
           "small",
           null,
@@ -423,13 +586,25 @@ function createKey(
     onConfirm: async () => {
       if (!modal.isCurrent()) return;
       if (name.value.trim() === "") {
-        toast(tr("キー名を入力してください", "Give the key a name"), "bad");
+        const message = tr("キー名を入力してください", "Give the key a name");
+        setFieldError(name, nameError, message, ["create-key-name-hint"]);
+        name.focus?.();
+        toast(message, "bad");
         return;
       }
+      setFieldError(name, nameError, null, ["create-key-name-hint"]);
       if (chosen.size === 0) {
-        toast(tr("スコープを1つ以上選択してください", "Choose at least one scope"), "bad");
+        const message = tr("スコープを1つ以上選択してください", "Choose at least one scope");
+        scopesError.hidden = false;
+        if (typeof scopesError.setAttribute === "function")
+          scopesError.setAttribute("role", "alert");
+        scopesError.replaceChildren(text(message));
+        toast(message, "bad");
         return;
       }
+      scopesError.hidden = true;
+      if (typeof scopesError.removeAttribute === "function") scopesError.removeAttribute("role");
+      scopesError.replaceChildren();
       const requestedName = name.value.trim();
       try {
         const created = await api.createApiKey(organizationId, {
