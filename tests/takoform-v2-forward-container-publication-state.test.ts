@@ -8,6 +8,14 @@ import { CONTAINER_CONTRACT as C, V2_CONTAINER_F2_FORM } from "../src/container-
 import type { JsonObject } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
+import {
+  fixedReferencesForContainerConsumerWorkerVersion,
+  prepareContainerConsumerWorkerVersionReferences,
+} from "../src/takoform-v2/forms/container-consumer-references.ts";
+import {
+  CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL,
+  CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/container-consumer-specs.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import {
@@ -21,13 +29,22 @@ import {
   parseForwardWorkerVersionSpec,
   validateForwardWorkerVersionUpdate,
 } from "../src/takoform-v2/forms/worker-specs.ts";
-import { createV2ForwardContainerWorkerPublicationState } from "../src/takoform-v2/index.ts";
+import {
+  createV2ForwardContainerBindingReader,
+  createV2ForwardContainerWorkerPublicationState,
+} from "../src/takoform-v2/index.ts";
+import { V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_SQL } from "../src/takoform-v2/operation-generation-index.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
-import { createForwardWorkerDeploymentForm } from "../src/takoform-v2/worker-deployment-backend.ts";
+import {
+  createContainerConsumerWorkerDeploymentForm,
+  createForwardWorkerDeploymentForm,
+} from "../src/takoform-v2/worker-deployment-backend.ts";
 import {
   createV2ForwardWorkerPublicationState,
   createV2WorkerPublicationState,
+  type V2ContainerServingTarget,
+  type V2ContainerServingTargetReader,
 } from "../src/takoform-v2/worker-publication-state.ts";
 import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
@@ -38,7 +55,7 @@ const MODULE_URL = "https://artifacts.example.test/forward-container/index.js";
 const MANIFEST_URL = "https://artifacts.example.test/forward-container/manifest.json";
 const digest = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 
-function fixture() {
+function fixture(readCurrentServingTarget?: V2ContainerServingTargetReader) {
   const root = mkdtempSync(join(tmpdir(), "forward-container-publication-"));
   const path = join(root, "metadata.sqlite");
   writeMigrateSqliteFile(path);
@@ -121,16 +138,26 @@ function fixture() {
     forms: {
       [MODULE_WORKER_FORM_URL]: metadata("fixture-module", { ready: true }),
       [C.formUrl]: metadata("fixture-container", { ready: true, servingGeneration: 1 }),
+      [V2_CONTAINER_F2_FORM]: metadata("fixture-container", { ready: true, servingGeneration: 1 }),
       [WORKER_BUNDLE_FORM_URL]: bundle.form,
       [FORWARD_WORKER_VERSION_FORM_URL]: forwardVersion,
       [FORWARD_WORKER_DEPLOYMENT_FORM_URL]: createForwardWorkerDeploymentForm({
+        targetKey: TARGET,
+      }),
+      [CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL]: {
+        ...forwardVersion,
+        references: (spec) =>
+          fixedReferencesForContainerConsumerWorkerVersion(parseForwardWorkerVersionSpec(spec)),
+        prepareAdmission: prepareContainerConsumerWorkerVersionReferences,
+      },
+      [CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL]: createContainerConsumerWorkerDeploymentForm({
         targetKey: TARGET,
       }),
     },
   });
   const options = { sql, now: () => new Date(nowMs), bundleCustody };
   const old = createV2ForwardWorkerPublicationState(options);
-  const fresh = createV2ForwardContainerWorkerPublicationState(options);
+  const fresh = createV2ForwardContainerWorkerPublicationState(options, readCurrentServingTarget);
   const generic = createV2WorkerPublicationState(options);
   let serial = 0;
   async function create(form: string, name: string, spec: JsonObject, settle = true) {
@@ -181,9 +208,10 @@ function fixture() {
       }),
     ).toBe(true);
   }
-  async function graph(withContainer = true) {
+  async function graph(withContainer = true, containerForm: string = C.formUrl) {
     const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
-    const container = await create(C.formUrl, "container", {
+    const f2 = containerForm === V2_CONTAINER_F2_FORM;
+    const container = await create(containerForm, "container", {
       image: `registry.example.test/app@sha256:${"a".repeat(64)}`,
       httpPort: 8080,
       healthPath: "/health",
@@ -202,7 +230,12 @@ function fixture() {
           }
         : {}),
     };
-    const version = await create(FORWARD_WORKER_VERSION_FORM_URL, "version", versionSpec, false);
+    const version = await create(
+      f2 ? CONTAINER_CONSUMER_WORKER_VERSION_FORM_URL : FORWARD_WORKER_VERSION_FORM_URL,
+      "version",
+      versionSpec,
+      false,
+    );
     const versionExecution = await claim(version.id);
     const preVersion = await old.resolveForwardVersion({ execution: versionExecution });
     await settle(versionExecution, {
@@ -211,7 +244,7 @@ function fixture() {
       bundleVerified: true,
     });
     const deployment = await create(
-      FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+      f2 ? CONTAINER_CONSUMER_WORKER_DEPLOYMENT_FORM_URL : FORWARD_WORKER_DEPLOYMENT_FORM_URL,
       "deployment",
       {
         worker: { resourceUid: worker.resourceUid },
@@ -229,6 +262,8 @@ function fixture() {
     fresh,
     generic,
     graph,
+    engine,
+    claim,
     settle,
     setHeldAvailable(value: boolean) {
       heldAvailable = value;
@@ -307,6 +342,121 @@ test("non-Container Forward graph has the existing behavior in both constructors
     expect((await f.fresh.resolveForward({ execution: graph.deploymentExecution })).kind).toBe(
       "ready",
     );
+  } finally {
+    f.close();
+  }
+});
+
+test("selected Container serving follows the trusted cutover proof before UPDATE settles", async () => {
+  let targetUid: string | undefined;
+  let serving: V2ContainerServingTarget | null = null;
+  // Only native selection is modeled. The accepted graph, publication reader,
+  // retained public observation and operation lease use the real SQLite path.
+  const readCurrentServingTarget: V2ContainerServingTargetReader = async (scope) =>
+    scope.principal === PRINCIPAL &&
+    scope.space === SPACE &&
+    scope.targetKey === TARGET &&
+    scope.targetUid === targetUid &&
+    scope.targetFormUrl === V2_CONTAINER_F2_FORM
+      ? serving
+      : null;
+  const f = fixture(readCurrentServingTarget);
+  try {
+    await f.sql.run(V2_FORWARD_CONTAINER_OPERATION_GENERATION_INDEX_SQL);
+    const graph = await f.graph(true, V2_CONTAINER_F2_FORM);
+    targetUid = graph.container.resourceUid;
+    await f.settle(graph.deploymentExecution, {
+      ready: true,
+      active: true,
+      selectedVersions: [{ resourceUid: graph.version.resourceUid, weight: 10_000 }],
+    });
+    const input = {
+      workerUid: graph.worker.resourceUid,
+      targetKey: TARGET,
+      sourceOperationId: graph.deployment.id,
+      expectedIdentity: {
+        generation: `takoserver-v2-operation:${graph.deployment.id}`,
+        workerResourceUid: graph.worker.resourceUid,
+        hostnames: [],
+        versions: [{ workerVersionUid: graph.version.resourceUid, weight: 10_000 }],
+      },
+    };
+    const binding = createV2ForwardContainerBindingReader({
+      sql: f.sql,
+      targetKey: TARGET,
+      workerBackendId: "fixture-forward-version",
+      containerBackendId: "fixture-container",
+      authorize: async (principal, space) => principal === PRINCIPAL && space === SPACE,
+      readCurrentServingTarget,
+    });
+    const claim = {
+      principal: PRINCIPAL,
+      space: SPACE,
+      workerVersionUid: graph.version.resourceUid,
+      workerVersionGeneration: 1,
+      operationId: graph.version.id,
+      bindingName: "APP",
+      targetUid,
+    };
+    expect((await f.fresh.resolveCurrentServing(input)).kind).toBe("ready");
+    expect(await binding(claim)).toMatchObject({ targetGeneration: 1 });
+    const update = await f.engine.acceptUpdate({
+      principal: PRINCIPAL,
+      key: "selected-container-update-key",
+      uid: targetUid,
+      expectedGeneration: 1,
+      spec: { workloadRevision: "rev2" },
+    });
+    const execution = await f.claim(update.id);
+    expect((await f.fresh.resolveCurrentServing(input)).kind).toBe("unresolved");
+    expect(await binding(claim)).toBeNull();
+
+    serving = Object.freeze({
+      incarnationId: "a".repeat(64),
+      generation: 1,
+      runtimeEpoch: 1,
+      revisionOperationId: graph.container.id,
+      claimId: "b".repeat(64),
+    });
+    const old = await f.fresh.resolveCurrentServing(input);
+    if (old.kind !== "ready") throw new Error("prior confirmed Container did not stay serving");
+    expect(await binding(claim)).toMatchObject({ targetGeneration: 1, nativeServing: serving });
+    expect(await old.stillCurrent()).toBe(true);
+
+    serving = Object.freeze({
+      ...serving,
+      generation: 2,
+      runtimeEpoch: 2,
+      revisionOperationId: update.id,
+      claimId: "c".repeat(64),
+    });
+    expect(await old.stillCurrent()).toBe(false);
+    expect((await f.fresh.resolveCurrentServing(input)).kind).toBe("ready");
+    expect(await binding(claim)).toMatchObject({
+      sourceOperationId: graph.version.id,
+      targetGeneration: 1,
+      targetSourceOperationId: graph.container.id,
+      nativeServing: serving,
+    });
+    expect(await binding({ ...claim, principal: "other-owner" })).toBeNull();
+    expect(
+      await f.sql.query("SELECT observed_generation FROM tf_v2_resources WHERE uid=?", [targetUid]),
+    ).toEqual([{ observed_generation: 1 }]);
+    const originalObservation = JSON.stringify({ ready: true, servingGeneration: 1 });
+    const replaceObservation = (value: string) =>
+      f.sql.run("UPDATE tf_v2_resources SET observed_json=? WHERE uid=?", [value, claim.targetUid]);
+    await replaceObservation(JSON.stringify({ ready: true, servingGeneration: 1, drift: true }));
+    expect(await binding(claim)).toBeNull();
+    await replaceObservation(originalObservation);
+    expect(await binding(claim)).toMatchObject({ targetGeneration: 1, nativeServing: serving });
+
+    await f.settle(execution, { ready: true, servingGeneration: 2 });
+    serving = null;
+    expect((await f.fresh.resolveCurrentServing(input)).kind).toBe("ready");
+    expect(await binding(claim)).toMatchObject({
+      targetGeneration: 2,
+      targetSourceOperationId: update.id,
+    });
   } finally {
     f.close();
   }

@@ -3,6 +3,7 @@ import {
   type ObjectBucketBindingForm,
   snapshotObjectBucketBindingForms,
 } from "./object-bucket-binding-profile.ts";
+import { selfhostContainerBindingClientSource } from "./providers/selfhost-container-binding-client.ts";
 import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
   selfhostDataServiceSource,
@@ -153,6 +154,8 @@ export interface WorkerdVersionGraphInput {
     readonly bindings: readonly { readonly publicName: string }[];
   };
   readonly serviceBindings: readonly WorkerdServiceBinding[];
+  /** Exact source-issued Container facades on the private service transport. */
+  readonly ociContainerBindings?: readonly string[];
   /** Unpublished opt-in forwarding facades for exact Host-owned Actor namespaces. */
   readonly actorForward?: readonly {
     readonly publicName: string;
@@ -271,6 +274,21 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   const v2KvBinding = projectV2KvBinding(input.v2KvBinding, v2PrivateNames);
   const v2QueueProducerBinding = projectV2KvBinding(input.v2QueueProducerBinding, v2PrivateNames);
   const serviceBindings = projectServiceBindings(input.serviceBindings);
+  const containerNames = input.ociContainerBindings ?? [];
+  if (
+    !Array.isArray(containerNames) ||
+    new Set(containerNames).size !== containerNames.length ||
+    containerNames.some(
+      (name) =>
+        typeof name !== "string" || !serviceBindings.some((binding) => binding.publicName === name),
+    ) ||
+    (containerNames.length > 0 && !v2PrivateNames)
+  )
+    invalid();
+  const containerClient =
+    input.mainModule === "__takoserver-v2-private-container-client.js"
+      ? "__takoserver-v2-private-container-client-alternate.js"
+      : "__takoserver-v2-private-container-client.js";
   const actorForward = projectActorForward(input.actorForward, v2PrivateNames);
   const workflowForward = projectWorkflowForward(
     input.workflowForward,
@@ -355,7 +373,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
   };
   // The exact profile was validated against every declared bucket above.
   // An empty accepted profile introduces no forward bucket semantics.
-  const wrapperSource =
+  let wrapperSource =
     forwardObjectBucketBindings === undefined || forwardObjectBucketBindings.length === 0
       ? selfhostWorkerEntrypointSource(wrapperInput, v2PrivateNames)
       : selfhostWorkerForwardObjectBucketEntrypointSource(
@@ -363,6 +381,23 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
           v2PrivateNames,
         );
 
+  if (containerNames.length) {
+    // Keep the original application namespace validation and retained callable.
+    // Only its existing environment projector receives the closed Container
+    // client, after the original private service facade has been constructed.
+    const original = "projected[descriptor.publicName] = createServiceAdapter(rawEnv, descriptor);";
+    const cases = containerNames.map((name) => `case ${JSON.stringify(name)}:`).join("\n");
+    wrapperSource =
+      `import { makeContainerBinding as makeOciContainerBinding } from ${JSON.stringify(`./${containerClient}`)};\n` +
+      wrapperSource.replace(
+        original,
+        `switch (descriptor.publicName) {
+        ${cases}
+          projected[descriptor.publicName] = makeOciContainerBinding(createServiceAdapter(rawEnv, descriptor)); break;
+        default: ${original}
+      }`,
+      );
+  }
   const preludeModule = selfhostWorkerPreludeModuleName(input.mainModule);
   const encoder = new TextEncoder();
   const wrapperModule = v2PrivateNames
@@ -382,6 +417,9 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     [wrapperModule, encoder.encode(wrapperSource)],
     [preludeModule, encoder.encode(selfhostWorkerPreludeSource())],
   ]);
+  if (containerNames.length) {
+    hostModules.set(containerClient, encoder.encode(selfhostContainerBindingClientSource()));
+  }
   if (v2ObjectBucketBinding !== undefined) {
     hostModules.set(
       SELFHOST_V2_OBJECT_BUCKET_DATA_SERVICE_MODULE,
@@ -464,6 +502,7 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     hostEntrypoint,
     hostModules: [
       preludeModule,
+      ...(containerNames.length ? [containerClient] : []),
       ...(actorForward === undefined && workflowForward === undefined ? [] : [wrapperModule]),
       ...(actorForward === undefined ? [] : [SELFHOST_ACTOR_FORWARD_RUNTIME_MODULE]),
       ...(workflowForward === undefined

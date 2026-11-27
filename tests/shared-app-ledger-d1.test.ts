@@ -1,8 +1,12 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Miniflare } from "miniflare";
 import {
   planSharedAppLegacyAdoption,
   type SharedAppAssignment,
+  SharedAppLedgerError,
   type SharedAppLegacyProjection,
   type SharedAppPin,
 } from "../src/shared-app-ledger.ts";
@@ -14,36 +18,52 @@ const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1_000; // A refusal boundary, not a reus
 const SERVER = { organizationId: "org-server", product: "takoserver" as const };
 const HOSTED = { organizationId: "org-hosted", product: "takosumi-hosted" as const };
 
-async function harness(options: { unpublishedRelease?: boolean } = {}) {
+async function harness(options: { unpublishedRelease?: boolean; persistencePath?: string } = {}) {
   const id = `shared-app-${crypto.randomUUID()}`;
-  const runtime = new Miniflare({
-    workers: [
-      {
-        config: {
-          name: id,
-          type: "worker",
-          compatibilityDate: "2026-08-17",
-          manifest: {
-            mainModule: "worker.js",
-            modules: {
-              "worker.js": {
-                type: "esm",
-                contents: "export default { fetch() { return new Response('ok'); } };",
+  const createRuntime = () =>
+    new Miniflare({
+      ...(options.persistencePath === undefined
+        ? {}
+        : { cf: false, resourcePersistencePath: options.persistencePath }),
+      workers: [
+        {
+          config: {
+            name: id,
+            type: "worker",
+            compatibilityDate: "2026-08-17",
+            manifest: {
+              mainModule: "worker.js",
+              modules: {
+                "worker.js": {
+                  type: "esm",
+                  contents: "export default { fetch() { return new Response('ok'); } };",
+                },
               },
             },
+            env: { STATE_DB: { type: "d1", id } },
+            triggers: [],
           },
-          env: { STATE_DB: { type: "d1", id } },
-          triggers: [],
         },
-      },
-    ],
-  });
-  const database = await runtime.getD1Database("STATE_DB");
-  const sql = createD1Sql(database);
-  // UNALLOCATED TEST-ONLY DDL: this is not a migration number, writer or live schema.
-  for (const realm of ["staging", "production"]) {
-    const prefix = `shared_app_${realm}`;
-    await sql.run(`CREATE TABLE ${prefix}_assignments (
+      ],
+    });
+  let runtime = createRuntime();
+  let disposal: Promise<void> | undefined;
+  const close = () => (disposal ??= runtime.dispose());
+  const disposeAfterFailure = async (error: unknown): Promise<never> => {
+    try {
+      await close();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "fixture setup and cleanup failed");
+    }
+    throw error;
+  };
+  try {
+    let database = await runtime.getD1Database("STATE_DB");
+    let sql = createD1Sql(database);
+    // UNALLOCATED TEST-ONLY DDL: this is not a migration number, writer or live schema.
+    for (const realm of ["staging", "production"]) {
+      const prefix = `shared_app_${realm}`;
+      await sql.run(`CREATE TABLE ${prefix}_assignments (
       incarnation TEXT PRIMARY KEY CHECK (length(incarnation) = 32 AND incarnation NOT GLOB '*[^0-9a-f]*'),
       name TEXT NOT NULL CHECK (length(name) BETWEEN 3 AND 32 AND name NOT GLOB '*[^a-z0-9-]*'),
       organization_id TEXT NOT NULL, product TEXT NOT NULL CHECK (product IN ('takoserver', 'takosumi-hosted')),
@@ -55,7 +75,7 @@ async function harness(options: { unpublishedRelease?: boolean } = {}) {
       CHECK (released_at IS NULL OR released_at >= created_at),
       CHECK (state <> 'reserved' OR script IS NULL), CHECK (state <> 'active' OR script IS NOT NULL)
     )`);
-    await sql.run(`CREATE TABLE ${prefix}_names (
+      await sql.run(`CREATE TABLE ${prefix}_names (
       normalized_name TEXT PRIMARY KEY CHECK (length(normalized_name) BETWEEN 3 AND 32
         AND normalized_name NOT GLOB '*[^a-z0-9-]*'),
       incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
@@ -64,14 +84,14 @@ async function harness(options: { unpublishedRelease?: boolean } = {}) {
       released_at INTEGER, updated_at INTEGER NOT NULL,
       CHECK ((state = 'released') = (released_at IS NOT NULL))
     )`);
-  }
-  if (options.unpublishedRelease) {
-    // Opt-in UNALLOCATED typed fixture; keep every old-schema test unchanged.
-    for (const realm of ["staging", "production"]) {
-      const prefix = `shared_app_${realm}`;
-      await sql.run(`ALTER TABLE ${prefix}_assignments ADD COLUMN binding_kind TEXT`);
-      await sql.run(`ALTER TABLE ${prefix}_assignments ADD COLUMN binding_json TEXT`);
-      await sql.run(`CREATE TABLE ${prefix}_route_commands (
+    }
+    if (options.unpublishedRelease) {
+      // Opt-in UNALLOCATED typed fixture; keep every old-schema test unchanged.
+      for (const realm of ["staging", "production"]) {
+        const prefix = `shared_app_${realm}`;
+        await sql.run(`ALTER TABLE ${prefix}_assignments ADD COLUMN binding_kind TEXT`);
+        await sql.run(`ALTER TABLE ${prefix}_assignments ADD COLUMN binding_json TEXT`);
+        await sql.run(`CREATE TABLE ${prefix}_route_commands (
         organization_id TEXT NOT NULL,product TEXT NOT NULL,reservation_id TEXT NOT NULL,name TEXT NOT NULL,
         incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
         action TEXT NOT NULL CHECK(action IN ('activate','advance','retire')),command_ref TEXT NOT NULL,
@@ -82,92 +102,120 @@ async function harness(options: { unpublishedRelease?: boolean } = {}) {
         created_at INTEGER NOT NULL,form_v2_original_json TEXT,
         PRIMARY KEY(organization_id,command_ref),UNIQUE(incarnation,next_generation),
         CHECK(next_generation=prior_generation+1),CHECK(next_generation BETWEEN 2 AND 9007199254740990))`);
-      await sql.run(`CREATE TABLE ${prefix}_batch_assertions (witness TEXT PRIMARY KEY,
+        await sql.run(`CREATE TABLE ${prefix}_batch_assertions (witness TEXT PRIMARY KEY,
         ok INTEGER NOT NULL CHECK(ok=1),apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
-    }
-    // This is deliberately an owner-like metadata constraint, not the HTTP carrier schema.
-    // Actual carrier/Engine qualification belongs to the authenticated composition suite.
-    await sql.run(`CREATE TABLE cancellation_metadata_fixture (
+      }
+      // This is deliberately an owner-like metadata constraint, not the HTTP carrier schema.
+      // Actual carrier/Engine qualification belongs to the authenticated composition suite.
+      await sql.run(`CREATE TABLE cancellation_metadata_fixture (
       incarnation TEXT PRIMARY KEY REFERENCES shared_app_staging_assignments(incarnation),
       state TEXT NOT NULL CHECK(state IN ('prepared','released')),released_at INTEGER,
       CHECK((state='released')=(released_at IS NOT NULL)))`);
-  }
-  let now = START;
-  const sessions: string[] = [];
-  let loseNextAck = false;
-  let hideNextCommittedRead = false;
-  let blockReads = false;
-  const binding: SharedAppPrimaryD1 = {
-    withSession(constraint) {
-      sessions.push(constraint);
-      const session = database.withSession(constraint);
-      const statementMap = new WeakMap<object, ReturnType<typeof session.prepare>>();
-      const wrap = (
-        native: ReturnType<typeof session.prepare>,
-      ): ReturnType<D1DatabaseLike["prepare"]> => {
-        const statement = {
-          bind(...values: Parameters<typeof native.bind>) {
-            return wrap(native.bind(...values));
-          },
-          async all() {
-            if (blockReads) throw new Error("injected lost read transport");
-            return await native.all();
+    }
+    let now = START;
+    const sessions: string[] = [];
+    let loseNextAck = false;
+    let hideNextCommittedRead = false;
+    let blockReads = false;
+    const binding: SharedAppPrimaryD1 = {
+      withSession(constraint) {
+        sessions.push(constraint);
+        const session = database.withSession(constraint);
+        const statementMap = new WeakMap<object, ReturnType<typeof session.prepare>>();
+        const wrap = (
+          native: ReturnType<typeof session.prepare>,
+        ): ReturnType<D1DatabaseLike["prepare"]> => {
+          const statement = {
+            bind(...values: Parameters<typeof native.bind>) {
+              return wrap(native.bind(...values));
+            },
+            async all() {
+              if (blockReads) throw new Error("injected lost read transport");
+              return await native.all();
+            },
+          };
+          statementMap.set(statement, native);
+          return statement;
+        };
+        return {
+          prepare: (query) => wrap(session.prepare(query)),
+          async batch(statements) {
+            const native = statements.map((statement) => {
+              const value = statementMap.get(statement);
+              if (!value) throw new Error("foreign test statement");
+              return value;
+            });
+            const result = await session.batch<Record<string, unknown>>(native);
+            if (hideNextCommittedRead) {
+              hideNextCommittedRead = false;
+              blockReads = true;
+            }
+            if (loseNextAck) {
+              loseNextAck = false;
+              blockReads = true;
+              throw new Error("injected lost batch ACK after native commit");
+            }
+            return result;
           },
         };
-        statementMap.set(statement, native);
-        return statement;
-      };
-      return {
-        prepare: (query) => wrap(session.prepare(query)),
-        async batch(statements) {
-          const native = statements.map((statement) => {
-            const value = statementMap.get(statement);
-            if (!value) throw new Error("foreign test statement");
-            return value;
-          });
-          const result = await session.batch<Record<string, unknown>>(native);
-          if (hideNextCommittedRead) {
-            hideNextCommittedRead = false;
-            blockReads = true;
-          }
-          if (loseNextAck) {
-            loseNextAck = false;
-            blockReads = true;
-            throw new Error("injected lost batch ACK after native commit");
-          }
-          return result;
-        },
-      };
-    },
-  };
-  const ledger = createSharedAppLedgerD1({
-    database: binding,
-    environment: "staging",
-    clock: () => new Date(now),
-  });
-  return {
-    sql,
-    database,
-    binding,
-    ledger,
-    sessions,
-    close: () => runtime.dispose(),
-    setNow(value: number) {
-      now = value;
-    },
-    loseAck() {
-      loseNextAck = true;
-    },
-    hideReadAfterCommit() {
-      hideNextCommittedRead = true;
-    },
-    restoreReads() {
-      blockReads = false;
-    },
-    blockReads() {
-      blockReads = true;
-    },
-  };
+      },
+    };
+    const createLedger = () =>
+      createSharedAppLedgerD1({
+        database: binding,
+        environment: "staging",
+        clock: () => new Date(now),
+      });
+    let ledger = createLedger();
+    return {
+      get sql() {
+        return sql;
+      },
+      get database() {
+        return database;
+      },
+      binding,
+      get ledger() {
+        return ledger;
+      },
+      sessions,
+      close,
+      async restart() {
+        if (options.persistencePath === undefined)
+          throw new Error("restart needs persisted fixture");
+        await close();
+        runtime = createRuntime();
+        disposal = undefined;
+        try {
+          database = await runtime.getD1Database("STATE_DB");
+          sql = createD1Sql(database);
+          loseNextAck = false;
+          hideNextCommittedRead = false;
+          blockReads = false;
+          ledger = createLedger();
+        } catch (error) {
+          return await disposeAfterFailure(error);
+        }
+      },
+      setNow(value: number) {
+        now = value;
+      },
+      loseAck() {
+        loseNextAck = true;
+      },
+      hideReadAfterCommit() {
+        hideNextCommittedRead = true;
+      },
+      restoreReads() {
+        blockReads = false;
+      },
+      blockReads() {
+        blockReads = true;
+      },
+    };
+  } catch (error) {
+    return await disposeAfterFailure(error);
+  }
 }
 
 function cancellationBatch(
@@ -656,6 +704,130 @@ test("native committed lost ACK retains original command and replays after recon
     });
   } finally {
     await h.close();
+  }
+});
+
+test("native runtime restart retains lost ACK originals and permanent retirement", async () => {
+  // A fresh local Workerd/D1 handle, not just a new JS ledger. No OS crash or live D1 claim.
+  const root = mkdtempSync(join(tmpdir(), "shared-app-native-restart-"));
+  let h: Awaited<ReturnType<typeof harness>> | undefined;
+  try {
+    h = await harness({ persistencePath: root });
+    const reserve = { reservationId: "restart-original", name: "restart-original" };
+    h.loseAck();
+    const reserveFailure = await h.ledger
+      .forTrustedOwner(SERVER)
+      .reserve(reserve)
+      .catch((error: unknown) => error);
+    expect(reserveFailure).toMatchObject({
+      code: "indeterminate",
+      original: { ...SERVER, ...reserve },
+    });
+    if (
+      !(reserveFailure instanceof SharedAppLedgerError) ||
+      reserveFailure.original?.action !== "reserve"
+    ) {
+      throw new Error("reserve lost ACK did not retain its original command");
+    }
+    const firstDatabase = h.database;
+    const firstLedger = h.ledger;
+    await h.restart();
+    expect(h.database).not.toBe(firstDatabase);
+    expect(h.ledger).not.toBe(firstLedger);
+    const reservedOwner = h.ledger.forTrustedOwner(SERVER);
+    const reserved = await reservedOwner.readOriginal(reserve.reservationId);
+    if (!reserved) throw new Error("persisted reservation missing after runtime restart");
+    expect(reserved).toMatchObject({
+      ...SERVER,
+      ...reserve,
+      incarnation: reserveFailure.original.incarnation,
+      state: "reserved",
+      generation: 1,
+    });
+    expect(await reservedOwner.reserve(reserveFailure.original)).toEqual(reserved);
+    await expect(
+      reservedOwner.reserve({ ...reserve, name: "changed-original" }),
+    ).rejects.toMatchObject({ code: "conflict" });
+
+    h.loseAck();
+    await expect(reservedOwner.activate(reserved, "persisted-script")).rejects.toMatchObject({
+      code: "indeterminate",
+      original: {
+        ...SERVER,
+        ...reserve,
+        action: "activate",
+        incarnation: reserved.incarnation,
+        expectedGeneration: reserved.generation,
+        acceptedScript: "persisted-script",
+      },
+    });
+    await h.restart();
+    const activeOwner = h.ledger.forTrustedOwner(SERVER);
+    const active = await activeOwner.readOriginal(reserve.reservationId);
+    if (!active) throw new Error("persisted activation missing after runtime restart");
+    expect(active).toMatchObject({
+      ...reserved,
+      state: "active",
+      script: "persisted-script",
+      generation: reserved.generation + 1,
+    });
+    expect(await activeOwner.activate(reserved, "persisted-script")).toEqual(active);
+    await expect(activeOwner.activate(reserved, "changed-script")).rejects.toMatchObject({
+      code: "conflict",
+    });
+
+    h.loseAck();
+    await expect(activeOwner.release(active)).rejects.toMatchObject({
+      code: "indeterminate",
+      original: {
+        ...SERVER,
+        ...reserve,
+        action: "release",
+        incarnation: active.incarnation,
+        expectedGeneration: active.generation,
+      },
+    });
+    h.setNow(START + THIRTY_DAYS * 2);
+    await h.restart();
+    const retiredOwner = h.ledger.forTrustedOwner(SERVER);
+    const retired = await retiredOwner.readOriginal(reserve.reservationId);
+    if (!retired) throw new Error("persisted retirement missing after runtime restart");
+    expect(retired).toMatchObject({
+      ...active,
+      state: "released",
+      generation: active.generation + 1,
+      releasedAt: START,
+    });
+    expect(await retiredOwner.release(active)).toEqual(retired);
+    expect(await retiredOwner.readOriginal(reserve.reservationId)).toEqual(retired);
+    expect(await h.ledger.forTrustedOwner(HOSTED).readOriginal(reserve.reservationId)).toBeNull();
+    for (const owner of [SERVER, HOSTED]) {
+      await expect(
+        h.ledger.forTrustedOwner(owner).reserve({ ...reserve, reservationId: "replacement" }),
+      ).rejects.toMatchObject({ code: "conflict" });
+    }
+    expect(await h.ledger.readCurrent(reserve.name)).toBeNull();
+    expect(await h.sql.query("SELECT COUNT(*) AS n FROM shared_app_staging_assignments")).toEqual([
+      { n: 1 },
+    ]);
+    expect(
+      await h.sql.query(
+        "SELECT incarnation,generation,state,released_at FROM shared_app_staging_names",
+      ),
+    ).toEqual([
+      {
+        incarnation: retired.incarnation,
+        generation: retired.generation,
+        state: "released",
+        released_at: START,
+      },
+    ]);
+    expect(h.sessions.every((constraint) => constraint === "first-primary")).toBe(true);
+  } finally {
+    if (h) {
+      await h.close();
+      rmSync(root, { recursive: true });
+    }
   }
 });
 

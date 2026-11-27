@@ -1,4 +1,8 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import type {
+  V2SqliteBindingGrant,
+  V2SqliteSelectedVersionObserver,
+} from "../sqlite-binding-authority-types.ts";
 import { parseStrictJson } from "../strict-json.ts";
 import type {
   V2WorkerInvocationHandle,
@@ -32,23 +36,10 @@ const UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const BINDING = /^[A-Za-z_$][A-Za-z0-9_$]{0,63}$/u;
 type ErrorCode = "sql_error" | "numeric_out_of_range" | "busy" | "backend_unavailable";
 
-/** Host-issued, immutable selected-Version identity. DB generation is deliberately absent. */
-export interface V2SqliteBindingGrant {
-  readonly principal: string;
-  readonly space: string;
-  readonly targetKey: string;
-  readonly workerUid: string;
-  readonly workerVersionUid: string;
-  readonly nativeVersionId: string;
-  readonly incarnationId: string;
-  readonly servingSourceOperationId: string;
-  readonly bindings: readonly { readonly name: string; readonly resourceUid: string }[];
-  /** Host-private WfP selection; absent from the existing self-host grant. */
-  readonly invocation?: {
-    readonly handle: V2WorkerInvocationHandle;
-    readonly expected: V2WorkerInvocationRetirementIdentity;
-  };
-}
+export type {
+  V2SqliteBindingGrant,
+  V2SqliteSelectedVersionObservation,
+} from "../sqlite-binding-authority-types.ts";
 
 export interface V2SqliteInvocationAuthority {
   /** Fixed D1 read of the exact existing custody row, not an arbitrary query. */
@@ -62,15 +53,6 @@ export interface V2SqliteInvocationAuthority {
   confirmSQLiteDrained(input: V2WorkerSQLiteDrainInput): Promise<boolean>;
 }
 
-export interface V2SqliteSelectedVersionObservation {
-  readonly kind: "confirmed";
-  readonly workerUid: string;
-  readonly versionId: string;
-  readonly incarnationId: string;
-  readonly servingSourceOperationId: string;
-  readonly status: "active" | "draining";
-}
-
 export interface V2SqliteBindingBrokerOptions {
   readonly store: SelfhostV2SQLiteStore;
   /** Existing operator-private real directory; never chosen by a Worker. */
@@ -78,12 +60,7 @@ export interface V2SqliteBindingBrokerOptions {
   /** A Host-private persistent key; never project it into a Worker service. */
   readonly signingKey: Uint8Array;
   /** Native owner readback, not a caller-supplied process-map assertion. */
-  readonly observeVersionTarget: (input: {
-    readonly workerUid: string;
-    readonly versionId: string;
-    readonly incarnationId: string;
-    readonly servingSourceOperationId: string;
-  }) => Promise<V2SqliteSelectedVersionObservation | { readonly kind: "unknown" }>;
+  readonly observeVersionTarget: V2SqliteSelectedVersionObserver;
   /** Core/current-publication proof mapping the accepted Version UID to native ID. */
   readonly graphStillCurrent: (grant: V2SqliteBindingGrant) => Promise<boolean>;
   /** Core-owned current settled Version-reference and database vector. */

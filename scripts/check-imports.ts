@@ -378,9 +378,17 @@ const LAYERS: readonly Layer[] = [
     ],
   },
   {
+    // Code-selected action restrictions carry contracts, never native adapters
+    // or Form construction. Only the explicit entry/application/engine callers
+    // below may consume this exact policy module.
+    name: "v2-retained-execution",
+    match: /^src\/takoform-v2\/retained-execution\.ts$/u,
+    may: ["v2-contract"],
+  },
+  {
     name: "v2-engine",
     match: /^src\/takoform-v2\/engine\.ts$/u,
-    may: ["core", "v2-contract", "v2-private", "v2-state"],
+    may: ["core", "v2-contract", "v2-private", "v2-state", "v2-retained-execution"],
   },
   {
     name: "v2-http",
@@ -418,6 +426,7 @@ const LAYERS: readonly Layer[] = [
       "v2-contract",
       "v2-private",
       "v2-config",
+      "v2-retained-execution",
       "v2-accounts",
       "v2-form",
       "v2-host",
@@ -555,11 +564,49 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|object-bucket-binding-profile|cron|selfhost-socket-layout|error-envelope|route-table|request-authorization|request-body|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|sqlite-migration-policy|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|object-bucket-binding-profile|cron|selfhost-socket-layout|error-envelope|route-table|request-authorization|request-body|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|sqlite-binding-authority-types|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|sqlite-migration-policy|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
     may: ["core", "release-data"],
+  },
+  {
+    // Node selects a concrete Docker or OCI owner from Host configuration.
+    name: "selfhost-linux-container-node-selection",
+    match: /^src\/selfhost-linux-(?:container|docker)-node-selection\.ts$/u,
+    may: ["adapter", "selfhost-linux-container-node-selection"],
+  },
+  {
+    // Only the Node composition joins Forms with the selected native owner.
+    name: "selfhost-linux-container-node-composition",
+    match: /^src\/selfhost-linux-container-node-composition\.ts$/u,
+    may: [
+      "core",
+      "app",
+      "adapter",
+      "selfhost-linux-container-node-selection",
+      "selfhost-linux-oci-binding-composition",
+      "v2-application",
+      "v2-contract",
+      "v2-private",
+      "v2-runtime",
+    ],
+  },
+  {
+    name: "selfhost-linux-docker-node-composition",
+    match: /^src\/selfhost-linux-docker-node-composition\.ts$/u,
+    may: ["core", "adapter", "selfhost-linux-container-node-composition"],
+  },
+  {
+    // The exact broker joins accepted binding reads with the original owner.
+    name: "selfhost-linux-oci-binding-composition",
+    match: /^src\/providers\/linux-oci-container-binding-broker\.ts$/u,
+    may: ["core", "adapter"],
+  },
+  {
+    name: "adapter",
+    match: /^src\/selfhost-linux-(?:docker|oci)-(?:core|container-backend)\.ts$/u,
+    may: ["core", "adapter", "native-contract"],
   },
   {
     name: "adapter",
@@ -873,7 +920,11 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     source: "src/takoform-v2/configured-private-inputs.ts",
     target: "src/takoform-v2/configured-update-inputs-schema.ts",
     typeOnly: false,
-    names: ["v2ConfiguredUpdateDiscardObjects", "v2ConfiguredUpdateDiscardSchema"],
+    names: [
+      "v2ConfiguredUpdateDiscardObjects",
+      "v2ConfiguredUpdateDiscardSchema",
+      "v2FinalDeleteConfiguredUpdateDiscardSchema",
+    ],
   },
   {
     source: "src/takoform-v2/worker-invocation-custody.ts",
@@ -891,7 +942,152 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     source: "src/takoform-v2/forward-container-binding-authority.ts",
     target: "src/takoform-v2/worker-publication-state.ts",
     typeOnly: false,
-    names: ["MAX_FAILED_TAIL"],
+    names: [
+      "MAX_FAILED_TAIL",
+      "type V2ContainerServingTarget",
+      "type V2ContainerServingTargetReader",
+    ],
+  },
+  {
+    source: "src/entry-bun.ts",
+    target: "src/selfhost-linux-container-node-composition.ts",
+    typeOnly: false,
+    names: [
+      "assertSelfhostLinuxContainerNodeSchema",
+      "captureSelfhostLinuxContainerFormRegistration",
+      "captureSelfhostLinuxContainerRetainedExecutionActions",
+      "createSelfhostLinuxContainerNodeComposition",
+      "type SelfhostLinuxContainerFormRegistration",
+      "type SelfhostLinuxContainerRetainedExecutionActions",
+    ],
+  },
+  {
+    source: "src/entry-bun.ts",
+    target: "src/selfhost-linux-container-node-selection.ts",
+    typeOnly: false,
+    names: [
+      "createSelfhostLinuxContainerNodeSelection",
+      "type SelfhostLinuxContainerNodeSelectionSource",
+    ],
+  },
+  {
+    // Node composition preflights the selected owner's exact schema before startup.
+    source: "src/selfhost-linux-container-node-composition.ts",
+    target: "src/takoform-v2/container-owner-schema.ts",
+    typeOnly: false,
+    names: [
+      "inspectV2ContainerOwnerApplicationSuccessorSchema",
+      "inspectV2ContainerOwnerShutdownIoSchema",
+    ],
+  },
+  {
+    // The tracked owner checks the close slot before detaching its original parent.
+    source: "src/providers/linux-oci-owned-bundle.ts",
+    target: "src/takoform-v2/container-owner-schema.ts",
+    typeOnly: false,
+    names: ["inspectV2ContainerOwnerShutdownIoSchema"],
+  },
+  {
+    source: "src/providers/linux-oci-physical-session.ts",
+    target: "src/takoform-v2/private-inputs.ts",
+    typeOnly: true,
+    names: ["V2PrivateInputKey"],
+  },
+  {
+    source: "src/providers/linux-oci-owned-bundle.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2BackendResult", "V2Execution", "V2Form"],
+  },
+  {
+    source: "src/providers/linux-oci-http-health.ts",
+    target: "src/takoform-v2/forms/container.ts",
+    typeOnly: false,
+    names: ["isContainerHealthPath"],
+  },
+  {
+    source: "src/providers/linux-oci-container-binding-broker.ts",
+    target: "src/takoform-v2/forward-container-binding-authority.ts",
+    typeOnly: false,
+    names: ["createV2ForwardContainerBindingReader", "type V2ForwardContainerBindingClaim"],
+  },
+  {
+    source: "src/selfhost-v2-worker-composition.ts",
+    target: "src/providers/linux-oci-container-binding-broker.ts",
+    typeOnly: true,
+    names: ["LinuxOciContainerBindingSource"],
+  },
+  {
+    source: "src/takoform-v2/worker-lifecycle-backend.ts",
+    target: "src/providers/linux-oci-container-binding-broker.ts",
+    typeOnly: true,
+    names: ["LinuxOciContainerBindingSource"],
+  },
+  {
+    source: "src/takoform-v2/worker-static-publication.ts",
+    target: "src/providers/linux-oci-container-binding-broker.ts",
+    typeOnly: true,
+    names: ["LinuxOciWorkerdContainerClaim"],
+  },
+  {
+    source: "src/workerd-worker-runtime-owner.ts",
+    target: "src/providers/linux-oci-container-binding-broker.ts",
+    typeOnly: true,
+    names: ["LinuxOciContainerBindingSource", "LinuxOciWorkerdContainerClaim"],
+  },
+  {
+    source: "src/selfhost-linux-docker-core.ts",
+    target: "src/takoform-v2/host-acceptance.ts",
+    typeOnly: true,
+    names: ["V2HostAcceptance"],
+  },
+  {
+    source: "src/selfhost-linux-docker-core.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Execution"],
+  },
+  {
+    source: "src/selfhost-linux-docker-container-backend.ts",
+    target: "src/takoform-v2/host-acceptance.ts",
+    typeOnly: true,
+    names: ["V2HostAcceptance"],
+  },
+  {
+    source: "src/selfhost-linux-docker-container-backend.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2BackendResult", "V2Execution", "V2Form"],
+  },
+  {
+    source: "src/selfhost-linux-container-node-selection.ts",
+    target: "src/runtime-input-seal-keyring.ts",
+    typeOnly: true,
+    names: ["RuntimeInputSealKeyRing"],
+  },
+  {
+    source: "src/selfhost-linux-docker-node-selection.ts",
+    target: "src/runtime-input-seal-keyring.ts",
+    typeOnly: true,
+    names: ["RuntimeInputSealKeyRing"],
+  },
+  {
+    source: "src/selfhost-linux-docker-node-composition.ts",
+    target: "src/takoform-v2/application.ts",
+    typeOnly: true,
+    names: ["V2OperatorFormSelectionFactory"],
+  },
+  {
+    source: "src/selfhost-linux-docker-node-composition.ts",
+    target: "src/takoform-v2/private-inputs.ts",
+    typeOnly: true,
+    names: ["V2PrivateInputCustody"],
+  },
+  {
+    source: "src/selfhost-linux-docker-node-composition.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Action"],
   },
   {
     source: "src/providers/selfhost-container-entry-contract.ts",
@@ -943,16 +1139,27 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
     source: "src/providers/docker-container-core-owner.ts",
     target: "src/takoform-v2/configured-private-inputs.ts",
     typeOnly: false,
-    names: ["readV2ConfiguredPrivateInputs"],
+    names: [
+      "createV2FinalDeleteConfiguredUpdateDiscard",
+      "readV2ConfiguredPrivateInputs",
+      "v2FinalDeleteConfiguredUpdateSchemaFence",
+    ],
   },
   {
     source: "src/providers/docker-container-core-owner.ts",
     target: "src/takoform-v2/container-owner-schema.ts",
     typeOnly: false,
     names: [
+      "createNativeOciContainerHostAcceptance",
       "createV2ContainerHostAcceptance",
+      "inspectV2ContainerOwnerHistoricalDeleteSchema",
+      "inspectV2ContainerOwnerSelectedSchema",
+      "inspectV2ContainerOwnerShutdownIoSchema",
       "serializeV2ContainerConfiguredPrivateInputs",
+      "V2_CONTAINER_APPLICATION_IO_RESERVED",
+      "V2_CONTAINER_CONTROL_RESERVED",
       "V2_CONTAINER_F2_FORM",
+      "V2_CONTAINER_OWNER_APPLICATION_SUCCESSOR_EXPAND",
       "validateV2ContainerF2SensitiveNames",
     ],
   },
@@ -1132,6 +1339,8 @@ for (const path of walk("src")) {
       violations.push(`${path} (${layer.name}) imports unclassified module ${target}`);
       continue;
     }
+    const exactRetainedExecutionEntryEdge =
+      path === "src/entry-worker.ts" && target === "src/takoform-v2/retained-execution.ts";
     const exactHostAcceptanceEdge =
       target === "src/takoform-v2/host-acceptance.ts" &&
       [
@@ -1273,6 +1482,7 @@ for (const path of walk("src")) {
         );
     if (
       !layer.may.includes(targetLayer.name) &&
+      !exactRetainedExecutionEntryEdge &&
       !exactHostAcceptanceEdge &&
       !exactHostAcceptanceCompositionTypeEdge(path, target) &&
       !exactContainerHostAcceptanceEdge &&
@@ -1346,6 +1556,16 @@ const HOST_ONLY = [
   "src/selfhost-workflow-serving.ts",
   "src/selfhost-workflow-http-transport.ts",
   "src/providers/docker-http-revision.ts",
+  "src/selfhost-linux-container-node-composition.ts",
+  "src/selfhost-linux-container-node-selection.ts",
+  "src/selfhost-linux-docker-container-backend.ts",
+  "src/selfhost-linux-docker-core.ts",
+  "src/selfhost-linux-docker-node-composition.ts",
+  "src/selfhost-linux-docker-node-selection.ts",
+  "src/selfhost-linux-oci-container-backend.ts",
+  "src/selfhost-linux-oci-core.ts",
+  "src/providers/linux-oci-physical-session.ts",
+  "src/providers/linux-oci-http-health.ts",
   // Applies native Linux network namespace/firewall policy, outside Workers.
   "src/providers/linux-container-egress.ts",
   "src/providers/selfhost-container-lifecycle.ts",

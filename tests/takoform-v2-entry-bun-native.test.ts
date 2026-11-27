@@ -323,14 +323,23 @@ async function waitForNativeQueueReceipt(
   try {
     const deadline = Date.now() + 20_000;
     while (Date.now() < deadline) {
-      const row = database
-        .query(
-          `SELECT receipt.state AS receipt_state, execution.state AS execution_state
-           FROM queue_v2_batch_settlements receipt
-           JOIN queue_v2_batch_executions execution ON execution.batch_id = receipt.batch_id
-           WHERE receipt.message_id = ?`,
-        )
-        .get(messageId) as Json | null;
+      let row: Json | null;
+      try {
+        row = database
+          .query(
+            `SELECT receipt.state AS receipt_state, execution.state AS execution_state
+             FROM queue_v2_batch_settlements receipt
+             JOIN queue_v2_batch_executions execution ON execution.batch_id = receipt.batch_id
+             WHERE receipt.message_id = ?`,
+          )
+          .get(messageId) as Json | null;
+      } catch (error) {
+        if (error && typeof error === "object" && "code" in error && error.code === "SQLITE_BUSY") {
+          await Bun.sleep(20);
+          continue;
+        }
+        throw error;
+      }
       if (row?.receipt_state === "settled" && row.execution_state === executionState) return;
       await Bun.sleep(20);
     }

@@ -10,8 +10,12 @@ import { createSelfhostContainerBindingBroker } from "./selfhost-container-bindi
 export async function openSelfhostContainerBindingSocket(
   options: Parameters<typeof createSelfhostContainerBindingBroker>[0] & {
     readonly directory: string;
+    readonly socketName?: string;
   },
 ) {
+  const socketName = options.socketName;
+  if (socketName !== undefined && !/^[0-9a-f]{64}\.sock$/u.test(socketName))
+    throw new TypeError("private broker basename required");
   const directory = await realpath(options.directory);
   const metadata = await lstat(options.directory);
   if (
@@ -22,60 +26,93 @@ export async function openSelfhostContainerBindingSocket(
     metadata.uid !== process.getuid?.()
   )
     throw new TypeError("private broker directory required");
-  const path = join(directory, `${randomUUID().replaceAll("-", "").slice(0, 22)}.sock`);
+  const path = join(
+    directory,
+    socketName ?? `${randomUUID().replaceAll("-", "").slice(0, 22)}.sock`,
+  );
   if (Buffer.byteLength(path) > 100) throw new TypeError("broker socket path too long");
   const broker = createSelfhostContainerBindingBroker(options);
-  const server = createServer({ maxHeaderSize: 65_536 }, async (incoming, outgoing) => {
+  let closing: Promise<void> | undefined;
+  const handlers = new Map<AbortController, Promise<void>>();
+  const server = createServer({ maxHeaderSize: 65_536 }, (incoming, outgoing) => {
     const abort = new AbortController();
-    incoming.on("aborted", () => abort.abort());
-    outgoing.on("close", () => {
-      if (!outgoing.writableFinished) abort.abort();
+    let resolveHandler!: () => void;
+    let rejectHandler!: (error: unknown) => void;
+    let cancellation: Promise<void> | undefined;
+    const settlement = new Promise<void>((resolve, reject) => {
+      resolveHandler = resolve;
+      rejectHandler = reject;
     });
-    try {
-      const headers = new Headers();
-      for (let index = 0; index < incoming.rawHeaders.length; index += 2)
-        headers.append(incoming.rawHeaders[index]!, incoming.rawHeaders[index + 1]!);
-      const body = Readable.toWeb(incoming) as unknown as ReadableStream<Uint8Array>;
-      const result = await broker(
-        new Request(`http://broker.invalid${incoming.url ?? "/"}`, {
-          method: incoming.method ?? "POST",
-          headers,
-          body,
-          signal: abort.signal,
-          ...({ duplex: "half" } as { duplex: "half" }),
-        }),
-      );
-      outgoing.writeHead(result.status, Object.fromEntries(result.headers));
-      outgoing.flushHeaders();
-      if (result.body) {
-        const input = result.body.getReader();
-        const cancel = () => {
-          void input.cancel().catch(() => {});
-        };
-        abort.signal.addEventListener("abort", cancel, { once: true });
-        try {
-          while (!abort.signal.aborted) {
-            const next = await input.read();
-            if (next.done) break;
-            if (!outgoing.write(next.value))
-              await new Promise<void>((resolve) => {
-                const finish = () => {
-                  outgoing.removeListener("drain", finish);
-                  outgoing.removeListener("close", finish);
-                  resolve();
-                };
-                outgoing.once("drain", finish);
-                outgoing.once("close", finish);
-              });
-          }
-        } finally {
-          abort.signal.removeEventListener("abort", cancel);
-          await input.cancel().catch(() => {});
-        }
+    // Retain the exact task before its body or cancellation can reenter close.
+    handlers.set(abort, settlement);
+    void settlement.catch(() => {});
+    void run()
+      .then(() => cancellation)
+      .then(() => {
+        handlers.delete(abort);
+        resolveHandler();
+      }, rejectHandler);
+    return settlement;
+
+    async function run() {
+      if (closing) {
+        outgoing.destroy();
+        return;
       }
-      outgoing.end();
-    } catch {
-      outgoing.destroy();
+      incoming.on("aborted", () => abort.abort());
+      outgoing.on("close", () => {
+        if (!outgoing.writableFinished) abort.abort();
+      });
+      try {
+        const headers = new Headers();
+        for (let index = 0; index < incoming.rawHeaders.length; index += 2)
+          headers.append(incoming.rawHeaders[index]!, incoming.rawHeaders[index + 1]!);
+        const body = Readable.toWeb(incoming) as unknown as ReadableStream<Uint8Array>;
+        const result = await broker(
+          new Request(`http://broker.invalid${incoming.url ?? "/"}`, {
+            method: incoming.method ?? "POST",
+            headers,
+            body,
+            signal: abort.signal,
+            ...({ duplex: "half" } as { duplex: "half" }),
+          }),
+        );
+        outgoing.writeHead(result.status, Object.fromEntries(result.headers));
+        outgoing.flushHeaders();
+        if (result.body) {
+          const input = result.body.getReader();
+          const cancel = () => {
+            if (!cancellation) cancellation = input.cancel();
+            return cancellation;
+          };
+          const onAbort = () => {
+            void cancel().catch(() => {});
+          };
+          abort.signal.addEventListener("abort", onAbort, { once: true });
+          try {
+            while (!abort.signal.aborted) {
+              const next = await input.read();
+              if (next.done) break;
+              if (!outgoing.write(next.value))
+                await new Promise<void>((resolve) => {
+                  const finish = () => {
+                    outgoing.removeListener("drain", finish);
+                    outgoing.removeListener("close", finish);
+                    resolve();
+                  };
+                  outgoing.once("drain", finish);
+                  outgoing.once("close", finish);
+                });
+            }
+          } finally {
+            abort.signal.removeEventListener("abort", onAbort);
+            await cancel().catch(() => {});
+          }
+        }
+        outgoing.end();
+      } catch {
+        outgoing.destroy();
+      }
     }
   });
   await new Promise<void>((resolve, reject) => {
@@ -84,18 +121,33 @@ export async function openSelfhostContainerBindingSocket(
   });
   await chmod(path, 0o600);
   const pin = await lstat(path);
-  let closed = false;
   return {
     path,
     identity: { dev: pin.dev, ino: pin.ino, uid: pin.uid },
-    async close() {
-      if (closed) return;
-      closed = true;
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-      const current = await lstat(path).catch(() => null);
-      if (current && current.dev === pin.dev && current.ino === pin.ino && current.uid === pin.uid)
-        await unlink(path);
+    close(): Promise<void> {
+      if (closing) return closing;
+      let resolveClose!: () => void;
+      let rejectClose!: (error: unknown) => void;
+      // Publish the join before the original close side effects can reenter.
+      closing = new Promise<void>((resolve, reject) => {
+        resolveClose = resolve;
+        rejectClose = reject;
+      });
+      void (async () => {
+        server.closeAllConnections();
+        for (const abort of handlers.keys()) abort.abort();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+        await Promise.all(handlers.values());
+        const current = await lstat(path).catch(() => null);
+        if (
+          current &&
+          current.dev === pin.dev &&
+          current.ino === pin.ino &&
+          current.uid === pin.uid
+        )
+          await unlink(path);
+      })().then(resolveClose, rejectClose);
+      return closing;
     },
     support: C.supported,
   };

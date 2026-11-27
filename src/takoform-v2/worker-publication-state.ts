@@ -67,6 +67,32 @@ import {
 
 export type { V2WorkerPublicationSqlGuard } from "./worker-publication-sql-guard.ts";
 
+/** A selection from the trusted OCI owner. It never grants native I/O. */
+export interface V2ContainerServingTarget {
+  readonly incarnationId: string;
+  readonly generation: number;
+  readonly runtimeEpoch: number;
+  readonly revisionOperationId: string;
+  readonly claimId: string;
+}
+
+interface ContainerServingTargetScope {
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly targetUid: string;
+  readonly targetFormUrl: string;
+}
+
+export type V2ContainerServingTargetReader = (
+  scope: ContainerServingTargetScope,
+) => Promise<V2ContainerServingTarget | null | undefined>;
+
+interface ContainerServingEvidence {
+  readonly scope: ContainerServingTargetScope;
+  readonly serving: V2ContainerServingTarget | null;
+}
+
 /** Accepted-source metadata only; not a publication, runtime or native send grant. */
 export interface V2ForwardWorkerFamilyProfile {
   readonly sourceOperationId: string;
@@ -227,6 +253,7 @@ type CurrentReadyCapture = Omit<ReadyCapture, "sqlGuard"> & {
     readonly sourceOwnerUid: string;
     readonly referenceSetIds: readonly string[];
     readonly inboundTargetIds: readonly string[];
+    readonly containerTargets: ReadonlyMap<string, ContainerServingEvidence>;
   };
 };
 type CurrentCapture = CurrentReadyCapture | Unresolved;
@@ -831,13 +858,17 @@ export function createV2ForwardWorkerPublicationState(options: PublicationStateO
   return createPublicationState(options, true, false);
 }
 /** Private Hosted source selection for read-only Forward Container graph data. */
-export function createV2ForwardContainerWorkerPublicationState(options: PublicationStateOptions) {
-  return createPublicationState(options, true, true);
+export function createV2ForwardContainerWorkerPublicationState(
+  options: PublicationStateOptions,
+  readCurrentContainerServing?: V2ContainerServingTargetReader,
+) {
+  return createPublicationState(options, true, true, readCurrentContainerServing);
 }
 function createPublicationState(
   options: PublicationStateOptions,
   forwardFamily: boolean,
   forwardContainerBindings: boolean,
+  readCurrentContainerServing?: V2ContainerServingTargetReader,
 ) {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
@@ -1149,6 +1180,13 @@ function createPublicationState(
       )
     )
       throw new SqlError("unavailable", "Serving fence evidence is incomplete");
+    if (readCurrentContainerServing) {
+      for (const { scope, serving } of initial.fence.containerTargets.values()) {
+        const latest = (await readCurrentContainerServing(scope)) ?? null;
+        if (canonicalJson(latest) !== canonicalJson(serving))
+          throw new SqlError("unavailable", "Container serving selection changed");
+      }
+    }
     return canonicalJson({ graph, relations } as unknown as JsonObject);
   }
   async function hasUnresolvedPriorEffect(row: ResourceRow): Promise<boolean> {
@@ -1444,6 +1482,7 @@ function createPublicationState(
     serviceTargets: ReadonlySet<string>,
     targetKey: string,
     containerTargets: ReadonlySet<string> = new Set(),
+    servingTargets?: Map<string, ContainerServingEvidence>,
   ): Promise<readonly unknown[] | null> {
     const evidence: unknown[] = [];
     for (const reference of rows) {
@@ -1457,10 +1496,30 @@ function createPublicationState(
         target.space !== space ||
         ((serviceTargets.has(reference.target_uid) || containerTargets.has(reference.target_uid)) &&
           target.target_key !== targetKey) ||
-        !settled(target, last) ||
+        target.deleted_at !== null ||
+        target.phase === "deleting" ||
         (reference.readiness === "ready" && observed?.ready !== true)
       )
         return null;
+      let nativeServing = null;
+      if (servingTargets && readCurrentContainerServing && containerTargets.has(target.uid)) {
+        const saved = servingTargets.get(target.uid);
+        if (saved) {
+          if (saved.scope.targetFormUrl !== reference.form_url) return null;
+          nativeServing = saved.serving;
+        } else {
+          const scope = {
+            principal,
+            space,
+            targetKey,
+            targetUid: target.uid,
+            targetFormUrl: reference.form_url,
+          };
+          nativeServing = (await readCurrentContainerServing(scope)) ?? null;
+          servingTargets.set(target.uid, { scope, serving: nativeServing });
+        }
+      }
+      if (!nativeServing && !settled(target, last)) return null;
       if (serviceTargets.has(reference.target_uid)) {
         try {
           parseModuleWorkerSpec(parseObject(target.spec_json));
@@ -1487,7 +1546,7 @@ function createPublicationState(
         )
           return null;
       }
-      evidence.push({ target, last });
+      evidence.push({ target, last, ...(nativeServing ? { nativeServing } : {}) });
     }
     return evidence;
   }
@@ -1787,6 +1846,7 @@ function createPublicationState(
   ): Promise<Capture | CurrentCapture> {
     let forward = "forward" in input && input.forward === true;
     const current = "currentServing" in input ? input.currentServing : null;
+    const servingTargets = new Map<string, ContainerServingEvidence>();
     const execution = "execution" in input ? input.execution : null;
     if (
       execution !== null &&
@@ -2252,6 +2312,7 @@ function createPublicationState(
                 )
               : [],
           ),
+          current ? servingTargets : undefined,
         );
         if (!active || !targets) {
           return unresolved("graph_unresolved", "Version active references changed");
@@ -2477,7 +2538,12 @@ function createPublicationState(
         snapshot,
         vector,
         materials,
-        fence: { sourceOwnerUid: own.uid, referenceSetIds, inboundTargetIds },
+        fence: {
+          sourceOwnerUid: own.uid,
+          referenceSetIds,
+          inboundTargetIds,
+          containerTargets: servingTargets,
+        },
       };
     }
     const finalNow = now().getTime();

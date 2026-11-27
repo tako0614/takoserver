@@ -17,7 +17,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
@@ -347,6 +347,38 @@ function withControl<T>(root: string, read: (database: Database) => T): T {
     return read(database);
   } finally {
     database.close();
+  }
+}
+
+/**
+ * Read the committed state after the Host has exited. A hot rollback journal
+ * can require writes even for a SELECT, so let SQLite recover only the copy.
+ */
+async function withStoppedControlSnapshot<T>(
+  root: string,
+  read: (database: Database) => T,
+): Promise<T> {
+  const directory = await mkdtemp(join(tmpdir(), "journey-control-"));
+  const source = join(root, "control.sqlite");
+  const snapshot = join(directory, "control.sqlite");
+  try {
+    await copyFile(source, snapshot);
+    for (const suffix of ["-journal", "-wal"]) {
+      try {
+        await copyFile(source + suffix, snapshot + suffix);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+    const database = new Database(snapshot);
+    try {
+      database.exec("PRAGMA busy_timeout = 1000");
+      return read(database);
+    } finally {
+      database.close();
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -1522,8 +1554,8 @@ test.skipIf(OPT_IN !== "1")(
       await killHost(host);
       host = null;
       const killedAt = Date.now();
-      // The Host is gone, so its database can be read without disturbing it.
-      const atCrash = withControl(
+      // Read the stopped Host state without recovering its original database.
+      const atCrash = await withStoppedControlSnapshot(
         root,
         (control) =>
           control
@@ -2035,7 +2067,7 @@ for (const { pending, signal, window } of PENDING_VARIANTS) {
         if (signal === "SIGKILL") await killHost(host);
         else await stopHost(host);
         host = null;
-        const atCrash = withControl(
+        const atCrash = await withStoppedControlSnapshot(
           root,
           (control) =>
             control

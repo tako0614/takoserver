@@ -54,6 +54,7 @@ function deferred<Value>() {
 function identity(id: string) {
   return {
     principal: { id, provider: "local", email: `${id}@example.test`, displayName: id },
+    nextOrganizationCursor: null,
     organizations: [
       { id: `org-${id}`, name: id, ownerPrincipalId: id, createdAt: "2026-11-04T00:00:00Z" },
     ],
@@ -272,7 +273,11 @@ for (const oldStatus of [200, 401, 503]) {
     expect(state.currentOrganization()?.id).toBe("org-new");
     expect(state.session()).toBe("cookie");
     expect(errors).toEqual([]);
-    expect(seen.every((request) => request.url === "https://a.example.test/v1/me")).toBe(true);
+    expect(
+      seen.every(
+        (request) => request.url === "https://a.example.test/v1/me?organizationPageSize=100",
+      ),
+    ).toBe(true);
   });
 }
 
@@ -321,6 +326,57 @@ test("the identity observer still reports a current failure and can be disposed 
   await flush();
   expect(state.principal()?.id).toBe("new");
 });
+
+for (const secondStatus of [200, 503]) {
+  test(`organization paging keeps selection across normal navigation and the final page (${secondStatus})`, async () => {
+    adopt("current");
+    const second = deferred<Response>();
+    const seen = transport((request) => {
+      if (new URL(request.url).searchParams.has("organizationCursor")) return second.promise;
+      return Response.json({
+        ...identity("current"),
+        organizations: [
+          {
+            ...identity("current").organizations[0],
+            id: "org-first-page",
+            createdAt: "2026-11-03T00:00:00Z",
+          },
+        ],
+        nextOrganizationCursor: "page-two",
+      });
+    });
+    const errors: unknown[] = [];
+    stopObserver = state.observeSessionIdentity((error) => errors.push(error));
+    await flush();
+    expect(seen).toHaveLength(1);
+    const continuation = state.loadOrganizationPage(state.nextOrganizationCursor() ?? undefined);
+    expect(seen).toHaveLength(2);
+    const { navigate } = await import("../console/src/router.ts");
+    navigate("/resources");
+    navigate("/billing");
+    expect(state.currentOrganizationId()).toBe("org-current");
+    expect(state.organizations().map((org) => org.id)).toEqual(["org-first-page"]);
+    expect(state.currentOrganization()?.id).toBe("org-current");
+    second.resolve(
+      secondStatus === 200
+        ? Response.json({ ...identity("current"), nextOrganizationCursor: null })
+        : Response.json({ error: { code: "unavailable" } }, { status: 503 }),
+    );
+    const continuationError = await continuation.catch((error: unknown) => error);
+    await flush();
+    expect(state.currentOrganizationId()).toBe("org-current");
+    expect(state.currentOrganization()?.id).toBe("org-current");
+    expect(seen).toHaveLength(2);
+    if (secondStatus === 200) {
+      expect(state.organizations().map((org) => org.id)).toEqual(["org-current"]);
+      expect(errors).toEqual([]);
+    } else {
+      expect(state.organizations().map((org) => org.id)).toEqual(["org-first-page"]);
+      expect(continuationError).toMatchObject({ status: 503 });
+      expect(errors).toEqual([]);
+    }
+  });
+}
 
 for (const provider of ["google", "takos-id"] as const) {
   for (const change of ["none", "other-host", "same-host-port"] as const) {
@@ -424,3 +480,111 @@ for (const provider of ["google", "takos-id"] as const) {
     expect(state.session()).toBe(null);
   });
 }
+
+test("a saved Organization missing from a partial first page stays unknown until an explicit page confirms it", async () => {
+  state.adoptSession("shared-auth");
+  state.selectOrganization("org-current");
+  const seen = transport((request) =>
+    Response.json(
+      new URL(request.url).searchParams.has("organizationCursor")
+        ? { ...identity("current"), nextOrganizationCursor: null }
+        : {
+            ...identity("current"),
+            organizations: [{ ...identity("current").organizations[0], id: "org-first" }],
+            nextOrganizationCursor: "page-two",
+          },
+    ),
+  );
+  stopObserver = state.observeSessionIdentity(() => {
+    throw new Error("unexpected page error");
+  });
+  await flush();
+  expect(seen).toHaveLength(1);
+  expect(state.currentOrganizationId()).toBe("org-current");
+  expect(state.currentOrganization()).toBeNull();
+  expect(values.get("takoserver.organization")).toBe("org-current");
+  await state.loadOrganizationPage(state.nextOrganizationCursor() ?? undefined);
+  expect(seen).toHaveLength(2);
+  expect(state.currentOrganization()?.id).toBe("org-current");
+  expect(state.organizations().map((org) => org.id)).toEqual(["org-current"]);
+});
+
+test("a saved missing selection never falls back even when a complete first page proves absence", async () => {
+  state.adoptSession("shared-auth");
+  state.selectOrganization("org-missing");
+  transport(() => Response.json(identity("current")));
+  stopObserver = state.observeSessionIdentity(() => {});
+  await flush();
+  expect(state.currentOrganization()).toBeNull();
+  expect(state.currentOrganizationId()).toBe("org-missing");
+  state.selectOrganization("org-current");
+  expect(state.currentOrganization()?.id).toBe("org-current");
+});
+
+test("a continuation from a different principal cannot replace the current page or selection", async () => {
+  adopt("current");
+  transport((request) =>
+    Response.json(
+      new URL(request.url).searchParams.has("organizationCursor")
+        ? identity("other")
+        : { ...identity("current"), nextOrganizationCursor: "page-two" },
+    ),
+  );
+  stopObserver = state.observeSessionIdentity(() => {});
+  await flush();
+  await expect(state.loadOrganizationPage("page-two")).rejects.toMatchObject({
+    code: "invalid_response",
+  });
+  expect(state.principal()?.id).toBe("current");
+  expect(state.currentOrganization()?.id).toBe("org-current");
+  expect(state.organizations()).toEqual(identity("current").organizations);
+});
+
+test("login with no saved choice waits for explicit selection and paging preserves that choice", async () => {
+  state.adoptSession("shared-auth");
+  transport((request) =>
+    Response.json(
+      new URL(request.url).searchParams.has("organizationCursor")
+        ? {
+            ...identity("current"),
+            organizations: [{ ...identity("current").organizations[0], id: "org-second" }],
+          }
+        : { ...identity("current"), nextOrganizationCursor: "page-two" },
+    ),
+  );
+  stopObserver = state.observeSessionIdentity(() => {});
+  await flush();
+  expect(state.currentOrganization()).toBeNull();
+  expect(state.currentOrganizationId()).toBeNull();
+  state.selectOrganization("org-current");
+  expect(state.currentOrganization()?.id).toBe("org-current");
+  await state.loadOrganizationPage("page-two");
+  expect(state.organizations().map((org) => org.id)).toEqual(["org-second"]);
+  expect(state.currentOrganization()?.id).toBe("org-current");
+  expect(state.currentOrganizationId()).toBe("org-current");
+});
+
+test("explicit navigation retains one page while keeping a confirmed selection from an earlier page", async () => {
+  state.adoptSession("shared-auth");
+  const seen = transport((request) => {
+    const index = Number(new URL(request.url).searchParams.get("organizationCursor") ?? 0);
+    return Response.json({
+      ...identity("current"),
+      organizations: Array.from({ length: 100 }, (_, i) => ({
+        ...identity("current").organizations[0],
+        id: `org-${index * 100 + i}`,
+      })),
+      nextOrganizationCursor: index === 3 ? null : String(index + 1),
+    });
+  });
+  stopObserver = state.observeSessionIdentity(() => {});
+  await flush();
+  state.selectOrganization("org-0");
+  for (let index = 1; index <= 3; index++) {
+    await state.loadOrganizationPage(String(index));
+    expect(seen).toHaveLength(index + 1);
+    expect(state.organizations()).toHaveLength(100);
+    expect(state.organizations()[0]?.id).toBe(`org-${index * 100}`);
+    expect(state.currentOrganization()?.id).toBe("org-0");
+  }
+});

@@ -12,10 +12,21 @@ import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-pri
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
 import {
   createV2ContainerHostAcceptance,
+  inspectV2ContainerOwnerAllocationSchema,
+  inspectV2ContainerOwnerControlSchema,
+  inspectV2ContainerOwnerFinalDeleteSchema,
   inspectV2ContainerOwnerSchema,
+  inspectV2ContainerOwnerSelectedSchema,
+  inspectV2ContainerOwnerShutdownIoSchema,
   V2_CONTAINER_OWNER_RECIPE as recipe,
+  V2_CONTAINER_CONTROL_RESERVED,
   V2_CONTAINER_F2_FORM,
+  V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+  V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+  V2_CONTAINER_OWNER_CONTROL_EXPAND,
+  V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND,
   V2_CONTAINER_OWNER_READY,
+  V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND,
 } from "../src/takoform-v2/container-owner-schema.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import {
@@ -2578,6 +2589,204 @@ test("genuine F2 omitted map cannot revive a removed name", async () => {
       }),
     ).rejects.toMatchObject({ code: "invalid_spec" });
     expect(await containerDeleteSnapshot(db)).toEqual(before);
+  } finally {
+    db.close();
+  }
+});
+
+// New additive allocation-state schema cases only; domain fixtures, never
+// native authority or a migration applied to an existing operator database.
+test("peer allocation schema old and additive exact shapes preserve protected NULL history", async () => {
+  const db = fixture();
+  try {
+    prepareIntent(db);
+    claim(db);
+    const sql = createSqliteSql(db);
+    expect(await inspectV2ContainerOwnerSchema(sql)).toBe(true);
+    expect(await inspectV2ContainerOwnerControlSchema(sql)).toBe(false);
+    for (const statement of V2_CONTAINER_OWNER_CONTROL_EXPAND.statements) db.exec(statement);
+    expect(await inspectV2ContainerOwnerControlSchema(sql)).toBe(true);
+    expect(await inspectV2ContainerOwnerAllocationSchema(sql)).toBe(false);
+    for (const statement of V2_CONTAINER_OWNER_ALLOCATION_EXPAND.statements) db.exec(statement);
+    expect(await inspectV2ContainerOwnerAllocationSchema(sql)).toBe(true);
+    expect(await inspectV2ContainerOwnerControlSchema(sql)).toBe(true);
+    expect(await inspectV2ContainerOwnerSchema(sql)).toBe(false); // explicit parent-only expanded shape
+    expect(
+      db.query("SELECT native_control,allocation_cleanup FROM tf_v2_container_create_claims").all(),
+    ).toEqual([{ native_control: null, allocation_cleanup: null }]);
+    expect(() =>
+      db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='untouched'"),
+    ).toThrow();
+    expect(() =>
+      db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='closed'"),
+    ).toThrow();
+    db.exec(
+      "CREATE TRIGGER tf_v2_container_foreign_cleanup BEFORE UPDATE ON tf_v2_container_create_claims BEGIN SELECT 1; END",
+    );
+    expect(await inspectV2ContainerOwnerControlSchema(sql)).toBe(false);
+    expect(await inspectV2ContainerOwnerAllocationSchema(sql)).toBe(false);
+  } finally {
+    db.close();
+  }
+});
+test("peer allocation schema fresh same sealed save alone initializes monotonic local cleanup", async () => {
+  const db = fixture();
+  try {
+    prepareIntent(db);
+    for (const statement of [
+      ...V2_CONTAINER_OWNER_CONTROL_EXPAND.statements,
+      ...V2_CONTAINER_OWNER_ALLOCATION_EXPAND.statements,
+    ])
+      db.exec(statement);
+    db.query(
+      "INSERT INTO tf_v2_container_create_claims(resource_uid,generation,installation_id,claim_id,state,claimed_at_ms,native_control) VALUES (?,1,'installation',?,'pending',10,?)",
+    ).run(UID, CLAIM, V2_CONTAINER_CONTROL_RESERVED);
+    expect(() =>
+      db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='untouched'"),
+    ).toThrow();
+    const sealed = JSON.stringify({
+      kind: "linux-oci-sealed-control@1",
+      scope: {
+        claimId: CLAIM,
+        resourceUid: UID,
+        generation: 1,
+        installationId: "installation",
+        purpose: "takoserver.linux-oci-parent-peer-control@1",
+      },
+    });
+    db.query(
+      "UPDATE tf_v2_container_create_claims SET native_control=?,allocation_cleanup='untouched'",
+    ).run(sealed);
+    expect(() =>
+      db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='consumed'"),
+    ).toThrow(); // pending
+    bind(db);
+    expect(() =>
+      db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='closed'"),
+    ).toThrow();
+    db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='consumed'");
+    for (const value of ["untouched", null])
+      expect(() =>
+        db.query("UPDATE tf_v2_container_create_claims SET allocation_cleanup=?").run(value),
+      ).toThrow();
+    db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='closed'");
+    expect(() =>
+      db.exec("UPDATE tf_v2_container_create_claims SET allocation_cleanup='consumed'"),
+    ).toThrow();
+    expect(
+      db
+        .query("SELECT state,allocation_cleanup,native_control FROM tf_v2_container_create_claims")
+        .all(),
+    ).toEqual([{ state: "bound", allocation_cleanup: "closed", native_control: sealed }]);
+  } finally {
+    db.close();
+  }
+});
+
+test("shutdown I/O exact optional schema binds and retains only an original claim close", async () => {
+  const db = fixture();
+  const sql = createSqliteSql(db);
+  try {
+    for (const expand of [
+      V2_CONTAINER_OWNER_CONTROL_EXPAND,
+      V2_CONTAINER_OWNER_ALLOCATION_EXPAND,
+      V2_CONTAINER_OWNER_APPLICATION_IO_EXPAND,
+    ]) {
+      for (const statement of expand.statements) db.exec(statement);
+    }
+    const before = db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all();
+    await expect(sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements)).rejects.toThrow();
+    expect(db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all()).toEqual(before);
+    db.exec("PRAGMA ignore_check_constraints=ON");
+    try {
+      await expect(sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements)).rejects.toThrow();
+      expect(db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all()).toEqual(before);
+    } finally {
+      db.exec("PRAGMA ignore_check_constraints=OFF");
+    }
+
+    await sql.batch(V2_CONTAINER_OWNER_FINAL_DELETE_EXPAND.statements);
+    expect(await inspectV2ContainerOwnerFinalDeleteSchema(sql)).toBe(true);
+    expect(await inspectV2ContainerOwnerShutdownIoSchema(sql)).toBe(false);
+    await sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements);
+    expect(await inspectV2ContainerOwnerFinalDeleteSchema(sql)).toBe(false);
+    expect(await inspectV2ContainerOwnerShutdownIoSchema(sql)).toBe(true);
+    const installed = db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all();
+    await expect(sql.batch(V2_CONTAINER_OWNER_SHUTDOWN_IO_EXPAND.statements)).rejects.toThrow();
+    expect(db.query("SELECT * FROM main.sqlite_schema ORDER BY name").all()).toEqual(installed);
+    for (const layer of ["control", "allocation", "application-io", "final-delete"] as const) {
+      expect(await inspectV2ContainerOwnerSelectedSchema(sql, layer)).toBe(true);
+    }
+
+    const table = "tf_v2_container_shutdown_io_closes";
+    const insert = db.query(
+      `INSERT INTO ${table}(resource_uid,generation,claim_id,native_id,close_document) VALUES (?,?,?,?,?)`,
+    );
+    const scope = {
+      purpose: "takoserver.linux-oci-host-shutdown-io-close@1",
+      resourceUid: UID,
+      incarnationId: INCARNATION,
+      claimId: CLAIM,
+      generation: 1,
+      nativeId: NATIVE,
+      installationId: "installation",
+      controlDigest: `sha256:${"d".repeat(64)}`,
+    };
+    const envelope = {
+      kind: "linux-oci-sealed-host-shutdown-io-close@1",
+      scope,
+      keyId: "fixture-key",
+      nonce: "fixture-nonce",
+      ciphertext: "fixture-ciphertext",
+    };
+    const document = JSON.stringify(envelope);
+    expect(() => insert.run(UID, 1, CLAIM, NATIVE, document)).toThrow();
+    prepareIntent(db);
+    db.query(
+      "INSERT INTO tf_v2_container_create_claims(resource_uid,generation,installation_id,claim_id,state,claimed_at_ms,native_control) VALUES (?,1,'installation',?,'pending',10,?)",
+    ).run(UID, CLAIM, V2_CONTAINER_CONTROL_RESERVED);
+    expect(() => insert.run(UID, 1, CLAIM, NATIVE, document)).toThrow();
+    db.query("UPDATE tf_v2_container_create_claims SET native_control=? WHERE generation=1").run(
+      JSON.stringify({ kind: "linux-oci-sealed-control@1", scope }),
+    );
+    bind(db);
+    const foreignClaim = "e".repeat(64);
+    const foreignNative = "f".repeat(64);
+    expect(() => insert.run(UID, 1, foreignClaim, NATIVE, document)).toThrow();
+    expect(() => insert.run(UID, 1, CLAIM, foreignNative, document)).toThrow();
+    for (const changed of [
+      { ...scope, installationId: "foreign" },
+      { ...scope, incarnationId: foreignClaim },
+      { ...scope, generation: "1" },
+      { ...scope, controlDigest: "unscoped" },
+      { ...scope, extra: true },
+    ]) {
+      expect(() =>
+        insert.run(UID, 1, CLAIM, NATIVE, JSON.stringify({ ...envelope, scope: changed })),
+      ).toThrow();
+    }
+    expect(() => insert.run(UID, 1, CLAIM, NATIVE, "{")).toThrow();
+    insert.run(UID, 1, CLAIM, NATIVE, document);
+    expect(() => db.exec(`UPDATE ${table} SET close_document=close_document`)).toThrow();
+    expect(() => db.exec(`DELETE FROM ${table}`)).toThrow();
+    db.exec("PRAGMA recursive_triggers=OFF");
+    expect(() =>
+      db
+        .query(`INSERT OR REPLACE INTO ${table} VALUES (?,?,?,?,?)`)
+        .run(UID, 1, CLAIM, NATIVE, document),
+    ).toThrow();
+    db.exec(
+      "UPDATE tf_v2_container_create_claims SET state='removed',removed_at_ms=12 WHERE generation=1",
+    );
+    expect(db.query(`SELECT close_document FROM ${table}`).get()).toEqual({
+      close_document: document,
+    });
+    expect(() => insert.run(UID, 1, CLAIM, NATIVE, document)).toThrow();
+    db.exec(
+      `CREATE TRIGGER foreign_shutdown_trigger BEFORE INSERT ON ${table} BEGIN SELECT 1; END`,
+    );
+    expect(await inspectV2ContainerOwnerShutdownIoSchema(sql)).toBe(false);
+    expect(await inspectV2ContainerOwnerSelectedSchema(sql, "control")).toBe(false);
   } finally {
     db.close();
   }

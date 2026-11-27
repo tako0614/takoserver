@@ -1,0 +1,382 @@
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -226,6 +226,9 @@
+ 
+ #include <linux/cache.h>
+ #include <linux/skbuff.h>
++#ifdef CONFIG_TAKO_TERMINAL
++#include <linux/tako_terminal_netdev_state.h>
++#endif
+ 
+ struct neighbour;
+ struct neigh_parms;
+@@ -2399,6 +2402,10 @@
+ 	/** @irq_moder: dim parameters used if IS_ENABLED(CONFIG_DIMLIB). */
+ 	struct dim_irq_moder	*irq_moder;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Independent original ledger refs, append-only until actual dev free. */
++	struct tako_terminal_device_refs tako_terminal_origins;
++#endif
+ 	u8			priv[] ____cacheline_aligned
+ 				       __counted_by(priv_len);
+ } ____cacheline_aligned;
+@@ -2577,9 +2584,24 @@
+ 	return read_pnet(&dev->nd_net);
+ }
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++void tako_terminal_device_record(struct net_device *dev, struct net *net);
++void tako_terminal_skb_from_dev(struct sk_buff *skb);
++void tako_terminal_netdev_freemem(struct net_device *dev);
++#else
++static inline void tako_terminal_skb_from_dev(struct sk_buff *skb) {}
++#define tako_terminal_netdev_freemem kvfree
++#endif
++
+ static inline
+ void dev_net_set(struct net_device *dev, struct net *net)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	/* The ORIGINAL setter owns live net here, before pointer publication.
++	 * Reserve independent ledger/device lifetime, never get_net from zero.
++	 */
++	tako_terminal_device_record(dev, net);
++#endif
+ 	write_pnet(&dev->nd_net, net);
+ }
+ 
+diff --git a/include/linux/tako_terminal_netdev_state.h b/include/linux/tako_terminal_netdev_state.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/tako_terminal_netdev_state.h
+@@ -0,0 +1,72 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef TAKO_TERMINAL_KERNEL_NETDEV_STATE_H
++#define TAKO_TERMINAL_KERNEL_NETDEV_STATE_H
++
++/* Embedded verbatim in include/linux/tako_terminal_netdev_state.h.
++ * Each published slot owns a genuine independent device-association ledger
++ * reservation. Slots only grow; migration never replaces or releases history.
++ * Kernel cmpxchg publishes initialized refs; readers use smp_load_acquire.
++ * Final device-allocation free is exclusive and puts a saved local copy only
++ * AFTER the allocation has been freed. This is not a namespace/terminal test.
++ */
++#ifdef __KERNEL__
++#include <linux/atomic.h>
++#include <linux/types.h>
++#else
++#include <stddef.h>
++#endif
++
++#define TAKO_TERMINAL_DEVICE_ORIGINS 4
++struct tako_terminal_owner;
++
++void tako_terminal_device_put(struct tako_terminal_owner *owner);
++void tako_terminal_device_poison(struct tako_terminal_owner *owner);
++
++struct tako_terminal_device_refs {
++	struct tako_terminal_owner *owners[TAKO_TERMINAL_DEVICE_ORIGINS];
++};
++
++/* Consume one already-reserved real association, including duplicate unwind.
++ * A failed CAS returns the actual published owner, so a concurrent duplicate
++ * cannot skip to a later slot and consume another history entry.
++ */
++static inline void tako_terminal_device_refs_take(
++	struct tako_terminal_device_refs *refs, struct tako_terminal_owner *owner)
++{
++	unsigned int i;
++
++	if (!owner)
++		return;
++	for (i = 0; i < TAKO_TERMINAL_DEVICE_ORIGINS; i++) {
++		struct tako_terminal_owner *previous;
++
++		previous = cmpxchg(&refs->owners[i], NULL, owner);
++		if (!previous)
++			return;
++		if (previous == owner) {
++			tako_terminal_device_put(owner);
++			return;
++		}
++	}
++	/* There is no retained ref for this fifth original: poison it BEFORE
++	 * dropping the reservation. Previously published history stays held.
++	 */
++	tako_terminal_device_poison(owner);
++	tako_terminal_device_put(owner);
++}
++
++static inline void tako_terminal_device_refs_put(
++	struct tako_terminal_device_refs *refs)
++{
++	unsigned int i;
++
++	for (i = 0; i < TAKO_TERMINAL_DEVICE_ORIGINS; i++) {
++		struct tako_terminal_owner *owner = refs->owners[i];
++
++		refs->owners[i] = NULL;
++		if (owner)
++			tako_terminal_device_put(owner);
++	}
++}
++
++#endif
+diff --git a/net/core/dev.c b/net/core/dev.c
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -4345,6 +4345,8 @@
+ 	int rc = -ENOMEM;
+ 	bool again = false;
+ 
++	/* Before timestamp clones, egress callbacks and qdisc enqueue. */
++	tako_terminal_skb_from_dev(skb);
+ 	skb_reset_mac_header(skb);
+ 	skb_assert_len(skb);
+ 
+@@ -5173,6 +5175,8 @@
+ {
+ 	int ret;
+ 
++	/* Reserve before timestamp deferral or the first RPS backlog. */
++	tako_terminal_skb_from_dev(skb);
+ 	net_timestamp_check(READ_ONCE(net_hotdata.tstamp_prequeue), skb);
+ 
+ 	trace_netif_rx(skb);
+@@ -5479,6 +5483,8 @@
+ 	pt_prev = NULL;
+ 
+ another_round:
++	/* Direct-core entry and actual device reassociation on another round. */
++	tako_terminal_skb_from_dev(skb);
+ 	skb->skb_iif = skb->dev->ifindex;
+ 
+ 	__this_cpu_inc(softnet_data.processed);
+@@ -5848,6 +5854,8 @@
+ {
+ 	int ret;
+ 
++	/* Reserve before timestamp deferral or the first RPS backlog. */
++	tako_terminal_skb_from_dev(skb);
+ 	net_timestamp_check(READ_ONCE(net_hotdata.tstamp_prequeue), skb);
+ 
+ 	if (skb_defer_rx_timestamp(skb))
+@@ -5877,6 +5885,8 @@
+ 	LIST_HEAD(sublist);
+ 
+ 	list_for_each_entry_safe(skb, next, head, list) {
++		/* Each list member precedes timestamp deferral and RPS enqueue. */
++		tako_terminal_skb_from_dev(skb);
+ 		net_timestamp_check(READ_ONCE(net_hotdata.tstamp_prequeue),
+ 				    skb);
+ 		skb_list_del_init(skb);
+@@ -11191,10 +11201,21 @@
+ 	free_percpu(dev->pcpu_refcnt);
+ free_dev:
+ #endif
++	tako_terminal_netdev_freemem(dev);
++	return NULL;
++}
++EXPORT_SYMBOL(alloc_netdev_mqs);
++
++#ifdef CONFIG_TAKO_TERMINAL
++void tako_terminal_netdev_freemem(struct net_device *dev)
++{
++	struct tako_terminal_device_refs held = dev->tako_terminal_origins;
++
++	/* The real final-free caller is exclusive. No read of dev after free. */
+ 	kvfree(dev);
+-	return NULL;
+-}
+-EXPORT_SYMBOL(alloc_netdev_mqs);
++	tako_terminal_device_refs_put(&held);
++}
++#endif
+ 
+ /**
+  * free_netdev - free network device
+@@ -11248,7 +11269,7 @@
+ 	/*  Compatibility with error handling in drivers */
+ 	if (dev->reg_state == NETREG_UNINITIALIZED ||
+ 	    dev->reg_state == NETREG_DUMMY) {
+-		kvfree(dev);
++		tako_terminal_netdev_freemem(dev);
+ 		return;
+ 	}
+ 
+diff --git a/net/core/gro.c b/net/core/gro.c
+--- a/net/core/gro.c
++++ b/net/core/gro.c
+@@ -472,6 +472,8 @@
+ 	enum gro_result ret;
+ 	int same_flow;
+ 
++	/* Before the first GRO hold/merge, including the normal bypass. */
++	tako_terminal_skb_from_dev(skb);
+ 	if (netif_elide_gro(skb->dev))
+ 		goto normal;
+ 
+@@ -513,6 +515,13 @@
+ 		break;
+ 	}
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* The callback may consume skb or merge its data into another header.
++	 * Exact cross-header origin transfer is not covered yet: poison the
++	 * actual retained origins before that transfer, not after consumption.
++	 */
++	tako_terminal_skb_poison(skb);
++#endif
+ 	pp = INDIRECT_CALL_INET(ptype->callbacks.gro_receive,
+ 				ipv6_gro_receive, inet_gro_receive,
+ 				&gro_list->list, skb);
+diff --git a/net/core/net-sysfs.c b/net/core/net-sysfs.c
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -2031,7 +2031,7 @@
+ 	 * device is dead and about to be freed.
+ 	 */
+ 	kfree(rcu_access_pointer(dev->ifalias));
+-	kvfree(dev);
++	tako_terminal_netdev_freemem(dev);
+ }
+ 
+ static const void *net_namespace(const struct device *d)
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -7156,6 +7156,31 @@
+ }
+ EXPORT_SYMBOL_GPL(tako_terminal_skb_poison);
+ 
++/* Only the original valid device allocation must remain alive here. Its
++ * published association refs outlive net memory, unregister and migration.
++ * No raw namespace pointer is read at any receive/transmit entry.
++ */
++void tako_terminal_skb_from_dev(struct sk_buff *skb)
++{
++	struct tako_terminal_skb_refs held = {0};
++	struct net_device *dev = skb->dev;
++	unsigned int i;
++
++	if (unlikely(!dev)) {
++		tako_terminal_skb_poison(skb);
++		return;
++	}
++	for (i = 0; i < TAKO_TERMINAL_DEVICE_ORIGINS; i++) {
++		struct tako_terminal_owner *owner;
++
++		owner = smp_load_acquire(&dev->tako_terminal_origins.owners[i]);
++		tako_terminal_skb_refs_take(&held,
++					  tako_terminal_packet_clone(owner));
++	}
++	tako_skb_restore(skb, &held);
++}
++EXPORT_SYMBOL_GPL(tako_terminal_skb_from_dev);
++
+ void tako_terminal_skb_set_owner(struct sk_buff *skb, struct net *net)
+ {
+ 	struct tako_terminal_skb_refs held = {0};
+diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
+--- a/net/core/tako_terminal.c
++++ b/net/core/tako_terminal.c
+@@ -28,6 +28,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/user_namespace.h>
+ #include <net/net_namespace.h>
++#include <linux/netdevice.h>
+ #include <net/sock.h>
+ #include <net/request_sock.h>
+ #include <net/inet_timewait_sock.h>
+@@ -40,6 +41,8 @@
+ 	struct tako_terminal_state requests;
+ 	struct tako_terminal_state timewait;
+ 	struct tako_terminal_state packet_groups;
++	/* Actual bound device histories; separate from skb groups/UAPI counts. */
++	struct tako_terminal_state device_associations;
+ 	struct tako_terminal_lifetime lifetime;
+ 	u64 net_cookie;
+ 	u64 namespace_inum;
+@@ -265,6 +268,36 @@
+ 		tako_aux_put(owner, &owner->timewait);
+ }
+ 
++void tako_terminal_device_put(struct tako_terminal_owner *owner)
++{
++	if (owner)
++		tako_aux_put(owner, &owner->device_associations);
++}
++
++void tako_terminal_device_poison(struct tako_terminal_owner *owner)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&owner->lock, flags);
++	owner->device_associations.poisoned = 1;
++	spin_unlock_irqrestore(&owner->lock, flags);
++}
++
++void tako_terminal_device_record(struct net_device *dev, struct net *net)
++{
++	struct tako_terminal_owner *owner = net ? net->tako_terminal : NULL;
++
++	if (!owner)
++		return;
++	/* Original dev_net_set target is live. Counter/ref BEFORE publication;
++	 * failure/duplicate unwind cannot discard any prior association.
++	 */
++	tako_aux_get(owner, &owner->device_associations);
++	tako_terminal_device_refs_take(&dev->tako_terminal_origins, owner);
++}
++/* dev_net_set was already public inline API; no new GPL-only restriction. */
++EXPORT_SYMBOL(tako_terminal_device_record);
++
+ struct tako_terminal_owner *tako_terminal_packet_reserve(struct net *net)
+ {
+ 	struct tako_terminal_owner *owner = net->tako_terminal;
+@@ -315,6 +348,7 @@
+ 
+ 	spin_lock_irqsave(&owner->lock, flags);
+ 	tako_terminal_state_seal(&owner->state);
++	tako_terminal_state_seal(&owner->device_associations);
+ 	spin_unlock_irqrestore(&owner->lock, flags);
+ }
+ 
+@@ -332,6 +366,7 @@
+ 		return -EALREADY;
+ 	}
+ 	tako_terminal_state_seal(&owner->state);
++	tako_terminal_state_seal(&owner->device_associations);
+ 	spin_unlock_irqrestore(&owner->lock, flags);
+ 	/* Clear the original context BEFORE the one raw put, never adopt or
+ 	 * drop another FD/PID's namespace. File ref keeps owner independently.
+@@ -424,6 +459,7 @@
+ 		tako_terminal_state_init(&owner->requests);
+ 		tako_terminal_state_init(&owner->timewait);
+ 		tako_terminal_state_init(&owner->packet_groups);
++		tako_terminal_state_init(&owner->device_associations);
+ 		ctx->owner = owner; /* ORIGINAL file keeps the allocation reference */
+ 		ctx->net = tako_terminal_new_net(owner);
+ 		if (IS_ERR(ctx->net)) {
+@@ -458,7 +494,8 @@
+ 		out.allocations = owner->state.allocations;
+ 		out.releases = owner->state.releases;
+ 		out.sealed = owner->state.sealed;
+-		out.poisoned = owner->state.poisoned;
++		out.poisoned = owner->state.poisoned |
++			owner->device_associations.poisoned;
+ 		spin_unlock_irqrestore(&owner->lock, flags);
+ 		if (!out.net_cookie || !out.namespace_inum) {
+ 			ret = -EUCLEAN;
+@@ -488,7 +525,8 @@
+ 		life.net_gone = owner->lifetime.net_gone;
+ 		life.poisoned = owner->lifetime.poisoned | owner->state.poisoned |
+ 			owner->requests.poisoned | owner->timewait.poisoned |
+-			owner->packet_groups.poisoned;
++			owner->packet_groups.poisoned |
++			owner->device_associations.poisoned;
+ 		spin_unlock_irqrestore(&owner->lock, flags);
+ 		if (!life.net_cookie || !life.namespace_inum) {
+ 			ret = -EUCLEAN;

@@ -1,5 +1,6 @@
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, Sql } from "../ports.ts";
+import type { LinuxOciContainerBindingSource } from "../providers/linux-oci-container-binding-broker.ts";
 import type { V2QueueProducerBindingGrant } from "../providers/selfhost-v2-queue-producer-broker.ts";
 import type { V2SqliteBindingGrant } from "../providers/selfhost-v2-sqlite-binding-broker.ts";
 import type { WorkerdRuntime } from "../workerd-runtime.ts";
@@ -593,6 +594,7 @@ function configuredInputReader(
  * not publish a Deployment or authorize scheduled event delivery.
  */
 type CodeWorkerVersionOptions = {
+  readonly v2ContainerBinding?: LinuxOciContainerBindingSource;
   readonly sql: Sql;
   readonly targetKey: string;
   readonly publicationState: VersionState;
@@ -626,7 +628,8 @@ function codeWorkerVersionForm(
   const parseSpec = forward
     ? (value: unknown) => {
         const spec = parseForwardWorkerVersionSpec(value);
-        if (spec.containerBindings.length) throw new TakoformV2Error("capability_required", 422);
+        if (spec.containerBindings.length && !options.v2ContainerBinding)
+          throw new TakoformV2Error("capability_required", 422);
         return spec;
       }
     : parseWorkerVersionSpec;
@@ -668,6 +671,10 @@ function codeWorkerVersionForm(
     throw new TypeError("Code WorkerVersion requires a v2 Workflow target authority");
   }
   const { sql, targetKey } = options;
+  const containerBinding = options.v2ContainerBinding;
+  containerBinding?.assertSql(sql);
+  if (containerBinding && containerBinding.targetKey !== targetKey)
+    throw new TypeError("Container target mismatch");
   const queueSettlement = options.queueSettlement;
   const sqliteBinding = options.v2SqliteBinding;
   const objectBucketBinding = options.v2ObjectBucketBinding;
@@ -751,6 +758,22 @@ function codeWorkerVersionForm(
         canonicalJson(snapshot.version.spec) !== canonicalJson(spec)
       ) {
         return unresolved();
+      }
+      const resolvedContainers: { name: string; resourceUid: string }[] = [];
+      for (const binding of forward ? parseForwardWorkerVersionSpec(spec).containerBindings : []) {
+        if (
+          !containerBinding ||
+          !(await resolution.stillCurrent()) ||
+          (await containerBinding.readVersionTarget({
+            principal: execution.principal,
+            space: execution.space,
+            workerVersionUid: execution.resourceUid,
+            targetUid: binding.resource.resourceUid,
+          })) !== binding.resource.resourceUid ||
+          !(await resolution.stillCurrent())
+        )
+          return unresolved();
+        resolvedContainers.push({ name: binding.name, resourceUid: binding.resource.resourceUid });
       }
       const materials = await resolution.readMaterials();
       const configuredPrivateInputs =
@@ -864,6 +887,7 @@ function codeWorkerVersionForm(
         inspectModule,
         ...(configuredPrivateInputs ? { privateInputs: configuredPrivateInputs } : {}),
         ...(resolvedServiceBindings.length > 0 ? { resolvedServiceBindings } : {}),
+        ...(resolvedContainers.length > 0 ? { resolvedContainerBindings: resolvedContainers } : {}),
         ...(resolvedSQLite.length > 0 ? { resolvedSqliteBindings: resolvedSQLite } : {}),
         ...(resolvedBuckets.length > 0 ? { resolvedObjectBucketBindings: resolvedBuckets } : {}),
         ...(resolvedKv.length > 0 ? { resolvedKvBindings: resolvedKv } : {}),
@@ -896,6 +920,19 @@ function codeWorkerVersionForm(
           target.tenantId !== execution.principal ||
           target.workerUid !== spec.worker.resourceUid ||
           target.vector !== binding.vector
+        )
+          return unresolved();
+      }
+      // Native target rows are additional to resolution's accepted graph.
+      // Re-read their original basis after material/inspector awaits as well.
+      for (const binding of resolvedContainers) {
+        if (
+          (await containerBinding!.readVersionTarget({
+            principal: execution.principal,
+            space: execution.space,
+            workerVersionUid: execution.resourceUid,
+            targetUid: binding.resourceUid,
+          })) !== binding.resourceUid
         )
           return unresolved();
       }
@@ -1308,8 +1345,8 @@ export function createInternalV2ForwardWorkerVersionForm(options: FamilyVersionO
 /**
  * WorkerVersion 0.8.0: the 0.7.0 spec grammar and execution ABI with containerBindings
  * sealed against Container 0.1.0 or 0.2.0 per binding. A separate identity and sealer, so
- * an accepted 0.7.0 Version is never reinterpreted. Self-host still has no Container
- * runtime, so a code Version naming a containerBinding is refused exactly as 0.7.0's is.
+ * an accepted 0.7.0 Version is never reinterpreted. Without an explicit original
+ * OCI source, Container code bindings retain their original refusal.
  */
 export function createInternalV2ContainerConsumerWorkerVersionForm(
   options: FamilyVersionOptions,

@@ -518,15 +518,18 @@ for (const kind of ["shared-auth", "takos-id"] as const) {
   });
 
   test(`managed session without an Organization gives guidance rather than a refused create (${kind})`, async () => {
-    if (kind === "shared-auth") state.adoptSession("shared-auth");
+    const current = state.principal();
+    if (!current) throw new Error("fixture principal missing");
+    identityReply = () =>
+      Response.json({
+        principal: { ...current, provider: kind === "takos-id" ? "takos-id" : "local" },
+        organizations: [],
+      });
+    state.adoptSession(kind === "shared-auth" ? "shared-auth" : "legacy");
     await tick();
-    if (kind === "takos-id") {
-      const current = state.principal();
-      if (!current) throw new Error("fixture principal missing");
-      state.principal.set({ ...current, provider: "takos-id" });
-    }
-    state.organizations.set([]);
-    await tick();
+    expect(state.organizationPageState()).toBe("ready");
+    expect(state.currentOrganizationId()).toBe("org-a");
+    expect(state.currentOrganization()).toBe(null);
     expect(createOrganizationButtons()).toHaveLength(0);
     expect(body.textContent).toContain("No organization available");
     expect(body.textContent).toContain("sign-in administrator");
@@ -595,6 +598,26 @@ test("failed identity lookup gives unavailable guidance without a create action"
   expect(state.principal()).toBe(null);
   expect(createOrganizationButtons()).toHaveLength(0);
   expect(body.textContent).toContain("Account details are not available yet");
+  expect(body.textContent).not.toContain("Organization list unavailable");
+  expect(
+    body.all().some((node) => node.tag === "button" && node.textContent === "First page"),
+  ).toBe(true);
   expect(body.textContent).not.toContain("No organization yet");
+  expect(posts()).toHaveLength(0);
+});
+
+test("a failed roster page after identity resolves keeps roster retry available", async () => {
+  const expected = state.principal();
+  expect(expected?.id).toBe("owner");
+  state.selectOrganization("org-unloaded");
+  identityReply = () => Response.json({ error: { code: "backend_unavailable" } }, { status: 503 });
+  await expect(state.loadOrganizationPage()).rejects.toMatchObject({ status: 503 });
+  await tick();
+  expect(state.principal()).toBe(expected);
+  expect(body.textContent).toContain("Organization list unavailable");
+  expect(body.textContent).not.toContain("Account details are not available yet");
+  expect(
+    body.all().some((node) => node.tag === "button" && node.textContent === "First page"),
+  ).toBe(true);
   expect(posts()).toHaveLength(0);
 });

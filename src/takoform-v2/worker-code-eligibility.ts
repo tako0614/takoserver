@@ -131,6 +131,11 @@ export interface V2WorkerCodeEligibilityInput {
   readonly privateInputs?: unknown;
   /** Supplied only after the current accepted SQL reference graph was verified. */
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
+  /** Exact accepted Container targets; pure projection metadata, no native grant. */
+  readonly resolvedContainerBindings?: readonly {
+    readonly name: string;
+    readonly resourceUid: string;
+  }[];
   readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
@@ -222,7 +227,17 @@ async function verifyV2WorkerCodeProjection(
       input.sourceForm !== undefined
         ? parseForwardWorkerVersionSpec(structuredClone(input.spec))
         : parseWorkerVersionSpec(structuredClone(input.spec));
-    if (input.sourceForm && parseForwardWorkerVersionSpec(spec).containerBindings.length)
+    const declared = input.sourceForm ? parseForwardWorkerVersionSpec(spec).containerBindings : [];
+    const resolved = input.resolvedContainerBindings?.map((binding) => ({ ...binding }));
+    if (
+      declared.length !== (resolved?.length ?? 0) ||
+      declared.some(
+        (binding, index) =>
+          Object.keys(resolved![index]!).sort().join(",") !== "name,resourceUid" ||
+          binding.name !== resolved![index]?.name ||
+          binding.resource.resourceUid !== resolved![index]?.resourceUid,
+      )
+    )
       throw versionUnavailable();
   } catch {
     throw versionUnavailable();

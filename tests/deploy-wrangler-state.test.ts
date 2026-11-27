@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -11,7 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir, userInfo } from "node:os";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
@@ -674,7 +675,17 @@ describe("Wrangler version publication output", () => {
     }
   });
 
-  test("shares the default same-owner kernel lease across process scratch directories", async () => {
+  test("shares the default same-owner kernel lease across process home and scratch directories", async () => {
+    const accountHome = execFileSync("/usr/bin/getent", ["passwd", String(process.getuid?.())], {
+      cwd: "/",
+      env: { LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8",
+      timeout: 5_000,
+      killSignal: "SIGKILL",
+      maxBuffer: 4096,
+    }).split(":")[5];
+    if (!accountHome) throw new Error("fixture Unix account home unavailable");
     const scratch = mkdtempSync(join(tmpdir(), "takoserver-default-publication-lease-"));
     const holderScratch = join(scratch, "holder");
     const contenderScratch = join(scratch, "contender");
@@ -685,14 +696,15 @@ describe("Wrangler version publication output", () => {
     const digest = createHash("sha256")
       .update(`${fixture.accountId}\0${fixture.workerName}`)
       .digest("hex");
-    const lockFile = join(userInfo().homedir, ".takoserver-worker-publication-locks", digest);
+    const leaseDirectory = ".takoserver-worker-publication-locks";
+    const lockFile = join(accountHome, leaseDirectory, digest);
     const moduleUrl = new URL("../scripts/deploy/wrangler-state.ts", import.meta.url).href;
     const fixtureScript = `
       import { acquireWranglerVersionPublicationLease as acquire, inspectWranglerVersionPublicationLease as inspect } from ${JSON.stringify(moduleUrl)};
       const target = ${JSON.stringify(fixture)};
     `;
-    mkdirSync(holderScratch);
-    mkdirSync(contenderScratch);
+    mkdirSync(holderScratch, { mode: 0o700 });
+    mkdirSync(contenderScratch, { mode: 0o700 });
     const holder = Bun.spawn(
       [
         process.execPath,
@@ -708,7 +720,11 @@ describe("Wrangler version publication output", () => {
           }
         `,
       ],
-      { env: { ...process.env, TMPDIR: holderScratch }, stdin: "pipe", stdout: "pipe" },
+      {
+        env: { ...process.env, HOME: holderScratch, TMPDIR: holderScratch },
+        stdin: "pipe",
+        stdout: "pipe",
+      },
     );
     const contend = () => {
       const contender = Bun.spawnSync(
@@ -729,7 +745,10 @@ describe("Wrangler version publication output", () => {
             console.log(JSON.stringify({ status, acquired }));
           `,
         ],
-        { env: { ...process.env, TMPDIR: contenderScratch }, stdout: "pipe" },
+        {
+          env: { ...process.env, HOME: contenderScratch, TMPDIR: contenderScratch },
+          stdout: "pipe",
+        },
       );
       expect(contender.exitCode).toBe(0);
       return JSON.parse(contender.stdout.toString("utf8"));
@@ -743,6 +762,9 @@ describe("Wrangler version publication output", () => {
           ready.releaseLock();
         }
         expect(contend()).toEqual({ status: "active", acquired: false });
+        expect(existsSync(lockFile)).toBe(true);
+        expect(existsSync(join(holderScratch, leaseDirectory))).toBe(false);
+        expect(existsSync(join(contenderScratch, leaseDirectory))).toBe(false);
       } finally {
         await holder.stdin.end();
         expect(await holder.exited).toBe(0);

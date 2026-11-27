@@ -763,15 +763,29 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
       if (serialize && writes[coreResultCount - 1]?.rows.length) return "dependency_conflict";
       return "conflict";
     },
-    async nextCandidate(nowMs: number): Promise<OperationRow | null> {
+    async nextCandidate(nowMs: number, retainedHolds?: string): Promise<OperationRow | null> {
       return ((
         await sql.query(
           `SELECT * FROM tf_v2_operations WHERE next_attempt_at_ms <= ? AND
           (status = 'queued' OR
             (status IN ('running', 'reconciling') AND
-              (lease_until_ms IS NULL OR lease_until_ms <= ?)))
+              (lease_until_ms IS NULL OR lease_until_ms <= ?)))${
+                retainedHolds === undefined
+                  ? ""
+                  : `
+          AND NOT EXISTS (
+            SELECT 1 FROM json_each(?) AS held
+            JOIN tf_v2_resources AS resource ON resource.uid = tf_v2_operations.resource_uid
+            WHERE json_extract(held.value, '$.form') = resource.form_url
+              AND json_extract(held.value, '$.backendId') = resource.backend_id
+              AND resource.backend_id = tf_v2_operations.backend_id
+              AND json_extract(held.value, '$.targetKey') = resource.target_key
+              AND resource.target_key = tf_v2_operations.target_key
+              AND json_extract(held.value, '$.action') = tf_v2_operations.action
+          )`
+              }
          ORDER BY updated_at, created_at, id LIMIT 1`,
-          [nowMs, nowMs],
+          retainedHolds === undefined ? [nowMs, nowMs] : [nowMs, nowMs, retainedHolds],
         )
       )[0] ?? null) as OperationRow | null;
     },

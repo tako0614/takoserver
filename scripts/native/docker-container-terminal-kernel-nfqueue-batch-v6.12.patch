@@ -1,0 +1,24 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] refuse owned batch-verdict metadata edits
+
+Against v6.12 with the retained tako_terminal base and NFQUEUE pieces.
+Checks each actual extracted entry before mark/priority mutation.
+Uses existing DROP cleanup and continues the original safe batch iterator.
+Config-off/unowned behavior stays unchanged. No terminal/grant or build claim.
+
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -1334,6 +1334,12 @@
+ 		return -ENOENT;
+ 
+ 	list_for_each_entry_safe(entry, tmp, &batch_list, list) {
++		/* Refuse this real entry before batch packet metadata edits. */
++		if (unlikely(tako_terminal_block(entry->state.net, entry->state.pf))) {
++			nfqnl_reinject(entry, NF_DROP);
++			continue;
++		}
++
+ 		if (nfqa[NFQA_MARK])
+ 			entry->skb->mark = ntohl(nla_get_be32(nfqa[NFQA_MARK]));
+ 

@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import type { IdentityProvider } from "../console/src/api.ts";
+import { waitForConsole } from "./helpers/console-test-wait.ts";
+
+const operatorProvider: IdentityProvider = {
+  id: "google",
+  displayName: "Operator assertion",
+  method: "operator-assertion",
+};
 
 function installConsoleGlobals(): void {
   const values = new Map<string, string>();
@@ -149,20 +156,20 @@ describe("Takoserver Console operator sign-in", () => {
           const request = new Request(input, init);
           requests.push(request);
           return new URL(request.url).pathname === "/v1/identity/providers"
-            ? Response.json({
-                providers: [{ id: "local", displayName: "Operator", method: "operator-assertion" }],
-              })
+            ? Response.json({ providers: [operatorProvider] })
             : response;
         },
         { preconnect: originalFetch.preconnect },
       );
       try {
         const page = requireSignInNode(signInPage());
-        await new Promise<void>((resolve) => setImmediate(resolve));
+        await waitForConsole("operator sign-in form", () =>
+          page.all().some((node) => node.tag === "form"),
+        );
         const textarea = page.all().find((node) => node.tag === "textarea");
         const form = page.all().find((node) => node.tag === "form");
         if (!textarea || !form) throw new Error("operator sign-in form missing");
-        textarea.value = assertionFor("local");
+        textarea.value = assertionFor(operatorProvider.id);
         const signingIn = form.submit();
         expect(requests.at(-1)?.url).toBe("https://old.example.test/v1/sessions");
         if (change === "other-host") state.setApiOrigin("https://new.example.test");
@@ -171,7 +178,7 @@ describe("Takoserver Console operator sign-in", () => {
           state.adoptSession();
           state.principal.set({
             id: "new",
-            provider: "local",
+            provider: operatorProvider.id,
             email: "new@example.test",
             displayName: "New",
           });
@@ -180,7 +187,7 @@ describe("Takoserver Console operator sign-in", () => {
           Response.json({
             principal: {
               id: "old-principal",
-              provider: "local",
+              provider: operatorProvider.id,
               email: "old@example.test",
               displayName: "Old",
             },
@@ -395,15 +402,15 @@ test("operator assertion input retains its unique visible label target", async (
     async (input: RequestInfo | URL) => {
       if (new URL(String(input)).pathname !== "/v1/identity/providers")
         throw new Error("unexpected fixture request");
-      return Response.json({
-        providers: [{ id: "local", displayName: "Operator", method: "operator-assertion" }],
-      });
+      return Response.json({ providers: [operatorProvider] });
     },
     { preconnect: originalFetch.preconnect },
   );
   try {
     const page = requireSignInNode(signInPage());
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await waitForConsole("operator sign-in form", () =>
+      page.all().some((node) => node.tag === "form"),
+    );
     const nodes = page.all();
     const input = nodes.find((n) => n.tag === "textarea");
     const label = nodes.find((n) => n.tag === "label" && n.attributes.get("for") === "assertion");

@@ -2044,6 +2044,85 @@ cp -a /etc/takoserver "$SNAP/etc"
 
 Record `$SNAP` with the commit that wrote the data (step 4).
 
+### Prepare an OCI shutdown evidence database
+
+The explicit tracked OCI selection requires the shutdown evidence schema. For an
+installation with the exact Container final-delete schema and the stock SQLite
+migration history, prepare the additive schema on a copy of the stopped
+control database. The backup procedure above preserves the service's file
+ownership. Make a separate private copy owned by the operator preparing it.
+Run the following as the same operator who owns the backup directory.
+For an installation with an external `TAKOSERVER_DB`, replace the
+`SOURCE_DB` assignment with its file from the same stopped backup window.
+
+```sh
+: "${SNAP:?Set SNAP to the completed stopped backup}"
+SOURCE_DB="$SNAP/data/control.sqlite"
+test -f "$SOURCE_DB" && test "$(realpath -- "$SOURCE_DB")" = "$SOURCE_DB" || exit 1
+for suffix in -wal -shm -journal; do
+  test ! -e "$SOURCE_DB$suffix" && test ! -L "$SOURCE_DB$suffix" || exit 1
+done
+OCI_PREP=$(mktemp -d "$SNAP/oci-prepare.XXXXXXXX") || exit 1
+install -m 0600 "$SOURCE_DB" "$OCI_PREP/control.sqlite" || exit 1
+bun --no-env-file scripts/selfhost-oci-shutdown-schema.ts prepare \
+  "$OCI_PREP/control.sqlite" "$OCI_PREP/control-with-oci-shutdown.sqlite"
+```
+
+The command reads the private copy and refuses SQLite sidecars, incomplete schema,
+and existing output. It publishes the new file after an atomic schema change,
+integrity check, and readback. The output contains the same private data as
+the backup. Keep all copies in private storage. Restore service ownership on
+the prepared database when restoring that same complete installation, with
+the fencing and runtime identity checks below.
+
+### Resume accepted OCI Container operations
+
+An operator-owned Bun launcher selects the original OCI backend through
+[`startSelfhostBunHost`](../src/entry-bun.ts). Pass it
+`linuxContainerSelection: { kind: "oci", selection }` from your private
+operator code. Match the backend and target recorded by the accepted operations.
+The Bun Worker composition expects the OCI binding to use
+`selfhost-v2-worker-primary` as its target key. Keep the original installation,
+runtime custody and required private inputs through the restore below. Tracked
+OCI startup requires the shutdown evidence schema prepared above.
+
+With a Linux Container backend selected, the default for retained
+`Container/0.2.0` operations is DELETE only. To resume other already accepted
+actions, pass `v2RetainedExecutionActions` to the same launcher with the exact
+`https://edge.forms.takoform.com/forms/Container/0.2.0/` key and the action list
+this replacement owns. For example, `["create", "delete"]` resumes accepted
+CREATE and DELETE while holding UPDATE. Apply the selection on the replacement
+after fencing the previous Host. The [retained execution rules](takoform-v2.md)
+preserve the original backend, target and operation identity. When a send may
+have occurred, the executor reconciles that same operation.
+
+To exercise fresh Container CREATE and UPDATE on an isolated Host, pass
+`linuxContainerFormRegistration: "complete"` from the same private launcher.
+Select the OCI runtime application owner with two disjoint topology slots and
+prepare a separate copy of the stopped control database with the application
+successor and final DELETE discard schemas. If your backup has the exact
+shutdown evidence schema or an earlier application-successor schema without
+the final DELETE discard schema, set `SHUTDOWN_BACKUP` to its operator-owned
+private copy and `OCI_PREP` to a private directory for the output. For a
+final-delete backup,
+use the shutdown preparation above first and set
+`SHUTDOWN_BACKUP="$OCI_PREP/control-with-oci-shutdown.sqlite"`.
+
+```sh
+bun --no-env-file scripts/selfhost-oci-shutdown-schema.ts prepare-successor \
+  "$SHUTDOWN_BACKUP" "$OCI_PREP/control-with-oci-successor.sqlite"
+```
+
+The command verifies the predecessor and advances the existing configured
+UPDATE custody schema on the output copy. It checks the application successor,
+final DELETE discard schema, and SQLite integrity before publishing the copy.
+The complete Form checks both schemas at startup. Use the new copy for the
+isolated Host.
+Omit `v2RetainedExecutionActions` when selecting the complete Form.
+The existing Host authentication and resource ownership checks apply to each
+request. Physical readiness still requires validating the actual runtime,
+topology, and image on that Host.
+
 ## Restore boundary
 
 Restoring the files is not a safe way to validate a clone. Starting

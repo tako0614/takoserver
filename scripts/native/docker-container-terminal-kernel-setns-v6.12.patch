@@ -1,0 +1,18 @@
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -1487,6 +1487,14 @@
+ 	struct nsproxy *nsproxy = nsset->nsproxy;
+ 	struct net *net = to_net_ns(ns);
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* nsset is staged; only current still holds the original source. */
++	struct net *source = current->nsproxy->net_ns;
++
++	if (source->tako_terminal && source != net)
++		return -EPERM;
++#endif
++
+ 	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN) ||
+ 	    !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
+ 		return -EPERM;

@@ -1,0 +1,104 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] retain original ledger per queued NF entry and genuine duplicate
+
+Apply after retained base/CUT/hook and NFQUEUE refusal/verdict/batch pieces.
+Initial entry reserves from the genuinely live saved net. Duplicates clear
+borrowed shallow tokens and clone only the original entry's held owner.
+Drop the saved reservation only after actual entry storage free. This is
+entry/call custody, not an async skb/offload/terminal or net-memory proof.
+
+diff --git a/include/net/netfilter/nf_queue.h b/include/net/netfilter/nf_queue.h
+--- a/include/net/netfilter/nf_queue.h
++++ b/include/net/netfilter/nf_queue.h
+@@ -19,6 +19,10 @@
+ 	struct net_device	*physout;
+ #endif
+ 	struct nf_hook_state	state;
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Independent original-owner reservation, never a copied skb token. */
++	struct tako_terminal_owner *tako_terminal;
++#endif
+ 	u16			size; /* sizeof(entry) + saved route keys */
+ 
+ 	/* extra space to store route keys */
+diff --git a/net/netfilter/nf_queue.c b/net/netfilter/nf_queue.c
+--- a/net/netfilter/nf_queue.c
++++ b/net/netfilter/nf_queue.c
+@@ -71,10 +71,26 @@
+ #endif
+ }
+ 
++/* The original entry owns this reservation even after skb consumption.
++ * Save it before actual storage free; never read entry or state.net afterward.
++ */
++static void nf_queue_entry_free_storage(struct nf_queue_entry *entry)
++{
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_owner *held = entry->tako_terminal;
++
++	entry->tako_terminal = NULL;
++#endif
++	kfree(entry);
++#ifdef CONFIG_TAKO_TERMINAL
++	tako_terminal_packet_put(held);
++#endif
++}
++
+ void nf_queue_entry_free(struct nf_queue_entry *entry)
+ {
+ 	nf_queue_entry_release_refs(entry);
+-	kfree(entry);
++	nf_queue_entry_free_storage(entry);
+ }
+ EXPORT_SYMBOL_GPL(nf_queue_entry_free);
+ 
+@@ -209,11 +225,15 @@
+ 		.hook_index = index,
+ 		.size	= sizeof(*entry) + route_key_size,
+ 	};
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Original __nf_queue caller retains this genuine live saved net. */
++	entry->tako_terminal = tako_terminal_packet_reserve(state->net);
++#endif
+ 
+ 	__nf_queue_entry_init_physdevs(entry);
+ 
+ 	if (!nf_queue_entry_get_refs(entry)) {
+-		kfree(entry);
++		nf_queue_entry_free_storage(entry);
+ 		return -ENOTCONN;
+ 	}
+ 
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -939,8 +939,17 @@
+ 	if (!entry)
+ 		return NULL;
+ 
+-	if (nf_queue_entry_get_refs(entry))
++#ifdef CONFIG_TAKO_TERMINAL
++	/* kmemdup copied a borrowed pointer, not an independent reservation. */
++	entry->tako_terminal = NULL;
++#endif
++	if (nf_queue_entry_get_refs(entry)) {
++#ifdef CONFIG_TAKO_TERMINAL
++		/* Original entry retains this owner; do not rederive from net. */
++		entry->tako_terminal = tako_terminal_packet_clone(e->tako_terminal);
++#endif
+ 		return entry;
++	}
+ 
+ 	kfree(entry);
+ 	return NULL;
+diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
+--- a/net/core/tako_terminal.c
++++ b/net/core/tako_terminal.c
+@@ -282,6 +282,7 @@
+ 		tako_aux_get(held, &held->packet_groups);
+ 	return held;
+ }
++EXPORT_SYMBOL_GPL(tako_terminal_packet_clone);
+ 
+ void tako_terminal_packet_put(struct tako_terminal_owner *held)
+ {

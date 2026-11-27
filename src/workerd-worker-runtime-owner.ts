@@ -16,6 +16,11 @@ import {
   unlink,
 } from "node:fs/promises";
 import { join } from "node:path";
+import type {
+  LinuxOciContainerBindingSource,
+  LinuxOciWorkerdContainerClaim,
+} from "./providers/linux-oci-container-binding-broker.ts";
+import { openSelfhostContainerBindingSocket } from "./providers/selfhost-container-binding-socket.ts";
 import {
   SELFHOST_V2_QUEUE_EVENT_CONTENT_TYPE,
   SELFHOST_V2_QUEUE_EVENT_PATH,
@@ -289,7 +294,18 @@ interface IncarnationHandle {
   readonly orphanedActorBindingLeases: Set<WorkerdPrivateServiceLease>;
   /** Native ServiceBinding calls pin the exact caller incarnation through body drain. */
   readonly serviceBindingLeases: Set<Promise<void>>;
+  /** Exact original Container invocations, including pending source reads and UNKNOWN. */
+  readonly containerCalls: Set<{
+    readonly abort: AbortController;
+    actual?: Awaited<ReturnType<LinuxOciContainerBindingSource["open"]>>;
+  }>;
   readonly serviceBindingForward?: V2ServiceBindingForwardIncarnation;
+  readonly containerBindingForward?: {
+    issueBinding(
+      claim: LinuxOciWorkerdContainerClaim,
+      binding: WorkerdServiceBinding,
+    ): Promise<void>;
+  };
   readonly serviceBindingDispatchToken: string;
   retirementTimer?: () => void;
   retiring?: Promise<WorkerdWorkerRetirementReceipt>;
@@ -619,6 +635,7 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   readonly workerResourceUid: string;
   readonly targetKey: string;
   readonly publicationState: PublicationState;
+  readonly v2ContainerBinding?: LinuxOciContainerBindingSource;
   /** Trusted Core reference authority and dynamic logical Worker owner lookup. */
   readonly v2ServiceBinding?: {
     readonly authority: {
@@ -3212,6 +3229,8 @@ async function openRuntimeOwner(
   }
 
   const cancelInvocations = async (incarnation: IncarnationHandle): Promise<void> => {
+    for (const call of incarnation.containerCalls)
+      call.abort.abort(new WorkerdWorkerRuntimeOwnerError("admission_closed"));
     for (const invocation of [...incarnation.invocations]) {
       invocation.abort.abort(new WorkerdWorkerRuntimeOwnerError("admission_closed"));
       invocation.cancelSocket?.();
@@ -3257,6 +3276,8 @@ async function openRuntimeOwner(
   const incarnationDirectory = (operationId: string): string =>
     join(directory, "incarnations", operationId);
 
+  if (options.v2ContainerBinding && !v2ServiceBinding)
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   const makeIncarnationHandle = (
     record: IncarnationRecord,
     group: WorkerdWorkerExecutionGroup,
@@ -3290,6 +3311,7 @@ async function openRuntimeOwner(
       string,
       {
         readonly binding: WorkerdServiceBinding;
+        readonly containerClaim?: string;
         readonly socket: WorkerdV2ServiceBindingBrokerSocket;
         readonly close: () => Promise<void>;
       }
@@ -3420,6 +3442,182 @@ async function openRuntimeOwner(
           },
         }
       : undefined;
+    const containerBindingForward = options.v2ContainerBinding
+      ? {
+          async issueBinding(input: LinuxOciWorkerdContainerClaim, binding: WorkerdServiceBinding) {
+            const claim = Object.freeze({ ...input });
+            const source = options.v2ContainerBinding!;
+            const owns = () => {
+              const latest = recordFor(record.operationId);
+              return (
+                !closed &&
+                !suspending &&
+                admissionClosedBy === null &&
+                claim.workerUid === options.workerResourceUid &&
+                claim.targetKey === options.targetKey &&
+                claim.incarnationId === record.operationId &&
+                claim.servingSourceOperationId === record.operationId &&
+                latest !== undefined &&
+                latest.receipt === null &&
+                !latest.executionCopiesCleanupStarted &&
+                !latest.executionCopiesReleased &&
+                (latest.status === "candidate" ||
+                  latest.status === "active" ||
+                  latest.status === "draining") &&
+                (latest.identity === null
+                  ? latest.status === "candidate"
+                  : latest.identity.versions.some(
+                      (version) =>
+                        version.versionId === claim.nativeVersionId &&
+                        version.workerVersionUid === claim.workerVersionUid,
+                    ))
+              );
+            };
+            const matches = (value: Awaited<ReturnType<typeof source.read>>) =>
+              value !== null &&
+              value.principal === claim.principal &&
+              value.space === claim.space &&
+              value.targetKey === claim.targetKey &&
+              value.workerVersionUid === claim.workerVersionUid &&
+              value.workerVersionFormUrl === claim.workerVersionFormUrl &&
+              value.workerVersionGeneration === claim.workerVersionGeneration &&
+              value.sourceOperationId === claim.operationId &&
+              value.targetUid === claim.targetUid;
+            if (
+              source.targetKey !== options.targetKey ||
+              binding.targetResourceUid !== claim.targetUid ||
+              binding.target !== (await v2ServiceTargetName(claim.targetUid)) ||
+              !owns() ||
+              !matches(await source.read(claim)) ||
+              !owns()
+            )
+              throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            const router = workerdServiceBindingRouterName(binding);
+            const prior = serviceBindingBrokers.get(router);
+            if (prior) {
+              if (
+                canonicalJson(prior.binding) !== canonicalJson(binding) ||
+                prior.containerClaim !== canonicalJson(claim)
+              )
+                throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+              return;
+            }
+            const broker = await openSelfhostContainerBindingSocket({
+              directory: privateSocketDirectoryFor(record.operationId),
+              socketName: workerdV2ServiceBindingBrokerSocketPath(
+                privateSocketDirectoryFor(record.operationId),
+                binding,
+              )
+                .split("/")
+                .at(-1)!,
+              async dispatch(request) {
+                // Request construction/framing already succeeded. This is the
+                // original native owner's closure, not an injectable verifier.
+                const incarnation = handles.get(record.operationId);
+                if (!incarnation || !owns())
+                  throw new WorkerdWorkerRuntimeOwnerError("not_serving");
+                const call: {
+                  abort: AbortController;
+                  actual?: Awaited<ReturnType<typeof source.open>>;
+                } = { abort: new AbortController() };
+                incarnation.containerCalls.add(call); // BEFORE native/source awaits
+                const signal = AbortSignal.any([request.signal, call.abort.signal]);
+                let lease: Awaited<ReturnType<typeof acquireServiceBindingRequest>>;
+                let actual: Awaited<ReturnType<typeof source.open>> | undefined;
+                const releaseKnown = async () => {
+                  await lease?.release();
+                  incarnation.containerCalls.delete(call);
+                };
+                try {
+                  lease = await acquireServiceBindingRequest({
+                    workerUid: claim.workerUid,
+                    versionId: claim.nativeVersionId,
+                    incarnationId: claim.incarnationId,
+                    servingSourceOperationId: claim.servingSourceOperationId,
+                  });
+                  if (!lease || signal.aborted || !owns())
+                    throw new WorkerdWorkerRuntimeOwnerError("not_serving");
+                  const identity = recordFor(record.operationId)?.identity;
+                  const resolution =
+                    identity && options.publicationState.resolveCurrentServing
+                      ? await options.publicationState.resolveCurrentServing({
+                          workerUid: claim.workerUid,
+                          targetKey: claim.targetKey,
+                          sourceOperationId: claim.servingSourceOperationId,
+                          expectedIdentity: identity,
+                        })
+                      : null;
+                  const version =
+                    resolution?.kind === "ready"
+                      ? resolution.snapshot.deployment?.versions.find(
+                          (v) => v.uid === claim.workerVersionUid,
+                        )
+                      : undefined;
+                  if (
+                    resolution?.kind !== "ready" ||
+                    !version ||
+                    version.form !== claim.workerVersionFormUrl ||
+                    version.generation !== claim.workerVersionGeneration ||
+                    version.sourceOperationId !== claim.operationId ||
+                    resolution.snapshot.worker.principal !== claim.principal ||
+                    resolution.snapshot.worker.space !== claim.space ||
+                    resolution.snapshot.worker.uid !== claim.workerUid ||
+                    !(await resolution.stillCurrent())
+                  )
+                    throw new WorkerdWorkerRuntimeOwnerError("not_serving");
+                  const accepted = await source.read(claim);
+                  if (
+                    !matches(accepted) ||
+                    !accepted ||
+                    !(await lease.stillCurrent()) ||
+                    signal.aborted ||
+                    !owns() ||
+                    handles.get(record.operationId) !== incarnation
+                  )
+                    throw new WorkerdWorkerRuntimeOwnerError("not_serving");
+                  const forwarded = new Request(request, { signal });
+                  actual = await source.open(accepted, forwarded, () => {
+                    if (
+                      signal.aborted ||
+                      !owns() ||
+                      handles.get(record.operationId) !== incarnation ||
+                      !incarnation.group.isReady() ||
+                      canonicalJson(recordFor(record.operationId)?.identity) !==
+                        canonicalJson(identity)
+                    )
+                      throw new WorkerdWorkerRuntimeOwnerError("not_serving");
+                  });
+                  call.actual = actual;
+                  // Head/body EOF or connector success cannot release this lease.
+                  // UNKNOWN retains this exact call, handle and native caller pin.
+                  void actual.settlement.then(releaseKnown, () => undefined).catch(() => undefined);
+                  return await actual.response;
+                } catch (error) {
+                  if (!actual) await releaseKnown(); // actual source refuses before starting I/O
+                  throw error;
+                }
+              },
+            });
+            // Retain the actual socket before the final accepted-source await.
+            // A failing read/close must not lose its original cleanup custody.
+            const entry = {
+              binding: { ...binding },
+              containerClaim: canonicalJson(claim),
+              socket: { socketPath: broker.path, identity: { ...broker.identity } },
+              close: broker.close,
+            };
+            serviceBindingBrokers.set(router, entry);
+            try {
+              if (!owns() || !matches(await source.read(claim)) || !owns())
+                throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+            } catch (error) {
+              await broker.close();
+              if (serviceBindingBrokers.get(router) === entry) serviceBindingBrokers.delete(router);
+              throw error;
+            }
+          },
+        }
+      : undefined;
     const runtime = createWorkerdRuntime({
       root: group.runtimeRoot,
       configPath: group.configurationPath,
@@ -3478,6 +3676,7 @@ async function openRuntimeOwner(
       ...(v2KvBinding ? { v2KvBinding } : {}),
       ...(v2QueueProducerBinding ? { v2QueueProducerBinding } : {}),
       ...(serviceBindingForward ? { v2ServiceBindingForward: serviceBindingForward } : {}),
+      ...(containerBindingForward ? { v2ContainerBindingForward: containerBindingForward } : {}),
       ...(actorForward ? { v2ActorForward: actorForward } : {}),
       ...(workflowForward ? { v2WorkflowForward: workflowForward } : {}),
       ...(record.eventToken === null ? {} : { scheduledEventToken: record.eventToken }),
@@ -3491,10 +3690,12 @@ async function openRuntimeOwner(
       ...(actorForward ? { actorForward } : {}),
       ...(workflowForward ? { workflowForward } : {}),
       ...(serviceBindingForward ? { serviceBindingForward } : {}),
+      ...(containerBindingForward ? { containerBindingForward } : {}),
       invocations: new Set(),
       workflowLeases: new Set(),
       orphanedActorBindingLeases: new Set(),
       serviceBindingLeases: new Set(),
+      containerCalls: new Set(),
     };
     handles.set(record.operationId, handle);
     return handle;
@@ -3914,8 +4115,53 @@ async function openRuntimeOwner(
           throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
       const declared = spec.serviceBindings;
-      const persisted =
+      const containers = version.form
+        ? parseForwardWorkerVersionSpec(version.spec).containerBindings
+        : [];
+      const allPersisted =
         selected.site.kind === "static" ? [] : (selected.site.serviceBindings ?? []);
+      if (allPersisted.length !== declared.length + containers.length)
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      const persisted = allPersisted.slice(0, declared.length);
+      const persistedContainers = allPersisted.slice(declared.length);
+      if (
+        persistedContainers.some(
+          (binding, index) =>
+            binding.name !== workerdVersionServiceBindingName(declared.length + index, true),
+        ) ||
+        !(await exactV2ResolvedServiceBindings(
+          containers,
+          persistedContainers.map((binding, index) => ({
+            ...binding,
+            name: containers[index]!.name,
+          })),
+        ))
+      )
+        throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      if (containers.length) {
+        const forward = handle.containerBindingForward;
+        if (!forward || !version.form)
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        for (const [index, binding] of persistedContainers.entries())
+          await forward.issueBinding(
+            {
+              principal: snapshot.worker.principal,
+              space: snapshot.worker.space,
+              targetKey: options.targetKey,
+              workerUid: snapshot.worker.uid,
+              workerVersionUid: version.uid,
+              workerVersionFormUrl: version.form,
+              workerVersionGeneration: version.generation,
+              operationId: version.sourceOperationId,
+              bindingName: containers[index]!.name,
+              targetUid: containers[index]!.resource.resourceUid,
+              nativeVersionId: pinnedVersion.versionId,
+              incarnationId: record.operationId,
+              servingSourceOperationId: record.operationId,
+            },
+            binding,
+          );
+      }
       const hasExactPrivateOrdinals = persisted.every(
         (binding, index) => binding.name === workerdVersionServiceBindingName(index, true),
       );

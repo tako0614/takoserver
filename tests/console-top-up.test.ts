@@ -801,6 +801,7 @@ async function billingPageFor(input: {
   readonly search?: string;
   readonly storage?: Map<string, string>;
   readonly signedIn?: boolean;
+  readonly mountWhenSelected?: boolean;
   readonly receiptState?: TopUpReceipt["state"];
   readonly workspaceUsage?: (url: URL) => Response | Promise<Response>;
   readonly checkoutResponse?: () => Response | Promise<Response>;
@@ -936,6 +937,7 @@ async function billingPageFor(input: {
     state.selectOrganization(organizationId);
   };
   if (input.signedIn === false) {
+    if (input.mountWhenSelected) state.adoptSession();
     state.principal.set(null);
     state.organizations.set([]);
   } else signIn();
@@ -948,7 +950,19 @@ async function billingPageFor(input: {
     segments: ["billing"],
     query: new URLSearchParams(location.search),
   });
-  const root = billingPage(organizationId) as unknown as TestNode;
+  let stopMount: (() => void) | undefined;
+  let root: TestNode;
+  if (input.mountWhenSelected) {
+    const { live } = await import("../console/src/dom.ts");
+    const { signal } = await import("../console/src/reactive.ts");
+    const active = signal(true);
+    stopMount = () => active.set(false);
+    root = live(() => {
+      if (!active()) return null;
+      const selected = state.currentOrganization();
+      return selected ? billingPage(selected.id) : null;
+    }) as unknown as TestNode;
+  } else root = billingPage(organizationId) as unknown as TestNode;
   await flush();
   const button = (label: string) =>
     [...root.all(), ...body.all()]
@@ -964,6 +978,7 @@ async function billingPageFor(input: {
     location,
     body,
     signIn,
+    stopMount,
     async click(label: string) {
       const target = button(label);
       expect(target).toBeDefined();
@@ -1298,27 +1313,71 @@ describe("billing page top-up lane", () => {
     }
   });
 
-  test("a hosted return before the owner scope loads is answered exactly once when it does", async () => {
+  test("a hosted return after owner loading reads once within one mount, including a status refresh", async () => {
     const { storage, reference } = await seededStorage();
     const page = await billingPageFor({
       subscription: "hosted",
       search: "?checkout=cs_test_hosted",
       storage,
       signedIn: false,
+      mountWhenSelected: true,
       receiptState: "pending",
     });
-    const receiptCall = `GET /v1/organizations/${organizationId}/wallet/checkout/${reference}`;
-    expect(page.calls()).not.toContain(receiptCall);
-    expect(page.location.search).toBe("?checkout=cs_test_hosted");
+    try {
+      const receiptCall = `GET /v1/organizations/${organizationId}/wallet/checkout/${reference}`;
+      expect(page.calls()).toEqual([]);
+      expect(page.calls()).not.toContain(receiptCall);
+      expect(page.location.search).toBe("?checkout=cs_test_hosted");
 
-    page.signIn();
-    await flush();
-    // Signal churn after the return was answered does not ask again.
-    page.signIn();
-    await flush();
-    expect(page.calls().filter((call) => call === receiptCall)).toHaveLength(1);
-    expect(page.calls()).not.toContain(fundingCall);
-    expect(storage.has(storageKey)).toBe(true);
+      page.signIn();
+      await flush();
+      expect(page.calls().filter((call) => call === receiptCall)).toHaveLength(1);
+      // A visible read refresh on this mounted page does not replay the return.
+      await page.click("Refresh status");
+      expect(page.calls().filter((call) => call === receiptCall)).toHaveLength(1);
+      expect(page.calls()).not.toContain(fundingCall);
+      expect(page.calls().every((call) => call.startsWith("GET "))).toBe(true);
+      expect(storage.has(storageKey)).toBe(true);
+    } finally {
+      page.stopMount?.();
+      await flush();
+    }
+  });
+
+  test("a hosted return rereads the same pending receipt on a fresh-owner page remount without payment effects", async () => {
+    const { storage, reference } = await seededStorage();
+    const original = storage.get(storageKey);
+    const page = await billingPageFor({
+      subscription: "hosted",
+      search: "?checkout=cs_test_hosted",
+      storage,
+      signedIn: false,
+      mountWhenSelected: true,
+      receiptState: "pending",
+    });
+    try {
+      const receiptCall = `GET /v1/organizations/${organizationId}/wallet/checkout/${reference}`;
+      expect(page.calls()).toEqual([]);
+      page.signIn();
+      await flush();
+      expect(page.calls().filter((call) => call === receiptCall)).toHaveLength(1);
+
+      // Fresh owner and membership objects remount the page through the real live boundary.
+      page.signIn();
+      await flush();
+      expect(page.calls().filter((call) => call.includes("/wallet/checkout/"))).toEqual([
+        receiptCall,
+        receiptCall,
+      ]);
+      expect(page.calls().every((call) => call.startsWith("GET "))).toBe(true);
+      expect(page.calls()).not.toContain(fundingCall);
+      expect(page.calls()).not.toContain(checkoutCall);
+      expect(storage.get(storageKey)).toBe(original);
+      expect(page.location.search).toBe("?checkout=cs_test_hosted");
+    } finally {
+      page.stopMount?.();
+      await flush();
+    }
   });
 });
 

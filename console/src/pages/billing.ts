@@ -64,9 +64,26 @@ export function billingPage(organizationId: string): Child {
   const isRouteCurrent = () => route() === openedRoute;
   const isOrganizationCurrent = captureSelectedOrganizationScope(organizationId);
   const isPageCurrent = () => isRouteCurrent() && isOrganizationCurrent();
-  const wallet = resource(() => api.wallet(organizationId));
-  const usageSummary = resource(() => api.usageSummary(organizationId));
-  const hostedSubscription = resource(() => api.subscription(organizationId));
+  if (!isPageCurrent())
+    return card(
+      tr("使用量と請求", "Usage & billing"),
+      empty(
+        tr("組織を選択してください", "Choose an organization"),
+        tr("一覧から組織を選択してください。", "Select an organization from the list."),
+      ),
+    );
+  const scopedRead = <Value>(load: () => Promise<Value>): Resource<Value> => {
+    const read = resource(load);
+    return {
+      get: () => (isPageCurrent() ? read.get() : { state: "loading" }),
+      reload: () => {
+        if (isPageCurrent()) read.reload();
+      },
+    };
+  };
+  const wallet = scopedRead(() => api.wallet(organizationId));
+  const usageSummary = scopedRead(() => api.usageSummary(organizationId));
+  const hostedSubscription = scopedRead(() => api.subscription(organizationId));
   const workspaceUsage = createWorkspaceUsageController({
     organizationId,
     api,
@@ -261,6 +278,21 @@ export function billingPage(organizationId: string): Child {
     );
   };
 
+  const includedUsage = live(() =>
+    whenReady(
+      usageSummary.get(),
+      ({ usageSummary: summary }) =>
+        stat(
+          tr("利用枠の使用率", "Included usage"),
+          formatUsagePercent(summary.utilizationBasisPoints, uiLocale()),
+          summary.effectiveIncludedMicros === "0"
+            ? tr("この期間の利用枠はありません", "No included allowance for this period")
+            : tr("使用済み＋確保中／利用枠", "used + held / included allowance"),
+        ),
+      { retry: usageSummary.reload },
+    ),
+  );
+
   return h(
     "div",
     { class: "page" },
@@ -281,127 +313,120 @@ export function billingPage(organizationId: string): Child {
         ),
       ),
       h(
-        "button",
-        {
-          class: "btn btn--primary",
-          type: "button",
-          onClick: openAddFunds,
-        },
-        icon(ICON.plus, 14),
-        text(tr("残高を追加", "Add funds")),
+        "div",
+        { class: "toolbar" },
+        h(
+          "button",
+          { class: "btn", type: "button", onClick: reloadWallet },
+          icon(ICON.refresh, 14),
+          text(tr("残高と使用量を更新", "Refresh balance and usage")),
+        ),
+        h(
+          "button",
+          {
+            class: "btn btn--primary",
+            type: "button",
+            onClick: openAddFunds,
+          },
+          icon(ICON.plus, 14),
+          text(tr("残高を追加", "Add funds")),
+        ),
       ),
     ),
     live(() => (billingMode() === "hosted" ? topUpStatus(topUp) : null)),
     hostedSubscriptionCard(hostedSubscription, checkout, ownerCanManage, cancellationFor),
-    live(() =>
-      whenReady(
-        wallet.get(),
-        ({ wallet: held }) =>
-          h(
-            "div",
-            { style: { display: "grid", gap: "16px" } },
-            h(
-              "div",
-              { class: "grid" },
-              stat(
-                tr("利用可能", "Available"),
-                formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
-                held.frozenMicros === undefined
-                  ? tr("このHostが報告した利用可能額", "available credit reported by this Host")
-                  : tr("現在のクレジット − 確保中 − 凍結額", "current credit − held − frozen"),
-              ),
-              stat(
-                tr("確保中", "Held"),
-                formatMicrosCurrency(held.heldMicros, held.currency, uiLocale()),
-                tr("処理中の操作に予約済み", "reserved against live work"),
-              ),
-              stat(
-                tr("現在のクレジット", "Current credit"),
-                formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
-                held.frozenMicros === undefined
-                  ? tr("このHostが報告した現在の残高", "current balance reported by this Host")
-                  : tr(
-                      "確保中・凍結中を含む有効なクレジット",
-                      "eligible credit, including held and frozen",
-                    ),
-              ),
-              stat(
-                tr("返金処理中の凍結額", "Frozen"),
-                held.frozenMicros === undefined
-                  ? tr("未報告", "Not reported")
-                  : formatMicrosCurrency(held.frozenMicros, held.currency, uiLocale()),
-                held.frozenMicros === undefined
-                  ? tr("Hostから凍結額の報告がありません", "this Host did not report frozen credit")
-                  : tr(
-                      "返金処理中のため利用できません",
-                      "unavailable while refund settlement is pending",
-                    ),
-              ),
-              stat(
-                tr("返金未回収額", "Refund receivable"),
-                held.refundReceivableMicros === undefined
-                  ? tr("未報告", "Not reported")
-                  : formatMicrosCurrency(held.refundReceivableMicros, held.currency, uiLocale()),
-                held.refundReceivableMicros === undefined
-                  ? tr(
-                      "Hostから返金未回収額の報告がありません",
-                      "this Host did not report refund debt",
-                    )
-                  : tr("利用可能残高に含まれない債務", "debt, separate from spendable credit"),
-              ),
-              live(() =>
-                whenReady(
-                  usageSummary.get(),
-                  ({ usageSummary: summary }) =>
-                    stat(
-                      tr("利用枠の使用率", "Included usage"),
-                      formatUsagePercent(summary.utilizationBasisPoints, uiLocale()),
-                      summary.effectiveIncludedMicros === "0"
-                        ? tr(
-                            "この期間の利用枠はありません",
-                            "No included allowance for this period",
-                          )
-                        : tr("使用済み＋確保中／利用枠", "used + held / included allowance"),
-                    ),
-                  { retry: usageSummary.reload },
-                ),
-              ),
-            ),
-            held.refundReceivableMicros === undefined
-              ? h(
-                  "div",
-                  { class: "notice notice--warn", role: "status" },
-                  tr(
-                    "返金未回収額は未報告です。利用可能残高だけでは新しい課金操作の可否は分かりません。操作時にHostが判定します。",
-                    "Refund debt was not reported. Available credit alone does not establish permission for new billable operations; the Host decides when an operation is requested.",
-                  ),
-                )
-              : BigInt(held.refundReceivableMicros) > 0n
-                ? h(
-                    "div",
-                    { class: "notice notice--bad", role: "status" },
-                    tr(
-                      "返金未回収額が残っているため、利用可能残高があっても新しい課金操作はできません。",
-                      "New billable operations are blocked while a refund receivable remains, even when available credit is positive.",
-                    ),
-                  )
-                : null,
-            card(
-              tr("取引履歴", "Ledger"),
-              held.entries.length === 0
-                ? empty(
-                    tr("履歴がありません", "No entries"),
-                    tr(
-                      "この組織にはまだ入金または請求がありません。",
-                      "Nothing has been funded or charged on this organization yet.",
-                    ),
-                  )
-                : h("div", { class: "table-scroll" }, ledgerTable(held.entries, held.currency)),
-            ),
+    live(() => {
+      const loaded = wallet.get();
+      if (loaded.state !== "ready")
+        return [
+          whenReady(loaded, () => null, { retry: reloadWallet }),
+          h("div", { class: "grid grid--stats" }, includedUsage),
+        ];
+      const { wallet: held } = loaded.value;
+      return h(
+        "div",
+        { style: { display: "grid", gap: "16px" } },
+        h(
+          "div",
+          { class: "grid" },
+          stat(
+            tr("利用可能", "Available"),
+            formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
+            held.frozenMicros === undefined
+              ? tr("このHostが報告した利用可能額", "available credit reported by this Host")
+              : tr("現在のクレジット − 確保中 − 凍結額", "current credit − held − frozen"),
           ),
-        { retry: reloadWallet },
-      ),
-    ),
+          stat(
+            tr("確保中", "Held"),
+            formatMicrosCurrency(held.heldMicros, held.currency, uiLocale()),
+            tr("処理中の操作に予約済み", "reserved against live work"),
+          ),
+          stat(
+            tr("現在のクレジット", "Current credit"),
+            formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
+            held.frozenMicros === undefined
+              ? tr("このHostが報告した現在の残高", "current balance reported by this Host")
+              : tr(
+                  "確保中・凍結中を含む有効なクレジット",
+                  "eligible credit, including held and frozen",
+                ),
+          ),
+          stat(
+            tr("返金処理中の凍結額", "Frozen"),
+            held.frozenMicros === undefined
+              ? tr("未報告", "Not reported")
+              : formatMicrosCurrency(held.frozenMicros, held.currency, uiLocale()),
+            held.frozenMicros === undefined
+              ? tr("Hostから凍結額の報告がありません", "this Host did not report frozen credit")
+              : tr(
+                  "返金処理中のため利用できません",
+                  "unavailable while refund settlement is pending",
+                ),
+          ),
+          stat(
+            tr("返金未回収額", "Refund receivable"),
+            held.refundReceivableMicros === undefined
+              ? tr("未報告", "Not reported")
+              : formatMicrosCurrency(held.refundReceivableMicros, held.currency, uiLocale()),
+            held.refundReceivableMicros === undefined
+              ? tr("Hostから返金未回収額の報告がありません", "this Host did not report refund debt")
+              : tr("利用可能残高に含まれない債務", "debt, separate from spendable credit"),
+          ),
+          includedUsage,
+        ),
+        held.refundReceivableMicros === undefined
+          ? h(
+              "div",
+              { class: "notice notice--warn", role: "status" },
+              tr(
+                "返金未回収額は未報告です。利用可能残高だけでは新しい課金操作の可否は分かりません。操作時にHostが判定します。",
+                "Refund debt was not reported. Available credit alone does not establish permission for new billable operations; the Host decides when an operation is requested.",
+              ),
+            )
+          : BigInt(held.refundReceivableMicros) > 0n
+            ? h(
+                "div",
+                { class: "notice notice--bad", role: "status" },
+                tr(
+                  "返金未回収額が残っているため、利用可能残高があっても新しい課金操作はできません。",
+                  "New billable operations are blocked while a refund receivable remains, even when available credit is positive.",
+                ),
+              )
+            : null,
+        card(
+          tr("取引履歴", "Ledger"),
+          held.entries.length === 0
+            ? empty(
+                tr("履歴がありません", "No entries"),
+                tr(
+                  "この組織にはまだ入金または請求がありません。",
+                  "Nothing has been funded or charged on this organization yet.",
+                ),
+              )
+            : h("div", { class: "table-scroll" }, ledgerTable(held.entries, held.currency)),
+        ),
+      );
+    }),
     workspaceUsageCard(workspaceUsage),
   );
 }

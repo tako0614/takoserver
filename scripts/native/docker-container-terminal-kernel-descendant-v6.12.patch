@@ -1,0 +1,17 @@
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -521,6 +521,13 @@
+ struct net *copy_net_ns(unsigned long flags,
+ 			struct user_namespace *user_ns, struct net *old_net)
+ {
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Original birth ownership is immutable, independent of admission state.
++	 * Refuse before namespace accounting/allocation; caller holds old_net.
++	 */
++	if ((flags & CLONE_NEWNET) && old_net && old_net->tako_terminal)
++		return ERR_PTR(-EPERM);
++#endif
+ 	return __copy_net_ns(flags, user_ns, old_net, NULL);
+ }
+ 

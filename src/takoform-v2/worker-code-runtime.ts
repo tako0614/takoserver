@@ -74,6 +74,10 @@ export async function projectV2WorkerCodeVersion(input: {
   /** Actual configured values from the trusted Resource-owned custody reader. */
   readonly configuredPrivateInputs?: unknown;
   readonly resolvedServiceBindings?: readonly V2ResolvedServiceBinding[];
+  readonly resolvedContainerBindings?: readonly {
+    readonly name: string;
+    readonly resourceUid: string;
+  }[];
   readonly resolvedSqliteBindings?: readonly V2ResolvedSqliteBinding[];
   readonly resolvedObjectBucketBindings?: readonly V2ResolvedObjectBucketBinding[];
   readonly resolvedKvBindings?: readonly V2ResolvedKvBinding[];
@@ -106,6 +110,10 @@ export async function projectV2WorkerCodeVersion(input: {
   if (configuredPrivateInputs === null) {
     throw new V2WorkerCodeRuntimeError("worker_private_inputs_unavailable");
   }
+  // Capture this pure accepted vector before any projection/inspection await.
+  const resolvedContainerBindings = input.resolvedContainerBindings?.map((binding) => ({
+    ...binding,
+  }));
   let resolvedServiceBindings: readonly V2ResolvedServiceBinding[] | undefined;
   try {
     resolvedServiceBindings = input.resolvedServiceBindings?.map((binding) => ({ ...binding }));
@@ -176,6 +184,7 @@ export async function projectV2WorkerCodeVersion(input: {
     privateInputs: input.privateInputs,
     ...(configuredPrivateInputs === undefined ? {} : { configuredPrivateInputs }),
     ...(resolvedServiceBindings === undefined ? {} : { resolvedServiceBindings }),
+    ...(resolvedContainerBindings === undefined ? {} : { resolvedContainerBindings }),
     ...(resolvedSqliteBindings === undefined ? {} : { resolvedSqliteBindings }),
     ...(resolvedObjectBucketBindings === undefined ? {} : { resolvedObjectBucketBindings }),
     ...(resolvedKvBindings === undefined ? {} : { resolvedKvBindings }),

@@ -12,6 +12,7 @@ import {
   AuthError,
   grants,
   type IdentityProviderDescriptor,
+  OrganizationPaginationRequiredError,
   PersonalOrganizationError,
 } from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
@@ -68,7 +69,7 @@ import {
   PaymentEventError,
   type PaymentEvents,
 } from "./payment-events.ts";
-import type { Clock } from "./ports.ts";
+import { type Clock, SqlError } from "./ports.ts";
 import { requestAuthorization } from "./request-authorization.ts";
 import { MAX_JSON_REQUEST_BODY_BYTES, readBoundedRequestBody } from "./request-body.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
@@ -1105,9 +1106,46 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       const principal = await accounts.principal(actor.principalId);
       if (!principal) throw new AuthError("unauthenticated");
-      return Response.json({
+      const sizes = url.searchParams.getAll("organizationPageSize");
+      const cursors = url.searchParams.getAll("organizationCursor");
+      if (sizes.length > 0 || cursors.length > 0) {
+        if (sizes.length !== 1 || cursors.length > 1 || !/^[1-9][0-9]{0,2}$/u.test(sizes[0] ?? ""))
+          throw new AuthError("invalid");
+        const page = await accounts
+          .organizationPage(actor.principalId, {
+            limit: Number(sizes[0]),
+            cursor: cursors[0],
+          })
+          .catch((error: unknown) => {
+            if (error instanceof SqlError && error.code === "unavailable")
+              controlError("unavailable", 503);
+            throw error;
+          });
+        const body = JSON.stringify({
+          principal,
+          organizations: page.organizations,
+          nextOrganizationCursor: page.nextCursor,
+        });
+        if (new TextEncoder().encode(body).byteLength > 65_536) controlError("unavailable", 503);
+        return new Response(body, {
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
+        });
+      }
+      // Success still means complete. Large rosters require explicit pagination.
+      const organizations = await accounts
+        .organizations(actor.principalId)
+        .catch((error: unknown) => {
+          if (error instanceof SqlError && error.code === "unavailable")
+            controlError("unavailable", 503);
+          throw error;
+        });
+      const body = JSON.stringify({
         principal,
-        organizations: await accounts.organizations(actor.principalId),
+        organizations,
+      });
+      if (new TextEncoder().encode(body).byteLength > 65_536) controlError("unavailable", 503);
+      return new Response(body, {
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
       });
     }
 
@@ -2414,11 +2452,17 @@ function controlError(code: string, status: number): never {
 export function controlErrorResponse(error: unknown): Response {
   const { code, status } = classify(error);
   const message =
-    error instanceof WorkerEndpointOriginReservationError ? error.publicMessage : undefined;
+    error instanceof OrganizationPaginationRequiredError
+      ? "Organization roster requires pagination; request organizationPageSize (1-100)."
+      : error instanceof WorkerEndpointOriginReservationError
+        ? error.publicMessage
+        : undefined;
   return Response.json(errorEnvelope(code, undefined, undefined, message), { status });
 }
 
 function classify(error: unknown): { code: string; status: number } {
+  if (error instanceof OrganizationPaginationRequiredError)
+    return { code: "invalid_argument", status: 400 };
   const billingFailure = stripeBillingFailure(error);
   if (billingFailure) return { code: billingFailure.code, status: billingFailure.status };
   if (error instanceof ControlError) return { code: error.code, status: error.status };

@@ -1,0 +1,240 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] join actual original owner destruction through owned completion
+
+Apply after formal18. A separate refcounted file/heap-owner anchor survives
+both original file close and actual last-owner destruction. BEGIN hands off
+only the original file owner ref after CUT/ref-release guards; READ polls the
+real post-kfree completion without mutation or consuming the event.
+This proves tracked-owner destruction only, not all-flow/terminal/Core removal.
+Existing sticky poison, CREATE one-use, namespace release and net_free stay.
+
+diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
+--- a/net/core/tako_terminal.c
++++ b/net/core/tako_terminal.c
+@@ -18,6 +18,7 @@
+ #include <linux/path.h>
+ #include <linux/proc_ns.h>
+ #include <linux/refcount.h>
++#include <linux/completion.h>
+ #include <linux/sched.h>
+ #include <linux/sched/signal.h>
+ #include <linux/slab.h>
+@@ -34,8 +35,20 @@
+ #include <net/inet_timewait_sock.h>
+ #include <uapi/linux/tako_terminal.h>
+ 
++/* File and heap owner hold independent references. No ctx pointer escapes
++ * into this anchor. Only the actual last-owner destructor publishes freed.
++ */
++struct tako_terminal_join {
++	refcount_t refs;
++	struct completion freed;
++	u64 birth_cookie, birth_inum;
++	u64 final_cookie, final_inum;
++	unsigned int failed;
++};
++
+ struct tako_terminal_owner {
+ 	refcount_t refs; /* original file + net + each reserved object */
++	struct tako_terminal_join *join;
+ 	spinlock_t lock;
+ 	struct tako_terminal_state state;
+ 	struct tako_terminal_admission admission;
+@@ -55,12 +68,65 @@
+ 	struct net *net;
+ 	struct tako_terminal_owner *owner; /* independent of ctx->net */
+ 	unsigned int attempted;
++	struct tako_terminal_join *join;
++	unsigned int join_attempted;
+ };
+ 
++static bool tako_admission_poisoned(const struct tako_terminal_owner *owner);
++
++static void tako_join_put(struct tako_terminal_join *join)
++{
++	if (join && refcount_dec_and_test(&join->refs))
++		kfree(join);
++}
++
++static int tako_join_attach(struct tako_terminal_file *ctx,
++			    struct tako_terminal_owner *owner)
++{
++	struct tako_terminal_join *join = kzalloc(sizeof(*join), GFP_KERNEL);
++
++	if (!join)
++		return -ENOMEM;
++	refcount_set(&join->refs, 2); /* original file and actual heap owner */
++	init_completion(&join->freed);
++	ctx->join = join;
++	owner->join = join;
++	return 0;
++}
++
+ static void tako_owner_put(struct tako_terminal_owner *owner)
+ {
+-	if (owner && refcount_dec_and_test(&owner->refs))
+-		kfree(owner);
++	struct tako_terminal_join *join;
++	unsigned long flags;
++
++	if (!owner || !refcount_dec_and_test(&owner->refs))
++		return;
++	join = owner->join;
++	if (join) {
++		/* Preserve the original poison/admission read lock contract, even
++		 * at the actual last reference, before actual heap free.
++		 */
++		spin_lock_irqsave(&owner->lock, flags);
++		join->final_cookie = owner->net_cookie;
++		join->final_inum = owner->namespace_inum;
++		join->failed = tako_admission_poisoned(owner) ||
++			!owner->admission.cut || owner->admission.opened ||
++			!owner->state.sealed || !owner->device_associations.sealed ||
++			!owner->lifetime.born || !owner->lifetime.release_attempted ||
++			!owner->lifetime.reference_released || !owner->lifetime.net_gone ||
++			!join->birth_cookie || !join->birth_inum ||
++			join->birth_cookie != join->final_cookie ||
++			join->birth_inum != join->final_inum;
++		spin_unlock_irqrestore(&owner->lock, flags);
++	}
++	kfree(owner);
++	if (join) {
++		/* Only saved anchor memory is touched after owner heap free.
++		 * READ never waits/consumes/resets this one permanent event.
++		 */
++		complete(&join->freed);
++		tako_join_put(join);
++	}
+ }
+ 
+ void tako_terminal_net_attach(struct net *net, struct tako_terminal_owner *owner)
+@@ -459,6 +525,71 @@
+ 	spin_lock_irqsave(&owner->lock, flags);
+ 	tako_terminal_lifetime_reference_put(&owner->lifetime);
+ 	spin_unlock_irqrestore(&owner->lock, flags);
++	return 0;
++}
++
++/* Original context mutex is held. Neither command accepts a target or
++ * observed count/flags; completion is tracked-owner destruction only.
++ */
++static int tako_join_caller(const struct tako_terminal_file *ctx)
++{
++	return ctx->creator == task_tgid(current) &&
++		ns_capable(&init_user_ns, CAP_SYS_ADMIN) &&
++		ns_capable(&init_user_ns, CAP_NET_ADMIN);
++}
++
++static int tako_join_begin(struct tako_terminal_file *ctx)
++{
++	struct tako_terminal_owner *owner = ctx->owner;
++	struct tako_terminal_join *join = ctx->join;
++	unsigned long flags;
++	bool valid;
++
++	if (!tako_join_caller(ctx))
++		return -EPERM;
++	if (ctx->join_attempted)
++		return -EALREADY;
++	if (!owner || !join || owner->join != join)
++		return -ENODATA;
++	if (ctx->net)
++		return -EBUSY;
++	spin_lock_irqsave(&owner->lock, flags);
++	valid = owner->lifetime.born && owner->lifetime.release_attempted &&
++		owner->lifetime.reference_released && owner->admission.cut &&
++		!owner->admission.opened && owner->state.sealed &&
++		owner->device_associations.sealed && join->birth_cookie &&
++		join->birth_inum && join->birth_cookie == owner->net_cookie &&
++		join->birth_inum == owner->namespace_inum;
++	spin_unlock_irqrestore(&owner->lock, flags);
++	if (!valid)
++		return -EUCLEAN;
++	/* Consumed before the only file-owner reference handoff. Original
++	 * ctx->attempted is never reset: CREATE remains permanently one-use.
++	 */
++	if (!tako_terminal_consume_birth(&ctx->join_attempted))
++		return -EALREADY;
++	ctx->owner = NULL;
++	tako_owner_put(owner);
++	return 0;
++}
++
++static int tako_join_read(struct tako_terminal_file *ctx)
++{
++	struct tako_terminal_join *join = ctx->join;
++
++	if (!tako_join_caller(ctx))
++		return -EPERM;
++	if (!ctx->join_attempted || ctx->owner || !join)
++		return -ENODATA;
++	/* Private anchor has no wait/try/reset consumers. completion_done
++	 * synchronizes with the finishing complete lock without consuming it.
++	 */
++	if (!completion_done(&join->freed))
++		return -EAGAIN;
++	if (join->failed || !join->birth_cookie || !join->birth_inum ||
++	    join->birth_cookie != join->final_cookie ||
++	    join->birth_inum != join->final_inum)
++		return -EUCLEAN;
+ 	return 0;
+ }
+ 
+@@ -544,6 +675,11 @@
+ 		tako_terminal_state_init(&owner->timewait);
+ 		tako_terminal_state_init(&owner->packet_groups);
+ 		tako_terminal_state_init(&owner->device_associations);
++		if (tako_join_attach(ctx, owner)) {
++			tako_owner_put(owner);
++			ret = -ENOMEM;
++			break;
++		}
+ 		ctx->owner = owner; /* ORIGINAL file keeps the allocation reference */
+ 		ctx->net = tako_terminal_new_net(owner);
+ 		if (IS_ERR(ctx->net)) {
+@@ -554,6 +690,8 @@
+ 		spin_lock_irqsave(&owner->lock, flags);
+ 		owner->net_cookie = ctx->net->net_cookie;
+ 		owner->namespace_inum = ctx->net->ns.inum;
++		ctx->join->birth_cookie = owner->net_cookie;
++		ctx->join->birth_inum = owner->namespace_inum;
+ 		spin_unlock_irqrestore(&owner->lock, flags);
+ 		ret = tako_namespace_fd(ctx->net);
+ 		/* Even failure/lost ACK retains this exact born net in ctx->net.
+@@ -573,6 +711,14 @@
+ 			tako_seal(ctx->owner);
+ 		}
+ 		ret = 0;
++		break;
++	case TAKO_TERMINAL_OWNER_JOIN_BEGIN:
++		if (arg) { ret = -EINVAL; break; }
++		ret = tako_join_begin(ctx);
++		break;
++	case TAKO_TERMINAL_OWNER_JOIN_READ:
++		if (arg) { ret = -EINVAL; break; }
++		ret = tako_join_read(ctx);
+ 		break;
+ 	case TAKO_TERMINAL_OBSERVE:
+ 		if (!ctx->owner) { ret = -ENODATA; break; }
+@@ -643,6 +789,7 @@
+ 	if (ctx->net)
+ 		tako_release_namespace(ctx);
+ 	tako_owner_put(ctx->owner);
++	tako_join_put(ctx->join);
+ 	put_pid(ctx->creator);
+ 	kfree(ctx);
+ 	return 0;
+diff --git a/include/uapi/linux/tako_terminal.h b/include/uapi/linux/tako_terminal.h
+--- a/include/uapi/linux/tako_terminal.h
++++ b/include/uapi/linux/tako_terminal.h
+@@ -51,4 +51,10 @@
+ };
+ #define TAKO_TERMINAL_LIFETIME _IOR(0xb7, 5, struct tako_terminal_lifetime_observation)
+ 
++/* Original-file tracked-owner destruction only, never traffic retirement.
++ * No inputs, target, flags or result DTO: arg must be zero for both.
++ */
++#define TAKO_TERMINAL_OWNER_JOIN_BEGIN _IO(0xb7, 7)
++#define TAKO_TERMINAL_OWNER_JOIN_READ  _IO(0xb7, 8)
++
+ #endif

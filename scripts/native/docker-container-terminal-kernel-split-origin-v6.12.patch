@@ -1,0 +1,31 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] retain original origins before positive skb_split effects
+
+Apply after the retained formal22 source graph. Before managed-zcopy page
+references or either split helper can move payload, retain the original
+origin union on the actual receiving header with the existing merge helper.
+Only len < original skb->len transfers positive tail payload; zero-tail has
+no new origin effect. All original statements, gfp0 zerocopy preconditions,
+page/protocol behavior and sticky failure poison remain unchanged. CONFIG-off
+removes this addition. No new API/helper/state. No saved actual caller, fixed
+OCI/TCP reachability, physical page/net lastfree, fulltraffic or terminal
+qualification is claimed by this generic source retention contract.
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -4254,6 +4254,14 @@
+ 	int pos = skb_headlen(skb);
+ 	const int zc_flags = SKBFL_SHARED_FRAG | SKBFL_PURE_ZEROCOPY;
+ 
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Retain the original history before downgrade can acquire page refs
++	 * and before either split helper moves payload to the other header.
++	 */
++	if (len < skb->len)
++		tako_terminal_skb_merge(skb1, skb);
++#endif
++
+ 	skb_zcopy_downgrade_managed(skb);
+ 
+ 	skb_shinfo(skb1)->flags |= skb_shinfo(skb)->flags & zc_flags;

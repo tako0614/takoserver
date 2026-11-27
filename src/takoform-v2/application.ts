@@ -20,7 +20,8 @@ import { createWorkerBundleForm } from "./forms/worker-bundle-backend.ts";
 import { createTakoformV2Host } from "./host.ts";
 import type { V2HostAcceptance } from "./host-acceptance.ts";
 import type { V2PrivateInputCustody } from "./private-inputs.ts";
-import type { V2Form } from "./types.ts";
+import { captureV2RetainedExecutionActions } from "./retained-execution.ts";
+import type { V2Form, V2RetainedExecutionActions } from "./types.ts";
 
 export interface V2OperatorFormMaps {
   /** Complete public support only. */
@@ -109,9 +110,14 @@ export function createTakoformV2Application(
     readonly privateInputCustody?: V2PrivateInputCustody;
     /** Code-selected at construction; covers automatic artifact Forms as well. */
     readonly allowFreshCreateAndUpdate?: boolean;
+    /** Code-only execution selection for retained Forms; not an admission policy. */
+    readonly retainedExecutionActions?: V2RetainedExecutionActions;
   },
   hostAcceptance?: V2HostAcceptance,
 ) {
+  const retainedExecutionActions = captureV2RetainedExecutionActions(
+    options.retainedExecutionActions,
+  );
   const allowFreshCreateAndUpdate = options.allowFreshCreateAndUpdate;
   if (
     (options.formFactory !== undefined && typeof options.formFactory !== "function") ||
@@ -234,6 +240,7 @@ export function createTakoformV2Application(
       authorize: access.authorize,
       forms: Object.freeze(forms),
       retainedForms: Object.freeze(retainedForms),
+      ...(retainedExecutionActions === undefined ? {} : { retainedExecutionActions }),
       ...(allowFreshCreateAndUpdate === undefined ? {} : { allowFreshCreateAndUpdate }),
       baseUrl: `${publicOrigin}/apis/forms.takoform.com/v2`,
       documentation: config.documentation,

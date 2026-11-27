@@ -63,7 +63,12 @@ export {
 } from "./deploy/integration-storage-generation.ts";
 export { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 export type { D1SchemaState, MigrationArtifact, MigrationFile } from "./deploy/migrations.ts";
-export { readD1SchemaShape, readD1SchemaState } from "./deploy/migrations.ts";
+export {
+  moneyUnitPolicyReady,
+  readD1SchemaShape,
+  readD1SchemaState,
+  readMoneyUnitPolicy,
+} from "./deploy/migrations.ts";
 export type {
   CloudflareCredential,
   CloudflareDeployEnvironment,

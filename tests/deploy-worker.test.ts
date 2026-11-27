@@ -404,6 +404,434 @@ function fixture(
 }
 
 describe("split Takoserver Worker surfaces", () => {
+  test("fresh100 reviewed code-only cutover publishes with the original Version lease", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-fresh100-reviewed-code-"));
+    try {
+      const selected = {
+        ...v2Target,
+        takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0100" },
+      } satisfies DeployTarget;
+      const current = fixture({
+        selectedTarget: selected,
+        local: canonicalMigrations,
+        applied: canonicalMigrations,
+        schemaState: freshAuth100State,
+        diff: "scripts/deploy/worker.ts\n",
+      });
+      const run: WorkerProcess = async (command, childOptions) => {
+        if (
+          command.join(" ") === "bun run typecheck:worker" ||
+          (command[0] === "bun" && command[1] === "test")
+        ) {
+          current.calls.push([...command]);
+          return ok("controlled scoped gate\n");
+        }
+        return await current.run(command, childOptions);
+      };
+      const invocation = {
+        surface: "takoserver-worker-authority-cutover",
+        environment: "integration",
+        commit: COMMIT,
+      } as const;
+      const options = {
+        ...current,
+        run,
+        review: "reviewer@example.test",
+        outputDirectory: root,
+        publicationLeaseRoot: join(root, "lease"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+          readState: async () => freshAuth100State,
+        }),
+        fetcher: publishedProductFetcher(),
+      };
+      const result = await runWorker({ ...invocation, action: "apply" }, selected, options);
+      expect(result).toMatchObject({
+        kind: "takoserver.worker-apply@v2",
+        surface: "takoserver-worker-authority-cutover",
+        reviewer: "reviewer@example.test",
+        previousVersionId: VERSION_BEFORE,
+        versionId: VERSION_AFTER,
+      });
+      expect(result.authorityPaths).toContain("scripts/deploy/worker.ts");
+      const uploads = current.calls.filter((call) => call.includes("--no-bundle"));
+      expect(uploads).toHaveLength(1);
+      expect(uploads[0]).toContain("versions");
+      expect(uploads[0]).toContain("upload");
+      const traffic = current.calls.filter(
+        (call) => call.includes("versions") && call.includes("deploy"),
+      );
+      expect(traffic).toHaveLength(1);
+      expect(traffic[0]).toContain(`${VERSION_AFTER}@100%`);
+      expect(current.calls).not.toContainEqual(["bun", "run", "check"]);
+      expect(current.calls).toContainEqual(["bun", "run", "typecheck:worker"]);
+      expect(current.calls.some((call) => call.includes("tests/deploy-worker.test.ts"))).toBe(true);
+      const status = await runWorker({ ...invocation, action: "status" }, selected, options);
+      expect(status).toMatchObject({ ready: true, commitMatches: true, pendingMigrations: [] });
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    "missing reviewer",
+    "advanced predecessor",
+    "changed secret inventory",
+    "missing storage proof",
+    "storage proof withdrawn after gate",
+    "scoped gate failure",
+    "lost upload acknowledgement",
+    "lost traffic acknowledgement",
+    "legacy selector",
+    "reverse selection",
+    "legacy annotations",
+  ] as const)(
+    "fresh100 reviewed code-only cutover refuses %s without blind resend",
+    async (mode) => {
+      const root = mkdtempSync(join(tmpdir(), "takoserver-fresh100-reviewed-refusal-"));
+      try {
+        const selected = {
+          ...v2Target,
+          takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0100" },
+        } satisfies DeployTarget;
+        const current = fixture({
+          selectedTarget: selected,
+          local: canonicalMigrations,
+          applied: canonicalMigrations,
+          schemaState: freshAuth100State,
+          diff: "scripts/deploy/worker.ts\n",
+          ...(mode === "advanced predecessor" ? { advanceDuringBuild: true } : {}),
+          ...(mode === "changed secret inventory" ? { secretsAfterBuild: [] } : {}),
+          ...(mode === "legacy annotations" ? { legacyBeforeWithoutVersionMetadata: true } : {}),
+        });
+        const original = integrationStorageVerificationOptions(selected, {
+          readState: async () => freshAuth100State,
+        });
+        const provider = original.provider;
+        if (provider === undefined) throw new Error("original fixture provider is required");
+        let storageReads = 0;
+        const run: WorkerProcess = async (command, childOptions) => {
+          if (
+            command.join(" ") === "bun run typecheck:worker" ||
+            (command[0] === "bun" && command[1] === "test")
+          ) {
+            current.calls.push([...command]);
+            return mode === "scoped gate failure"
+              ? { exitCode: 7, stdout: "controlled gate failure", stderr: "" }
+              : ok("controlled scoped gate\n");
+          }
+          const result = await current.run(command, childOptions);
+          if (
+            (mode === "lost upload acknowledgement" && command.includes("--no-bundle")) ||
+            (mode === "lost traffic acknowledgement" &&
+              command.includes("versions") &&
+              command.includes("deploy"))
+          ) {
+            return { exitCode: 9, stdout: "", stderr: "controlled lost acknowledgement" };
+          }
+          return result;
+        };
+        const invocation = {
+          surface: "takoserver-worker-authority-cutover",
+          environment: "integration",
+          commit: COMMIT,
+          ...(mode === "legacy selector" ? { legacyPredecessorVersionId: VERSION_BEFORE } : {}),
+          ...(mode === "reverse selection" ? { reverse: true } : {}),
+        } as const;
+        const options = {
+          ...current,
+          run,
+          review: mode === "missing reviewer" ? "" : "reviewer@example.test",
+          outputDirectory: root,
+          publicationLeaseRoot: join(root, "lease"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+          integrationStorageVerification: {
+            ...original,
+            ...(mode === "missing storage proof" || mode === "storage proof withdrawn after gate"
+              ? {
+                  provider: {
+                    getD1: (id: string) => provider.getD1(id),
+                    async getR2(name: string) {
+                      storageReads += 1;
+                      if (mode === "missing storage proof" || storageReads > 1)
+                        throw new Error("controlled storage identity unavailable");
+                      return await provider.getR2(name);
+                    },
+                  },
+                }
+              : {}),
+          },
+          fetcher: publishedProductFetcher(),
+        };
+        const failure = await runWorker(
+          { ...invocation, action: "apply" },
+          selected,
+          options,
+        ).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(DeployError);
+        if (!(failure instanceof DeployError)) throw new Error("expected original owner refusal");
+        const ambiguous =
+          mode === "lost upload acknowledgement" || mode === "lost traffic acknowledgement";
+        expect(failure.phase).toBe(ambiguous ? "mutation" : "preflight");
+        expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(
+          ambiguous ? 1 : 0,
+        );
+        expect(
+          current.calls.filter((call) => call.includes("versions") && call.includes("deploy")),
+        ).toHaveLength(mode === "lost traffic acknowledgement" ? 1 : 0);
+        expect(current.calls.some((call) => call.includes("--secrets-file"))).toBe(false);
+        if (mode === "missing reviewer") {
+          expect(failure.message).toContain("review");
+          expect(current.calls).not.toContainEqual(["bun", "run", "typecheck:worker"]);
+        }
+        if (mode === "scoped gate failure") {
+          expect(failure.message).toContain("typecheck failed (exit 7)");
+          expect(current.calls.some((call) => call.includes("--dry-run"))).toBe(false);
+        }
+        if (mode === "storage proof withdrawn after gate") {
+          expect(storageReads).toBe(2);
+          expect(current.calls).toContainEqual(["bun", "run", "typecheck:worker"]);
+        }
+        if (ambiguous) {
+          expect(failure.message).toContain("indeterminate");
+          expect(failure.message).toContain("--status");
+          const status = await runWorker({ ...invocation, action: "status" }, selected, options);
+          expect(status).toMatchObject({
+            versionId: mode === "lost traffic acknowledgement" ? VERSION_AFTER : VERSION_BEFORE,
+          });
+          expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+          expect(
+            current.calls.filter((call) => call.includes("versions") && call.includes("deploy")),
+          ).toHaveLength(mode === "lost traffic acknowledgement" ? 1 : 0);
+        }
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("ordinary fresh100 Host proves same-source readiness and publishes one scoped code successor", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-ordinary-fresh100-"));
+    try {
+      const selected = {
+        ...v2Target,
+        takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0100" },
+      } satisfies DeployTarget;
+      const current = fixture({
+        selectedTarget: selected,
+        local: canonicalMigrations,
+        applied: canonicalMigrations,
+        schemaState: freshAuth100State,
+        beforeMessage: `takoserver-worker:${COMMIT}:${"c".repeat(64)}`,
+      });
+      const options = {
+        ...current,
+        outputDirectory: root,
+        publicationLeaseRoot: join(root, "lease"),
+        integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+          readState: async () => freshAuth100State,
+        }),
+      };
+      const invocation = {
+        surface: "takoserver-worker",
+        environment: "integration",
+        commit: COMMIT,
+      } as const;
+      const status = await runWorker({ ...invocation, action: "status" }, selected, options);
+      expect(status).toMatchObject({
+        ready: true,
+        commitMatches: true,
+        moneyUnitSchemaReady: true,
+        pendingMigrations: [],
+      });
+      expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+      // The global financial/current-schema predicate retains its old boundary.
+      expect(workerSchemaAllowsPending(selected, await current.migrations.read())).toBe(false);
+      const updating = fixture({
+        selectedTarget: selected,
+        local: canonicalMigrations,
+        applied: canonicalMigrations,
+        schemaState: freshAuth100State,
+      });
+      const run: WorkerProcess = async (command, childOptions) => {
+        if (
+          command.join(" ") === "bun run typecheck:worker" ||
+          (command[0] === "bun" && command[1] === "test")
+        ) {
+          updating.calls.push([...command]);
+          return ok("controlled scoped gate\n");
+        }
+        return await updating.run(command, childOptions);
+      };
+      const applyOptions = {
+        ...options,
+        ...updating,
+        run,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        fetcher: publishedProductFetcher(),
+      };
+      const result = await runWorker({ ...invocation, action: "apply" }, selected, applyOptions);
+      expect(result).toMatchObject({
+        kind: "takoserver.worker-apply@v2",
+        surface: "takoserver-worker",
+        commit: COMMIT,
+        previousVersionId: VERSION_BEFORE,
+        versionId: VERSION_AFTER,
+      });
+      expect(updating.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      expect(updating.calls).not.toContainEqual(["bun", "run", "check"]);
+      expect(updating.calls).toContainEqual(["bun", "run", "typecheck:worker"]);
+      expect(updating.calls.some((call) => call.includes("tests/deploy-worker.test.ts"))).toBe(
+        true,
+      );
+      const after = await runWorker({ ...invocation, action: "status" }, selected, applyOptions);
+      expect(after).toMatchObject({ ready: true, commitMatches: true, pendingMigrations: [] });
+      expect(updating.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    "foreign ledger",
+    "foreign shape",
+    "missing Money policy",
+    "missing storage proof",
+    "storage proof withdrawn after gate",
+    "wrong selected source",
+    "changed secret inventory",
+    "scoped gate failure",
+    "advanced predecessor",
+    "authority diff",
+    "implicit lineage",
+    "authority surface",
+    "production target",
+    "lost upload acknowledgement",
+  ] as const)("ordinary fresh100 Host refuses %s without blind resend", async (mode) => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-ordinary-fresh100-refusal-"));
+    try {
+      const selected = {
+        ...v2Target,
+        environment: mode === "production target" ? "production" : "integration",
+        takoformV2: {
+          ...v2Target.takoformV2,
+          ...(mode === "implicit lineage" ? {} : { storageLineage: "v2-0100" }),
+        },
+      } satisfies DeployTarget;
+      const current = fixture({
+        selectedTarget: selected,
+        local:
+          mode === "foreign ledger"
+            ? [...canonicalMigrations.slice(0, -1), "0100_foreign.sql"]
+            : canonicalMigrations,
+        applied: canonicalMigrations,
+        schemaState:
+          mode === "foreign shape"
+            ? {
+                shape: "[]",
+                shapeDigest: `sha256:${createHash("sha256").update("[]").digest("hex")}`,
+              }
+            : freshAuth100State,
+        ...(mode === "changed secret inventory" ? { secretsAfterBuild: [] } : {}),
+        ...(mode === "advanced predecessor" ? { advanceDuringBuild: true } : {}),
+        ...(mode === "authority diff" ? { diff: "src/auth.ts\n" } : {}),
+      });
+      const original = integrationStorageVerificationOptions(selected, {
+        readState: async () => freshAuth100State,
+      });
+      const provider = original.provider;
+      if (provider === undefined) throw new Error("original fixture provider is required");
+      let storageReads = 0;
+      const run: WorkerProcess = async (command, childOptions) => {
+        const key = command.join(" ");
+        if (key === "bun run typecheck:worker" || (command[0] === "bun" && command[1] === "test")) {
+          current.calls.push([...command]);
+          return mode === "scoped gate failure"
+            ? { exitCode: 7, stdout: "controlled gate failure", stderr: "" }
+            : ok("controlled scoped gate\n");
+        }
+        const result = await current.run(command, childOptions);
+        if (mode === "wrong selected source" && key === "git rev-parse HEAD")
+          return ok(`${LIVE_COMMIT}\n`);
+        if (mode === "lost upload acknowledgement" && command.includes("--no-bundle")) {
+          return { exitCode: 9, stdout: "", stderr: "controlled lost acknowledgement" };
+        }
+        return result;
+      };
+      const options = {
+        ...current,
+        migrations: {
+          async read() {
+            const value = await current.migrations.read();
+            return mode === "missing Money policy" ? { ...value, moneyUnitPolicy: [] } : value;
+          },
+        },
+        run,
+        outputDirectory: root,
+        publicationLeaseRoot: join(root, "lease"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        integrationStorageVerification: {
+          ...original,
+          ...(mode === "missing storage proof" || mode === "storage proof withdrawn after gate"
+            ? {
+                provider: {
+                  getD1: (id: string) => provider.getD1(id),
+                  async getR2(name: string) {
+                    storageReads += 1;
+                    if (mode === "missing storage proof" || storageReads > 1)
+                      throw new Error("controlled storage identity unavailable");
+                    return await provider.getR2(name);
+                  },
+                },
+              }
+            : {}),
+        },
+        fetcher: publishedProductFetcher(),
+      };
+      const invocation = {
+        surface:
+          mode === "authority surface"
+            ? "takoserver-worker-authority-cutover"
+            : "takoserver-worker",
+        action: "apply",
+        environment: selected.environment,
+        commit: COMMIT,
+      } as const;
+      const failure = await runWorker(invocation, selected, options).catch(
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(DeployError);
+      if (!(failure instanceof DeployError)) throw new Error("expected original owner refusal");
+      expect(failure.phase).toBe(mode === "lost upload acknowledgement" ? "mutation" : "preflight");
+      expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(
+        mode === "lost upload acknowledgement" ? 1 : 0,
+      );
+      expect(current.calls.some((call) => call.includes("--secrets-file"))).toBe(false);
+      if (mode === "scoped gate failure") {
+        expect(failure.message).toContain("ordinary fresh100 Worker typecheck failed (exit 7)");
+        expect(current.calls.some((call) => call.includes("--dry-run"))).toBe(false);
+      }
+      if (mode === "storage proof withdrawn after gate") {
+        expect(storageReads).toBe(2);
+        expect(current.calls).toContainEqual(["bun", "run", "typecheck:worker"]);
+      }
+      if (mode === "lost upload acknowledgement") {
+        expect(failure.message).toContain("indeterminate");
+        expect(
+          current.calls.some((call) => call.includes("versions") && call.includes("deploy")),
+        ).toBe(false);
+        const status = await runWorker({ ...invocation, action: "status" }, selected, options);
+        // The lease reports lock availability, not an acknowledgement outcome.
+        // Only this original read-only status is allowed after the indeterminate upload.
+        expect(status).toMatchObject({ versionId: VERSION_BEFORE, commitMatches: false });
+        expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("qualified 0094 publication distinguishes exact frozen refusal from readiness", async () => {
     const origin = "https://money.example.workers.dev";
     const frozen = async (_url: string) =>

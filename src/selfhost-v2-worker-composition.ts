@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readdir, realpath } from "node:fs/promises";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
+import type { LinuxOciContainerBindingSource } from "./providers/linux-oci-container-binding-broker.ts";
 import { createSelfhostV2KvBindingBroker } from "./providers/selfhost-v2-kv-binding-broker.ts";
 import type { SelfhostV2KvStore } from "./providers/selfhost-v2-kv-store.ts";
 import { createSelfhostV2ObjectBucketBindingBroker } from "./providers/selfhost-v2-object-bucket-binding-broker.ts";
@@ -102,6 +103,7 @@ import {
   MODULE_WORKER_LIFECYCLE_BACKEND_ID,
 } from "./takoform-v2/worker-lifecycle-backend.ts";
 import {
+  createV2ForwardContainerWorkerPublicationState,
   createV2ForwardWorkerPublicationState,
   createV2WorkerPublicationState,
 } from "./takoform-v2/worker-publication-state.ts";
@@ -194,6 +196,7 @@ export interface SelfhostV2WorkflowBootPort {
 }
 
 export interface SelfhostV2WorkerCompositionOptions {
+  readonly ociContainerBinding?: LinuxOciContainerBindingSource;
   readonly sql: Sql;
   readonly objects: ObjectStoreAccess;
   readonly clock: Clock;
@@ -356,6 +359,15 @@ export function createSelfhostV2ForwardWorkerComposition(
 ) {
   return createWorkerComposition(options, true);
 }
+/** Explicit genuine OCI source only; no default/public Form activation. */
+export function createSelfhostV2ContainerWorkerComposition(
+  options: SelfhostV2ForwardWorkerCompositionOptions & {
+    readonly ociContainerBinding: LinuxOciContainerBindingSource;
+  },
+) {
+  options.ociContainerBinding.assertSql(options.sql);
+  return createWorkerComposition(options, true);
+}
 function createWorkerComposition(
   options: SelfhostV2ForwardWorkerCompositionOptions,
   forwardFamily: boolean,
@@ -409,6 +421,12 @@ function createWorkerComposition(
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
   }
   const { sql, objects, clock, config, targetKey } = options;
+  const ociContainerBinding = options.ociContainerBinding;
+  if (ociContainerBinding) {
+    ociContainerBinding.assertSql(sql);
+    if (!forwardFamily || ociContainerBinding.targetKey !== targetKey)
+      throw new TypeError("OCI binding source profile mismatch");
+  }
   const configuredEndpoint =
     options.endpoint === undefined ? undefined : Object.freeze({ ...options.endpoint });
   const queueSettlement = options.queueSettlement;
@@ -619,14 +637,20 @@ function createWorkerComposition(
         }),
       })
     : undefined;
-  const publicationState = (
-    forwardFamily ? createV2ForwardWorkerPublicationState : createV2WorkerPublicationState
-  )({
+  const publicationOptions = {
     sql,
     now: clock,
     ...(bundleCustody ? { bundleCustody } : {}),
     ...(assetCustody ? { assetCustody } : {}),
-  });
+  };
+  const publicationState = ociContainerBinding
+    ? createV2ForwardContainerWorkerPublicationState(
+        publicationOptions,
+        ociContainerBinding.readCurrentServingTarget,
+      )
+    : (forwardFamily ? createV2ForwardWorkerPublicationState : createV2WorkerPublicationState)(
+        publicationOptions,
+      );
   const moduleInspector = createWorkerdWorkerModuleInspector({
     binary: options.workerdBinary,
     ...(options.moduleInspectionRoot === undefined
@@ -1057,6 +1081,7 @@ function createWorkerComposition(
         workerResourceUid: uid,
         targetKey,
         publicationState,
+        ...(ociContainerBinding ? { v2ContainerBinding: ociContainerBinding } : {}),
         ...(configuredInputs ? { configuredInputs } : {}),
         ...(queueSettlement ? { v2QueueSettlement: queueSettlement } : {}),
         ...(sqliteBoot ? { v2SqliteBinding: sqliteBoot } : {}),
@@ -1339,6 +1364,7 @@ function createWorkerComposition(
       throw new TypeError("v2 Worker Endpoint frontend proof is not composed");
     }
     const versionOptions = {
+      ...(ociContainerBinding ? { v2ContainerBinding: ociContainerBinding } : {}),
       sql,
       targetKey,
       publicationState,

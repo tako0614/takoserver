@@ -1,0 +1,1417 @@
+From: Takoserver Native source candidate
+Subject: [SOURCE ONLY v6.12] targeted fresh-netns owner, born-closed NF gate and full-IP-sock lifetime
+
+Exact upstream: Linux v6.12 (tag), per-file SHA256 receipt UPSTREAM.json.
+No module/kernel build or runtime execution has qualified this patch.
+The original device context has a no-field, one-use OPEN transition. CUT,
+poison, namespace release and file close permanently prohibit reopening.
+No terminal/grant operation exists. This patch alone does not qualify all
+packet/device/offload continuations or packets already past a dispatch gate.
+The OCI caller does not yet invoke OPEN; birth DROP remains installed.
+
+diff --git a/include/linux/netfilter.h b/include/linux/netfilter.h
+--- a/include/linux/netfilter.h
++++ b/include/linux/netfilter.h
+@@ -3,6 +3,7 @@
+ #define __LINUX_NETFILTER_H
+ 
+ #include <linux/init.h>
++#include <linux/tako_terminal.h>
+ #include <linux/skbuff.h>
+ #include <linux/net.h>
+ #include <linux/if.h>
+@@ -228,6 +229,12 @@
+ 	struct nf_hook_entries *hook_head = NULL;
+ 	int ret = 1;
+ 
++	/* Owned birth gate precedes the no-hooks static-key fast path. */
++	if (unlikely(tako_terminal_block(net, pf))) {
++		kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
++		return -EPERM;
++	}
++
+ #ifdef CONFIG_JUMP_LABEL
+ 	if (__builtin_constant_p(pf) &&
+ 	    __builtin_constant_p(hook) &&
+@@ -298,6 +305,11 @@
+ {
+ 	int ret;
+ 
++	/* cond=false otherwise skips nf_hook completely. */
++	if (unlikely(tako_terminal_block(net, pf))) {
++		kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
++		return -EPERM;
++	}
+ 	if (!cond ||
+ 	    ((ret = nf_hook(pf, hook, net, sk, skb, in, out, okfn)) == 1))
+ 		ret = okfn(net, sk, skb);
+@@ -321,6 +333,16 @@
+ 	     int (*okfn)(struct net *, struct sock *, struct sk_buff *))
+ {
+ 	struct nf_hook_entries *hook_head = NULL;
++
++	if (unlikely(tako_terminal_block(net, pf))) {
++		struct sk_buff *skb, *next;
++
++		list_for_each_entry_safe(skb, next, head, list) {
++			skb_list_del_init(skb);
++			kfree_skb_reason(skb, SKB_DROP_REASON_NETFILTER_DROP);
++		}
++		return;
++	}
+ 
+ #ifdef CONFIG_JUMP_LABEL
+ 	if (__builtin_constant_p(pf) &&
+diff --git a/include/linux/tako_terminal.h b/include/linux/tako_terminal.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/tako_terminal.h
+@@ -0,0 +1,90 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_TAKO_TERMINAL_H
++#define _LINUX_TAKO_TERMINAL_H
++
++#include <linux/types.h>
++#include <linux/stddef.h>
++struct net;
++struct sock;
++struct request_sock;
++struct inet_timewait_sock;
++struct tako_terminal_owner;
++
++#ifdef CONFIG_TAKO_TERMINAL
++struct net *tako_terminal_new_net(struct tako_terminal_owner *owner);
++void tako_terminal_net_attach(struct net *net, struct tako_terminal_owner *owner);
++struct tako_terminal_owner *tako_terminal_net_detach(struct net *net);
++void tako_terminal_net_freed(struct tako_terminal_owner *owner);
++void tako_terminal_sock_init(struct sock *sk);
++struct tako_terminal_owner *tako_terminal_sock_reserve(struct net *net, int family);
++struct tako_terminal_owner *tako_terminal_clone_reserve(const struct sock *sk);
++void tako_terminal_sock_attach(struct sock *sk, struct tako_terminal_owner *owner);
++struct tako_terminal_owner *tako_terminal_sock_detach(struct sock *sk);
++void tako_terminal_sock_put(struct tako_terminal_owner *owner);
++
++struct tako_terminal_owner *tako_terminal_request_reserve(const struct sock *sk);
++struct tako_terminal_owner *tako_terminal_request_clone_reserve(const struct request_sock *req);
++void tako_terminal_request_attach(struct request_sock *req, struct tako_terminal_owner *owner);
++struct tako_terminal_owner *tako_terminal_request_detach(struct request_sock *req);
++void tako_terminal_request_put(struct tako_terminal_owner *owner);
++struct tako_terminal_owner *tako_terminal_timewait_reserve(const struct sock *sk);
++void tako_terminal_timewait_attach(struct inet_timewait_sock *tw, struct tako_terminal_owner *owner);
++struct tako_terminal_owner *tako_terminal_timewait_detach(struct inet_timewait_sock *tw);
++void tako_terminal_timewait_put(struct tako_terminal_owner *owner);
++/* Packet group API: caller retains actual net/owner; clones/COW reserve an
++ * independent ref; only final extension-group free calls put. An allocation
++ * that cannot be tracked must poison before discarding its reservation.
++ * The separate skb patch must consume this API; this API alone covers no skb.
++ */
++struct tako_terminal_owner *tako_terminal_packet_reserve(struct net *net);
++struct tako_terminal_owner *tako_terminal_packet_clone(struct tako_terminal_owner *held);
++void tako_terminal_packet_put(struct tako_terminal_owner *held);
++void tako_terminal_packet_poison(struct tako_terminal_owner *held);
++
++bool tako_terminal_block(const struct net *net, u8 pf);
++#else
++static inline void tako_terminal_net_attach(struct net *net,
++					   struct tako_terminal_owner *owner) {}
++static inline struct tako_terminal_owner *
++tako_terminal_net_detach(struct net *net) { return NULL; }
++static inline void tako_terminal_net_freed(struct tako_terminal_owner *owner) {}
++static inline void tako_terminal_sock_init(struct sock *sk) {}
++static inline struct tako_terminal_owner *
++tako_terminal_sock_reserve(struct net *net, int family) { return NULL; }
++static inline struct tako_terminal_owner *
++tako_terminal_clone_reserve(const struct sock *sk) { return NULL; }
++static inline void tako_terminal_sock_attach(struct sock *sk,
++					   struct tako_terminal_owner *owner) {}
++static inline struct tako_terminal_owner *
++tako_terminal_sock_detach(struct sock *sk) { return NULL; }
++static inline void tako_terminal_sock_put(struct tako_terminal_owner *owner) {}
++
++static inline struct tako_terminal_owner *
++tako_terminal_request_reserve(const struct sock *sk) { return NULL; }
++static inline struct tako_terminal_owner *
++tako_terminal_request_clone_reserve(const struct request_sock *req) { return NULL; }
++static inline void tako_terminal_request_attach(struct request_sock *req,
++						struct tako_terminal_owner *owner) {}
++static inline struct tako_terminal_owner *
++tako_terminal_request_detach(struct request_sock *req) { return NULL; }
++static inline void tako_terminal_request_put(struct tako_terminal_owner *owner) {}
++static inline struct tako_terminal_owner *
++tako_terminal_timewait_reserve(const struct sock *sk) { return NULL; }
++static inline void tako_terminal_timewait_attach(struct inet_timewait_sock *tw,
++						struct tako_terminal_owner *owner) {}
++static inline struct tako_terminal_owner *
++tako_terminal_timewait_detach(struct inet_timewait_sock *tw) { return NULL; }
++static inline void tako_terminal_timewait_put(struct tako_terminal_owner *owner) {}
++static inline struct tako_terminal_owner *
++tako_terminal_packet_reserve(struct net *net) { return NULL; }
++static inline struct tako_terminal_owner *
++tako_terminal_packet_clone(struct tako_terminal_owner *held) { return NULL; }
++static inline void tako_terminal_packet_put(struct tako_terminal_owner *held) {}
++static inline void tako_terminal_packet_poison(struct tako_terminal_owner *held) {}
++
++static inline bool tako_terminal_block(const struct net *net, u8 pf)
++{
++	return false;
++}
++#endif
++#endif
+diff --git a/include/linux/tako_terminal_lifetime.h b/include/linux/tako_terminal_lifetime.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/tako_terminal_lifetime.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef TAKO_TERMINAL_KERNEL_LIFETIME_H
++#define TAKO_TERMINAL_KERNEL_LIFETIME_H
++
++/* Embedded verbatim in the version-pinned kernel patch. Events are wired to
++ * fresh net allocation, the original file's one reference put, and the actual
++ * final net_free after slab release. None is a terminal/idle predicate.
++ * Serialize with the kernel ledger lock; callers cannot supply event flags.
++ */
++struct tako_terminal_lifetime {
++	unsigned int born;
++	unsigned int release_attempted;
++	unsigned int reference_released;
++	unsigned int net_gone;
++	unsigned int poisoned;
++};
++
++static inline void tako_terminal_lifetime_born(struct tako_terminal_lifetime *s)
++{
++	if (s->born || s->net_gone) {
++		s->poisoned = 1;
++		return;
++	}
++	s->born = 1;
++}
++
++static inline int
++tako_terminal_lifetime_release_attempt(struct tako_terminal_lifetime *s)
++{
++	if (!s->born) {
++		s->poisoned = 1;
++		return 0;
++	}
++	if (s->release_attempted)
++		return 0;
++	s->release_attempted = 1;
++	return 1;
++}
++
++static inline void
++tako_terminal_lifetime_reference_put(struct tako_terminal_lifetime *s)
++{
++	if (!s->release_attempted || s->reference_released) {
++		s->poisoned = 1;
++		return;
++	}
++	s->reference_released = 1;
++}
++
++static inline void
++tako_terminal_lifetime_net_freed(struct tako_terminal_lifetime *s)
++{
++	/* Creation unwind can free a net before any explicit release attempt;
++	 * cleanup work can also finish before put_net returns to its caller.
++	 */
++	if (!s->born || s->net_gone) {
++		s->poisoned = 1;
++		return;
++	}
++	s->net_gone = 1;
++}
++
++#endif
+diff --git a/include/linux/tako_terminal_state.h b/include/linux/tako_terminal_state.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/tako_terminal_state.h
+@@ -0,0 +1,121 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef TAKO_TERMINAL_KERNEL_STATE_H
++#define TAKO_TERMINAL_KERNEL_STATE_H
++
++/* Embedded unchanged as include/linux/tako_terminal_state.h in the v6.12
++ * patch. Callers serialize every transition with the kernel owner's lock.
++ * Reserve before full socket/clone allocation, release only after actual
++ * memory free (or failed allocation unwind). In-flight reservations count.
++ * There is intentionally no idle, complete, ready, or retirement predicate.
++ */
++#ifdef __KERNEL__
++#include <linux/types.h>
++typedef u64 tako_terminal_u64;
++#else
++#include <stdint.h>
++typedef uint64_t tako_terminal_u64;
++#endif
++
++#define TAKO_TERMINAL_U64_MAX ((tako_terminal_u64)~(tako_terminal_u64)0)
++
++/* The private device context calls this before allocation, including failed
++ * allocation and lost-return cases. It cannot authorize a second birth. */
++static inline int tako_terminal_consume_birth(unsigned int *attempted)
++{
++	if (*attempted)
++		return 0;
++	*attempted = 1;
++	return 1;
++}
++
++struct tako_terminal_state {
++	tako_terminal_u64 sockets;
++	tako_terminal_u64 allocations;
++	tako_terminal_u64 releases;
++	unsigned int poisoned;
++	unsigned int sealed;
++};
++
++static inline void tako_terminal_state_init(struct tako_terminal_state *s)
++{
++	s->sockets = 0;
++	s->allocations = 0;
++	s->releases = 0;
++	s->poisoned = 0;
++	s->sealed = 0;
++}
++
++static inline void tako_terminal_state_get(struct tako_terminal_state *s)
++{
++	if (s->poisoned)
++		return;
++	if (s->sockets == TAKO_TERMINAL_U64_MAX ||
++	    s->allocations == TAKO_TERMINAL_U64_MAX) {
++		s->poisoned = 1;
++		return;
++	}
++	s->sockets++;
++	s->allocations++;
++}
++
++static inline void tako_terminal_state_put(struct tako_terminal_state *s)
++{
++	if (s->poisoned)
++		return;
++	if (!s->sockets || s->releases == TAKO_TERMINAL_U64_MAX) {
++		s->poisoned = 1;
++		return;
++	}
++	s->sockets--;
++	s->releases++;
++}
++
++static inline void tako_terminal_state_seal(struct tako_terminal_state *s)
++{
++	/* Sealing never prevents counting late kernel allocations or clones. */
++	s->sealed = 1;
++}
++
++/* Only the original device context may invoke OPEN, under its owner lock.
++ * No observed count/boolean is an admission input. CUT is permanent and
++ * neither transition erases an outstanding object or grants retirement.
++ */
++struct tako_terminal_admission {
++	unsigned int attempted;
++	unsigned int opened;
++	unsigned int cut;
++};
++
++static inline void tako_terminal_admission_init(struct tako_terminal_admission *s)
++{
++	s->attempted = 0;
++	s->opened = 0;
++	s->cut = 0;
++}
++
++static inline int tako_terminal_admission_open(struct tako_terminal_admission *s,
++					      const struct tako_terminal_state *objects)
++{
++	if (s->attempted)
++		return 0;
++	s->attempted = 1;
++	if (s->cut || objects->sealed || objects->poisoned)
++		return 0;
++	s->opened = 1;
++	return 1;
++}
++
++static inline void tako_terminal_admission_cut(struct tako_terminal_admission *s)
++{
++	s->attempted = 1;
++	s->cut = 1;
++	s->opened = 0;
++}
++
++static inline int tako_terminal_admission_blocked(
++	const struct tako_terminal_admission *s, const struct tako_terminal_state *objects)
++{
++	return !s->opened || s->cut || objects->sealed || objects->poisoned;
++}
++
++#endif
+diff --git a/include/net/inet_timewait_sock.h b/include/net/inet_timewait_sock.h
+--- a/include/net/inet_timewait_sock.h
++++ b/include/net/inet_timewait_sock.h
+@@ -75,6 +75,9 @@
+ 	struct timer_list	tw_timer;
+ 	struct inet_bind_bucket	*tw_tb;
+ 	struct inet_bind2_bucket	*tw_tb2;
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_owner *tw_tako_terminal;
++#endif
+ };
+ #define tw_tclass tw_tos
+ 
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -50,6 +50,7 @@
+ struct sock;
+ struct ctl_table_header;
+ struct net_generic;
++struct tako_terminal_owner;
+ struct uevent_sock;
+ struct netns_ipvs;
+ struct bpf_prog;
+@@ -59,6 +60,10 @@
+ #define NETDEV_HASHENTRIES (1 << NETDEV_HASHBITS)
+ 
+ struct net {
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Immutable owner installed only by the fresh in-kernel constructor. */
++	struct tako_terminal_owner *tako_terminal;
++#endif
+ 	/* First cache line can be often dirtied.
+ 	 * Do not place here read-mostly fields.
+ 	 */
+diff --git a/include/net/request_sock.h b/include/net/request_sock.h
+--- a/include/net/request_sock.h
++++ b/include/net/request_sock.h
+@@ -12,6 +12,7 @@
+ #define _REQUEST_SOCK_H
+ 
+ #include <linux/slab.h>
++#include <linux/tako_terminal.h>
+ #include <linux/spinlock.h>
+ #include <linux/types.h>
+ #include <linux/bug.h>
+@@ -77,6 +78,9 @@
+ 	u32				secid;
+ 	u32				peer_secid;
+ 	u32				timeout;
++#ifdef CONFIG_TAKO_TERMINAL
++	struct tako_terminal_owner	*rsk_tako_terminal;
++#endif
+ };
+ 
+ static inline struct request_sock *inet_reqsk(const struct sock *sk)
+@@ -130,11 +134,14 @@
+ 
+ static inline void __reqsk_free(struct request_sock *req)
+ {
++	struct tako_terminal_owner *terminal = tako_terminal_request_detach(req);
++
+ 	req->rsk_ops->destructor(req);
+ 	if (req->rsk_listener)
+ 		sock_put(req->rsk_listener);
+ 	kfree(req->saved_syn);
+ 	kmem_cache_free(req->rsk_ops->slab, req);
++	tako_terminal_request_put(terminal);
+ }
+ 
+ static inline void reqsk_free(struct request_sock *req)
+diff --git a/include/net/sock.h b/include/net/sock.h
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -544,6 +544,10 @@
+ 	struct rcu_head		sk_rcu;
+ 	netns_tracker		ns_tracker;
+ 	struct xarray		sk_user_frags;
++#ifdef CONFIG_TAKO_TERMINAL
++	/* Clones reserve an independent ref before allocation/copy. */
++	struct tako_terminal_owner *sk_tako_terminal;
++#endif
+ };
+ 
+ struct sock_bh_locked {
+diff --git a/include/uapi/linux/tako_terminal.h b/include/uapi/linux/tako_terminal.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/linux/tako_terminal.h
+@@ -0,0 +1,54 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_TAKO_TERMINAL_H
++#define _UAPI_LINUX_TAKO_TERMINAL_H
++
++#include <linux/ioctl.h>
++#include <linux/types.h>
++
++/* Experimental private v6.12 source ABI, not a terminal certificate.
++ * CREATE takes arg=0, consumes this device open's only attempt, and returns
++ * an O_CLOEXEC NSFS FD for a newly allocated namespace. No PID/nsFD input.
++ * The original device open retains the same net even on a lost return.
++ * CUT is monotonic, arg=0, and never opens the birth-deny gate.
++ * full_ip_sockets includes in-flight/failing full-sock reservations.
++ * OPEN is arg=0, one use, and limited to the original born namespace.
++ * CUT, poison, release and close forbid reopening. No count is a grant.
++ * No START, ADOPT, DELETE, or TERMINAL operation exists in this unit.
++ */
++#define TAKO_TERMINAL_CREATE _IO(0xb7, 1)
++#define TAKO_TERMINAL_CUT _IO(0xb7, 2)
++#define TAKO_TERMINAL_OPEN _IO(0xb7, 6)
++
++struct tako_terminal_observation {
++	__u64 net_cookie;
++	__u64 namespace_inum;
++	__u64 full_ip_sockets;
++	__u64 allocations;
++	__u64 releases;
++	__u32 sealed;
++	__u32 poisoned;
++};
++#define TAKO_TERMINAL_OBSERVE _IOR(0xb7, 3, struct tako_terminal_observation)
++
++/* Drop ONLY this original device context's own net reference. The same device
++ * FD retains its standalone kernel ledger. Other NSFS/runtime/task/socket refs
++ * can keep the namespace alive. No wait/terminal result is provided.
++ */
++#define TAKO_TERMINAL_RELEASE_NAMESPACE _IO(0xb7, 4)
++struct tako_terminal_lifetime_observation {
++	__u64 net_cookie;
++	__u64 namespace_inum;
++	__u64 full_ip_sockets;
++	__u64 requests;
++	__u64 timewait;
++	__u64 packet_groups;
++	__u32 born;
++	__u32 release_attempted;
++	__u32 reference_released;
++	__u32 net_gone;
++	__u32 poisoned;
++	__u32 reserved;
++};
++#define TAKO_TERMINAL_LIFETIME _IOR(0xb7, 5, struct tako_terminal_lifetime_observation)
++
++#endif
+diff --git a/net/Kconfig b/net/Kconfig
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -25,6 +25,19 @@
+ 	  <http://www.tldp.org/docs.html#howto>.
+ 
+ if NET
++
++config TAKO_TERMINAL
++	bool "Experimental targeted fresh-netns birth ownership"
++	depends on NET_NS && INET && IPV6 && NETFILTER && PROC_FS
++	default n
++	help
++	  Linux v6.12 source-only first lifetime unit. A root-only private
++	  device creates a new namespace with an immutable birth-deny gate
++	  and full IPv4/IPv6 socket-object accounting. Ordinary namespaces
++	  are unaffected. There is no open, start or terminal certificate.
++	  Full/request/TIME_WAIT object refs are counted; packet/queue/offload
++	  ownership is incomplete and no terminal predicate exists.
++	  Do not use this as a qualified production retirement mechanism.
+ 
+ config WANT_COMPAT_NETLINK_MESSAGES
+ 	bool
+diff --git a/net/core/Makefile b/net/core/Makefile
+--- a/net/core/Makefile
++++ b/net/core/Makefile
+@@ -8,6 +8,7 @@
+ 	 flow_dissector.o
+ 
+ obj-$(CONFIG_SYSCTL) += sysctl_net_core.o
++obj-$(CONFIG_TAKO_TERMINAL) += tako_terminal.o
+ 
+ obj-y		     += dev.o dev_addr_lists.o dst.o netevent.o \
+ 			neighbour.o rtnetlink.o utils.o link_watch.o filter.o \
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -2,6 +2,7 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/workqueue.h>
++#include <linux/tako_terminal.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/cache.h>
+ #include <linux/slab.h>
+@@ -446,12 +447,17 @@
+ static void net_free(struct net *net)
+ {
+ 	if (refcount_dec_and_test(&net->passive)) {
++		struct tako_terminal_owner *terminal;
++
+ 		kfree(rcu_access_pointer(net->gen));
+ 
+ 		/* There should not be any trackers left there. */
+ 		ref_tracker_dir_exit(&net->notrefcnt_tracker);
+ 
++		terminal = tako_terminal_net_detach(net);
+ 		kmem_cache_free(net_cachep, net);
++		/* Only actual final namespace slab release drives netGone. */
++		tako_terminal_net_freed(terminal);
+ 	}
+ }
+ 
+@@ -463,8 +469,9 @@
+ 		net_free(net);
+ }
+ 
+-struct net *copy_net_ns(unsigned long flags,
+-			struct user_namespace *user_ns, struct net *old_net)
++static struct net *__copy_net_ns(unsigned long flags,
++		struct user_namespace *user_ns, struct net *old_net,
++		struct tako_terminal_owner *terminal)
+ {
+ 	struct ucounts *ucounts;
+ 	struct net *net;
+@@ -483,6 +490,8 @@
+ 		goto dec_ucounts;
+ 	}
+ 
++	/* Fresh allocation only, before pernet init or namespace publication. */
++	tako_terminal_net_attach(net, terminal);
+ 	preinit_net(net, user_ns);
+ 	net->ucounts = ucounts;
+ 	get_user_ns(user_ns);
+@@ -508,6 +517,21 @@
+ 	}
+ 	return net;
+ }
++
++struct net *copy_net_ns(unsigned long flags,
++			struct user_namespace *user_ns, struct net *old_net)
++{
++	return __copy_net_ns(flags, user_ns, old_net, NULL);
++}
++
++#ifdef CONFIG_TAKO_TERMINAL
++struct net *tako_terminal_new_net(struct tako_terminal_owner *owner)
++{
++	/* Only the private device constructor calls this. No adoption target. */
++	return __copy_net_ns(CLONE_NEWNET, &init_user_ns,
++			     NULL, owner);
++}
++#endif
+ 
+ /**
+  * net_ns_get_ownership - get sysfs ownership data for @net
+diff --git a/net/core/sock.c b/net/core/sock.c
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -88,6 +88,7 @@
+ #include <linux/unaligned.h>
+ #include <linux/capability.h>
+ #include <linux/errno.h>
++#include <linux/tako_terminal.h>
+ #include <linux/errqueue.h>
+ #include <linux/types.h>
+ #include <linux/socket.h>
+@@ -2170,6 +2171,7 @@
+ 		sk = kmalloc(prot->obj_size, priority);
+ 
+ 	if (sk != NULL) {
++		tako_terminal_sock_init(sk);
+ 		if (security_sk_alloc(sk, family, priority))
+ 			goto out_free;
+ 
+@@ -2191,6 +2193,7 @@
+ 
+ static void sk_prot_free(struct proto *prot, struct sock *sk)
+ {
++	struct tako_terminal_owner *terminal = tako_terminal_sock_detach(sk);
+ 	struct kmem_cache *slab;
+ 	struct module *owner;
+ 
+@@ -2204,6 +2207,8 @@
+ 		kmem_cache_free(slab, sk);
+ 	else
+ 		kfree(sk);
++	/* Count release only AFTER the actual socket slab/kmalloc free. */
++	tako_terminal_sock_put(terminal);
+ 	module_put(owner);
+ }
+ 
+@@ -2218,10 +2223,13 @@
+ struct sock *sk_alloc(struct net *net, int family, gfp_t priority,
+ 		      struct proto *prot, int kern)
+ {
++	struct tako_terminal_owner *terminal;
+ 	struct sock *sk;
+ 
++	terminal = tako_terminal_sock_reserve(net, family);
+ 	sk = sk_prot_alloc(prot, priority | __GFP_ZERO, family);
+ 	if (sk) {
++		tako_terminal_sock_attach(sk, terminal);
+ 		sk->sk_family = family;
+ 		/*
+ 		 * See comment in struct sock definition to understand
+@@ -2249,6 +2257,8 @@
+ 		sk_tx_queue_clear(sk);
+ 	}
+ 
++	if (!sk)
++		tako_terminal_sock_put(terminal);
+ 	return sk;
+ }
+ EXPORT_SYMBOL(sk_alloc);
+@@ -2371,16 +2381,21 @@
+  */
+ struct sock *sk_clone_lock(const struct sock *sk, const gfp_t priority)
+ {
++	struct tako_terminal_owner *terminal;
+ 	struct proto *prot = READ_ONCE(sk->sk_prot);
+ 	struct sk_filter *filter;
+ 	bool is_charged = true;
+ 	struct sock *newsk;
+ 
++	terminal = tako_terminal_clone_reserve(sk);
+ 	newsk = sk_prot_alloc(prot, priority, sk->sk_family);
+-	if (!newsk)
++	if (!newsk) {
++		tako_terminal_sock_put(terminal);
+ 		goto out;
++	}
+ 
+ 	sock_copy(newsk, sk);
++	tako_terminal_sock_attach(newsk, terminal);
+ 
+ 	newsk->sk_prot_creator = prot;
+ 
+diff --git a/net/core/tako_terminal.c b/net/core/tako_terminal.c
+new file mode 100644
+--- /dev/null
++++ b/net/core/tako_terminal.c
+@@ -0,0 +1,617 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Linux v6.12 first mechanical ownership unit. This is NOT a full lifetime
++ * barrier: skb/queues, device/offload continuations,
++ * and release certification are deliberately not exported as completed.
++ * No operation can open this namespace's birth-deny gate.
++ */
++#include <linux/capability.h>
++#include <linux/compat.h>
++#include <linux/cred.h>
++#include <linux/file.h>
++#include <linux/fs.h>
++#include <linux/init.h>
++#include <linux/miscdevice.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/netfilter.h>
++#include <linux/pid.h>
++#include <linux/path.h>
++#include <linux/proc_ns.h>
++#include <linux/refcount.h>
++#include <linux/sched.h>
++#include <linux/sched/signal.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/tako_terminal.h>
++#include <linux/tako_terminal_state.h>
++#include <linux/tako_terminal_lifetime.h>
++#include <linux/uaccess.h>
++#include <linux/user_namespace.h>
++#include <net/net_namespace.h>
++#include <net/sock.h>
++#include <net/request_sock.h>
++#include <net/inet_timewait_sock.h>
++#include <uapi/linux/tako_terminal.h>
++
++struct tako_terminal_owner {
++	refcount_t refs; /* original file + net + each reserved object */
++	spinlock_t lock;
++	struct tako_terminal_state state;
++	struct tako_terminal_admission admission;
++	struct tako_terminal_state requests;
++	struct tako_terminal_state timewait;
++	struct tako_terminal_state packet_groups;
++	struct tako_terminal_lifetime lifetime;
++	u64 net_cookie;
++	u64 namespace_inum;
++};
++
++struct tako_terminal_file {
++	struct mutex lock;
++	struct pid *creator;
++	struct net *net;
++	struct tako_terminal_owner *owner; /* independent of ctx->net */
++	unsigned int attempted;
++};
++
++static void tako_owner_put(struct tako_terminal_owner *owner)
++{
++	if (owner && refcount_dec_and_test(&owner->refs))
++		kfree(owner);
++}
++
++void tako_terminal_net_attach(struct net *net, struct tako_terminal_owner *owner)
++{
++	/* Called on newly zero-allocated, unpublished net BEFORE preinit/setup.
++	 * This is not an adoption API and has no exported module symbol.
++	 */
++	if (owner) {
++		unsigned long flags;
++
++		refcount_inc(&owner->refs);
++		spin_lock_irqsave(&owner->lock, flags);
++		tako_terminal_lifetime_born(&owner->lifetime);
++		spin_unlock_irqrestore(&owner->lock, flags);
++		net->tako_terminal = owner;
++	}
++}
++
++struct tako_terminal_owner *tako_terminal_net_detach(struct net *net)
++{
++	/* Transfer the final net allocation's ledger reference into the local
++	 * net_free variable. No read of net memory is allowed after slab free.
++	 */
++	return net->tako_terminal;
++}
++
++void tako_terminal_net_freed(struct tako_terminal_owner *owner)
++{
++	unsigned long flags;
++
++	if (!owner)
++		return;
++	/* Called ONLY after actual final net kmem_cache_free, never an ioctl
++	 * or a userspace ACK/boolean. Standalone original file/sock refs can
++	 * keep this ledger observable beyond namespace memory destruction.
++	 */
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_lifetime_net_freed(&owner->lifetime);
++	spin_unlock_irqrestore(&owner->lock, flags);
++	tako_owner_put(owner);
++}
++
++void tako_terminal_sock_init(struct sock *sk)
++{
++	sk->sk_tako_terminal = NULL;
++}
++
++static void tako_sock_get(struct tako_terminal_owner *owner)
++{
++	unsigned long flags;
++
++	if (!owner)
++		return;
++	refcount_inc(&owner->refs);
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_state_get(&owner->state);
++	spin_unlock_irqrestore(&owner->lock, flags);
++}
++
++struct tako_terminal_owner *tako_terminal_sock_reserve(struct net *net, int family)
++{
++	struct tako_terminal_owner *owner = NULL;
++
++	/* Reserve BEFORE allocation. Protocol is not initialized yet, so count
++	 * ALL full IPv4/IPv6 sockets, including raw/ICMP and kernel sockets.
++	 * In-progress and failing allocation reservations are conservative.
++	 * The net owner exists before pernet init can allocate these objects.
++	 */
++	if (family == AF_INET || family == AF_INET6) {
++		owner = net->tako_terminal;
++		tako_sock_get(owner);
++	}
++	return owner;
++}
++
++struct tako_terminal_owner *tako_terminal_clone_reserve(const struct sock *sk)
++{
++	struct tako_terminal_owner *owner = sk->sk_tako_terminal;
++
++	/* Parent socket retains owner. Reserve a NEW ref before clone malloc,
++	 * including allocator/LSM/module failures before sock_copy is reached.
++	 */
++	tako_sock_get(owner);
++	return owner;
++}
++
++void tako_terminal_sock_attach(struct sock *sk, struct tako_terminal_owner *owner)
++{
++	/* Consume the already-held reservation, without incrementing twice. */
++	sk->sk_tako_terminal = owner;
++}
++
++struct tako_terminal_owner *tako_terminal_sock_detach(struct sock *sk)
++{
++	struct tako_terminal_owner *owner = sk->sk_tako_terminal;
++
++	sk->sk_tako_terminal = NULL;
++	return owner;
++}
++
++void tako_terminal_sock_put(struct tako_terminal_owner *owner)
++{
++	unsigned long flags;
++
++	if (!owner)
++		return;
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_state_put(&owner->state);
++	spin_unlock_irqrestore(&owner->lock, flags);
++	tako_owner_put(owner);
++}
++
++
++/* Each actual object kind has a separate subcounter but shares the original
++ * allocation's independent ledger lifetime. These do not imply full coverage.
++ */
++static void tako_aux_get(struct tako_terminal_owner *owner,
++			 struct tako_terminal_state *counter)
++{
++	unsigned long flags;
++
++	refcount_inc(&owner->refs);
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_state_get(counter);
++	spin_unlock_irqrestore(&owner->lock, flags);
++}
++
++static void tako_aux_put(struct tako_terminal_owner *owner,
++			 struct tako_terminal_state *counter)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_state_put(counter);
++	spin_unlock_irqrestore(&owner->lock, flags);
++	tako_owner_put(owner);
++}
++
++struct tako_terminal_owner *tako_terminal_request_reserve(const struct sock *sk)
++{
++	struct tako_terminal_owner *owner = sk->sk_tako_terminal;
++
++	if (owner)
++		tako_aux_get(owner, &owner->requests);
++	return owner;
++}
++
++struct tako_terminal_owner *
++tako_terminal_request_clone_reserve(const struct request_sock *req)
++{
++	struct tako_terminal_owner *owner = req->rsk_tako_terminal;
++
++	if (owner)
++		tako_aux_get(owner, &owner->requests);
++	return owner;
++}
++
++void tako_terminal_request_attach(struct request_sock *req,
++				   struct tako_terminal_owner *owner)
++{
++	req->rsk_tako_terminal = owner;
++}
++
++struct tako_terminal_owner *tako_terminal_request_detach(struct request_sock *req)
++{
++	struct tako_terminal_owner *owner = req->rsk_tako_terminal;
++
++	req->rsk_tako_terminal = NULL;
++	return owner;
++}
++EXPORT_SYMBOL_GPL(tako_terminal_request_detach);
++
++void tako_terminal_request_put(struct tako_terminal_owner *owner)
++{
++	if (owner)
++		tako_aux_put(owner, &owner->requests);
++}
++EXPORT_SYMBOL_GPL(tako_terminal_request_put);
++
++struct tako_terminal_owner *tako_terminal_timewait_reserve(const struct sock *sk)
++{
++	struct tako_terminal_owner *owner = sk->sk_tako_terminal;
++
++	if (owner)
++		tako_aux_get(owner, &owner->timewait);
++	return owner;
++}
++
++void tako_terminal_timewait_attach(struct inet_timewait_sock *tw,
++				    struct tako_terminal_owner *owner)
++{
++	tw->tw_tako_terminal = owner;
++}
++
++struct tako_terminal_owner *tako_terminal_timewait_detach(struct inet_timewait_sock *tw)
++{
++	struct tako_terminal_owner *owner = tw->tw_tako_terminal;
++
++	tw->tw_tako_terminal = NULL;
++	return owner;
++}
++
++void tako_terminal_timewait_put(struct tako_terminal_owner *owner)
++{
++	if (owner)
++		tako_aux_put(owner, &owner->timewait);
++}
++
++struct tako_terminal_owner *tako_terminal_packet_reserve(struct net *net)
++{
++	struct tako_terminal_owner *owner = net->tako_terminal;
++
++	if (owner)
++		tako_aux_get(owner, &owner->packet_groups);
++	return owner;
++}
++
++struct tako_terminal_owner *tako_terminal_packet_clone(struct tako_terminal_owner *held)
++{
++	if (held)
++		tako_aux_get(held, &held->packet_groups);
++	return held;
++}
++
++void tako_terminal_packet_put(struct tako_terminal_owner *held)
++{
++	if (held)
++		tako_aux_put(held, &held->packet_groups);
++}
++
++void tako_terminal_packet_poison(struct tako_terminal_owner *held)
++{
++	unsigned long flags;
++
++	if (!held)
++		return;
++	spin_lock_irqsave(&held->lock, flags);
++	held->packet_groups.poisoned = 1;
++	spin_unlock_irqrestore(&held->lock, flags);
++}
++
++/* This concrete field is added together with the netdevice-header definition
++ * by the selected NETDEV patch. It is not a coverage/readiness capability.
++ * Caller holds the original owner lock for every poison/admission read.
++ */
++static bool tako_admission_poisoned(const struct tako_terminal_owner *owner)
++{
++	return owner->state.poisoned || owner->requests.poisoned ||
++		owner->timewait.poisoned || owner->packet_groups.poisoned ||
++#ifdef TAKO_TERMINAL_DEVICE_ORIGINS
++		owner->device_associations.poisoned ||
++#endif
++		owner->lifetime.poisoned;
++}
++
++bool tako_terminal_block(const struct net *net, u8 pf)
++{
++	struct tako_terminal_owner *owner = net->tako_terminal;
++	unsigned long flags;
++	bool blocked;
++
++	/* The immutable birth owner is held by this live net. Admission is
++	 * read under the SAME lock as original OPEN/CUT and poison writers.
++	 * This gate is not a join of packets already past the dispatch point,
++	 * nor a coverage claim about every device/offload path.
++	 */
++	if (!owner || (pf != NFPROTO_IPV4 && pf != NFPROTO_IPV6))
++		return false;
++	spin_lock_irqsave(&owner->lock, flags);
++	blocked = tako_terminal_admission_blocked(&owner->admission, &owner->state) ||
++		tako_admission_poisoned(owner) ||
++		owner->lifetime.release_attempted || owner->lifetime.reference_released ||
++		owner->lifetime.net_gone;
++	spin_unlock_irqrestore(&owner->lock, flags);
++	return blocked;
++}
++EXPORT_SYMBOL_GPL(tako_terminal_block);
++
++static void tako_cut_admission(struct tako_terminal_owner *owner)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_admission_cut(&owner->admission);
++	spin_unlock_irqrestore(&owner->lock, flags);
++}
++
++static void tako_seal(struct tako_terminal_owner *owner)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_state_seal(&owner->state);
++	spin_unlock_irqrestore(&owner->lock, flags);
++}
++
++/* Caller holds the original device context mutex. No namespace/PID/flags or
++ * positive observation is accepted from userspace. The original open owns
++ * both ctx->net and the independent same-owner ledger throughout this call.
++ */
++static int tako_open_admission(struct tako_terminal_file *ctx)
++{
++	struct tako_terminal_owner *owner = ctx->owner;
++	unsigned long flags;
++	int ret = -EUCLEAN;
++
++	if (ctx->creator != task_tgid(current) ||
++	    !ns_capable(&init_user_ns, CAP_SYS_ADMIN) ||
++	    !ns_capable(&init_user_ns, CAP_NET_ADMIN))
++		return -EPERM;
++	if (!owner || !ctx->net || ctx->net->tako_terminal != owner)
++		return -ENODATA;
++	spin_lock_irqsave(&owner->lock, flags);
++	if (!owner->lifetime.born || owner->lifetime.release_attempted ||
++	    owner->lifetime.reference_released || owner->lifetime.net_gone ||
++	    tako_admission_poisoned(owner) ||
++	    !owner->net_cookie || !owner->namespace_inum ||
++	    owner->net_cookie != ctx->net->net_cookie ||
++	    owner->namespace_inum != ctx->net->ns.inum)
++		goto out;
++	ret = tako_terminal_admission_open(&owner->admission, &owner->state) ?
++		0 : -EALREADY;
++out:
++	spin_unlock_irqrestore(&owner->lock, flags);
++	return ret;
++}
++
++static int tako_release_namespace(struct tako_terminal_file *ctx)
++{
++	struct tako_terminal_owner *owner = ctx->owner;
++	struct net *net = ctx->net;
++	unsigned long flags;
++
++	if (!net)
++		return -EALREADY;
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_admission_cut(&owner->admission);
++	if (!tako_terminal_lifetime_release_attempt(&owner->lifetime)) {
++		spin_unlock_irqrestore(&owner->lock, flags);
++		return -EALREADY;
++	}
++	tako_terminal_state_seal(&owner->state);
++	spin_unlock_irqrestore(&owner->lock, flags);
++	/* Clear the original context BEFORE the one raw put, never adopt or
++	 * drop another FD/PID's namespace. File ref keeps owner independently.
++	 */
++	ctx->net = NULL;
++	put_net(net);
++	spin_lock_irqsave(&owner->lock, flags);
++	tako_terminal_lifetime_reference_put(&owner->lifetime);
++	spin_unlock_irqrestore(&owner->lock, flags);
++	return 0;
++}
++
++static struct ns_common *tako_ns_get(void *arg)
++{
++	struct net *net = arg;
++
++	return &get_net(net)->ns;
++}
++
++static int tako_namespace_fd(struct net *net)
++{
++	struct path path;
++	struct file *file;
++	int fd, ret;
++
++	/* ns_get_path_cb consumes the callback's net reference on all paths. */
++	ret = ns_get_path_cb(&path, tako_ns_get, net);
++	if (ret)
++		return ret;
++	file = dentry_open(&path, O_RDONLY, current_cred());
++	path_put(&path);
++	if (IS_ERR(file))
++		return PTR_ERR(file);
++	fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0) {
++		fput(file);
++		return fd;
++	}
++	fd_install(fd, file);
++	return fd;
++}
++
++static int tako_open(struct inode *inode, struct file *file)
++{
++	struct tako_terminal_file *ctx;
++
++	/* Deliberately initial-userns operator only; no unprivileged adopter. */
++	if (!ns_capable(&init_user_ns, CAP_SYS_ADMIN) ||
++	    !ns_capable(&init_user_ns, CAP_NET_ADMIN))
++		return -EPERM;
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return -ENOMEM;
++	mutex_init(&ctx->lock);
++	ctx->creator = get_pid(task_tgid(current));
++	file->private_data = ctx;
++	return 0;
++}
++
++static long tako_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
++{
++	struct tako_terminal_file *ctx = file->private_data;
++	struct tako_terminal_observation out = {};
++	struct tako_terminal_lifetime_observation life = {};
++	struct tako_terminal_owner *owner;
++	unsigned long flags;
++	long ret = -ENOTTY;
++
++	/* The original opener process owns mutation/readback. PID struct
++	 * identity cannot be recycled while this open retains its reference.
++	 */
++	if (ctx->creator != task_tgid(current) ||
++	    !ns_capable(&init_user_ns, CAP_SYS_ADMIN) ||
++	    !ns_capable(&init_user_ns, CAP_NET_ADMIN))
++		return -EPERM;
++	mutex_lock(&ctx->lock);
++	switch (cmd) {
++	case TAKO_TERMINAL_CREATE:
++		if (arg) { ret = -EINVAL; break; }
++		/* Shared tested transition consumes BEFORE allocation/effect. */
++		if (!tako_terminal_consume_birth(&ctx->attempted)) {
++			ret = -EALREADY;
++			break;
++		}
++		owner = kzalloc(sizeof(*owner), GFP_KERNEL);
++		if (!owner) { ret = -ENOMEM; break; }
++		refcount_set(&owner->refs, 1);
++		spin_lock_init(&owner->lock);
++		tako_terminal_state_init(&owner->state);
++		tako_terminal_admission_init(&owner->admission);
++		tako_terminal_state_init(&owner->requests);
++		tako_terminal_state_init(&owner->timewait);
++		tako_terminal_state_init(&owner->packet_groups);
++		ctx->owner = owner; /* ORIGINAL file keeps the allocation reference */
++		ctx->net = tako_terminal_new_net(owner);
++		if (IS_ERR(ctx->net)) {
++			ret = PTR_ERR(ctx->net);
++			ctx->net = NULL;
++			break;
++		}
++		spin_lock_irqsave(&owner->lock, flags);
++		owner->net_cookie = ctx->net->net_cookie;
++		owner->namespace_inum = ctx->net->ns.inum;
++		spin_unlock_irqrestore(&owner->lock, flags);
++		ret = tako_namespace_fd(ctx->net);
++		/* Even failure/lost ACK retains this exact born net in ctx->net.
++		 * A second CREATE is refused. There is no replacement/adoption.
++		 */
++		break;
++	case TAKO_TERMINAL_OPEN:
++		if (arg) { ret = -EINVAL; break; }
++		ret = tako_open_admission(ctx);
++		break;
++	case TAKO_TERMINAL_CUT:
++		if (arg) { ret = -EINVAL; break; }
++		/* CUT before CREATE also consumes the original birth attempt. */
++		tako_terminal_consume_birth(&ctx->attempted);
++		if (ctx->owner) {
++			tako_cut_admission(ctx->owner);
++			tako_seal(ctx->owner);
++		}
++		ret = 0;
++		break;
++	case TAKO_TERMINAL_OBSERVE:
++		if (!ctx->owner) { ret = -ENODATA; break; }
++		owner = ctx->owner;
++		spin_lock_irqsave(&owner->lock, flags);
++		out.net_cookie = owner->net_cookie;
++		out.namespace_inum = owner->namespace_inum;
++		out.full_ip_sockets = owner->state.sockets;
++		out.allocations = owner->state.allocations;
++		out.releases = owner->state.releases;
++		out.sealed = owner->state.sealed;
++		out.poisoned = owner->state.poisoned;
++		spin_unlock_irqrestore(&owner->lock, flags);
++		if (!out.net_cookie || !out.namespace_inum) {
++			ret = -EUCLEAN;
++			break;
++		}
++		ret = copy_to_user((void __user *)arg, &out, sizeof(out)) ? -EFAULT : 0;
++		break;
++	case TAKO_TERMINAL_RELEASE_NAMESPACE:
++		if (arg) { ret = -EINVAL; break; }
++		tako_terminal_consume_birth(&ctx->attempted);
++		if (!ctx->owner) { ret = -ENODATA; break; }
++		ret = tako_release_namespace(ctx);
++		break;
++	case TAKO_TERMINAL_LIFETIME:
++		if (!ctx->owner) { ret = -ENODATA; break; }
++		owner = ctx->owner;
++		spin_lock_irqsave(&owner->lock, flags);
++		life.net_cookie = owner->net_cookie;
++		life.namespace_inum = owner->namespace_inum;
++		life.full_ip_sockets = owner->state.sockets;
++		life.requests = owner->requests.sockets;
++		life.timewait = owner->timewait.sockets;
++		life.packet_groups = owner->packet_groups.sockets;
++		life.born = owner->lifetime.born;
++		life.release_attempted = owner->lifetime.release_attempted;
++		life.reference_released = owner->lifetime.reference_released;
++		life.net_gone = owner->lifetime.net_gone;
++		life.poisoned = owner->lifetime.poisoned | owner->state.poisoned |
++			owner->requests.poisoned | owner->timewait.poisoned |
++			owner->packet_groups.poisoned;
++		spin_unlock_irqrestore(&owner->lock, flags);
++		if (!life.net_cookie || !life.namespace_inum) {
++			ret = -EUCLEAN;
++			break;
++		}
++		ret = copy_to_user((void __user *)arg, &life, sizeof(life)) ? -EFAULT : 0;
++		break;
++	}
++	mutex_unlock(&ctx->lock);
++	return ret;
++}
++
++static int tako_release(struct inode *inode, struct file *file)
++{
++	struct tako_terminal_file *ctx = file->private_data;
++
++	/* Closing never grants retirement. Any external net references or
++	 * object references retain the actual net/ledger naturally.
++	 */
++	if (ctx->owner) {
++		tako_cut_admission(ctx->owner);
++		tako_seal(ctx->owner);
++	}
++	if (ctx->net)
++		tako_release_namespace(ctx);
++	tako_owner_put(ctx->owner);
++	put_pid(ctx->creator);
++	kfree(ctx);
++	return 0;
++}
++
++static const struct file_operations tako_fops = {
++	.owner = THIS_MODULE,
++	.open = tako_open,
++	.release = tako_release,
++	.unlocked_ioctl = tako_ioctl,
++	.compat_ioctl = compat_ptr_ioctl,
++};
++
++static struct miscdevice tako_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "tako-terminal",
++	.fops = &tako_fops,
++	.mode = 0600,
++};
++
++static int __init tako_terminal_init(void)
++{
++	return misc_register(&tako_device);
++}
++device_initcall(tako_terminal_init);
+diff --git a/net/ipv4/inet_connection_sock.c b/net/ipv4/inet_connection_sock.c
+--- a/net/ipv4/inet_connection_sock.c
++++ b/net/ipv4/inet_connection_sock.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/module.h>
++#include <linux/tako_terminal.h>
+ #include <linux/jhash.h>
+ 
+ #include <net/inet_connection_sock.h>
+@@ -916,15 +917,21 @@
+ reqsk_alloc_noprof(const struct request_sock_ops *ops, struct sock *sk_listener,
+ 		   bool attach_listener)
+ {
++	struct tako_terminal_owner *terminal;
+ 	struct request_sock *req;
+ 
++	terminal = tako_terminal_request_reserve(sk_listener);
+ 	req = kmem_cache_alloc_noprof(ops->slab, GFP_ATOMIC | __GFP_NOWARN);
+-	if (!req)
++	if (!req) {
++		tako_terminal_request_put(terminal);
+ 		return NULL;
++	}
++	tako_terminal_request_attach(req, terminal);
+ 	req->rsk_listener = NULL;
+ 	if (attach_listener) {
+ 		if (unlikely(!refcount_inc_not_zero(&sk_listener->sk_refcnt))) {
+ 			kmem_cache_free(ops->slab, req);
++			tako_terminal_request_put(terminal);
+ 			return NULL;
+ 		}
+ 		req->rsk_listener = sk_listener;
+@@ -973,11 +980,14 @@
+ static struct request_sock *inet_reqsk_clone(struct request_sock *req,
+ 					     struct sock *sk)
+ {
++	struct tako_terminal_owner *terminal;
+ 	struct sock *req_sk, *nreq_sk;
+ 	struct request_sock *nreq;
+ 
++	terminal = tako_terminal_request_clone_reserve(req);
+ 	nreq = kmem_cache_alloc(req->rsk_ops->slab, GFP_ATOMIC | __GFP_NOWARN);
+ 	if (!nreq) {
++		tako_terminal_request_put(terminal);
+ 		__NET_INC_STATS(sock_net(sk), LINUX_MIB_TCPMIGRATEREQFAILURE);
+ 
+ 		/* paired with refcount_inc_not_zero() in reuseport_migrate_sock() */
+@@ -993,6 +1003,7 @@
+ 	unsafe_memcpy(&nreq_sk->sk_dontcopy_end, &req_sk->sk_dontcopy_end,
+ 		      req->rsk_ops->obj_size - offsetof(struct sock, sk_dontcopy_end),
+ 		      /* alloc is larger than struct, see above */);
++	tako_terminal_request_attach(nreq, terminal);
+ 
+ 	sk_node_init(&nreq_sk->sk_node);
+ 	nreq_sk->sk_tx_queue_mapping = req_sk->sk_tx_queue_mapping;
+diff --git a/net/ipv4/inet_timewait_sock.c b/net/ipv4/inet_timewait_sock.c
+--- a/net/ipv4/inet_timewait_sock.c
++++ b/net/ipv4/inet_timewait_sock.c
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/kernel.h>
++#include <linux/tako_terminal.h>
+ #include <linux/slab.h>
+ #include <linux/module.h>
+ #include <net/inet_hashtables.h>
+@@ -73,9 +74,11 @@
+ 
+ void inet_twsk_free(struct inet_timewait_sock *tw)
+ {
++	struct tako_terminal_owner *terminal = tako_terminal_timewait_detach(tw);
+ 	struct module *owner = tw->tw_prot->owner;
+ 	twsk_destructor((struct sock *)tw);
+ 	kmem_cache_free(tw->tw_prot->twsk_prot->twsk_slab, tw);
++	tako_terminal_timewait_put(terminal);
+ 	module_put(owner);
+ }
+ 
+@@ -179,16 +182,20 @@
+ 					   struct inet_timewait_death_row *dr,
+ 					   const int state)
+ {
++	struct tako_terminal_owner *terminal;
+ 	struct inet_timewait_sock *tw;
+ 
+ 	if (refcount_read(&dr->tw_refcount) - 1 >=
+ 	    READ_ONCE(dr->sysctl_max_tw_buckets))
+ 		return NULL;
+ 
++	terminal = tako_terminal_timewait_reserve(sk);
+ 	tw = kmem_cache_alloc(sk->sk_prot_creator->twsk_prot->twsk_slab,
+ 			      GFP_ATOMIC);
+ 	if (tw) {
+ 		const struct inet_sock *inet = inet_sk(sk);
++
++		tako_terminal_timewait_attach(tw, terminal);
+ 
+ 		tw->tw_dr	    = dr;
+ 		/* Give us an identity. */
+@@ -221,6 +228,8 @@
+ 		__module_get(tw->tw_prot->owner);
+ 	}
+ 
++	if (!tw)
++		tako_terminal_timewait_put(terminal);
+ 	return tw;
+ }
+ EXPORT_SYMBOL_GPL(inet_twsk_alloc);
