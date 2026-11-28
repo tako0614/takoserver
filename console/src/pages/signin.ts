@@ -413,12 +413,17 @@ function googleGlyph(): SVGSVGElement {
  */
 function operatorForm(providers: readonly IdentityProvider[]): Child {
   const busy = signal(false);
+  const activeError = signal<(() => string) | null>(null);
   const hintIds = ["assertion-hint"];
   const assertionError = h("div", {
     class: "field__error",
     id: "assertion-error",
     hidden: true,
   });
+  const showError = (describe: (() => string) | null): void => {
+    activeError.set(describe);
+    setFieldError(assertion, assertionError, describe ? describe() : null, hintIds);
+  };
   const assertion = h("textarea", {
     id: "assertion",
     name: "assertion",
@@ -427,7 +432,7 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
     spellcheck: "false",
     "aria-describedby": "assertion-hint",
     onInput: () => {
-      setFieldError(assertion, assertionError, null, hintIds);
+      showError(null);
     },
   });
   const label = h("label", { for: "assertion" });
@@ -436,6 +441,11 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
     class: "btn",
     type: "submit",
     style: { width: "100%" },
+  });
+  effect(() => {
+    consoleLocale();
+    const describe = untrack(activeError);
+    if (describe) setFieldError(assertion, assertionError, describe(), hintIds);
   });
   effect(() => {
     label.replaceChildren(text(tr("運営者assertion", "Operator assertion")));
@@ -471,16 +481,11 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
     if (assertion.value.trim() === "") {
       // Said beside the field, not only in a passing toast, and the caret goes
       // where the paste belongs.
-      setFieldError(
-        assertion,
-        assertionError,
-        tr("assertionを貼り付けてください", "Paste an assertion first"),
-        hintIds,
-      );
+      showError(() => tr("assertionを貼り付けてください", "Paste an assertion first"));
       assertion.focus?.();
       return;
     }
-    setFieldError(assertion, assertionError, null, hintIds);
+    showError(null);
     busy.set(true);
     const isCurrent = captureSessionScope();
     try {
@@ -491,17 +496,18 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
       );
     } catch (error) {
       if (isCurrent()) {
-        const message =
+        const describeError =
           error instanceof Error &&
           error.message === "operator assertion does not name an advertised provider"
-            ? tr(
-                "assertionの形式が正しくないか、この環境で有効なプロバイダーと一致しません。",
-                "The assertion format is invalid or does not match an advertised provider for this environment.",
-              )
-            : explain(error as Error);
+            ? () =>
+                tr(
+                  "assertionの形式が正しくないか、この環境で有効なプロバイダーと一致しません。",
+                  "The assertion format is invalid or does not match an advertised provider for this environment.",
+                )
+            : () => explain(error as Error);
         // The refusal stays beside the field until the assertion changes, so it
         // can still be read after the toast has gone.
-        setFieldError(assertion, assertionError, message, hintIds);
+        showError(describeError);
         assertion.focus?.();
       }
     } finally {
@@ -587,24 +593,30 @@ function languageSwitch(): Child {
  * static bundle that may be served from a laptop against a local server.
  */
 function endpointField(reload: () => void): Child {
+  const activeError = signal<(() => string) | null>(null);
   const originError = h("div", {
     class: "field__error",
     id: "signin-api-origin-error",
     hidden: true,
   });
+  const showError = (describe: (() => string) | null): void => {
+    activeError.set(describe);
+    setFieldError(input, originError, describe ? describe() : null);
+  };
   const save = (): void => {
     const normalized = normalizeApiOrigin(input.value);
     if (!normalized) {
-      const message = tr(
-        "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
-        "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
-      );
-      setFieldError(input, originError, message);
+      const describeError = () =>
+        tr(
+          "有効なHTTP(S)オリジンを入力してください（例: https://api.example.com）",
+          "Enter a valid HTTP(S) origin (for example, https://api.example.com)",
+        );
+      showError(describeError);
       input.focus?.();
-      toast(message, "bad");
+      toast(describeError(), "bad");
       return;
     }
-    setFieldError(input, originError, null);
+    showError(null);
     input.value = normalized;
     setApiOrigin(normalized);
     void refreshSharedAuthAvailability(true);
@@ -620,7 +632,7 @@ function endpointField(reload: () => void): Child {
     spellcheck: "false",
     value: untrack(apiOrigin),
     onInput: () => {
-      if (normalizeApiOrigin(input.value)) setFieldError(input, originError, null);
+      if (normalizeApiOrigin(input.value)) showError(null);
     },
     onKeydown: (event: KeyboardEvent) => {
       if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
@@ -628,6 +640,11 @@ function endpointField(reload: () => void): Child {
         save();
       }
     },
+  });
+  effect(() => {
+    consoleLocale();
+    const describe = untrack(activeError);
+    if (describe) setFieldError(input, originError, describe());
   });
   const summary = h("summary");
   const label = h("label", { for: "signin-api-origin", class: "visually-hidden" });

@@ -703,7 +703,7 @@ export function openModal(options: ModalOptions): () => void {
         void done.finally(() => {
           sending = false;
           settle();
-          if (closed) return;
+          if (closed || modalStack[modalStack.length - 1] !== scrim) return;
           // Disabling a focused confirm button while sending moves focus to
           // document.body; if the dialog stays open after a refusal and no
           // field claimed focus, return focus inside the dialog.

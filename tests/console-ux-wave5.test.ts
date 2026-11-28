@@ -409,6 +409,50 @@ describe("Console Wave 5 UI/UX improvements", () => {
     expect(details.getAttribute("open")).toBe("");
     expect(host.textContent).toContain("Manage resources declared through Takoform");
     expect(host.textContent).toContain("API endpoint");
+
+    // Active inline validation errors re-translate in place when toggling JA <-> EN.
+    const form = host.all().find((node) => node.tag === "form");
+    const assertionError = host.all().find((node) => node.id === "assertion-error");
+    const originInput = host.all().find((node) => node.id === "signin-api-origin");
+    const originError = host.all().find((node) => node.id === "signin-api-origin-error");
+    const saveOriginBtn = details.all().find((node) => node.tag === "button");
+    if (!form || !assertionError || !originInput || !originError || !saveOriginBtn) {
+      throw new Error("sign-in error controls missing");
+    }
+
+    jaBtn.click();
+    await flush();
+    textarea.value = "";
+    form.dispatch("submit");
+    originInput.value = "not-a-valid-origin";
+    saveOriginBtn.click();
+    await flush();
+    expect(assertionError.hidden).toBe(false);
+    expect(assertionError.textContent).toBe("assertionを貼り付けてください");
+    expect(originError.hidden).toBe(false);
+    expect(originError.textContent).toContain("有効なHTTP(S)オリジン");
+
+    enBtn.focus();
+    enBtn.click();
+    await flush();
+    expect(doc.activeElement).toBe(enBtn);
+    expect(assertionError.hidden).toBe(false);
+    expect(assertionError.textContent).toBe("Paste an assertion first");
+    expect(originError.hidden).toBe(false);
+    expect(originError.textContent).toContain("Enter a valid HTTP(S) origin");
+
+    jaBtn.click();
+    await flush();
+    expect(assertionError.textContent).toBe("assertionを貼り付けてください");
+    expect(originError.textContent).toContain("有効なHTTP(S)オリジン");
+
+    textarea.value = "some-token";
+    textarea.dispatch("input");
+    originInput.value = "https://valid.example.test";
+    originInput.dispatch("input");
+    await flush();
+    expect(assertionError.hidden).toBe(true);
+    expect(originError.hidden).toBe(true);
   });
 
   test("hostedSubscriptionCard keeps cancel and checkout buttons mounted and focused across async transitions", async () => {
@@ -673,25 +717,38 @@ describe("Console Wave 5 UI/UX improvements", () => {
     expect(failedNotice?.getAttribute("role")).toBe("alert");
     expect(failedNotice?.style.display).toBe("grid");
 
-    // Resources filter count keeps exact same live-region node across edits.
+    // Resources filter count keeps exact same live-region node exposed in a11y tree across edits.
     const resInput = resPage.all().find((node) => node.id === "resources-filter");
-    const resCount = resPage.all().find((node) => node.className === "filter-count");
+    const resCount = resPage
+      .all()
+      .find((node) => node.className.split(" ").includes("filter-count"));
     if (!resInput || !resCount) throw new Error("resources filter controls missing");
     expect(resCount.getAttribute("role")).toBe("status");
     expect(resCount.getAttribute("aria-live")).toBe("polite");
-    expect(resCount.hidden).toBe(true);
+    expect(resCount.hidden).toBe(false);
+    expect(resCount.className).toBe("filter-count visually-hidden");
 
     resInput.value = "a";
     resInput.dispatch("input");
     await flush();
     expect(resCount.hidden).toBe(false);
+    expect(resCount.className).toBe("filter-count");
     expect(resCount.textContent).toBe("2 of 2");
 
     resInput.value = "alpha";
     resInput.dispatch("input");
     await flush();
-    expect(resPage.all().find((node) => node.className === "filter-count")).toBe(resCount);
+    expect(resPage.all().find((node) => node.className.split(" ").includes("filter-count"))).toBe(
+      resCount,
+    );
     expect(resCount.textContent).toBe("1 of 2");
+
+    resInput.value = "";
+    resInput.dispatch("input");
+    await flush();
+    expect(resCount.hidden).toBe(false);
+    expect(resCount.className).toBe("filter-count visually-hidden");
+    expect(resCount.textContent).toBe("");
 
     // Keys page: live region node stability, .keys-scopes__list class (not inline flex-end), Actions th.
     root.replaceChildren();
@@ -701,17 +758,24 @@ describe("Console Wave 5 UI/UX improvements", () => {
     await flush();
 
     const keysInput = kPage.all().find((node) => node.id === "keys-filter");
-    const keysCount = kPage.all().find((node) => node.className === "filter-count");
+    const keysCount = kPage
+      .all()
+      .find((node) => node.className.split(" ").includes("filter-count"));
     if (!keysInput || !keysCount) throw new Error("keys filter controls missing");
+    expect(keysCount.hidden).toBe(false);
+    expect(keysCount.className).toBe("filter-count visually-hidden");
     keysInput.value = "dep";
     keysInput.dispatch("input");
     await flush();
     expect(keysCount.hidden).toBe(false);
+    expect(keysCount.className).toBe("filter-count");
     expect(keysCount.textContent).toBe("1 of 1");
     keysInput.value = "deploy";
     keysInput.dispatch("input");
     await flush();
-    expect(kPage.all().find((node) => node.className === "filter-count")).toBe(keysCount);
+    expect(kPage.all().find((node) => node.className.split(" ").includes("filter-count"))).toBe(
+      keysCount,
+    );
 
     const scopesList = kPage.all().find((node) => node.className === "keys-scopes__list");
     expect(scopesList).toBeDefined();
@@ -838,6 +902,44 @@ describe("Console Wave 5 UI/UX improvements", () => {
     await flush();
     expect(sendBtn.disabled).toBe(false);
     expect(doc.activeElement).toBe(sendBtn);
+
+    // If a second modal opens while a lower modal's async confirm is in flight,
+    // the lower modal's completion must not steal focus from the upper modal.
+    let finishLower!: () => void;
+    const closeLower = openModal({
+      title: "Lower modal",
+      confirmLabel: "Lower send",
+      body: "Lower body",
+      onConfirm: () =>
+        new Promise<void>((resolve) => {
+          finishLower = resolve;
+        }),
+    });
+    const lowerSend = body
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Lower send");
+    if (!lowerSend) throw new Error("Lower send button missing");
+    lowerSend.focus();
+    lowerSend.click();
+    expect(lowerSend.disabled).toBe(true);
+
+    const closeUpper = openModal({
+      title: "Upper modal",
+      dismissLabel: "Close upper",
+      body: "Upper body",
+    });
+    const upperCloseBtn = body
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "Close upper");
+    if (!upperCloseBtn) throw new Error("Upper close button missing");
+    expect(doc.activeElement).toBe(upperCloseBtn);
+
+    finishLower();
+    await flush();
+    expect(doc.activeElement).toBe(upperCloseBtn);
+
+    closeUpper();
+    closeLower();
     close();
   });
 
@@ -907,13 +1009,16 @@ describe("Console Wave 5 UI/UX improvements", () => {
     expect(contrastRatio(lightInk4, "#ffffff")).toBeGreaterThanOrEqual(3.0);
     expect(contrastRatio(lightInk4, "#f6f6f7")).toBeGreaterThanOrEqual(3.0);
 
-    expect(css).toContain(".btn[hidden],\n.filter-count[hidden],\n[hidden] {\n  display: none;\n}");
+    expect(css).toContain(".btn[hidden],\n[hidden] {\n  display: none;\n}");
     expect(css).toContain(".hosted-continuation__facts dd {");
     expect(css).toContain("overflow-wrap: anywhere;");
     expect(css).toContain(".keys-scopes__list {");
     expect(css).toContain(".keys-table .keys-scopes__list {\n    justify-content: flex-end;\n  }");
     expect(css).toContain(".wallet-card__notice {");
     expect(css).toContain(".head__text > .dim > a,");
+    expect(css).toContain(
+      ".published a,\n  .row__value > a,\n  .ref a {\n    display: inline-block;",
+    );
   });
 
   test("topbar sign-out button stays stably mounted and keeps focus when principal resolves or locale toggles", async () => {

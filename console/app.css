@@ -735,7 +735,6 @@ tbody tr.is-clickable:hover {
 }
 
 .btn[hidden],
-.filter-count[hidden],
 [hidden] {
   display: none;
 }
@@ -1923,17 +1922,25 @@ h1.empty__title {
   }
 
   .head__text > .dim > a,
-  .published a,
   .wallet-line a,
   .rows--counts .row__label a,
   .row__label > a,
-  .row__value > a,
-  .ref a,
   .attention-table .attention-name a {
     display: inline-flex;
     align-items: center;
     gap: 0.25em;
     min-height: 44px;
+  }
+
+  /* Wrapping URL links keep inline flow so a trailing "↗" stays attached to the
+     last line instead of floating beside a flex column, while still meeting 44px. */
+  .published a,
+  .row__value > a,
+  .ref a {
+    display: inline-block;
+    padding: 11px 0;
+    line-height: 22px;
+    overflow-wrap: anywhere;
   }
 
   .keys-table .keys-actions {

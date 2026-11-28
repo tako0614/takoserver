@@ -280,13 +280,13 @@ function createKeysFilterToolbar(
     input.focus?.();
   };
   bindSearchShortcut(input, () => filter.set(""), isActive);
-  // Keep the status live region and Clear button stably mounted so screen
-  // readers reliably announce match-count updates as the person types.
+  // Keep the status live region exposed in the accessibility tree even while
+  // inactive (visually-hidden rather than display: none) so the very first
+  // filter keystroke or paste is announced reliably by screen readers.
   const count = h("span", {
-    class: "filter-count",
+    class: "filter-count visually-hidden",
     role: "status",
     "aria-live": "polite",
-    hidden: true,
   });
   const clearButton = h(
     "button",
@@ -301,7 +301,7 @@ function createKeysFilterToolbar(
   );
   effect(() => {
     const active = filter() !== "";
-    count.hidden = !active;
+    count.className = active ? "filter-count" : "filter-count visually-hidden";
     clearButton.hidden = !active;
     count.replaceChildren(
       active ? text(tr(`${matched()} / ${total()} 件`, `${matched()} of ${total()}`)) : text(""),
