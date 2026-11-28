@@ -480,6 +480,7 @@ function createKey(
     },
   });
   const chosen = new Set<string>(DEFAULT_KEY_SCOPES);
+  const scopeBoxes: HTMLInputElement[] = [];
   const aiFields: HTMLFieldSetElement[] = [];
   const aiBoxes: HTMLInputElement[] = [];
   const lifetime = h(
@@ -542,6 +543,7 @@ function createKey(
                   }
                 },
               });
+              scopeBoxes.push(box);
               if (scope.id === "ai:invoke") aiBoxes.push(box);
               return h(
                 "label",
@@ -592,6 +594,7 @@ function createKey(
         if (typeof scopesError.setAttribute === "function")
           scopesError.setAttribute("role", "alert");
         scopesError.replaceChildren(text(message));
+        scopeBoxes.find((box) => !box.disabled && !box.closest?.("[hidden]"))?.focus?.();
         toast(message, "bad");
         return;
       }
@@ -680,6 +683,8 @@ function revealSecret(
   const options: ModalOptions = {
     title: tr("今すぐキーをコピーしてください", "Copy this key now"),
     dismissLabel: tr("完了", "Done"),
+    // The secret is shown once; a click beside the dialog must not throw it away.
+    dismissOnBackdrop: false,
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -741,7 +746,11 @@ function revealSecret(
             // One command per line, as the shell reads it: scroll rather than wrap.
             h(
               "pre",
-              { class: "json", style: { whiteSpace: "pre", overflowWrap: "normal" } },
+              {
+                class: "json",
+                tabindex: "0",
+                style: { whiteSpace: "pre", overflowWrap: "normal" },
+              },
               usage,
             ),
             h(

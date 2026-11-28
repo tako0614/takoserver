@@ -483,6 +483,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
   .shell { width: calc(100% - 32px); }
   .top { min-height: 72px; gap: 4px 16px; }
   .top-nav { gap: 0 14px; }
+  .top-link { min-width: 44px; justify-content: center; }
   .hero { padding: 48px 0 32px; }
   .hero-title { gap: 12px; }
   .here { margin-top: 28px; padding: 22px 20px; }
@@ -662,14 +663,14 @@ ${formGroups}
 ${text("hostTitle", "h2", ' id="start-title"')}
 <div class="host">
 <ol class="steps">
-<li>${text("hostStep1", "p")}<pre>git clone ${REPOSITORY}
+<li>${text("hostStep1", "p")}<pre tabindex="0">git clone ${REPOSITORY}
 cd takoserver
 COMMIT=$(git rev-parse origin/main)
 git checkout --detach "$COMMIT"
 bun install --frozen-lockfile</pre></li>
 <li>${text("hostStep2", "p")}<p class="more"><a href="${WORKERD_RELEASE}" data-i18n="releases">${copy.releases}</a></p></li>
 <li>${text("hostStep3", "p")}</li>
-<li>${text("hostStep4", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span><pre>bun --no-env-file src/entry-bun.ts</pre></li>
+<li>${text("hostStep4", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span><pre tabindex="0">bun --no-env-file src/entry-bun.ts</pre></li>
 </ol>
 <aside>
 ${text("hostNote", "p", ' class="note"')}
@@ -688,20 +689,20 @@ ${chain}
 </ol>
 <div class="code">
 ${text("endpointBaseLabel", "p")}
-<pre>V2=${deployV2Base}
+<pre tabindex="0">V2=${deployV2Base}
 F=https://edge.forms.takoform.com/forms</pre>
 ${text("createLabel", "p")}
-<pre>jq -n --arg form "$F/ModuleWorker/0.3.0/" --arg space "$ORG" \\
+<pre tabindex="0">jq -n --arg form "$F/ModuleWorker/0.3.0/" --arg space "$ORG" \\
   '{$form, $space, name: "hello", spec: {}}' |
 curl -sS "$V2/resources" --data @- \\
   -H "authorization: Bearer $KEY" \\
   -H "content-type: application/json" \\
   -H "idempotency-key: takoserver-first-use-hello"</pre>
-<pre><span class="file">worker.js</span>export default {
+<pre tabindex="0"><span class="file">worker.js</span>export default {
   fetch() { return new Response("hello from takoserver\\n"); },
 };</pre>
 ${text("resultLabel", "p")}
-<pre>NAME=$(curl -sS "$V2/resources/$ENDPOINT" \\
+<pre tabindex="0">NAME=$(curl -sS "$V2/resources/$ENDPOINT" \\
   -H "authorization: Bearer $KEY" | jq -r .output.hostname)
 curl -sS "https://$NAME/"
 <span class="out">hello from takoserver</span></pre>
@@ -723,7 +724,7 @@ ${text("afterTitle", "h2", ' id="after-title"')}
 <li><strong>WorkerVersion 0.5.0 <span>hello-version-v2</span></strong>${text("shipVersion", "p")}</li>
 <li><strong>WorkerDeployment 0.4.0 <span>hello-deployment</span></strong>${text("shipDeploy", "p")}</li>
 </ol>
-<pre>PUT ${shipTarget}/&lt;Deployment UID&gt;
+<pre tabindex="0">PUT ${shipTarget}/&lt;Deployment UID&gt;
 idempotency-key: &lt;a new key&gt;
 takoform-expected-generation: &lt;the generation it read&gt;
 

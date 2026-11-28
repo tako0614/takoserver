@@ -1056,6 +1056,13 @@ tbody tr.is-clickable:hover {
   margin-bottom: 6px;
 }
 
+/* A page-level empty state's title is the page's h1; it keeps the look. */
+h1.empty__title {
+  margin: 0 0 6px;
+  font-size: inherit;
+  letter-spacing: normal;
+}
+
 .empty__body {
   max-width: 46ch;
   margin: 0 auto;
@@ -1168,16 +1175,23 @@ tbody tr.is-clickable:hover {
   background: rgb(8 8 9 / 55%);
 }
 
+/* The head and the foot stay in view and only the body scrolls, so a long
+   dialog (a new Resource, a key's scopes) keeps its title and its Create and
+   Cancel buttons on screen on a phone instead of scrolling them away. */
 .modal {
+  display: flex;
+  flex-direction: column;
   width: min(540px, 100%);
-  max-height: 86vh;
-  overflow-y: auto;
+  /* dvh: a phone's collapsing toolbar cannot push the foot off screen. */
+  max-height: 86dvh;
+  overflow: hidden;
   background: var(--surface-1);
   border: 1px solid var(--line-1);
   border-radius: var(--radius-lg);
 }
 
 .modal__head {
+  flex: none;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -1187,6 +1201,10 @@ tbody tr.is-clickable:hover {
 }
 
 .modal__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 18px;
   display: flex;
   flex-direction: column;
@@ -1194,6 +1212,7 @@ tbody tr.is-clickable:hover {
 }
 
 .modal__foot {
+  flex: none;
   display: flex;
   justify-content: flex-end;
   gap: 8px;
@@ -1670,17 +1689,45 @@ tbody tr.is-clickable:hover {
   }
 
   .btn--sm {
-    min-height: 40px;
+    min-height: 44px;
   }
 
   .toast__dismiss {
-    width: 40px;
-    height: 40px;
+    width: 44px;
+    height: 44px;
   }
 
   .segmented__item {
-    min-width: 40px;
-    min-height: 40px;
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .topbar__org {
+    min-height: 44px;
+  }
+
+  .input,
+  .select {
+    min-height: 44px;
+  }
+
+  .copy {
+    min-height: 44px;
+    padding: 8px 6px;
+    margin: 0;
+  }
+
+  .request-details summary {
+    min-height: 44px;
+    padding: 12px 0;
+    line-height: 20px;
+  }
+
+  .signin__endpoint summary {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 44px;
   }
 
   .search-box {

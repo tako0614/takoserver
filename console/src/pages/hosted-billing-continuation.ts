@@ -138,6 +138,8 @@ export function hostedBillingContinuationPage(selector: string): Child {
       empty(
         tr("続行情報が無効です", "Invalid continuation"),
         tr("このリンクから続行できません。", "This continuation link is invalid."),
+        undefined,
+        { heading: true },
       ),
     );
   }
@@ -218,7 +220,14 @@ export function hostedBillingContinuationPage(selector: string): Child {
     live(() => {
       const loaded = continuation.get();
       if (loaded.state === "loading")
-        return card(null, text(tr("続行内容を確認しています…", "Loading continuation…")));
+        return card(
+          null,
+          h(
+            "div",
+            { class: "card__body", role: "status", "aria-busy": "true" },
+            tr("続行内容を確認しています…", "Loading continuation…"),
+          ),
+        );
       if (loaded.state === "error")
         return card(
           null,

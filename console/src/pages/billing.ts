@@ -44,6 +44,7 @@ import {
   type ModalOptions,
   openModal,
   refreshButton,
+  setFieldError,
   skeletonRows,
   stat,
   toast,
@@ -738,6 +739,54 @@ function watchBillingModalScope(
  */
 function addFunds(organizationId: string, reload: () => void, isScopeCurrent: () => boolean): void {
   const amountId = `funding-amount-${++nextFundingInputId}`;
+  const amountHintId = `${amountId}-hint`;
+  const amountError = h("div", {
+    class: "field__error",
+    id: `${amountId}-error`,
+    hidden: true,
+  });
+  const busy = signal(false);
+  let open = true;
+  const isCurrent = () => open && isScopeCurrent();
+  const submit = async (): Promise<void> => {
+    if (busy()) return;
+    if (!isCurrent()) {
+      close();
+      return;
+    }
+    const dollars = Number(amount.value);
+    if (!Number.isFinite(dollars) || dollars < 5) {
+      const message = tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5");
+      setFieldError(amount, amountError, message, [amountHintId]);
+      amount.focus?.();
+      toast(message, "bad");
+      return;
+    }
+    setFieldError(amount, amountError, null, [amountHintId]);
+    busy.set(true);
+    try {
+      const started = await api.beginCheckout(organizationId, Math.round(dollars * 100));
+      if (!isCurrent()) {
+        close();
+        return;
+      }
+      window.location.assign(started.checkout.url);
+    } catch (error) {
+      if (!isCurrent()) {
+        close();
+        return;
+      }
+      busy.set(false);
+      const failure = error as { code?: string };
+      if (failure.code === "not_found") {
+        // This deployment takes no card. Offer the way it does take money.
+        close();
+        operatorFunding(organizationId, reload, isScopeCurrent);
+        return;
+      }
+      toast(explain(error as Error), "bad");
+    }
+  };
   const amount = h("input", {
     id: amountId,
     name: "amount",
@@ -747,15 +796,26 @@ function addFunds(organizationId: string, reload: () => void, isScopeCurrent: ()
     value: "50",
     min: "5",
     step: "5",
+    "aria-describedby": amountHintId,
+    onInput: () => {
+      const dollars = Number(amount.value);
+      if (Number.isFinite(dollars) && dollars >= 5) {
+        setFieldError(amount, amountError, null, [amountHintId]);
+      }
+    },
+    onKeydown: (event: KeyboardEvent) => {
+      if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
+        event.preventDefault();
+        void submit();
+      }
+    },
   });
-  const busy = signal(false);
-  let open = true;
-  const isCurrent = () => open && isScopeCurrent();
 
   const close = openBillingModal(
     {
       title: tr("残高を追加", "Add funds"),
       confirmLabel: tr("支払いへ進む", "Continue to payment"),
+      confirmBlocked: () => busy(),
       onClose: () => {
         open = false;
       },
@@ -767,9 +827,10 @@ function addFunds(organizationId: string, reload: () => void, isScopeCurrent: ()
           { class: "field" },
           h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
           amount,
+          amountError,
           h(
             "small",
-            null,
+            { id: amountHintId },
             tr(
               "一度だけ決済します。支払い確定後に残高へ反映されます。",
               "Charged once. The balance is credited when the payment settles.",
@@ -782,40 +843,7 @@ function addFunds(organizationId: string, reload: () => void, isScopeCurrent: ()
             : h("div"),
         ),
       ),
-      onConfirm: async () => {
-        if (!isCurrent()) {
-          close();
-          return;
-        }
-        const dollars = Number(amount.value);
-        if (!Number.isFinite(dollars) || dollars < 5) {
-          toast(tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"), "bad");
-          return;
-        }
-        busy.set(true);
-        try {
-          const started = await api.beginCheckout(organizationId, Math.round(dollars * 100));
-          if (!isCurrent()) {
-            close();
-            return;
-          }
-          window.location.assign(started.checkout.url);
-        } catch (error) {
-          if (!isCurrent()) {
-            close();
-            return;
-          }
-          busy.set(false);
-          const failure = error as { code?: string };
-          if (failure.code === "not_found") {
-            // This deployment takes no card. Offer the way it does take money.
-            close();
-            operatorFunding(organizationId, reload, isScopeCurrent);
-            return;
-          }
-          toast(explain(error as Error), "bad");
-        }
-      },
+      onConfirm: submit,
     },
     isScopeCurrent,
   );
@@ -852,6 +880,42 @@ function hostedAddFunds(
   const pending =
     state.status === "unresolved" || state.status === "amount_conflict" ? state.amountMinor : null;
   const amountId = `top-up-amount-${++nextFundingInputId}`;
+  const amountHintId = `${amountId}-hint`;
+  const amountError = h("div", {
+    class: "field__error",
+    id: `${amountId}-error`,
+    hidden: true,
+  });
+  const minimumMinor = bounds?.minimumMinor ?? 500;
+  const isValidAmount = (raw: string): boolean => {
+    const dollars = Number(raw);
+    const amountMinor = Math.round(dollars * 100);
+    return (
+      raw.trim() !== "" &&
+      Number.isFinite(dollars) &&
+      amountMinor >= minimumMinor &&
+      (bounds === null || amountMinor <= bounds.maximumMinor)
+    );
+  };
+  const submit = async (): Promise<void> => {
+    if (!isScopeCurrent() || ["busy", "redirecting"].includes(topUp.state().status)) return;
+    const dollars = Number(amount.value);
+    const amountMinor = Math.round(dollars * 100);
+    if (!isValidAmount(amount.value)) {
+      const message = bounds
+        ? tr(
+            `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}の金額を入力してください`,
+            `Enter an amount from ${money(bounds.minimumMinor)} to ${money(bounds.maximumMinor)}`,
+          )
+        : tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5");
+      setFieldError(amount, amountError, message, [amountHintId]);
+      amount.focus?.();
+      toast(message, "bad");
+      return;
+    }
+    setFieldError(amount, amountError, null, [amountHintId]);
+    await topUp.start(amountMinor);
+  };
   const amount = h("input", {
     id: amountId,
     name: "amount",
@@ -859,8 +923,19 @@ function hostedAddFunds(
     class: "input",
     type: "number",
     value: String(pending === null ? 50 : pending / 100),
-    min: String((bounds?.minimumMinor ?? 500) / 100),
+    min: String(minimumMinor / 100),
+    ...(bounds ? { max: String(bounds.maximumMinor / 100) } : {}),
     step: "1",
+    "aria-describedby": amountHintId,
+    onInput: () => {
+      if (isValidAmount(amount.value)) setFieldError(amount, amountError, null, [amountHintId]);
+    },
+    onKeydown: (event: KeyboardEvent) => {
+      if (event.key === "Enter" && !event.isComposing && event.keyCode !== 229) {
+        event.preventDefault();
+        void submit();
+      }
+    },
   });
 
   openBillingModal(
@@ -876,9 +951,10 @@ function hostedAddFunds(
           { class: "field" },
           h("label", { for: amountId }, tr("金額（USD）", "Amount (USD)")),
           amount,
+          amountError,
           h(
             "small",
-            null,
+            { id: amountHintId },
             bounds
               ? tr(
                   `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}。一度だけ決済し、支払い確定後に残高へ反映されます。`,
@@ -925,29 +1001,7 @@ function hostedAddFunds(
           return topUpMessage(current);
         }),
       ),
-      onConfirm: async () => {
-        if (!isScopeCurrent()) return;
-        const dollars = Number(amount.value);
-        const amountMinor = Math.round(dollars * 100);
-        const minimumMinor = bounds?.minimumMinor ?? 500;
-        if (
-          !Number.isFinite(dollars) ||
-          amountMinor < minimumMinor ||
-          (bounds !== null && amountMinor > bounds.maximumMinor)
-        ) {
-          toast(
-            bounds
-              ? tr(
-                  `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}の金額を入力してください`,
-                  `Enter an amount from ${money(bounds.minimumMinor)} to ${money(bounds.maximumMinor)}`,
-                )
-              : tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"),
-            "bad",
-          );
-          return;
-        }
-        await topUp.start(amountMinor);
-      },
+      onConfirm: submit,
     },
     isScopeCurrent,
   );
@@ -1075,15 +1129,25 @@ function operatorFunding(
   let open = true;
   const isCurrent = () => open && isScopeCurrent();
   const inputId = `operator-funding-${++nextFundingInputId}`;
+  const inputHintId = `${inputId}-hint`;
+  const inputError = h("div", {
+    class: "field__error",
+    id: `${inputId}-error`,
+    hidden: true,
+  });
   const input = h("textarea", {
     id: inputId,
     name: "settlementProof",
     autocomplete: "off",
     class: "textarea",
+    "aria-describedby": inputHintId,
     placeholder: tr(
       "この組織に発行された入金証明を貼り付けてください",
       "Paste the settlement proof issued for this organization",
     ),
+    onInput: () => {
+      setFieldError(input, inputError, null, [inputHintId]);
+    },
   });
 
   const close = openBillingModal(
@@ -1114,9 +1178,10 @@ function operatorFunding(
           { class: "field" },
           h("label", { for: inputId }, tr("入金証明", "Settlement proof")),
           input,
+          inputError,
           h(
             "small",
-            null,
+            { id: inputHintId },
             tr(
               "運営者がこの組織に対して発行した証明です。",
               "Issued by the operator against this organization.",
@@ -1131,9 +1196,13 @@ function operatorFunding(
         }
         const proof = input.value.trim();
         if (proof === "") {
-          toast(tr("入金証明を貼り付けてください", "Paste a settlement proof first"), "bad");
+          const message = tr("入金証明を貼り付けてください", "Paste a settlement proof first");
+          setFieldError(input, inputError, message, [inputHintId]);
+          input.focus?.();
+          toast(message, "bad");
           return;
         }
+        setFieldError(input, inputError, null, [inputHintId]);
         try {
           await api.fund(organizationId, proof);
           if (!isCurrent()) {
@@ -1144,8 +1213,12 @@ function operatorFunding(
           reload();
           close();
         } catch (error) {
-          if (isCurrent()) toast(explain(error as Error), "bad");
-          else close();
+          if (isCurrent()) {
+            const message = explain(error as Error);
+            setFieldError(input, inputError, message, [inputHintId]);
+            input.focus?.();
+            toast(message, "bad");
+          } else close();
         }
       },
     },
