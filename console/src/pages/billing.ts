@@ -1326,7 +1326,6 @@ function hostedSubscriptionCard(
   return card(
     tr("サブスクリプション", "Subscription"),
     live(() => {
-      const checkoutState = checkout.state();
       const subscriptionState = subscription.get();
       if (isSubscriptionUnavailable(subscriptionState)) {
         return h(
@@ -1353,23 +1352,15 @@ function hostedSubscriptionCard(
           const owner = ownerCanManage();
           const cancelController =
             owner && current ? cancellationFor(current.subscriptionRef) : null;
-          const cancellationState = cancelController?.state();
           const planActions: HTMLElement[] = !owner
             ? []
             : current && !isTerminalSubscription(current)
-              ? [cancellationAction(current, cancelController, cancellationState?.status)].filter(
+              ? [cancellationAction(current, cancelController)].filter(
                   (action): action is HTMLElement => action !== null,
                 )
-              : configuredPlans
-                  .map((plan) =>
-                    checkoutAction(
-                      checkout,
-                      checkoutState.status,
-                      plan.planId,
-                      current?.subscriptionRef,
-                    ),
-                  )
-                  .filter((action): action is HTMLElement => action !== null);
+              : configuredPlans.map((plan) =>
+                  checkoutAction(checkout, plan.planId, current?.subscriptionRef),
+                );
           const body = h(
             "div",
             { class: "card__body billing-plan__content" },
@@ -1403,9 +1394,9 @@ function hostedSubscriptionCard(
                         ),
                       ),
                 ),
-            current ? cancellationMessage(current, cancellationState) : null,
+            current ? live(() => cancellationMessage(current, cancelController?.state())) : null,
             !current || isTerminalSubscription(current)
-              ? checkoutMessage(checkoutState.status)
+              ? live(() => checkoutMessage(checkout.state().status))
               : null,
             owner
               ? planActions.length > 0
@@ -1467,41 +1458,58 @@ function subscriptionProjectionView(subscription: HostedSubscriptionProjection):
   );
 }
 
+function syncOptionalAttr(element: HTMLElement, name: string, value: string | null): void {
+  if (value !== null) {
+    element.setAttribute(name, value);
+  } else if (typeof element.removeAttribute === "function") {
+    element.removeAttribute(name);
+  }
+}
+
 function checkoutAction(
   checkout: ReturnType<typeof createSubscriptionCheckoutController>,
-  status: string,
   planKey: string,
   terminalSubscriptionRef?: string,
-): HTMLElement | null {
+): HTMLElement {
   const terminalRepurchase = terminalSubscriptionRef !== undefined;
-  if (!terminalRepurchase && (status === "associated" || status === "missing_intent")) return null;
-  const expired = status === "expired";
-  const disabled = ["busy", "redirecting", "intent_conflict"].includes(status);
-  return h(
-    "button",
-    {
-      class: "btn btn--primary billing-plan__action",
-      type: "button",
-      disabled,
-      onClick: () =>
-        terminalRepurchase
-          ? void checkout.startNewPurchase(planKey, terminalSubscriptionRef)
-          : expired
-            ? void checkout.startNewPurchase(planKey)
-            : void checkout.start(planKey),
+  let blocked = false;
+  // Stable button updates label and busy/disabled state in place so keyboard
+  // focus survives idle -> busy -> pending/uncertain/cancelled transitions.
+  const button = h("button", {
+    class: "btn btn--primary billing-plan__action",
+    type: "button",
+    onClick: () => {
+      if (blocked) return;
+      const status = checkout.state().status;
+      if (terminalRepurchase) void checkout.startNewPurchase(planKey, terminalSubscriptionRef);
+      else if (status === "expired") void checkout.startNewPurchase(planKey);
+      else void checkout.start(planKey);
     },
-    terminalRepurchase || expired
-      ? tr(`${planKey} の新しいCheckoutを開始`, `Start a new ${planKey} Checkout`)
-      : status === "pending" || status === "uncertain" || status === "cancelled"
-        ? tr(`${planKey} のCheckoutを再確認`, `Retry ${planKey} Checkout`)
-        : tr(`${planKey} を開始`, `Begin ${planKey} subscription`),
-  );
+  });
+  effect(() => {
+    const status = checkout.state().status;
+    const hidden = !terminalRepurchase && (status === "associated" || status === "missing_intent");
+    const busy = status === "busy" || status === "redirecting";
+    blocked = hidden || busy || status === "intent_conflict";
+    button.hidden = hidden;
+    syncOptionalAttr(button, "aria-busy", busy ? "true" : null);
+    syncOptionalAttr(button, "aria-disabled", blocked ? "true" : null);
+    button.replaceChildren(
+      text(
+        terminalRepurchase || status === "expired"
+          ? tr(`${planKey} の新しいCheckoutを開始`, `Start a new ${planKey} Checkout`)
+          : status === "pending" || status === "uncertain" || status === "cancelled"
+            ? tr(`${planKey} のCheckoutを再確認`, `Retry ${planKey} Checkout`)
+            : tr(`${planKey} を開始`, `Begin ${planKey} subscription`),
+      ),
+    );
+  });
+  return button;
 }
 
 function cancellationAction(
   subscription: HostedSubscriptionProjection,
   controller: ReturnType<typeof createSubscriptionCancellationController> | null,
-  status: string | undefined,
 ): HTMLElement | null {
   if (
     !controller ||
@@ -1510,19 +1518,33 @@ function cancellationAction(
     subscription.status === "incomplete_expired"
   )
     return null;
-  if (status === "verified") return null;
-  return h(
-    "button",
-    {
-      class: "btn billing-plan__action",
-      type: "button",
-      disabled: status === "busy",
-      onClick: () => void controller.cancel(),
+  let blocked = false;
+  // Stable button updates in place so keyboard focus stays on the control
+  // across idle -> busy -> pending/uncertain/target_mismatch transitions.
+  const button = h("button", {
+    class: "btn billing-plan__action",
+    type: "button",
+    onClick: () => {
+      if (!blocked) void controller.cancel();
     },
-    status === "pending" || status === "uncertain" || status === "target_mismatch"
-      ? tr("解約状態を再確認", "Retry cancellation status")
-      : tr("期間終了時に解約", "Schedule period-end cancellation"),
-  );
+  });
+  effect(() => {
+    const status = controller.state().status;
+    const hidden = status === "verified";
+    const busy = status === "busy";
+    blocked = hidden || busy;
+    button.hidden = hidden;
+    syncOptionalAttr(button, "aria-busy", busy ? "true" : null);
+    syncOptionalAttr(button, "aria-disabled", blocked ? "true" : null);
+    button.replaceChildren(
+      text(
+        status === "pending" || status === "uncertain" || status === "target_mismatch"
+          ? tr("解約状態を再確認", "Retry cancellation status")
+          : tr("期間終了時に解約", "Schedule period-end cancellation"),
+      ),
+    );
+  });
+  return button;
 }
 
 function checkoutMessage(status: string): HTMLElement | null {

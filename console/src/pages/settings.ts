@@ -187,8 +187,8 @@ export function settingsPage(organization: Organization): Child {
               "small",
               { id: "settings-api-origin-hint" },
               tr(
-                "このコンソールのすべてのリクエストがここへ送られます。変更してもデータは移動しません。",
-                "Every request from this console goes here. Changing it does not move any data.",
+                "このコンソールのすべてのリクエストがここへ送られます。別のオリジンへ変更すると、現在のセッションからサインアウトします。変更してもデータは移動しません。",
+                "Every request from this console goes here. Switching to a different origin signs you out of the current session. Changing it does not move any data.",
               ),
             ),
           ),

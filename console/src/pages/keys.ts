@@ -280,6 +280,33 @@ function createKeysFilterToolbar(
     input.focus?.();
   };
   bindSearchShortcut(input, () => filter.set(""), isActive);
+  // Keep the status live region exposed in the accessibility tree even while
+  // inactive (visually-hidden rather than display: none) so the very first
+  // filter keystroke or paste is announced reliably by screen readers.
+  const count = h("span", {
+    class: "filter-count visually-hidden",
+    role: "status",
+    "aria-live": "polite",
+  });
+  const clearButton = h(
+    "button",
+    {
+      class: "btn btn--ghost btn--sm",
+      type: "button",
+      "aria-label": tr("絞り込みをクリア", "Clear filter"),
+      hidden: true,
+      onClick: clear,
+    },
+    tr("クリア", "Clear"),
+  );
+  effect(() => {
+    const active = filter() !== "";
+    count.className = active ? "filter-count" : "filter-count visually-hidden";
+    clearButton.hidden = !active;
+    count.replaceChildren(
+      active ? text(tr(`${matched()} / ${total()} 件`, `${matched()} of ${total()}`)) : text(""),
+    );
+  });
   return {
     clear,
     element: h(
@@ -291,27 +318,8 @@ function createKeysFilterToolbar(
         input,
         h("kbd", { class: "kbd-hint", "aria-hidden": "true" }, "/"),
       ),
-      live(() =>
-        filter() === ""
-          ? null
-          : [
-              h(
-                "span",
-                { class: "filter-count", role: "status" },
-                tr(`${matched()} / ${total()} 件`, `${matched()} of ${total()}`),
-              ),
-              h(
-                "button",
-                {
-                  class: "btn btn--ghost btn--sm",
-                  type: "button",
-                  "aria-label": tr("絞り込みをクリア", "Clear filter"),
-                  onClick: clear,
-                },
-                tr("クリア", "Clear"),
-              ),
-            ],
-      ),
+      count,
+      clearButton,
     ),
   };
 }
@@ -348,7 +356,11 @@ function table(
         h("th", { role: "columnheader" }, tr("スコープ", "Scopes")),
         h("th", { role: "columnheader" }, tr("作成日時", "Created")),
         h("th", { role: "columnheader" }, tr("有効期限", "Expires")),
-        h("th", { role: "columnheader" }, ""),
+        h(
+          "th",
+          { role: "columnheader" },
+          h("span", { class: "visually-hidden" }, tr("操作", "Actions")),
+        ),
       ),
     ),
     h(
@@ -368,18 +380,7 @@ function table(
           h(
             "td",
             { class: "keys-scopes", role: "cell", "data-label": tr("スコープ", "Scopes") },
-            h(
-              "div",
-              {
-                style: {
-                  display: "flex",
-                  gap: "4px",
-                  flexWrap: "wrap",
-                  justifyContent: "flex-end",
-                },
-              },
-              ...key.scopes.map((scope) => badge(scope)),
-            ),
+            h("div", { class: "keys-scopes__list" }, ...key.scopes.map((scope) => badge(scope))),
           ),
           h(
             "td",
@@ -769,6 +770,12 @@ function revealSecret(
                 "a",
                 { href: INSTALL_GUIDE_STEPS, target: "_blank", rel: "noopener noreferrer" },
                 tr("導入手順書（英語）の手順8〜13", "Steps 8 to 13 of the install guide"),
+                h("span", { "aria-hidden": "true" }, " ↗"),
+                h(
+                  "span",
+                  { class: "visually-hidden" },
+                  tr("（新しいタブで開きます）", " (opens in a new tab)"),
+                ),
               ),
               tr(
                 "にあります。手順5の変数Fと、手順6で用意した成果物も使います。",
