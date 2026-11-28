@@ -13,7 +13,7 @@ import { consoleLocale, tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { api } from "../state.ts";
 import { subscriptionPlanOptions } from "../subscription-plan-options.ts";
-import { card, empty, explain } from "../ui.ts";
+import { card, empty, explain, setFieldError } from "../ui.ts";
 
 type EffectResult =
   | { readonly kind: "topup"; readonly value: TopUpCheckoutStart }
@@ -414,6 +414,22 @@ function renderSelection(
   const actions: Child[] = [];
 
   if (capabilities.topUps && usage) {
+    const amountHintId = "hosted-continuation-topup-amount-hint";
+    const amountError = h("div", {
+      class: "field__error",
+      id: "hosted-continuation-topup-amount-error",
+      hidden: true,
+    });
+    const parseTopUpAmount = (raw: string): number | null => {
+      const amountMinor = usdInputToMinorUnits(raw.trim());
+      if (
+        amountMinor === null ||
+        amountMinor < usage.checkoutMinimumMinor ||
+        amountMinor > usage.checkoutMaximumMinor
+      )
+        return null;
+      return amountMinor;
+    };
     const amount = h("input", {
       class: "input",
       type: "number",
@@ -424,6 +440,12 @@ function renderSelection(
       value: usdDecimalFromMinorUnits(usage.checkoutMinimumMinor),
       id: "hosted-continuation-topup-amount",
       "aria-label": tr("金額（USD）", "Amount (USD)"),
+      "aria-describedby": amountHintId,
+      onInput: () => {
+        if (parseTopUpAmount(amount.value) !== null) {
+          setFieldError(amount, amountError, null, [amountHintId]);
+        }
+      },
     });
     const consent = consentControl(
       tr(
@@ -443,9 +465,10 @@ function renderSelection(
             tr("金額（USD）", "Amount (USD)"),
           ),
           amount,
+          amountError,
           h(
             "small",
-            null,
+            { id: amountHintId },
             tr(
               `設定範囲: ${usdFromMinorUnits(usage.checkoutMinimumMinor, locale)}〜${usdFromMinorUnits(usage.checkoutMaximumMinor, locale)} USD。`,
               `Configured range: ${usdFromMinorUnits(usage.checkoutMinimumMinor, locale)}–${usdFromMinorUnits(usage.checkoutMaximumMinor, locale)} USD.`,
@@ -460,15 +483,17 @@ function renderSelection(
         tr("チャージを準備", "Prepare top-up"),
         locked,
         () => {
-          const amountMinor = usdInputToMinorUnits(amount.value);
-          if (
-            amountMinor === null ||
-            amountMinor < usage.checkoutMinimumMinor ||
-            amountMinor > usage.checkoutMaximumMinor
-          ) {
-            amount.reportValidity();
+          const amountMinor = parseTopUpAmount(amount.value);
+          if (amountMinor === null) {
+            const message = tr(
+              `${usdFromMinorUnits(usage.checkoutMinimumMinor, locale)}〜${usdFromMinorUnits(usage.checkoutMaximumMinor, locale)} USDの範囲で金額を入力してください（小数第2位まで）。`,
+              `Enter an amount from ${usdFromMinorUnits(usage.checkoutMinimumMinor, locale)} to ${usdFromMinorUnits(usage.checkoutMaximumMinor, locale)} USD (up to 2 decimal places).`,
+            );
+            setFieldError(amount, amountError, message, [amountHintId]);
+            amount.focus?.();
             return;
           }
+          setFieldError(amount, amountError, null, [amountHintId]);
           onPrepare({ kind: "topup", amountMinor, checkoutConsent: "interactive-checkout" });
         },
       ),

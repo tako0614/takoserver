@@ -517,14 +517,15 @@ export function refreshButton(options: {
   readonly isActive: () => boolean;
   readonly isBusy: () => boolean;
   readonly onRefresh: () => void;
+  readonly compact?: boolean;
 }): HTMLButtonElement {
-  const glyph = icon(ICON.refresh, 14);
+  const glyph = icon(ICON.refresh, options.compact ? 13 : 14);
   const label = h("span");
   let currentBusy = false;
   const button = h(
     "button",
     {
-      class: "btn",
+      class: options.compact ? "btn btn--sm" : "btn",
       type: "button",
       onClick: () => {
         if (!currentBusy && options.isActive()) options.onRefresh();

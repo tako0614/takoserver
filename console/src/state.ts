@@ -415,6 +415,27 @@ export function currentOrganization(): Organization | null {
 
 export const theme = signal<Theme>((localStorage.getItem(THEME_KEY) as Theme | null) ?? "system");
 
+const systemColorSchemeMedia =
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(prefers-color-scheme: dark)")
+    : null;
+const systemPrefersDark = signal<boolean>(systemColorSchemeMedia?.matches ?? false);
+systemColorSchemeMedia?.addEventListener?.("change", (event) => {
+  systemPrefersDark.set(event.matches);
+});
+
+/** The light/dark theme currently in effect, resolving `"system"` via `matchMedia`. */
+export function resolvedTheme(): "light" | "dark" {
+  const current = theme();
+  if (current === "light" || current === "dark") return current;
+  // Subscribe to live OS color-scheme changes while also reading the current matchMedia state.
+  const preferred = systemPrefersDark();
+  if (typeof window !== "undefined" && typeof window.matchMedia === "function") {
+    return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  }
+  return preferred ? "dark" : "light";
+}
+
 export function applyTheme(next: Theme): void {
   localStorage.setItem(THEME_KEY, next);
   theme.set(next);

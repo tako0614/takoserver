@@ -1674,6 +1674,12 @@ h1.empty__title {
 }
 
 @media (width < 620px) {
+  .brand a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+
   .topbar .btn--sm {
     min-height: 44px;
     min-width: 44px;
