@@ -122,22 +122,44 @@ export function stat(label: string, value: Child, note?: Child): HTMLElement {
   );
 }
 
-export function empty(title: string, body: Child, action?: Child): HTMLElement {
+/**
+ * An empty or missing state. When it stands in for a whole page (no
+ * organization, no such page, no such Resource), `heading` makes its title
+ * the page's one `h1`, so a screen reader still lands on a named page.
+ */
+export function empty(
+  title: string,
+  body: Child,
+  action?: Child,
+  options: { readonly heading?: boolean } = {},
+): HTMLElement {
   return h(
     "div",
     { class: "empty" },
-    h("div", { class: "empty__title" }, title),
+    h(options.heading ? "h1" : "div", { class: "empty__title" }, title),
     h("div", { class: "empty__body" }, body),
     action ? h("div", { style: { marginTop: "14px" } }, action) : null,
   );
 }
 
 export function skeletonRows(count = 4): HTMLElement {
+  // The bars are decoration; the status line is what a screen reader hears,
+  // so a loading region is announced instead of reading as empty.
   return h(
     "div",
-    { class: "card__body", style: { display: "grid", gap: "12px" } },
+    {
+      class: "card__body",
+      role: "status",
+      "aria-busy": "true",
+      style: { display: "grid", gap: "12px" },
+    },
+    h("span", { class: "visually-hidden" }, tr("読み込み中…", "Loading…")),
     ...Array.from({ length: count }, (_, index) =>
-      h("div", { class: "skeleton", style: { width: `${100 - index * 9}%` } }),
+      h("div", {
+        class: "skeleton",
+        "aria-hidden": "true",
+        style: { width: `${100 - index * 9}%` },
+      }),
     ),
   );
 }
@@ -274,8 +296,25 @@ export function explain(error: Error): string {
       "Something else changed this first. Reload and try again.",
     ),
   };
+  // The console's own reading of an answer it could not parse, and a Host that
+  // failed rather than refused, are not refusals; saying "refused" sends a
+  // person to fix input that was never the problem.
+  const unreadable = tr(
+    `Hostの応答をこのコンソールで読み取れませんでした。ページを再読み込みしてください。続く場合は、コンソールとHostのバージョンが一致しているか運用者に確認してください（${code}）。`,
+    `This console could not read the Host's answer. Reload the page; if it keeps happening, ask the operator whether the console and Host versions match (${code}).`,
+  );
+  const failed =
+    typeof status === "number" && status >= 500
+      ? tr(
+          `Hostで問題が発生しました（HTTP ${status}、${code}）。少し待ってからやり直してください。`,
+          `The Host ran into a problem (HTTP ${status}, ${code}). Try again shortly.`,
+        )
+      : null;
   const sentence =
-    known[code] ?? tr(`サーバーが拒否しました: ${code}`, `The server refused this: ${code}`);
+    known[code] ??
+    (code === "invalid_response" ? unreadable : null) ??
+    failed ??
+    tr(`サーバーが拒否しました: ${code}`, `The server refused this: ${code}`);
   // The Host's own explanation is a specific English sentence, so it replaces
   // the general one; in Japanese it follows a neutral line.
   if (typeof detail !== "string" || detail === "") return sentence;
@@ -295,7 +334,8 @@ export function explain(error: Error): string {
  * name rather than as a tag.
  */
 export function jsonBlock(value: unknown): HTMLElement {
-  const pre = h("pre", { class: "json" });
+  // Focusable so a keyboard can scroll a long line into view (WCAG 2.1.1).
+  const pre = h("pre", { class: "json", tabindex: "0" });
   write(pre, value, 0);
   return pre;
 }
@@ -357,6 +397,12 @@ export interface ModalOptions {
   readonly confirmBlocked?: () => boolean;
   readonly dismissLabel?: string;
   readonly onClose?: () => void;
+  /**
+   * Whether a click on the backdrop closes the dialog. Off for a dialog whose
+   * content cannot be shown again, such as a new key's secret: a stray click
+   * must not lose it. Escape and the dismiss button still close it.
+   */
+  readonly dismissOnBackdrop?: boolean;
 }
 
 const FOCUSABLE_SELECTOR = [
@@ -664,6 +710,7 @@ export function openModal(options: ModalOptions): () => void {
   }
 
   const titleId = `modal-title-${++nextModalTitleId}`;
+  let startedInsideDialog = false;
   const dialog = h(
     "div",
     {
@@ -673,6 +720,9 @@ export function openModal(options: ModalOptions): () => void {
       "aria-label": options.title,
       "aria-labelledby": titleId,
       tabindex: "-1",
+      onPointerdown: () => {
+        startedInsideDialog = true;
+      },
     },
     h("header", { class: "modal__head", id: titleId }, options.title),
     h("div", { class: "modal__body" }, options.body),
@@ -692,8 +742,13 @@ export function openModal(options: ModalOptions): () => void {
     "div",
     {
       class: "scrim",
+      onPointerdown: (event: PointerEvent) => {
+        if (event.target === scrim) startedInsideDialog = false;
+      },
       onClick: (event: MouseEvent) => {
-        if (event.target === scrim) close();
+        const draggedOut = startedInsideDialog;
+        startedInsideDialog = false;
+        if (event.target === scrim && !draggedOut && options.dismissOnBackdrop !== false) close();
       },
     },
     dialog,

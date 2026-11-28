@@ -261,7 +261,7 @@ function topbar(): Child {
     }
   });
   return h(
-    "div",
+    "header",
     { class: "topbar" },
     live(() =>
       organizationPicker((node) => {
@@ -494,6 +494,7 @@ function page(): Child {
             tr("続行情報が無効です", "Invalid continuation"),
             tr("このリンクから続行できません。", "This continuation link is invalid."),
             h("a", { class: "btn", ...linkProps("/") }, tr("ホームへ戻る", "Return home")),
+            { heading: true },
           ),
         );
   }
@@ -531,6 +532,7 @@ function page(): Child {
               tr("組織を作成", "Create organization"),
             )
           : null,
+        { heading: true },
       ),
     );
   }
@@ -556,6 +558,7 @@ function page(): Child {
           tr("ページがありません", "No such page"),
           tr(`${here.path} にはページがありません。`, `Nothing is served at ${here.path}.`),
           h("a", { class: "btn", ...linkProps("/") }, tr("ホームへ戻る", "Return home")),
+          { heading: true },
         ),
       );
   }

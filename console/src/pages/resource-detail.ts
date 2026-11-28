@@ -72,6 +72,14 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
   return h(
     "div",
     { class: "page" },
+    // While the Resource loads or fails to, its name is not known yet; the page
+    // still has its one heading, hidden so the layout does not shift when the
+    // name replaces it.
+    live(() =>
+      page.get().state === "ready"
+        ? null
+        : h("h1", { class: "visually-hidden" }, tr("リソース詳細", "Resource")),
+    ),
     live(() =>
       whenReady(
         page.get(),
@@ -95,6 +103,7 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
                     { class: "btn", ...linkProps("/resources") },
                     tr("リソース一覧へ戻る", "Back to resources"),
                   ),
+                  { heading: true },
                 ),
               );
         },

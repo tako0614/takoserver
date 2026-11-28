@@ -44,7 +44,7 @@ export function signInPage(): Child {
   });
 
   return h(
-    "div",
+    "main",
     { class: "signin" },
     h(
       "div",
@@ -198,16 +198,26 @@ function operatorProviderFromAssertion(
     : null;
 }
 
+function signInLoadingBar(): HTMLElement {
+  return h(
+    "div",
+    { role: "status", "aria-busy": "true" },
+    h("span", { class: "visually-hidden" }, tr("読み込み中…", "Loading…")),
+    h("div", { class: "skeleton", "aria-hidden": "true", style: { height: "50px" } }),
+  );
+}
+
 function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>): Child {
   const state = providers.get();
   if (state.state === "loading") {
-    return h("div", { class: "skeleton", style: { height: "50px" } });
+    return signInLoadingBar();
   }
   if (state.state === "error") {
     return h(
       "div",
       {
         class: "notice notice--bad",
+        role: "alert",
         style: { display: "grid", gap: "10px", justifyItems: "start" },
       },
       h("span", null, explain(state.error)),
@@ -237,13 +247,14 @@ function wayIn(providers: Resource<{ providers: readonly IdentityProvider[] }>):
   if (operators.length > 0) return operatorForm(operators);
   if (sharedAuthAvailable() === true) return null;
   if (sharedAuthAvailable() === null && sharedAuthProbeState() === "loading") {
-    return h("div", { class: "skeleton", style: { height: "50px" } });
+    return signInLoadingBar();
   }
   if (sharedAuthAvailable() === null && sharedAuthProbeState() === "error") {
     return h(
       "div",
       {
         class: "notice notice--warn",
+        role: "alert",
         style: { display: "grid", gap: "10px", justifyItems: "start" },
       },
       h(
@@ -389,6 +400,12 @@ function googleGlyph(): SVGSVGElement {
  */
 function operatorForm(providers: readonly IdentityProvider[]): Child {
   const busy = signal(false);
+  const hintIds = ["assertion-hint"];
+  const assertionError = h("div", {
+    class: "field__error",
+    id: "assertion-error",
+    hidden: true,
+  });
   const assertion = h("textarea", {
     id: "assertion",
     name: "assertion",
@@ -399,15 +416,28 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
     ),
     autocomplete: "off",
     spellcheck: "false",
+    "aria-describedby": "assertion-hint",
+    onInput: () => {
+      setFieldError(assertion, assertionError, null, hintIds);
+    },
   });
 
   const submit = async (event: Event): Promise<void> => {
     event.preventDefault();
     if (busy()) return;
     if (assertion.value.trim() === "") {
-      toast(tr("assertionを貼り付けてください", "Paste an assertion first"), "bad");
+      // Said beside the field, not only in a passing toast, and the caret goes
+      // where the paste belongs.
+      setFieldError(
+        assertion,
+        assertionError,
+        tr("assertionを貼り付けてください", "Paste an assertion first"),
+        hintIds,
+      );
+      assertion.focus?.();
       return;
     }
+    setFieldError(assertion, assertionError, null, hintIds);
     busy.set(true);
     const isCurrent = captureSessionScope();
     try {
@@ -426,7 +456,10 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
                 "The assertion format is invalid or does not match an advertised provider for this environment.",
               )
             : explain(error as Error);
-        toast(message, "bad");
+        // The refusal stays beside the field until the assertion changes, so it
+        // can still be read after the toast has gone.
+        setFieldError(assertion, assertionError, message, hintIds);
+        assertion.focus?.();
       }
     } finally {
       busy.set(false);
@@ -441,9 +474,10 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
       { class: "field" },
       h("label", { for: "assertion" }, tr("運営者assertion", "Operator assertion")),
       assertion,
+      assertionError,
       h(
         "small",
-        null,
+        { id: "assertion-hint" },
         tr(
           "この環境に設定された運営者キーでオフライン署名されたものです。",
           "Signed offline by the operator key this deployment is configured with.",
@@ -508,11 +542,17 @@ function languageSwitch(): Child {
             class: "segmented__item",
             type: "button",
             title: option === "ja" ? "日本語" : "English",
-            "aria-label": option === "ja" ? "日本語" : "English",
             "aria-pressed": consoleLocale() === option ? "true" : "false",
             onClick: () => setConsoleLocale(option),
           },
-          option === "ja" ? "JA" : "EN",
+          // The visible code is part of the name (WCAG 2.5.3), so voice control
+          // users can say what they see; the full name follows for screen readers.
+          h("span", { "aria-hidden": "true" }, option === "ja" ? "JA" : "EN"),
+          h(
+            "span",
+            { class: "visually-hidden", lang: option },
+            option === "ja" ? "JA 日本語" : "EN English",
+          ),
         ),
       ),
     ),
