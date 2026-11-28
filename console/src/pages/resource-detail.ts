@@ -11,7 +11,7 @@ import {
 } from "../form-specs.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
-import { resource } from "../reactive.ts";
+import { effect, resource } from "../reactive.ts";
 import {
   MODULE_WORKER,
   publishedUrl,
@@ -24,7 +24,18 @@ import { findReferrers, REFERRER_PAGES } from "../referrers.ts";
 import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
-import { badge, card, copyable, copyText, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
+import {
+  badge,
+  card,
+  copyable,
+  copyText,
+  empty,
+  ICON,
+  icon,
+  jsonBlock,
+  refreshButton,
+  whenReady,
+} from "../ui.ts";
 import { createResource, deleteResource, updateResource } from "./create-resource.ts";
 
 export { publishedUrl, type SpecReference, specReferences } from "../references.ts";
@@ -69,17 +80,69 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
     }
   });
 
+  // Persistent header keeps Reload mounted and focused across ready -> loading -> ready.
+  const reload = refreshButton({
+    idleLabel: () => tr("再読み込み", "Reload"),
+    busyLabel: () => tr("読み込み中…", "Reloading…"),
+    isActive: isCurrent,
+    isBusy: () => page.get().state === "loading",
+    onRefresh: page.reload,
+  });
+  const header = h(
+    "div",
+    { class: "head" },
+    h(
+      "div",
+      { class: "head__text" },
+      h(
+        "div",
+        { class: "dim" },
+        h("a", { ...linkProps("/resources") }, tr("リソース", "Resources")),
+      ),
+      // While the Resource loads or fails to, its name is not known yet; the page
+      // still has its one heading, hidden so the layout does not shift when the
+      // name replaces it.
+      live(() => {
+        const state = page.get();
+        if (state.state !== "ready")
+          return h("h1", { class: "visually-hidden" }, tr("リソース詳細", "Resource"));
+        if (!state.value || !isCurrent()) return null;
+        return detailHeading(state.value);
+      }),
+    ),
+    h(
+      "div",
+      { class: "toolbar" },
+      live(() => {
+        const state = page.get();
+        return state.state === "ready" && state.value && isCurrent()
+          ? workerAction(state.value).toolbar
+          : null;
+      }),
+      reload,
+      live(() => {
+        const state = page.get();
+        return state.state === "ready" && state.value && isCurrent()
+          ? detailActions(state.value, organizationId)
+          : null;
+      }),
+    ),
+  );
+  const headerHost = h("div", { class: "live" });
+  let headerMounted = false;
+  effect(() => {
+    const state = page.get();
+    const visible = state.state !== "ready" || (state.value !== null && isCurrent());
+    if (visible === headerMounted) return;
+    headerMounted = visible;
+    if (visible) headerHost.replaceChildren(header);
+    else headerHost.replaceChildren();
+  });
+
   return h(
     "div",
     { class: "page" },
-    // While the Resource loads or fails to, its name is not known yet; the page
-    // still has its one heading, hidden so the layout does not shift when the
-    // name replaces it.
-    live(() =>
-      page.get().state === "ready"
-        ? null
-        : h("h1", { class: "visually-hidden" }, tr("リソース詳細", "Resource")),
-    ),
+    headerHost,
     live(() =>
       whenReady(
         page.get(),
@@ -89,7 +152,7 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
             document.title = `${found.name} — Takoserver Console`;
           }
           return found
-            ? body(found, organizationId, page.reload, workerAction(found))
+            ? body(found, organizationId, workerAction(found))
             : card(
                 null,
                 empty(
@@ -119,122 +182,101 @@ interface WorkerAction {
   readonly notice: Child;
 }
 
-function body(
-  found: ResourceSummary,
-  organizationId: string,
-  reload: () => void,
-  action: WorkerAction,
-): Child {
+function detailHeading(found: ResourceSummary): Child {
   const state = health(found);
   const url = publishedUrl(found.output);
+  return [
+    // The heading is the name alone; the state sits beside it, not inside it.
+    h(
+      "div",
+      { class: "title-row" },
+      h(
+        "h1",
+        null,
+        // The name is the page title; .mono alone would shrink it to body size.
+        h(
+          "span",
+          { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
+          found.name,
+        ),
+      ),
+      badge(phaseLabel(state.phase), state.tone, true),
+    ),
+    h(
+      "p",
+      { class: "published" },
+      httpsUrl(found.form)
+        ? h(
+            "a",
+            { href: found.form, target: "_blank", rel: "noopener noreferrer" },
+            formLabel(found.form),
+            h("span", { "aria-hidden": "true" }, " ↗"),
+            h(
+              "span",
+              { class: "visually-hidden" },
+              tr("（公開仕様、新しいタブで開きます）", " (published contract, opens in a new tab)"),
+            ),
+          )
+        : formLabel(found.form),
+    ),
+    url
+      ? h(
+          "p",
+          { class: "published" },
+          h(
+            "a",
+            { href: url, target: "_blank", rel: "noopener noreferrer" },
+            url,
+            h("span", { "aria-hidden": "true" }, " ↗"),
+            newTab(),
+          ),
+        )
+      : null,
+  ];
+}
+
+function detailActions(found: ResourceSummary, organizationId: string): Child {
+  return [
+    // A version or an artifact never changes; sending its same spec again
+    // still retries it, for example after its create failed.
+    h(
+      "button",
+      {
+        class: "btn",
+        type: "button",
+        onClick: () =>
+          acceptsChanges(found.form)
+            ? updateResource(organizationId, found)
+            : updateResource(organizationId, found, {
+                spec: found.spec,
+                note: tr(
+                  "このFormのリソースは変更できません。同じ設定をもう一度送ると、失敗した作成などを再試行できます。",
+                  "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
+                ),
+                title: tr(`${found.name}を再適用`, `Re-apply ${found.name}`),
+                confirmLabel: tr("再適用する", "Re-apply"),
+              }),
+      },
+      acceptsChanges(found.form) ? tr("更新", "Update") : tr("再適用", "Re-apply"),
+    ),
+    h(
+      "button",
+      {
+        class: "btn btn--danger",
+        type: "button",
+        onClick: () => deleteResource(organizationId, found),
+      },
+      tr("削除", "Delete"),
+    ),
+  ];
+}
+
+function body(found: ResourceSummary, organizationId: string, action: WorkerAction): Child {
+  const state = health(found);
   const references = specReferences(found.spec);
   return h(
     "div",
     { style: { display: "grid", gap: "18px" } },
-    h(
-      "div",
-      { class: "head" },
-      h(
-        "div",
-        { class: "head__text" },
-        h(
-          "div",
-          { class: "dim" },
-          h("a", { ...linkProps("/resources") }, tr("リソース", "Resources")),
-        ),
-        // The heading is the name alone; the state sits beside it, not inside it.
-        h(
-          "div",
-          { class: "title-row" },
-          h(
-            "h1",
-            null,
-            // The name is the page title; .mono alone would shrink it to body size.
-            h(
-              "span",
-              { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
-              found.name,
-            ),
-          ),
-          badge(phaseLabel(state.phase), state.tone, true),
-        ),
-        h(
-          "p",
-          { class: "published" },
-          httpsUrl(found.form)
-            ? h(
-                "a",
-                { href: found.form, target: "_blank", rel: "noopener noreferrer" },
-                formLabel(found.form),
-                h("span", { "aria-hidden": "true" }, " ↗"),
-                h(
-                  "span",
-                  { class: "visually-hidden" },
-                  tr(
-                    "（公開仕様、新しいタブで開きます）",
-                    " (published contract, opens in a new tab)",
-                  ),
-                ),
-              )
-            : formLabel(found.form),
-        ),
-        url
-          ? h(
-              "p",
-              { class: "published" },
-              h(
-                "a",
-                { href: url, target: "_blank", rel: "noopener noreferrer" },
-                url,
-                h("span", { "aria-hidden": "true" }, " ↗"),
-                newTab(),
-              ),
-            )
-          : null,
-      ),
-      h(
-        "div",
-        { class: "toolbar" },
-        action.toolbar,
-        h(
-          "button",
-          { class: "btn", type: "button", onClick: reload },
-          icon(ICON.refresh, 14),
-          text(tr("再読み込み", "Reload")),
-        ),
-        // A version or an artifact never changes; sending its same spec again
-        // still retries it, for example after its create failed.
-        h(
-          "button",
-          {
-            class: "btn",
-            type: "button",
-            onClick: () =>
-              acceptsChanges(found.form)
-                ? updateResource(organizationId, found)
-                : updateResource(organizationId, found, {
-                    spec: found.spec,
-                    note: tr(
-                      "このFormのリソースは変更できません。同じ設定をもう一度送ると、失敗した作成などを再試行できます。",
-                      "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
-                    ),
-                    title: tr(`${found.name}を再適用`, `Re-apply ${found.name}`),
-                    confirmLabel: tr("再適用する", "Re-apply"),
-                  }),
-          },
-          acceptsChanges(found.form) ? tr("更新", "Update") : tr("再適用", "Re-apply"),
-        ),
-        h(
-          "button",
-          {
-            class: "btn btn--danger",
-            type: "button",
-            onClick: () => deleteResource(organizationId, found),
-          },
-          tr("削除", "Delete"),
-        ),
-      ),
-    ),
     state.stale
       ? h(
           "div",

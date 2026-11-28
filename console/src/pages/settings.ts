@@ -2,7 +2,7 @@ import type { Organization } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { guideLink, workerSupport } from "../first-run.ts";
 import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
-import { resource } from "../reactive.ts";
+import { effect, resource } from "../reactive.ts";
 import { linkProps } from "../router.ts";
 import {
   api,
@@ -31,42 +31,46 @@ export function settingsPage(organization: Organization): Child {
   return h(
     "div",
     { class: "page" },
-    h(
-      "div",
-      { class: "head" },
+    live(() =>
       h(
         "div",
-        { class: "head__text" },
-        h("h1", null, tr("設定", "Settings")),
+        { class: "head" },
         h(
-          "p",
-          null,
-          tr(
-            "サインイン中のアカウントと、このコンソールの接続先を確認します。",
-            "Who you are signed in as, and what this console is talking to.",
+          "div",
+          { class: "head__text" },
+          h("h1", null, tr("設定", "Settings")),
+          h(
+            "p",
+            null,
+            tr(
+              "サインイン中のアカウントと、このコンソールの接続先を確認します。",
+              "Who you are signed in as, and what this console is talking to.",
+            ),
           ),
         ),
       ),
     ),
-    card(
-      tr("組織", "Organization"),
-      h(
-        "div",
-        { class: "card__body" },
+    live(() =>
+      card(
+        tr("組織", "Organization"),
         h(
           "div",
-          { class: "rows" },
-          row(tr("名前", "Name"), organization.name),
-          row(tr("識別子", "Identifier"), copyable(organization.id)),
-          row(tr("作成日時", "Created"), when(organization.createdAt)),
-          row(
-            tr("スペース", "Space"),
-            h(
-              "span",
-              { class: "dim" },
-              tr(
-                "Host API v2では、この識別子がスペース（Space）になります。リソースは組織ごとに分かれ、この組織のAPIキーとサインイン中のセッションは、どちらもこの組織として操作します。",
-                "In Host API v2 this identifier is the Space. Each resource belongs to one organization, and its API keys (within their scopes) and your signed-in session act as that organization.",
+          { class: "card__body" },
+          h(
+            "div",
+            { class: "rows" },
+            row(tr("名前", "Name"), organization.name),
+            row(tr("識別子", "Identifier"), copyable(organization.id)),
+            row(tr("作成日時", "Created"), when(organization.createdAt)),
+            row(
+              tr("スペース", "Space"),
+              h(
+                "span",
+                { class: "dim" },
+                tr(
+                  "Host API v2では、この識別子がスペース（Space）になります。リソースは組織ごとに分かれ、この組織のAPIキーとサインイン中のセッションは、どちらもこの組織として操作します。",
+                  "In Host API v2 this identifier is the Space. Each resource belongs to one organization, and its API keys (within their scopes) and your signed-in session act as that organization.",
+                ),
               ),
             ),
           ),
@@ -108,56 +112,8 @@ export function settingsPage(organization: Organization): Child {
         ),
       );
     }),
-    live(() =>
-      card(
-        tr("表示", "Appearance"),
-        h(
-          "div",
-          { class: "card__body" },
-          h(
-            "div",
-            { class: "toolbar" },
-            ...(["system", "light", "dark"] as const).map((option) =>
-              h(
-                "button",
-                {
-                  class: theme() === option ? "btn btn--primary" : "btn",
-                  type: "button",
-                  "aria-pressed": theme() === option ? "true" : "false",
-                  onClick: () => applyTheme(option as Theme),
-                },
-                themeLabel(option),
-              ),
-            ),
-          ),
-        ),
-      ),
-    ),
-    live(() =>
-      card(
-        tr("言語", "Language"),
-        h(
-          "div",
-          { class: "card__body" },
-          h(
-            "div",
-            { class: "toolbar" },
-            ...(["ja", "en"] as const).map((option) =>
-              h(
-                "button",
-                {
-                  class: consoleLocale() === option ? "btn btn--primary" : "btn",
-                  type: "button",
-                  "aria-pressed": consoleLocale() === option ? "true" : "false",
-                  onClick: () => setConsoleLocale(option),
-                },
-                option === "ja" ? "日本語" : "English",
-              ),
-            ),
-          ),
-        ),
-      ),
-    ),
+    appearanceCard(),
+    languageCard(),
     live(() => {
       const originError = h("div", {
         class: "field__error",
@@ -347,6 +303,51 @@ export function hostCard(organizationId: string): Child {
         }),
       ),
     ),
+  );
+}
+
+function appearanceCard(): Child {
+  const buttons = (["system", "light", "dark"] as const).map((option) => {
+    const button = h("button", {
+      class: "btn",
+      type: "button",
+      onClick: () => applyTheme(option),
+    });
+    effect(() => {
+      const selected = theme() === option;
+      button.className = selected ? "btn btn--primary" : "btn";
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+      button.replaceChildren(text(themeLabel(option)));
+    });
+    return button;
+  });
+  return card(
+    live(() => tr("表示", "Appearance")),
+    h("div", { class: "card__body" }, h("div", { class: "toolbar" }, ...buttons)),
+  );
+}
+
+function languageCard(): Child {
+  const buttons = (["ja", "en"] as const).map((option) => {
+    const button = h(
+      "button",
+      {
+        class: "btn",
+        type: "button",
+        onClick: () => setConsoleLocale(option),
+      },
+      option === "ja" ? "日本語" : "English",
+    );
+    effect(() => {
+      const selected = consoleLocale() === option;
+      button.className = selected ? "btn btn--primary" : "btn";
+      button.setAttribute("aria-pressed", selected ? "true" : "false");
+    });
+    return button;
+  });
+  return card(
+    live(() => tr("言語", "Language")),
+    h("div", { class: "card__body" }, h("div", { class: "toolbar" }, ...buttons)),
   );
 }
 

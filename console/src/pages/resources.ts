@@ -278,7 +278,9 @@ export function resourcesPage(organizationId: string): Child {
     );
   const pagingError = (): Child => {
     const error = moreError();
-    return error ? h("div", { class: "notice notice--bad" }, text(explain(error))) : null;
+    return error
+      ? h("div", { class: "notice notice--bad", role: "alert" }, text(explain(error)))
+      : null;
   };
   return h(
     "div",
@@ -385,7 +387,11 @@ export function resourcesPage(organizationId: string): Child {
             ),
             live(() =>
               recoveryError()
-                ? h("div", { class: "notice notice--bad" }, explain(recoveryError() as Error))
+                ? h(
+                    "div",
+                    { class: "notice notice--bad", role: "alert" },
+                    explain(recoveryError() as Error),
+                  )
                 : null,
             ),
           ),

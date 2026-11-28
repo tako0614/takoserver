@@ -307,7 +307,13 @@ export function billingPage(organizationId: string): Child {
       ),
     ),
     live(() => (billingMode() === "hosted" ? topUpStatus(topUp) : null)),
-    hostedSubscriptionCard(hostedSubscription, checkout, ownerCanManage, cancellationFor),
+    hostedSubscriptionCard(
+      hostedSubscription,
+      checkout,
+      ownerCanManage,
+      cancellationFor,
+      isPageCurrent,
+    ),
     live(() =>
       whenReady(
         wallet.get(),
@@ -429,7 +435,7 @@ export function billingPage(organizationId: string): Child {
         { retry: reloadWallet },
       ),
     ),
-    workspaceUsageCard(workspaceUsage),
+    workspaceUsageCard(workspaceUsage, isPageCurrent),
   );
 }
 
@@ -443,26 +449,33 @@ export function billingPage(organizationId: string): Child {
  */
 function workspaceUsageCard(
   controller: ReturnType<typeof createWorkspaceUsageController>,
+  isActive: () => boolean,
 ): HTMLElement {
-  return live(() => {
-    const state = controller.state();
-    if (state.status === "unavailable") return null;
-    return card(
-      tr("ワークスペース別の使用量", "Workspace usage"),
-      workspaceUsageBody(state, controller),
-      h(
-        "button",
-        {
-          class: "btn btn--sm",
-          type: "button",
-          ...(state.status === "loading" ? { disabled: true, "aria-busy": "true" } : {}),
-          onClick: controller.reload,
-        },
-        icon(ICON.refresh, 13),
-        text(tr("更新", "Refresh")),
-      ),
-    );
+  const host = h("div", { class: "live" });
+  const section = card(
+    tr("ワークスペース別の使用量", "Workspace usage"),
+    live(() => {
+      const state = controller.state();
+      return state.status === "unavailable" ? null : workspaceUsageBody(state, controller);
+    }),
+    refreshButton({
+      compact: true,
+      idleLabel: () => tr("更新", "Refresh"),
+      busyLabel: () => tr("更新中…", "Refreshing…"),
+      isActive,
+      isBusy: () => controller.state().status === "loading",
+      onRefresh: controller.reload,
+    }),
+  );
+  let mounted = false;
+  effect(() => {
+    const visible = controller.state().status !== "unavailable";
+    if (visible === mounted) return;
+    mounted = visible;
+    if (visible) host.replaceChildren(section);
+    else host.replaceChildren();
   });
+  return host;
 }
 
 function workspaceUsageBody(
@@ -562,7 +575,11 @@ function workspaceUsageBody(
           "div",
           { class: "card__body", style: { display: "grid", gap: "8px", justifyItems: "center" } },
           state.more.status === "error"
-            ? h("div", { class: "notice notice--bad" }, text(explain(state.more.error)))
+            ? h(
+                "div",
+                { class: "notice notice--bad", role: "alert" },
+                text(explain(state.more.error)),
+              )
             : null,
           h(
             "button",
@@ -1269,6 +1286,16 @@ function settleReturn(organizationId: string, reload: () => void, isCurrent: () 
   );
 }
 
+function isSubscriptionUnavailable(
+  state: ReturnType<Resource<OrganizationSubscription>["get"]>,
+): boolean {
+  return (
+    state.state === "error" &&
+    state.error instanceof ApiError &&
+    (state.error.status === 404 || state.error.code === "not_found")
+  );
+}
+
 function hostedSubscriptionCard(
   subscription: Resource<OrganizationSubscription>,
   checkout: ReturnType<typeof createSubscriptionCheckoutController>,
@@ -1276,17 +1303,32 @@ function hostedSubscriptionCard(
   cancellationFor: (
     subscriptionRef: string,
   ) => ReturnType<typeof createSubscriptionCancellationController>,
+  isActive: () => boolean,
 ): HTMLElement {
+  const actionsHost = h("div", { class: "live" });
+  const refresh = refreshButton({
+    compact: true,
+    idleLabel: () => tr("状態を更新", "Refresh status"),
+    busyLabel: () => tr("更新中…", "Refreshing…"),
+    isActive,
+    isBusy: () => subscription.get().state === "loading",
+    onRefresh: subscription.reload,
+  });
+  let refreshMounted = false;
+  effect(() => {
+    const visible = !isSubscriptionUnavailable(subscription.get());
+    if (visible === refreshMounted) return;
+    refreshMounted = visible;
+    if (visible) actionsHost.replaceChildren(refresh);
+    else actionsHost.replaceChildren();
+  });
+
   return card(
     tr("サブスクリプション", "Subscription"),
     live(() => {
       const checkoutState = checkout.state();
       const subscriptionState = subscription.get();
-      if (
-        subscriptionState.state === "error" &&
-        subscriptionState.error instanceof ApiError &&
-        (subscriptionState.error.status === 404 || subscriptionState.error.code === "not_found")
-      ) {
+      if (isSubscriptionUnavailable(subscriptionState)) {
         return h(
           "div",
           { class: "card__body" },
@@ -1312,6 +1354,22 @@ function hostedSubscriptionCard(
           const cancelController =
             owner && current ? cancellationFor(current.subscriptionRef) : null;
           const cancellationState = cancelController?.state();
+          const planActions: HTMLElement[] = !owner
+            ? []
+            : current && !isTerminalSubscription(current)
+              ? [cancellationAction(current, cancelController, cancellationState?.status)].filter(
+                  (action): action is HTMLElement => action !== null,
+                )
+              : configuredPlans
+                  .map((plan) =>
+                    checkoutAction(
+                      checkout,
+                      checkoutState.status,
+                      plan.planId,
+                      current?.subscriptionRef,
+                    ),
+                  )
+                  .filter((action): action is HTMLElement => action !== null);
           const body = h(
             "div",
             { class: "card__body billing-plan__content" },
@@ -1350,29 +1408,9 @@ function hostedSubscriptionCard(
               ? checkoutMessage(checkoutState.status)
               : null,
             owner
-              ? h(
-                  "div",
-                  { class: "toolbar billing-plan__actions" },
-                  current && !isTerminalSubscription(current)
-                    ? cancellationAction(current, cancelController, cancellationState?.status)
-                    : configuredPlans.map((plan) =>
-                        checkoutAction(
-                          checkout,
-                          checkoutState.status,
-                          plan.planId,
-                          current?.subscriptionRef,
-                        ),
-                      ),
-                  h(
-                    "button",
-                    {
-                      class: "btn billing-plan__action",
-                      type: "button",
-                      onClick: () => subscription.reload(),
-                    },
-                    tr("状態を更新", "Refresh status"),
-                  ),
-                )
+              ? planActions.length > 0
+                ? h("div", { class: "toolbar billing-plan__actions" }, ...planActions)
+                : null
               : h(
                   "small",
                   { class: "dim" },
@@ -1389,6 +1427,7 @@ function hostedSubscriptionCard(
         },
       );
     }),
+    actionsHost,
   );
 }
 

@@ -28,6 +28,7 @@ import {
   organizations,
   principal,
   recordCreatedOrganization,
+  resolvedTheme,
   resolveSharedSessionReturnPath,
   selectOrganization,
   session,
@@ -83,9 +84,13 @@ function boot(): void {
   effect(() => {
     const screen = !sessionReady()
       ? h(
-          "div",
-          { class: "signin", role: "status" },
-          tr("セッションを確認しています…", "Checking your session…"),
+          "main",
+          { class: "signin" },
+          h(
+            "div",
+            { role: "status", "aria-busy": "true" },
+            tr("セッションを確認しています…", "Checking your session…"),
+          ),
         )
       : session()
         ? shell()
@@ -260,6 +265,41 @@ function topbar(): Child {
       activeSelect.value = selected;
     }
   });
+  // Stable topbar controls update attributes and glyphs in place so toggling
+  // language or theme from the keyboard preserves focus on the button.
+  const localeText = h("span");
+  const localeButton = h(
+    "button",
+    {
+      class: "btn btn--ghost btn--sm",
+      type: "button",
+      onClick: () => setConsoleLocale(consoleLocale() === "ja" ? "en" : "ja"),
+    },
+    localeText,
+  );
+  effect(() => {
+    const isJapanese = consoleLocale() === "ja";
+    localeButton.setAttribute("title", tr("英語に切り替える", "Switch to Japanese"));
+    // Named by what it shows, so voice control and screen readers say what
+    // sighted people read; only that text is in the other language, and the
+    // title, in the page's language, explains it.
+    localeText.setAttribute("lang", isJapanese ? "en" : "ja");
+    localeText.replaceChildren(text(isJapanese ? "EN" : "日本語"));
+  });
+
+  const themeButton = h("button", {
+    class: "btn btn--ghost btn--sm",
+    type: "button",
+    onClick: () => applyTheme(resolvedTheme() === "dark" ? "light" : "dark"),
+  });
+  effect(() => {
+    const label = `${tr("テーマ", "Theme")}: ${themeName(theme())}`;
+    const dark = resolvedTheme() === "dark";
+    themeButton.setAttribute("title", label);
+    themeButton.setAttribute("aria-label", label);
+    themeButton.replaceChildren(icon(dark ? ICON.sun : ICON.moon, 16));
+  });
+
   return h(
     "header",
     { class: "topbar" },
@@ -269,39 +309,8 @@ function topbar(): Child {
       }),
     ),
     h("div", { class: "topbar__spacer" }),
-    live(() =>
-      h(
-        "button",
-        {
-          class: "btn btn--ghost btn--sm",
-          type: "button",
-          title: tr("英語に切り替える", "Switch to Japanese"),
-          onClick: () => setConsoleLocale(consoleLocale() === "ja" ? "en" : "ja"),
-        },
-        // Named by what it shows, so voice control and screen readers say what
-        // sighted people read; only that text is in the other language, and the
-        // title, in the page's language, explains it.
-        h(
-          "span",
-          { lang: consoleLocale() === "ja" ? "en" : "ja" },
-          consoleLocale() === "ja" ? "EN" : "日本語",
-        ),
-      ),
-    ),
-    live(() => {
-      const label = `${tr("テーマ", "Theme")}: ${themeName(theme())}`;
-      return h(
-        "button",
-        {
-          class: "btn btn--ghost btn--sm",
-          type: "button",
-          title: label,
-          "aria-label": label,
-          onClick: () => applyTheme(theme() === "dark" ? "light" : "dark"),
-        },
-        icon(theme() === "dark" ? ICON.sun : ICON.moon, 16),
-      );
-    }),
+    localeButton,
+    themeButton,
     live(() => {
       const who = principal();
       const label = who

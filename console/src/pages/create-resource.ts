@@ -254,6 +254,8 @@ interface FormChoice {
   /** True when all known Forms answered unsupported and the person has not switched to a custom URL. */
   allKnownUnsupported(): boolean;
   setDisabled(disabled: boolean): void;
+  setError(message: string | null): void;
+  focus(): void;
   /** Chooses an exact Form URL, as a person would. */
   choose(form: string): void;
   /** Aborts any in-flight support probes when the dialog closes. */
@@ -337,8 +339,15 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
     ),
     h("option", { value: OTHER_FORM }, tr("別のForm URLを入力…", "Another exact Form URL…")),
   );
+  const formError = h("div", {
+    class: "field__error",
+    id: "create-resource-form-error",
+    hidden: true,
+  });
   const label = h("label", { for: "create-resource-form" }, "Form");
-  const hint = h("small");
+  const hint = h("small", { id: "create-resource-form-hint" });
+  select.setAttribute("aria-describedby", "create-resource-form-hint");
+  url.setAttribute("aria-describedby", "create-resource-form-hint");
   // Why the SQLite migration Forms are missing, once the Host says they are.
   const migrations = h("small");
   let pending = options.size;
@@ -349,6 +358,12 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   let probeRun = 0;
 
   const typed = (): boolean => select.hidden || select.value === OTHER_FORM;
+  const activeControl = (): HTMLElement => (typed() ? url : select);
+  const setError = (message: string | null): void => {
+    const inactive = typed() ? select : url;
+    setFieldError(inactive, formError, null, ["create-resource-form-hint"]);
+    setFieldError(activeControl(), formError, message, ["create-resource-form-hint"]);
+  };
   const value = (): string =>
     typed() ? url.value.trim() : select.value.startsWith("https://") ? select.value : "";
   const updateBlocked = (): void => {
@@ -356,6 +371,7 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   };
   const render = (): void => {
     url.hidden = !typed();
+    if (value() !== "") setError(null);
     updateBlocked();
     if (!typed() && select.value.startsWith("https://")) {
       hint.replaceChildren(
@@ -418,8 +434,14 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
     render();
     onChange();
   };
-  select.addEventListener("change", sync);
-  url.addEventListener("input", sync);
+  select.addEventListener("change", () => {
+    setError(null);
+    sync();
+  });
+  url.addEventListener("input", () => {
+    setError(null);
+    sync();
+  });
 
   const settle = (runId: number, form: string, supported: boolean | null): void => {
     if (runId !== probeRun) return;
@@ -499,12 +521,16 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   runProbes();
 
   return {
-    element: h("div", { class: "field" }, label, select, url, hint, migrations),
+    element: h("div", { class: "field" }, label, select, url, formError, hint, migrations),
     value,
     allKnownUnsupported: () => allUnsupported(),
     setDisabled(disabled) {
       url.disabled = disabled;
       select.disabled = disabled;
+    },
+    setError,
+    focus() {
+      activeControl().focus?.();
     },
     choose(form) {
       if (options.has(form)) {
@@ -997,8 +1023,19 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           const specCheck = validateSpecInline();
           const parsed = specCheck.ok ? specCheck.value : null;
           if (!selectedForm || !selectedName || !parsed) {
+            if (!selectedForm) {
+              form.setError(
+                tr(
+                  "Formを選ぶか、正確なForm URLを入力してください。",
+                  "Choose a Form or enter an exact Form URL.",
+                ),
+              );
+            } else {
+              form.setError(null);
+            }
             if (!selectedName) validateNameInline(true);
-            if (!selectedName) name.focus?.();
+            if (!selectedForm) form.focus();
+            else if (!selectedName) name.focus?.();
             else if (!parsed) spec.focus?.();
             toast(
               tr(
@@ -1009,6 +1046,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
             );
             return;
           }
+          form.setError(null);
           // The Host's own name rule, so a refused name costs no round trip.
           if (!validateNameInline(true)) {
             name.focus?.();
@@ -1041,17 +1079,17 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
             const supported = await api.formSupport(organizationId, selectedForm);
             if (!modal.isCurrent()) return;
             if (!supported) {
-              toast(
-                tr(
-                  "このHostはそのFormの作成をサポートしていません",
-                  "This Host does not support create for that exact Form",
-                ),
-                "bad",
+              const unsupportedMessage = tr(
+                "このHostはそのFormの作成をサポートしていません",
+                "This Host does not support create for that exact Form",
               );
               form.setDisabled(false);
               name.disabled = false;
               spec.disabled = false;
               picker?.setDisabled(false);
+              form.setError(unsupportedMessage);
+              form.focus();
+              toast(unsupportedMessage, "bad");
               return;
             }
             if (!modal.isCurrent()) return;

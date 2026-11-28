@@ -53,6 +53,8 @@ const landingMessages = {
     description:
       "Takoserver is an open-source cloud you host yourself. Deploy Workers and their SQLite, KV, object storage and queues to your own machine from Takoform definitions.",
     skip: "Skip to content",
+    navPrimary: "Primary",
+    navFooter: "Resources and links",
     navForms: "Forms",
     navStart: "Self-host",
     navDeploy: "Deploy",
@@ -164,6 +166,8 @@ const landingMessages = {
     description:
       "Takoserverは、自分でホストするオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義から自分のマシンへデプロイできます。",
     skip: "本文へ移動",
+    navPrimary: "セクション移動",
+    navFooter: "関連リンク",
     navForms: "対応Form",
     navStart: "導入",
     navDeploy: "デプロイ",
@@ -499,6 +503,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
   .preview .frame { max-width: 406px; margin-inline: auto; }
   section.block { padding-top: 64px; }
   .forms > div, .deploy, .after, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .more a { min-height: 44px; }
   .steps > li > pre, .steps > li > .chips { grid-column: 1 / -1; }
   footer { margin-top: 80px; }
 }
@@ -630,7 +635,7 @@ ${siteAssets ? '@font-face { font-family: "Bricolage Grotesque"; font-style: nor
 <div class="shell">
 <header class="top">
 <a class="brand" href="${brandHref}" aria-label="Takoserver">${takoMark(26)}<span>takoserver</span></a>
-<nav class="top-nav" aria-label="Takoserver">
+<nav class="top-nav" aria-label="${copy.navPrimary}" data-i18n-aria-label="navPrimary">
 <a class="top-link" href="#forms" data-i18n="navForms">${copy.navForms}</a>
 <a class="top-link" href="#start" data-i18n="navStart">${copy.navStart}</a>
 <a class="top-link" href="#deploy" data-i18n="navDeploy">${copy.navDeploy}</a>
@@ -638,7 +643,7 @@ ${siteAssets ? '@font-face { font-family: "Bricolage Grotesque"; font-style: nor
 <a class="top-link" href="${REPOSITORY}">GitHub</a>
 </nav>
 </header>
-<main id="main">
+<main id="main" tabindex="-1">
 <section class="hero" aria-labelledby="headline">
 <div class="hero-title">${takoMark(56)}<h1 id="headline">Takoserver</h1></div>
 ${here}
@@ -749,7 +754,7 @@ ${text("ecosystemIntro", "p", ' class="intro"')}
 </main>
 <footer>
 <span class="footer-brand">takoserver</span>
-<nav class="footer-links" aria-label="Takoserver">
+<nav class="footer-links" aria-label="${copy.navFooter}" data-i18n-aria-label="navFooter">
 <a href="${base}/openapi.json" data-i18n="openapi">${copy.openapi}</a>
 <a href="${base}/.well-known/takoform/v2" data-i18n="discovery">${copy.discovery}</a>
 <a href="${base}/.well-known/takoserver" data-i18n="product">${copy.product}</a>
@@ -762,7 +767,7 @@ ${text("ecosystemIntro", "p", ' class="intro"')}
 <script>
 const messages=${JSON.stringify(landingMessages)};
 const pathLocale=location.pathname.split("/")[1];
-const setLocale=(locale)=>{const lang=locale==="ja"?"ja":"en";document.documentElement.lang=lang;for(const selector of['meta[name="description"]','meta[property="og:description"]','meta[name="twitter:description"]'])document.querySelector(selector).content=messages[lang].description;for(const node of document.querySelectorAll("[data-i18n]"))node.textContent=messages[lang][node.dataset.i18n];for(const node of document.querySelectorAll("[data-i18n-alt]"))node.alt=messages[lang][node.dataset.i18nAlt];for(const node of document.querySelectorAll("[data-locale-srcset]"))node.srcset=node.dataset.localeSrcset.replace("{lang}",lang);for(const node of document.querySelectorAll("[data-locale-src]"))node.src=node.dataset.localeSrc.replace("{lang}",lang);for(const node of document.querySelectorAll("[data-locale-href-en]"))node.href=lang==="ja"?node.dataset.localeHrefJa:node.dataset.localeHrefEn};
+const setLocale=(locale)=>{const lang=locale==="ja"?"ja":"en";document.documentElement.lang=lang;for(const selector of['meta[name="description"]','meta[property="og:description"]','meta[name="twitter:description"]'])document.querySelector(selector).content=messages[lang].description;for(const node of document.querySelectorAll("[data-i18n]"))node.textContent=messages[lang][node.dataset.i18n];for(const node of document.querySelectorAll("[data-i18n-alt]"))node.alt=messages[lang][node.dataset.i18nAlt];for(const node of document.querySelectorAll("[data-i18n-aria-label]"))node.setAttribute("aria-label",messages[lang][node.dataset.i18nAriaLabel]);for(const node of document.querySelectorAll("[data-locale-srcset]"))node.srcset=node.dataset.localeSrcset.replace("{lang}",lang);for(const node of document.querySelectorAll("[data-locale-src]"))node.src=node.dataset.localeSrc.replace("{lang}",lang);for(const node of document.querySelectorAll("[data-locale-href-en]"))node.href=lang==="ja"?node.dataset.localeHrefJa:node.dataset.localeHrefEn};
 const browserLocale=(navigator.languages??[navigator.language]).map(language=>String(language).toLowerCase().split("-")[0]).find(language=>language==="ja"||language==="en")??"en";
 setLocale(pathLocale==="ja"||pathLocale==="en"?pathLocale:browserLocale);
 ${siteAssets ? "" : 'for(const node of document.querySelectorAll("[data-origin]"))node.textContent=location.origin;'}

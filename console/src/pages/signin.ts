@@ -3,7 +3,7 @@ import { type Child, h, live } from "../dom.ts";
 import { beginGoogleSignIn } from "../google.ts";
 import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
 import { mark } from "../mark.ts";
-import { type Resource, resource, signal, untrack } from "../reactive.ts";
+import { effect, type Resource, resource, signal, untrack } from "../reactive.ts";
 import { route } from "../router.ts";
 import {
   api,
@@ -502,32 +502,35 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
 }
 
 function themeSwitch(): Child {
-  return live(() =>
-    h(
-      "div",
-      { class: "segmented", role: "group", "aria-label": tr("表示", "Appearance") },
-      ...(
-        [
-          ["system", ICON.monitor, tr("システム", "System")],
-          ["light", ICON.sun, tr("ライト", "Light")],
-          ["dark", ICON.moon, tr("ダーク", "Dark")],
-        ] as const
-      ).map(([value, glyph, label]) =>
-        h(
-          "button",
-          {
-            class: "segmented__item",
-            type: "button",
-            title: label,
-            "aria-label": label,
-            "aria-pressed": theme() === value ? "true" : "false",
-            onClick: () => applyTheme(value),
-          },
-          icon(glyph, 15),
-        ),
-      ),
-    ),
-  );
+  const items = (
+    [
+      ["system", ICON.monitor, () => tr("システム", "System")],
+      ["light", ICON.sun, () => tr("ライト", "Light")],
+      ["dark", ICON.moon, () => tr("ダーク", "Dark")],
+    ] as const
+  ).map(([value, glyph, label]) => {
+    const button = h(
+      "button",
+      {
+        class: "segmented__item",
+        type: "button",
+        onClick: () => applyTheme(value),
+      },
+      icon(glyph, 15),
+    );
+    effect(() => {
+      const name = label();
+      button.setAttribute("title", name);
+      button.setAttribute("aria-label", name);
+      button.setAttribute("aria-pressed", theme() === value ? "true" : "false");
+    });
+    return button;
+  });
+  const group = h("div", { class: "segmented", role: "group" }, ...items);
+  effect(() => {
+    group.setAttribute("aria-label", tr("表示", "Appearance"));
+  });
+  return group;
 }
 
 function languageSwitch(): Child {
