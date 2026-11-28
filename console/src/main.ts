@@ -85,8 +85,12 @@ function boot(): void {
     const screen = !sessionReady()
       ? h(
           "main",
-          { class: "signin", role: "status", "aria-busy": "true" },
-          tr("セッションを確認しています…", "Checking your session…"),
+          { class: "signin" },
+          h(
+            "div",
+            { role: "status", "aria-busy": "true" },
+            tr("セッションを確認しています…", "Checking your session…"),
+          ),
         )
       : session()
         ? shell()

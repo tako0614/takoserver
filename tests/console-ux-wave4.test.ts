@@ -729,8 +729,9 @@ describe("Console & Site Wave 4 UI/UX improvements", () => {
   test("boot pre-session status uses <main> landmark, topbar theme resolves system dark on first click and keeps focus", async () => {
     const mainSource = readFileSync(new URL("../console/src/main.ts", import.meta.url), "utf8");
     expect(mainSource).toContain(
-      '"main",\n          { class: "signin", role: "status", "aria-busy": "true" }',
+      '"main",\n          { class: "signin" },\n          h(\n            "div",\n            { role: "status", "aria-busy": "true" },',
     );
+    expect(mainSource).not.toContain('{ class: "signin", role: "status"');
 
     const { doc, root } = installFakeDom("/", { prefersDark: true });
     const state = await import("../console/src/state.ts");
@@ -803,27 +804,44 @@ describe("Console & Site Wave 4 UI/UX improvements", () => {
     expect(localeBtn.textContent).toBe("EN");
   });
 
-  test("settings Appearance card and sign-in themeSwitch preserve focus across theme clicks", async () => {
+  test("settings Appearance/Language cards (inside live page) and sign-in themeSwitch preserve focus", async () => {
     const { doc, root } = installFakeDom("/settings");
     const state = await import("../console/src/state.ts");
+    const { live } = await import("../console/src/dom.ts");
     const { consoleLocale } = await import("../console/src/i18n.ts");
     const { settingsPage } = await import("../console/src/pages/settings.ts");
     const { signInPage } = await import("../console/src/pages/signin.ts");
     consoleLocale.set("en");
     state.setApiOrigin("https://settings-w4.example.test");
     state.applyTheme("light");
-    globalThis.fetch = Object.assign(async () => Response.json({ providers: [] }), {
-      preconnect: globalThis.fetch.preconnect,
-    });
+    let supportProbeCalls = 0;
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/support")) {
+          supportProbeCalls += 1;
+          return Response.json({ supported: true, operations: ["create"] });
+        }
+        return Response.json({ providers: [] });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
 
-    const settings = settingsPage({
+    const org = {
       id: "org-1",
       name: "Alpha",
       ownerPrincipalId: "prn-1",
       createdAt: "2026-01-01T00:00:00.000Z",
-    }) as unknown as FakeNode;
-    root.append(settings);
-    const darkBtn = settings
+    };
+    // Mount inside live(...) just like main.ts's live(page), so any accidental synchronous
+    // theme()/consoleLocale() read in settingsPage() would tear down the page and drop focus.
+    const pageHost = live(() => settingsPage(org)) as unknown as FakeNode;
+    root.append(pageHost);
+    await flush();
+    const initialSupportCalls = supportProbeCalls;
+    expect(initialSupportCalls).toBe(2);
+
+    const darkBtn = pageHost
       .all()
       .find((node) => node.tag === "button" && node.textContent === "Dark");
     expect(darkBtn).toBeDefined();
@@ -832,9 +850,48 @@ describe("Console & Site Wave 4 UI/UX improvements", () => {
     darkBtn.click();
     await flush();
     expect(state.theme()).toBe("dark");
-    expect(settings.all().includes(darkBtn)).toBe(true);
+    expect(pageHost.all().includes(darkBtn)).toBe(true);
     expect(doc.activeElement).toBe(darkBtn);
     expect(darkBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(supportProbeCalls).toBe(initialSupportCalls);
+
+    // Switching language in Settings must NOT remount settingsPage(), drop focus, or re-probe Host support.
+    const jaBtn = pageHost
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "日本語");
+    const enBtn = pageHost
+      .all()
+      .find((node) => node.tag === "button" && node.textContent === "English");
+    expect(jaBtn).toBeDefined();
+    expect(enBtn).toBeDefined();
+    if (!jaBtn || !enBtn) throw new Error("Settings language buttons missing");
+
+    jaBtn.focus();
+    jaBtn.click();
+    await flush();
+    expect(consoleLocale()).toBe("ja");
+    expect(pageHost.all().includes(jaBtn)).toBe(true);
+    expect(doc.activeElement).toBe(jaBtn);
+    expect(jaBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(enBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(pageHost.all().find((node) => node.tag === "h1")?.textContent).toBe("設定");
+    expect(
+      pageHost
+        .all()
+        .some((node) => node.className === "card__title" && node.textContent === "組織"),
+    ).toBe(true);
+    expect(supportProbeCalls).toBe(initialSupportCalls);
+
+    enBtn.focus();
+    enBtn.click();
+    await flush();
+    expect(consoleLocale()).toBe("en");
+    expect(pageHost.all().includes(enBtn)).toBe(true);
+    expect(doc.activeElement).toBe(enBtn);
+    expect(enBtn.getAttribute("aria-pressed")).toBe("true");
+    expect(jaBtn.getAttribute("aria-pressed")).toBe("false");
+    expect(pageHost.all().find((node) => node.tag === "h1")?.textContent).toBe("Settings");
+    expect(supportProbeCalls).toBe(initialSupportCalls);
 
     // Sign-in segmented theme control preserves focus too.
     root.replaceChildren();
@@ -854,7 +911,7 @@ describe("Console & Site Wave 4 UI/UX improvements", () => {
     expect(lightBtn.getAttribute("aria-pressed")).toBe("true");
   });
 
-  test("createResource validates missing Form inline, focuses Form before Name/Spec, and clears on selection", async () => {
+  test("createResource validates missing and unsupported custom Form inline, focuses Form first, and clears on edit", async () => {
     const { doc, body } = installFakeDom("/resources");
     const state = await import("../console/src/state.ts");
     const { consoleLocale } = await import("../console/src/i18n.ts");
@@ -874,14 +931,17 @@ describe("Console & Site Wave 4 UI/UX improvements", () => {
     state.selectOrganization("org-1");
     body.append(mountToasts() as unknown as FakeNode);
 
+    const unsupportedFormUrl = "https://example.invalid/forms/Unsupported/0.1.0/";
     globalThis.fetch = Object.assign(
       async (input: RequestInfo | URL) => {
         const url = new URL(String(input));
         if (url.pathname.endsWith("/support")) {
+          const requestedForm = url.searchParams.get("form") ?? "";
+          const supported = requestedForm !== unsupportedFormUrl;
           return Response.json({
-            form: url.searchParams.get("form") ?? "",
-            supported: true,
-            operations: ["create"],
+            form: requestedForm,
+            supported,
+            operations: supported ? ["create"] : [],
           });
         }
         return Response.json({ error: { code: "not_found" } }, { status: 404 });
@@ -893,12 +953,13 @@ describe("Console & Site Wave 4 UI/UX improvements", () => {
     await flush();
 
     const formSelect = body.all().find((node) => node.id === "create-resource-form");
+    const formUrlInput = body.all().find((node) => node.id === "create-resource-form-url");
     const formError = body.all().find((node) => node.id === "create-resource-form-error");
     const nameInput = body.all().find((node) => node.id === "create-resource-name");
     const createBtn = body
       .all()
       .find((node) => node.tag === "button" && node.textContent === "Create");
-    if (!formSelect || !formError || !nameInput || !createBtn)
+    if (!formSelect || !formUrlInput || !formError || !nameInput || !createBtn)
       throw new Error("createResource controls missing");
 
     // Submit with both Form and Name empty: Form gets inline error and takes focus first.
@@ -918,6 +979,35 @@ describe("Console & Site Wave 4 UI/UX improvements", () => {
     await flush();
     expect(formError.hidden).toBe(true);
     expect(formSelect.getAttribute("aria-invalid")).toBeNull();
+
+    // Switching to custom Form URL ("other") and submitting an unsupported Form shows inline error on the URL input.
+    formSelect.value = "other";
+    formSelect.dispatch("change");
+    await flush();
+    expect(formUrlInput.hidden).toBe(false);
+
+    formUrlInput.value = unsupportedFormUrl;
+    formUrlInput.dispatch("input");
+    nameInput.value = "demo-resource";
+    nameInput.dispatch("input");
+    createBtn.click();
+    await flush();
+    expect(formError.hidden).toBe(false);
+    expect(formError.getAttribute("role")).toBe("alert");
+    expect(formError.textContent).toContain("does not support create");
+    expect(formUrlInput.getAttribute("aria-invalid")).toBe("true");
+    expect(formUrlInput.getAttribute("aria-describedby")).toBe(
+      "create-resource-form-hint create-resource-form-error",
+    );
+    expect(doc.activeElement).toBe(formUrlInput);
+
+    // Clearing the custom Form URL text immediately clears the stale unsupported-Form error.
+    formUrlInput.value = "";
+    formUrlInput.dispatch("input");
+    await flush();
+    expect(formError.hidden).toBe(true);
+    expect(formUrlInput.getAttribute("aria-invalid")).toBeNull();
+    expect(formUrlInput.getAttribute("aria-describedby")).toBe("create-resource-form-hint");
 
     doc.dispatchKey("Escape", { keyCode: 27 });
   });

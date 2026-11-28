@@ -438,7 +438,10 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
     setError(null);
     sync();
   });
-  url.addEventListener("input", sync);
+  url.addEventListener("input", () => {
+    setError(null);
+    sync();
+  });
 
   const settle = (runId: number, form: string, supported: boolean | null): void => {
     if (runId !== probeRun) return;

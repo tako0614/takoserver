@@ -31,42 +31,46 @@ export function settingsPage(organization: Organization): Child {
   return h(
     "div",
     { class: "page" },
-    h(
-      "div",
-      { class: "head" },
+    live(() =>
       h(
         "div",
-        { class: "head__text" },
-        h("h1", null, tr("設定", "Settings")),
+        { class: "head" },
         h(
-          "p",
-          null,
-          tr(
-            "サインイン中のアカウントと、このコンソールの接続先を確認します。",
-            "Who you are signed in as, and what this console is talking to.",
+          "div",
+          { class: "head__text" },
+          h("h1", null, tr("設定", "Settings")),
+          h(
+            "p",
+            null,
+            tr(
+              "サインイン中のアカウントと、このコンソールの接続先を確認します。",
+              "Who you are signed in as, and what this console is talking to.",
+            ),
           ),
         ),
       ),
     ),
-    card(
-      tr("組織", "Organization"),
-      h(
-        "div",
-        { class: "card__body" },
+    live(() =>
+      card(
+        tr("組織", "Organization"),
         h(
           "div",
-          { class: "rows" },
-          row(tr("名前", "Name"), organization.name),
-          row(tr("識別子", "Identifier"), copyable(organization.id)),
-          row(tr("作成日時", "Created"), when(organization.createdAt)),
-          row(
-            tr("スペース", "Space"),
-            h(
-              "span",
-              { class: "dim" },
-              tr(
-                "Host API v2では、この識別子がスペース（Space）になります。リソースは組織ごとに分かれ、この組織のAPIキーとサインイン中のセッションは、どちらもこの組織として操作します。",
-                "In Host API v2 this identifier is the Space. Each resource belongs to one organization, and its API keys (within their scopes) and your signed-in session act as that organization.",
+          { class: "card__body" },
+          h(
+            "div",
+            { class: "rows" },
+            row(tr("名前", "Name"), organization.name),
+            row(tr("識別子", "Identifier"), copyable(organization.id)),
+            row(tr("作成日時", "Created"), when(organization.createdAt)),
+            row(
+              tr("スペース", "Space"),
+              h(
+                "span",
+                { class: "dim" },
+                tr(
+                  "Host API v2では、この識別子がスペース（Space）になります。リソースは組織ごとに分かれ、この組織のAPIキーとサインイン中のセッションは、どちらもこの組織として操作します。",
+                  "In Host API v2 this identifier is the Space. Each resource belongs to one organization, and its API keys (within their scopes) and your signed-in session act as that organization.",
+                ),
               ),
             ),
           ),
