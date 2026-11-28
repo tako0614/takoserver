@@ -1,5 +1,5 @@
 import type { IdentityProvider } from "../api.ts";
-import { type Child, h, live } from "../dom.ts";
+import { type Child, h, live, text } from "../dom.ts";
 import { beginGoogleSignIn } from "../google.ts";
 import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
 import { mark } from "../mark.ts";
@@ -43,6 +43,33 @@ export function signInPage(): Child {
     }
   });
 
+  // Update translated copy in place via child effects so switching JA <-> EN
+  // never remounts signInPage(), preserves focus on the language switch, keeps
+  // any pasted assertion or open API endpoint disclosure, and avoids re-fetching providers.
+  const lede = h("p", { class: "signin__lede" });
+  effect(() => {
+    lede.replaceChildren(
+      text(
+        tr(
+          "Takoformで宣言したリソース、使用量、請求を管理します。",
+          "Manage resources declared through Takoform, usage, and billing.",
+        ),
+      ),
+    );
+  });
+
+  const legal = h("p", { class: "signin__legal" });
+  effect(() => {
+    legal.replaceChildren(
+      text(
+        tr(
+          "続行すると、作成したリソースと使用量に応じた請求に同意したものとみなします。",
+          "By continuing, you agree to charges for the resources and usage you create.",
+        ),
+      ),
+    );
+  });
+
   return h(
     "main",
     { class: "signin" },
@@ -59,24 +86,10 @@ export function signInPage(): Child {
         "div",
         { class: "signin__panel" },
         h("h1", null, "Takoserver"),
-        h(
-          "p",
-          { class: "signin__lede" },
-          tr(
-            "Takoformで宣言したリソース、使用量、請求を管理します。",
-            "Manage resources declared through Takoform, usage, and billing.",
-          ),
-        ),
+        lede,
         sharedSessionRow(),
         live(() => wayIn(providers)),
-        h(
-          "p",
-          { class: "signin__legal" },
-          tr(
-            "続行すると、作成したリソースと使用量に応じた請求に同意したものとみなします。",
-            "By continuing, you agree to charges for the resources and usage you create.",
-          ),
-        ),
+        legal,
       ),
       themeSwitch(),
       languageSwitch(),
@@ -410,16 +423,46 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
     id: "assertion",
     name: "assertion",
     class: "textarea",
-    placeholder: tr(
-      "運営者が署名したassertionを貼り付けてください",
-      "Paste the assertion the operator signed",
-    ),
     autocomplete: "off",
     spellcheck: "false",
     "aria-describedby": "assertion-hint",
     onInput: () => {
       setFieldError(assertion, assertionError, null, hintIds);
     },
+  });
+  const label = h("label", { for: "assertion" });
+  const hint = h("small", { id: "assertion-hint" });
+  const submitButton = h("button", {
+    class: "btn",
+    type: "submit",
+    style: { width: "100%" },
+  });
+  effect(() => {
+    label.replaceChildren(text(tr("運営者assertion", "Operator assertion")));
+    assertion.setAttribute(
+      "placeholder",
+      tr(
+        "運営者が署名したassertionを貼り付けてください",
+        "Paste the assertion the operator signed",
+      ),
+    );
+    hint.replaceChildren(
+      text(
+        tr(
+          "この環境に設定された運営者キーでオフライン署名されたものです。",
+          "Signed offline by the operator key this deployment is configured with.",
+        ),
+      ),
+    );
+    const sending = busy();
+    submitButton.disabled = sending;
+    submitButton.replaceChildren(
+      text(
+        sending
+          ? tr("サインインしています…", "Signing in…")
+          : tr("assertionでサインイン", "Sign in with assertion"),
+      ),
+    );
   });
 
   const submit = async (event: Event): Promise<void> => {
@@ -469,35 +512,8 @@ function operatorForm(providers: readonly IdentityProvider[]): Child {
   return h(
     "form",
     { style: { display: "grid", gap: "10px" }, onSubmit: submit },
-    h(
-      "div",
-      { class: "field" },
-      h("label", { for: "assertion" }, tr("運営者assertion", "Operator assertion")),
-      assertion,
-      assertionError,
-      h(
-        "small",
-        { id: "assertion-hint" },
-        tr(
-          "この環境に設定された運営者キーでオフライン署名されたものです。",
-          "Signed offline by the operator key this deployment is configured with.",
-        ),
-      ),
-    ),
-    live(() =>
-      h(
-        "button",
-        {
-          class: "btn",
-          type: "submit",
-          style: { width: "100%" },
-          ...(busy() ? { disabled: true } : {}),
-        },
-        busy()
-          ? tr("サインインしています…", "Signing in…")
-          : tr("assertionでサインイン", "Sign in with assertion"),
-      ),
-    ),
+    h("div", { class: "field" }, label, assertion, assertionError, hint),
+    submitButton,
   );
 }
 
@@ -534,32 +550,34 @@ function themeSwitch(): Child {
 }
 
 function languageSwitch(): Child {
-  return live(() =>
-    h(
-      "div",
-      { class: "segmented", role: "group", "aria-label": tr("言語", "Language") },
-      ...(["ja", "en"] as const).map((option) =>
-        h(
-          "button",
-          {
-            class: "segmented__item",
-            type: "button",
-            title: option === "ja" ? "日本語" : "English",
-            "aria-pressed": consoleLocale() === option ? "true" : "false",
-            onClick: () => setConsoleLocale(option),
-          },
-          // The visible code is part of the name (WCAG 2.5.3), so voice control
-          // users can say what they see; the full name follows for screen readers.
-          h("span", { "aria-hidden": "true" }, option === "ja" ? "JA" : "EN"),
-          h(
-            "span",
-            { class: "visually-hidden", lang: option },
-            option === "ja" ? "JA 日本語" : "EN English",
-          ),
-        ),
+  const items = (["ja", "en"] as const).map((option) => {
+    const button = h(
+      "button",
+      {
+        class: "segmented__item",
+        type: "button",
+        title: option === "ja" ? "日本語" : "English",
+        onClick: () => setConsoleLocale(option),
+      },
+      // The visible code is part of the name (WCAG 2.5.3), so voice control
+      // users can say what they see; the full name follows for screen readers.
+      h("span", { "aria-hidden": "true" }, option === "ja" ? "JA" : "EN"),
+      h(
+        "span",
+        { class: "visually-hidden", lang: option },
+        option === "ja" ? "JA 日本語" : "EN English",
       ),
-    ),
-  );
+    );
+    effect(() => {
+      button.setAttribute("aria-pressed", consoleLocale() === option ? "true" : "false");
+    });
+    return button;
+  });
+  const group = h("div", { class: "segmented", role: "group" }, ...items);
+  effect(() => {
+    group.setAttribute("aria-label", tr("言語", "Language"));
+  });
+  return group;
 }
 
 /**
@@ -600,7 +618,7 @@ function endpointField(reload: () => void): Child {
     type: "url",
     autocomplete: "off",
     spellcheck: "false",
-    value: apiOrigin(),
+    value: untrack(apiOrigin),
     onInput: () => {
       if (normalizeApiOrigin(input.value)) setFieldError(input, originError, null);
     },
@@ -611,32 +629,24 @@ function endpointField(reload: () => void): Child {
       }
     },
   });
+  const summary = h("summary");
+  const label = h("label", { for: "signin-api-origin", class: "visually-hidden" });
+  const saveButton = h("button", { class: "btn", type: "button", onClick: save });
+  effect(() => {
+    const title = tr("API接続先", "API endpoint");
+    summary.replaceChildren(text(title));
+    label.replaceChildren(text(title));
+    saveButton.replaceChildren(text(tr("保存", "Save")));
+  });
   return h(
     "details",
     { class: "signin__endpoint" },
-    h("summary", null, tr("API接続先", "API endpoint")),
+    summary,
     h(
       "div",
       { class: "field", style: { marginTop: "8px" } },
-      h(
-        "label",
-        { for: "signin-api-origin", class: "visually-hidden" },
-        tr("API接続先", "API endpoint"),
-      ),
-      h(
-        "div",
-        { style: { display: "flex", gap: "8px" } },
-        input,
-        h(
-          "button",
-          {
-            class: "btn",
-            type: "button",
-            onClick: save,
-          },
-          tr("保存", "Save"),
-        ),
-      ),
+      label,
+      h("div", { style: { display: "flex", gap: "8px" } }, input, saveButton),
       originError,
     ),
   );

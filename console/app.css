@@ -16,7 +16,8 @@
   --ink-1: #0e0e10;
   --ink-2: #45464b;
   --ink-3: #65676d;
-  --ink-4: #96989f;
+  /* Non-text UI icons (.copy__icon, .rowbutton__chevron): >= 3:1 WCAG 1.4.11 on surface-0/2. */
+  --ink-4: #767880;
 
   --surface-0: #ffffff;
   --surface-1: #ffffff;
@@ -733,6 +734,12 @@ tbody tr.is-clickable:hover {
   background: var(--surface-2);
 }
 
+.btn[hidden],
+.filter-count[hidden],
+[hidden] {
+  display: none;
+}
+
 .btn[disabled],
 .btn[aria-disabled="true"] {
   opacity: 0.5;
@@ -782,6 +789,64 @@ tbody tr.is-clickable:hover {
 .btn--sm {
   padding: 4px 8px;
   font-size: 12px;
+}
+
+.hosted-continuation__facts {
+  margin: 0 0 14px;
+  display: grid;
+  grid-template-columns: 184px minmax(0, 1fr);
+  gap: 8px 14px;
+  font-size: 13px;
+}
+
+.hosted-continuation__facts dt {
+  color: var(--ink-3);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.hosted-continuation__facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.hosted-continuation__actions h2 {
+  margin: 18px 0 10px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.hosted-continuation__actions dl {
+  margin: 10px 0 14px;
+  display: grid;
+  font-size: 13px;
+}
+
+.hosted-continuation__actions dl > div {
+  display: grid;
+  grid-template-columns: 184px minmax(0, 1fr);
+  gap: 14px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-1);
+}
+
+.hosted-continuation__actions dl > div:last-child {
+  border-bottom: 0;
+}
+
+.hosted-continuation__actions dl dt {
+  color: var(--ink-3);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.hosted-continuation__actions dl dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
 }
 
 .hosted-continuation__actions .btn:focus-visible {
@@ -1400,11 +1465,27 @@ h1.empty__title {
   .row {
     grid-template-columns: 1fr;
     gap: 3px;
+    padding: 6px 0;
+  }
+
+  .hosted-continuation__facts {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 3px;
+  }
+
+  .hosted-continuation__facts dd {
+    margin-bottom: 8px;
+  }
+
+  .hosted-continuation__actions dl > div {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
   }
 
   /* A name and its count stay on one line. */
   .rows--counts .row {
     grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
     gap: 14px;
   }
 }
@@ -1627,6 +1708,20 @@ h1.empty__title {
 }
 
 /* The overview's wallet: one line after what was deployed, never a headline. */
+.keys-scopes__list {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.rows__caption {
+  grid-column: 1 / -1;
+}
+
+.wallet-card__notice {
+  margin: 0 16px 16px;
+}
+
 .wallet-line {
   display: flex;
   flex-wrap: wrap;
@@ -1821,6 +1916,24 @@ h1.empty__title {
 
   .keys-table .keys-scopes {
     align-items: flex-start;
+  }
+
+  .keys-table .keys-scopes__list {
+    justify-content: flex-end;
+  }
+
+  .head__text > .dim > a,
+  .published a,
+  .wallet-line a,
+  .rows--counts .row__label a,
+  .row__label > a,
+  .row__value > a,
+  .ref a,
+  .attention-table .attention-name a {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25em;
+    min-height: 44px;
   }
 
   .keys-table .keys-actions {

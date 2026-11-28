@@ -93,7 +93,7 @@ export function overviewPage(organization: Organization): Child {
           // never been used shows nothing here; Usage & billing still has the
           // wallet. One that has been used keeps its line at $0.
           walletInUse(held) ? walletLine(held) : h("div", { style: { display: "none" } }),
-        { skeleton: false },
+        { skeleton: false, retry: wallet.reload },
       ),
     ),
   );
@@ -212,7 +212,7 @@ function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
     h(
       "div",
       { class: "card__body rows rows--counts" },
-      h("div", { class: "row" }, h("div", { class: "row__label dim" }, caption)),
+      h("div", { class: "row" }, h("div", { class: "row__label dim rows__caption" }, caption)),
       ...byForm(all).map((entry) =>
         h(
           "div",
@@ -308,7 +308,7 @@ function walletLine(held: Wallet): Child {
     held.refundReceivableMicros === undefined
       ? h(
           "div",
-          { class: "notice notice--warn", role: "status" },
+          { class: "notice notice--warn wallet-card__notice", role: "status" },
           tr(
             "返金未回収額は未報告です。利用可能残高だけでは新しい課金操作の可否は分かりません。操作時にHostが判定します。",
             "Refund debt was not reported. Available credit alone does not establish permission for new billable operations; the Host decides when an operation is requested.",
@@ -317,7 +317,7 @@ function walletLine(held: Wallet): Child {
       : BigInt(held.refundReceivableMicros) > 0n
         ? h(
             "div",
-            { class: "notice notice--bad", role: "status" },
+            { class: "notice notice--bad wallet-card__notice", role: "status" },
             tr(
               "返金未回収額が残っているため、利用可能残高があっても新しい課金操作はできません。",
               "New billable operations are blocked while a refund receivable remains, even when available credit is positive.",
@@ -533,6 +533,11 @@ function address(endpoint: ResourceSummary): Child {
       { href: url, target: "_blank", rel: "noopener noreferrer" },
       url,
       h("span", { "aria-hidden": "true" }, " ↗"),
+      h(
+        "span",
+        { class: "visually-hidden" },
+        tr("（新しいタブで開きます）", " (opens in a new tab)"),
+      ),
     );
   }
   return h(

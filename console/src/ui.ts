@@ -703,6 +703,19 @@ export function openModal(options: ModalOptions): () => void {
         void done.finally(() => {
           sending = false;
           settle();
+          if (closed) return;
+          // Disabling a focused confirm button while sending moves focus to
+          // document.body; if the dialog stays open after a refusal and no
+          // field claimed focus, return focus inside the dialog.
+          const active =
+            typeof document !== "undefined" && "activeElement" in document
+              ? (document.activeElement as HTMLElement | null)
+              : null;
+          const inside =
+            typeof dialog.contains === "function" && active ? dialog.contains(active) : false;
+          if (!inside) {
+            (!button.disabled ? button : dialog).focus?.();
+          }
         });
       }
     });

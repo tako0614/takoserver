@@ -152,7 +152,10 @@ export function hostedBillingContinuationPage(selector: string): Child {
   const preparationPrior = priorPreparation(selector);
   const preparation = signal<PrepareState | null>(
     preparationPrior === "attempted"
-      ? { kind: "unknown", message: "A prior prepare attempt is unresolved" }
+      ? {
+          kind: "unknown",
+          message: tr("前回の準備操作が未確定です", "A prior prepare attempt is unresolved"),
+        }
       : preparationPrior === "storage-error"
         ? { kind: "storage-error" }
         : null,
@@ -231,7 +234,15 @@ export function hostedBillingContinuationPage(selector: string): Child {
       if (loaded.state === "error")
         return card(
           null,
-          empty(tr("続行内容を確認できません", "Continuation unavailable"), explain(loaded.error)),
+          empty(
+            tr("続行内容を確認できません", "Continuation unavailable"),
+            explain(loaded.error),
+            h(
+              "button",
+              { class: "btn btn--sm", type: "button", onClick: continuation.reload },
+              tr("再試行", "Try again"),
+            ),
+          ),
         );
       const current = loaded.value.kind === "view" ? (prepared() ?? loaded.value) : loaded.value;
       if (
@@ -902,6 +913,12 @@ function checkoutResult(url: string): Child {
       "a",
       { href: url, target: "_blank", rel: "noopener noreferrer" },
       tr("Stripeで続ける", "Continue to Stripe"),
+      h("span", { "aria-hidden": "true" }, " ↗"),
+      h(
+        "span",
+        { class: "visually-hidden" },
+        tr("（新しいタブで開きます）", " (opens in a new tab)"),
+      ),
     ),
   );
 }

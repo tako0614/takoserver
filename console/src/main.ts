@@ -300,6 +300,31 @@ function topbar(): Child {
     themeButton.replaceChildren(icon(dark ? ICON.sun : ICON.moon, 16));
   });
 
+  const signOutText = h("span", { class: "topbar__who" });
+  const signOutButton = h(
+    "button",
+    {
+      class: "btn btn--ghost btn--sm",
+      type: "button",
+      onClick: () => {
+        void signOut().catch((error: unknown) => toast(explain(error as Error), "bad"));
+      },
+    },
+    icon(ICON.signOut, 15),
+    signOutText,
+  );
+  effect(() => {
+    const who = principal();
+    const label = who
+      ? `${who.displayName} — ${tr("サインアウト", "sign out")}`
+      : tr("サインアウト", "Sign out");
+    // On a phone only the icon shows; the label keeps the button's name, and
+    // updating in place preserves keyboard focus when principal() resolves.
+    signOutButton.setAttribute("title", label);
+    signOutButton.setAttribute("aria-label", label);
+    signOutText.replaceChildren(text(who ? who.displayName : tr("サインアウト", "Sign out")));
+  });
+
   return h(
     "header",
     { class: "topbar" },
@@ -311,27 +336,7 @@ function topbar(): Child {
     h("div", { class: "topbar__spacer" }),
     localeButton,
     themeButton,
-    live(() => {
-      const who = principal();
-      const label = who
-        ? `${who.displayName} — ${tr("サインアウト", "sign out")}`
-        : tr("サインアウト", "Sign out");
-      // On a phone only the icon shows; the label keeps the button's name.
-      return h(
-        "button",
-        {
-          class: "btn btn--ghost btn--sm",
-          type: "button",
-          title: label,
-          "aria-label": label,
-          onClick: () => {
-            void signOut().catch((error: unknown) => toast(explain(error as Error), "bad"));
-          },
-        },
-        icon(ICON.signOut, 15),
-        h("span", { class: "topbar__who" }, who ? who.displayName : tr("サインアウト", "Sign out")),
-      );
-    }),
+    signOutButton,
   );
 }
 

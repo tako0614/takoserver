@@ -3,7 +3,7 @@ import { type Child, h, live, text } from "../dom.ts";
 import { firstRunNote, once } from "../first-run.ts";
 import { formName } from "../forms.ts";
 import { tr } from "../i18n.ts";
-import { resource, signal } from "../reactive.ts";
+import { effect, resource, signal } from "../reactive.ts";
 import {
   canReplayResourceIntent,
   sendResourceIntent,
@@ -207,16 +207,22 @@ export function resourcesPage(organizationId: string): Child {
     if (current.status === "failed") {
       return h(
         "div",
-        { class: "notice notice--bad" },
-        tr("失敗しました", "Failed"),
-        current.error
-          ? h(
-              "span",
-              null,
-              text(`${tr("：", ": ")}${current.error.message} `),
-              h("span", { class: "mono dim" }, `(${current.error.code})`),
-            )
-          : raw,
+        {
+          class: "notice notice--bad",
+          role: "alert",
+          style: { display: "grid", gap: "6px" },
+        },
+        h(
+          "span",
+          null,
+          tr("失敗しました", "Failed"),
+          current.error
+            ? [
+                text(`${tr("：", ": ")}${current.error.message} `),
+                h("span", { class: "mono dim" }, `(${current.error.code})`),
+              ]
+            : raw,
+        ),
         // Whether anything changed decides whether a retry is safe.
         h("div", null, failedEffect(current.effect)),
       );
@@ -498,6 +504,33 @@ function createFilterToolbar(
     input.focus?.();
   };
   bindSearchShortcut(input, () => filter.set(""), isActive);
+  // Keep the status live region and Clear button stably mounted so screen
+  // readers reliably announce match-count updates as the person types.
+  const count = h("span", {
+    class: "filter-count",
+    role: "status",
+    "aria-live": "polite",
+    hidden: true,
+  });
+  const clearButton = h(
+    "button",
+    {
+      class: "btn btn--ghost btn--sm",
+      type: "button",
+      "aria-label": tr("絞り込みをクリア", "Clear filter"),
+      hidden: true,
+      onClick: clear,
+    },
+    tr("クリア", "Clear"),
+  );
+  effect(() => {
+    const active = filter() !== "";
+    count.hidden = !active;
+    clearButton.hidden = !active;
+    count.replaceChildren(
+      active ? text(tr(`${matched()} / ${total()} 件`, `${matched()} of ${total()}`)) : text(""),
+    );
+  });
   return {
     clear,
     element: h(
@@ -509,27 +542,8 @@ function createFilterToolbar(
         input,
         h("kbd", { class: "kbd-hint", "aria-hidden": "true" }, "/"),
       ),
-      live(() =>
-        filter() === ""
-          ? null
-          : [
-              h(
-                "span",
-                { class: "filter-count", role: "status" },
-                tr(`${matched()} / ${total()} 件`, `${matched()} of ${total()}`),
-              ),
-              h(
-                "button",
-                {
-                  class: "btn btn--ghost btn--sm",
-                  type: "button",
-                  "aria-label": tr("絞り込みをクリア", "Clear filter"),
-                  onClick: clear,
-                },
-                tr("クリア", "Clear"),
-              ),
-            ],
-      ),
+      count,
+      clearButton,
     ),
   };
 }
